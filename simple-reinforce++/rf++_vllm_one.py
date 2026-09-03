@@ -189,7 +189,8 @@ def gen_worker(Q, physics_device):
                 # 必须用顶层函数+partial（lambda 无法跨进程序列化）；
                 # vLLM 0.12 需配环境变量 VLLM_ALLOW_INSECURE_SERIALIZATION=1
                 import functools
-                vllm_gen.apply_model(functools.partial(vllm_load_weights, sd_items=new_state_dict.items()))
+                # 注意必须是 list：odict_items 视图不可 pickle（TypeError: cannot pickle 'odict_items'）
+                vllm_gen.apply_model(functools.partial(vllm_load_weights, sd_items=list(new_state_dict.items())))
                 synced = 'apply_model'
             elif hasattr(vllm_gen.llm_engine, 'model_executor'):
                 # V0引擎旧路径（VLLM_USE_V1=0 时可用）
