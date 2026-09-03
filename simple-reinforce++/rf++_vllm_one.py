@@ -22,6 +22,7 @@ ref_server = base_config["ref_server"]
 
 
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
+from sync_utils import vllm_load_weights  # 【修复2】顶层函数必须放独立模块，EngineCore spawn 进程才能反序列化
 
 
 def get_batch():
@@ -143,7 +144,10 @@ def gen_worker(Q, physics_device):
             return False
     
     def reward_format(answer):
-        pattern = r"^<think>.*?</think>[\n ]<answer>.*?</answer>$"
+        # 【修复】原版 [\n ] 要求 </think> 和 <answer> 之间必须有空白，
+        # 与 GRPO 的紧连式正则互斥（Ed悖论：格式完美的紧连答案被冤判-2）。
+        # 改为与 grpo_ref_split.py 完全一致，保证两算法同 reward 口径可比。
+        pattern = r"^<think>.*?</think><answer>.*?</answer>$"
         think_count = answer.count("<think>") + answer.count("</think>")
         answer_count = answer.count("<answer>") + answer.count("</answer>")
         return True if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count == 2 and answer_count == 2 else False
@@ -167,18 +171,42 @@ def gen_worker(Q, physics_device):
         return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
 
     def try_update_model():
+        # 【修复】原来 bare except 会把队列空/权重加载失败全部静默吞掉，
+        # 导致"生成器永远停在base"却看不出任何异常（训练日志零接收端打印即此症状）
+        import queue as _queue
         try:
             new_state_dict = Q.get_nowait()
-            print('[VLLM PROC] recving new model ...')
-            llm_model = vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(new_state_dict.items())
-            # 【修复】同步torch gen_logps副本，保证和vLLM用的是同一份最新策略权重
-            gen_torch.load_state_dict({k: v.to(torch.bfloat16) for k, v in new_state_dict.items()})
-            print('[VLLM PROC] model updated')
-            del new_state_dict
-        except:
-            #print('[VLLM PROC] no new model')
+        except _queue.Empty:
             return
+        print('[VLLM PROC] recving new model ...')
+        try:
+            # 【修复2】vLLM 0.10(V1引擎)的 model_executor 已搬进独立 EngineCore 进程，
+            # 旧路径 llm_engine.model_executor 不存在（AttributeError 曾被静默吞掉，
+            # 导致生成器全程冻结在 base）。按优先级尝试多种同步路径：
+            synced = None
+            if hasattr(vllm_gen, 'apply_model'):
+                # 官方API：把函数RPC到EngineCore进程内对模型就地执行。
+                # 必须用顶层函数+partial（lambda 无法跨进程序列化）；
+                # vLLM 0.12 需配环境变量 VLLM_ALLOW_INSECURE_SERIALIZATION=1
+                import functools
+                vllm_gen.apply_model(functools.partial(vllm_load_weights, sd_items=new_state_dict.items()))
+                synced = 'apply_model'
+            elif hasattr(vllm_gen.llm_engine, 'model_executor'):
+                # V0引擎旧路径（VLLM_USE_V1=0 时可用）
+                vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model \
+                    .load_weights(new_state_dict.items())
+                synced = 'v0 model_executor'
+            else:
+                raise AttributeError('no weight-sync path for this vLLM version (V1 engine, no apply_model)')
+            # 【顺序】只有 vLLM 同步成功后才同步 gen_logps 副本——两者必须保持同一份权重
+            gen_torch.load_state_dict({k: v.to(torch.bfloat16) for k, v in new_state_dict.items()})
+            print(f'[VLLM PROC] model updated via {synced}, {len(new_state_dict)} tensors')
+            del new_state_dict
+        except Exception:
+            import traceback; traceback.print_exc()
+            # 【修复2】同步失败 = 生成器与训练器权重脱钩，训练数据全部作废。
+            # 宁可崩掉生成进程让 "waiting for batch" 卡住暴露问题，也不用旧权重静默续训
+            raise RuntimeError('[VLLM PROC] weight sync failed -> gen worker abort (fail-fast)')
         
     from torch.nn.utils.rnn import pad_sequence
     for it in range(999999999):
