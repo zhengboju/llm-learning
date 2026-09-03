@@ -39,10 +39,21 @@ def reward_correct(answer, ground_truth):
     nums = re.findall(pattern, answer)
     if len(nums) == 0: return 0.0
     try:
-        ans = parse(nums[-1], extraction_config=[ExprExtractionConfig()])
-        gt = parse(ground_truth, extraction_config=[ExprExtractionConfig()])
-        return 1.0 if verify(ans, gt) else 0.0
+        # 【多线程适配·并行版全0的根因】math_verify 默认 parsing_timeout/timeout_seconds=5，
+        # 内部用 signal.alarm 实现——signal 只能在主线程用，worker 线程里必抛
+        # ValueError("signal only works in main thread")，被下面 except 吞掉 => 所有题 a=0。
+        # 库方建议线程环境置 None（自管超时）；GSM8K 只解析短数字串，无挂起风险。
+        ans = parse(nums[-1], extraction_config=[ExprExtractionConfig()], parsing_timeout=None)
+        gt = parse(ground_truth, extraction_config=[ExprExtractionConfig()], parsing_timeout=None)
+        return 1.0 if verify(ans, gt, timeout_seconds=None) else 0.0
     except Exception:
+        # 双保险：真出异常就退化为纯数值比较
+        try:
+            gt_nums = re.findall(pattern, ground_truth.replace(",", ""))
+            if gt_nums and abs(float(nums[-1]) - float(gt_nums[-1])) < 1e-6:
+                return 1.0
+        except Exception:
+            pass
         return 0.0
 
 def reward_format(answer):
