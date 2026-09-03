@@ -19,7 +19,7 @@ N = args.n
 do_sample = args.do_sample
 
 system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
-The reasoning process and answer are enclosed within  thinking  response and<answer> </answer> tags, respectively, i.e.,  thinking reasoning process here  response<answer> answer here </answer>."""
+The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
 
 # ---------- 与训练完全一致的奖励函数（0/1 化便于统计） ----------
 def reward_correct(answer, ground_truth):
@@ -36,7 +36,7 @@ def reward_correct(answer, ground_truth):
 def reward_format(answer):
     if "reasoning process here" in answer.lower():  # 与新训练一致：占位符判格式失败
         return 0.0
-    pattern = r"^ thinking.*? response<answer>.*?</answer>$"
+    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
     return 1.0 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else 0.0
 
 # ---------- 加载 GSM8K **test** split ----------

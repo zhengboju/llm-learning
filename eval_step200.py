@@ -8,7 +8,7 @@ base_path = "/root/Qwen2.5-3B"
 tuned_path = "./step_200"
 
 system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
-The reasoning process and answer are enclosed within  thinking  response and<answer> </answer> tags, respectively, i.e.,  thinking reasoning process here  response<answer> answer here </answer>."""
+The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
 
 questions = [
     # 挑几条训练日志里见过的题 + 一条没见过的
