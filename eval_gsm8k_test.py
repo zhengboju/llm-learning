@@ -154,14 +154,19 @@ def eval_one(name, path, gpu):
                     do_sample=do_sample,
                     temperature=0.9 if do_sample else None,
                     num_return_sequences=1,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id)
+                    pad_token_id=tokenizer.pad_token_id)
+                # 停止词用模型默认(与串行版一致，Qwen即151645 <|im_end|>)，绝不显式覆盖：
+                # tokenizer.eos_token_id=151643(<|endoftext|>)≠模型默认，覆盖会导致冲过</answer>继续 rambling 到512 token
+                _eos = model.generation_config.eos_token_id
+                stop_ids = set(_eos if isinstance(_eos, list) else [_eos])
+                stop_ids |= {tokenizer.eos_token_id, tokenizer.pad_token_id}
                 for i, item in enumerate(chunk):
                     row_ids = out[i][base_len:].tolist()
                     # 去掉 batch 补齐的 pad 尾（greedy 到 EOS 即停，pad 只在 EOS 之后）
-                    eos_id = tokenizer.eos_token_id
-                    if eos_id is not None and eos_id in row_ids:
-                        row_ids = row_ids[:row_ids.index(eos_id)]
+                    for _k, _t in enumerate(row_ids):
+                        if _t in stop_ids:
+                            row_ids = row_ids[:_k]
+                            break
                     ans = tokenizer.decode(row_ids, skip_special_tokens=True)
                     if len(ans.strip()) == 0:
                         continue
