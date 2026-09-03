@@ -1,16 +1,19 @@
-# 【3B单卡适配版】原版是 Qwen2-7B + 2卡训练 + 7B，已改为适配 H20 2卡Pod(60G内存limit)
+# 【batch128单变量实验版】验证假设：RF++过训滑坡源于macro batch=32太小→批基线方差大
+# 原版(batch32): Q_batch_size=32, gradient_accumulation_steps=8, all_steps=300, save_steps=100, gen_update_steps=16
+# 本版: macro batch = grad_accum(32) × micro(4) = 128；all_steps=1200 使 optimizer 更新数与原版严格配对
+#   (1200/32=37.5 次更新 = 原版 300/8；checkpoint step_400/800/1200 对应原版 step_100/200/300 的更新数)
 # 布局：GPU0 = ref_server + vLLM生成(共用)，GPU1 = 训练(单卡)
 base_config={
-  "model_path": "/root/Qwen2.5-3B",      # 原版 Qwen2-7B → 3B（Pod装不下7B）
-  "gen_device": "0",                      # vLLM和ref_server共用物理P0；P1留给训练
-  "train_gpu_num": 1,                     # 原版2 → 单卡训练
-  "train_batch_size": 4,
-  "beta": 0.01,                           # REINFORCE++默认KL权重
-  "all_steps": 300,                       # 和GRPO实验对齐，方便对比
-  "Q_batch_size": 32,
-  "num_pre_Q": 1,                         # REINFORCE++核心：不依赖组
-  "gen_update_steps": 16,
-  "save_steps": 100,                      # 100的倍数，确保step300也被保存
+  "model_path": "/root/Qwen2.5-3B",
+  "gen_device": "0",                      # 必须指向 ref_server 所在的卡
+  "train_gpu_num": 1,
+  "train_batch_size": 4,                  # micro batch 不变（显存约束，单变量只动 macro）
+  "beta": 0.01,
+  "all_steps": 1200,                      # micro步数；1200/32=37.5次更新，与原版300步(37.5次)配对
+  "Q_batch_size": 128,                    # 【实验变量】32→128，每题仍只采1条(num_pre_Q=1)
+  "num_pre_Q": 1,
+  "gen_update_steps": 64,                 # 64 micro步=2次更新同步一次，与原版频率等比
+  "save_steps": 400,                      # step_400/800/1200 三个checkpoint
   "clip_param": 0.2,
   "port": 51414,
   "ref_server": "http://localhost:51414",
@@ -19,14 +22,13 @@ base_config={
 
 ds_config = {
     "train_micro_batch_size_per_gpu": 4,
-    # 单卡凑 macro_step: train_gpu_num(1) * grad_accum(8) = 8（原版是2*4=8）
-    "gradient_accumulation_steps": 8,
+    "gradient_accumulation_steps": 32,    # 【实验变量】8→32：macro=4*32=128
     "optimizer": {
         "type": "AdamW",
         "params": { "lr": 1e-6 }
     },
     "bf16": {"enabled": True},
-    # 【3B适配】stage0全放GPU(~60G<96G)，不offload→不占CPU内存(避免-9)、不pin_memory
+    # stage0全放GPU(~60G<96G)，不offload→不占CPU内存(避免-9)、不pin_memory
     "zero_optimization": {
         "stage": 0
     }
