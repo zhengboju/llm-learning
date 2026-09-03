@@ -21,6 +21,7 @@ parser.add_argument("--skip_base", action="store_true", help="跳过 BASE，只�
 parser.add_argument("--workers", type=int, default=3, help="每卡并发评测的模型数(线程级，同CUDA上下文多流真并行；3B bf16每路约8G，H20上每卡3路≈25G)")
 parser.add_argument("--gpus", type=str, default="auto", help="使用的卡：auto=所有可见卡(默认)，或显式如 0,1；模型按 round-robin 自动拆分到各卡")
 parser.add_argument("--batch_size", type=int, default=8, help="每模型每轮 generate 的题数(greedy下与逐题数学等价，只提吞吐不改结果)")
+parser.add_argument("--attn", type=str, default="sdpa", help="attention 实现：sdpa(默认快) / eager(参照路径，批量结果异常时切 eager 排查)")
 args = parser.parse_args()
 
 base_path = "/root/Qwen2.5-3B"
@@ -135,7 +136,7 @@ def eval_one(name, path, gpu):
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"  # 批量生成必须左padding；单题ids与串行版逐字符一致
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa").to(dev).eval()
+        path, torch_dtype=torch.bfloat16, _attn_implementation=args.attn).to(dev).eval()
     try:
         acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
         next_milestone = 20
@@ -145,7 +146,7 @@ def eval_one(name, path, gpu):
                 prompts = [build_prompt(tokenizer, item["Q"]) for item in chunk]
                 # 与串行版相同的逐题分词，只是拼成一个 batch（左pad不改变每题真实ids）
                 enc = tokenizer(prompts, return_tensors="pt", padding=True)
-                plen_list = enc["attention_mask"].sum(dim=1).tolist()
+                base_len = enc["input_ids"].shape[1]  # 左pad后全行等长Lmax；生成部分一律从 base_len 开始（注意不是每题真实长度Li！）
                 out = model.generate(
                     input_ids=enc["input_ids"].to(dev),
                     attention_mask=enc["attention_mask"].to(dev),
@@ -156,8 +157,7 @@ def eval_one(name, path, gpu):
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id)
                 for i, item in enumerate(chunk):
-                    plen = int(plen_list[i])
-                    row_ids = out[i][plen:].tolist()
+                    row_ids = out[i][base_len:].tolist()
                     # 去掉 batch 补齐的 pad 尾（greedy 到 EOS 即停，pad 只在 EOS 之后）
                     eos_id = tokenizer.eos_token_id
                     if eos_id is not None and eos_id in row_ids:
