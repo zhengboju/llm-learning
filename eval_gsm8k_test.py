@@ -22,6 +22,7 @@ parser.add_argument("--workers", type=int, default=3, help="每卡并发评测�
 parser.add_argument("--gpus", type=str, default="auto", help="使用的卡：auto=所有可见卡(默认)，或显式如 0,1；模型按 round-robin 自动拆分到各卡")
 parser.add_argument("--batch_size", type=int, default=8, help="每模型每轮 generate 的题数(greedy下与逐题数学等价，只提吞吐不改结果)")
 parser.add_argument("--attn", type=str, default="sdpa", help="attention 实现：sdpa(默认快) / eager(参照路径，批量结果异常时切 eager 排查)")
+parser.add_argument("--show", type=int, default=0, help="打印每模型第一批的前N个原始回答+单题得分(排障开箱验货用)")
 args = parser.parse_args()
 
 base_path = "/root/Qwen2.5-3B"
@@ -139,6 +140,7 @@ def eval_one(name, path, gpu):
         path, torch_dtype=torch.bfloat16, _attn_implementation=args.attn).to(dev).eval()
     try:
         acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
+        shown = []
         next_milestone = 20
         with torch.inference_mode():
             for s in range(0, len(sample), BATCH):
@@ -175,12 +177,20 @@ def eval_one(name, path, gpu):
                     a = reward_correct(ans, gt)
                     f = reward_format(ans)
                     acc += a; fmt += f; both += (a == 1.0 and f == 1.0)
+                    if s == 0 and len(shown) < args.show:
+                        shown.append((a, f, ans))
                 done = min(s + BATCH, len(sample))
                 if done >= next_milestone or done == len(sample):
                     with print_lock:
                         print(f"    {name} {done}/{len(sample)}  acc_sofar={acc/max(1, n_valid):.3f}")
                     while next_milestone <= done:
                         next_milestone += 20
+                if shown and s == 0:  # 只打第一批，开箱验货
+                    with print_lock:
+                        print(f"  ---- {name} 首{len(shown)}个回答 ----")
+                        for _a, _f, _t in shown:
+                            print(f"  [a={_a:.0f} f={_f:.0f}] {_t[:400]}")
+                    shown.clear()
         return name, {
             "acc": acc / n_valid if n_valid else 0,
             "fmt": fmt / n_valid if n_valid else 0,
