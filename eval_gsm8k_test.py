@@ -12,6 +12,8 @@ parser.add_argument("--n", type=int, default=100, help="评测题数(test共1319
 parser.add_argument("--tuned", default="./step_200", help="逗号分隔的一个或多个 checkpoint，可用 name=path 显式命名(推荐)；否则按路径末3段自动命名，同名自动加 #2/#3 后缀")
 parser.add_argument("--do_sample", action="store_true", help="开启采样(temperature=0.9)；默认greedy更稳定")
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--out", default="eval_gsm8k_test_result.json", help="结果 json 输出路径(并发跑时每路指定不同文件，防互踩)")
+parser.add_argument("--skip_base", action="store_true", help="跳过 BASE，只评 --tuned(并发第二路用，BASE 只跑一次)")
 args = parser.parse_args()
 
 base_path = "/root/Qwen2.5-3B"
@@ -92,8 +94,8 @@ def _auto_label(p, used):
     return label
 
 
-models = [("BASE", base_path)]
-_used = {"BASE"}
+models = ([] if args.skip_base else [("BASE", base_path))]
+_used = set() if args.skip_base else {"BASE"}
 for _item in args.tuned.split(","):
     _item = _item.strip()
     if not _item:
@@ -150,6 +152,6 @@ for name, r in results.items():
     print(f"{name:<16}{r['acc']*100:>9.1f}%{r['fmt']*100:>9.1f}%{r['both']*100:>9.1f}%{r['n']:>10}")
 
 # 存一份 json 备查
-with open("eval_gsm8k_test_result.json", "w", encoding="utf-8") as f:
+with open(args.out, "w", encoding="utf-8") as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
-print("\n结果已存 eval_gsm8k_test_result.json")
+print(f"\n结果已存 {args.out}")
