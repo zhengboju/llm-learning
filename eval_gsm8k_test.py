@@ -2,9 +2,9 @@
 # 定量评测：GSM8K **test** split 上对比 BASE vs 各 RL checkpoint
 # train 在训练时被反复采样过(有泄漏)，必须用 held-out test 测泛化
 # 用法:
-#   单卡3模型并行+8题批量: CUDA_VISIBLE_DEVICES=0 python eval_gsm8k_test.py --n 300 --workers 3 --batch_size 8 \
-#       --tuned grpo200=/path/grpo,dapo200=/path/dapo
-#   退化成老行为(串行逐题): --workers 1 --batch_size 1
+#   双卡全自动(单命令跑完6模型): python eval_gsm8k_test.py --n 300 --gpus 0,1 --workers 3 --batch_size 8 \
+#       --tuned grpo200=/path/grpo,dapo200=/path/dapo,rfpp100=/path/100,rfpp200=/path/200,rfpp300=/path/300
+#   --gpus auto(默认)=所有可见卡；--workers=每卡并发模型数；退化成老行为: --gpus 0 --workers 1 --batch_size 1
 import json, os, re, random, argparse, threading
 import torch
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +18,8 @@ parser.add_argument("--do_sample", action="store_true", help="开启采样(tempe
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out", default="eval_gsm8k_test_result.json", help="结果 json 输出路径(并发跑时每路指定不同文件，防互踩)")
 parser.add_argument("--skip_base", action="store_true", help="跳过 BASE，只评 --tuned(并发第二路用，BASE 只跑一次)")
-parser.add_argument("--workers", type=int, default=3, help="同进程内并发评测的模型数(线程级，同CUDA上下文多流真并行；3B bf16每路约8G，H20上3路≈25G)")
+parser.add_argument("--workers", type=int, default=3, help="每卡并发评测的模型数(线程级，同CUDA上下文多流真并行；3B bf16每路约8G，H20上每卡3路≈25G)")
+parser.add_argument("--gpus", type=str, default="auto", help="使用的卡：auto=所有可见卡(默认)，或显式如 0,1；模型按 round-robin 自动拆分到各卡")
 parser.add_argument("--batch_size", type=int, default=8, help="每模型每轮 generate 的题数(greedy下与逐题数学等价，只提吞吐不改结果)")
 args = parser.parse_args()
 
@@ -112,8 +113,7 @@ for _item in args.tuned.split(","):
     models.append((_name, _p))
 
 assert len(models) > 0, "--tuned 为空且 --skip_base，同时没有可评模型"
-workers = max(1, min(args.workers, len(models)))
-print(f"[2/3] 生成并评分 ... （模型数={len(models)}，同卡并发 workers={workers}，每轮批量 batch_size={BATCH}）")
+print(f"[2/3] 生成并评分 ... （模型数={len(models)}，每卡并发 workers={args.workers}，每轮批量 batch_size={BATCH}）")
 
 # ---------- 单个模型的评测（线程入口：自带 tokenizer+model，与串行版数学等价） ----------
 print_lock = threading.Lock()
@@ -125,15 +125,17 @@ def build_prompt(tok, q):
          {"role": "user", "content": q}], tokenize=False, add_generation_prompt=True)
 
 
-def eval_one(name, path):
+def eval_one(name, path, gpu):
+    dev = f"cuda:{gpu}"
+    torch.cuda.set_device(dev)  # 线程级当前设备 + 全显式 device，跨线程不串卡
     with print_lock:
-        print(f"  [线程启动] {name}: {path}")
+        print(f"  [线程启动][GPU{gpu}] {name}: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"  # 批量生成必须左padding；单题ids与串行版逐字符一致
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa").cuda().eval()
+        path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa").to(dev).eval()
     try:
         acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
         next_milestone = 20
@@ -145,8 +147,8 @@ def eval_one(name, path):
                 enc = tokenizer(prompts, return_tensors="pt", padding=True)
                 plen_list = enc["attention_mask"].sum(dim=1).tolist()
                 out = model.generate(
-                    input_ids=enc["input_ids"].to("cuda"),
-                    attention_mask=enc["attention_mask"].to("cuda"),
+                    input_ids=enc["input_ids"].to(dev),
+                    attention_mask=enc["attention_mask"].to(dev),
                     max_new_tokens=512,
                     do_sample=do_sample,
                     temperature=0.9 if do_sample else None,
@@ -182,14 +184,30 @@ def eval_one(name, path):
         }
     finally:
         del model, tokenizer
-        torch.cuda.empty_cache()
+        with torch.cuda.device(gpu):
+            torch.cuda.empty_cache()
 
 
-# 主线程先初始化一次 CUDA 上下文，再起工作线程（同进程多流真并行；多进程只是分时片）
-torch.cuda.init()
+# ---------- 多卡自动拆分：模型按 round-robin 分到各卡，同进程线程级并发 ----------
+# 单进程多线程(而非多进程)：同CUDA上下文多流真并行，无spawn/IPC开销，结果字典直接共享
+if args.gpus.strip().lower() == "auto":
+    gpus = list(range(torch.cuda.device_count()))
+else:
+    gpus = [int(x) for x in args.gpus.split(",") if x.strip() != ""]
+assert len(gpus) > 0, "无可用 GPU（torch.cuda.device_count()=0，检查驱动/CUDA_VISIBLE_DEVICES）"
+# 主线程逐卡初始化一次 CUDA 上下文，再起工作线程
+for _d in gpus:
+    with torch.cuda.device(_d):
+        torch.cuda.init()
+plan = {}
+for _i, (_name, _p) in enumerate(models):
+    plan.setdefault(gpus[_i % len(gpus)], []).append(_name)
+print("  任务分配: " + "；".join(f"GPU{d}<-{','.join(ns)}" for d, ns in plan.items()))
+pool_size = min(max(1, args.workers) * len(gpus), len(models))
 results = {}
-with ThreadPoolExecutor(max_workers=workers) as ex:
-    futs = [(name, ex.submit(eval_one, name, path)) for name, path in models]
+with ThreadPoolExecutor(max_workers=pool_size) as ex:
+    futs = [(name, ex.submit(eval_one, name, path, gpus[i % len(gpus)]))
+            for i, (name, path) in enumerate(models)]
     for name, fut in futs:  # 按提交顺序回收，表格顺序稳定
         n, r = fut.result()
         results[n] = r
