@@ -20,6 +20,7 @@ parser.add_argument("--gpu_mem", type=float, default=None, help="单进程vLLM�
 parser.add_argument("--skip_base", action="store_true")
 parser.add_argument("--base_path", default="/root/Qwen2.5-3B")
 parser.add_argument("--show", type=int, default=0)
+parser.add_argument("--split", default="test", choices=["test", "train"], help="train=训练集内抽样(过拟合诊断)")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
 args = parser.parse_args()
 
@@ -71,7 +72,7 @@ def run_one(idx, name, path):
     out_json = f"eval_v_{re.sub(r'[^0-9A-Za-z_.-]+', '_', name)}.json"
     time.sleep(idx * 3)  # 错峰启动：避免同卡多实例同时剖析显存（vLLM 0.12 的内存自洽断言会撞车）
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
-           "--n", str(args.n), "--seed", str(args.seed),
+           "--n", str(args.n), "--seed", str(args.seed), "--split", args.split,
            "--gpu_mem", str(GPU_MEM), "--out", out_json]
     if args.show:
         cmd += ["--show", str(args.show)]

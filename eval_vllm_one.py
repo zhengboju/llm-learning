@@ -16,6 +16,7 @@ parser.add_argument("--out", default=None, help="结果json路径，默认 eval_
 parser.add_argument("--gpu_mem", type=float, default=0.26, help="vLLM显存占比(占总显存)；同卡并行N个进程就各给≈1/N")
 parser.add_argument("--max_len", type=int, default=1280, help="prompt(~400)+生成(≤512)上限，1280足够")
 parser.add_argument("--max_tokens", type=int, default=512)
+parser.add_argument("--split", default="test", choices=["test", "train"], help="test=held-out(默认)；train=训练集内抽样(过拟合诊断：train高test低=过优化实锤)")
 parser.add_argument("--show", type=int, default=0, help="打印前N个原始回答")
 args = parser.parse_args()
 
@@ -58,10 +59,10 @@ try:
     from modelscope.msdatasets import MsDataset
     for did in ("modelscope/gsm8k",):
         try:
-            ds = MsDataset.load(did, subset_name="main", split="test", trust_remote_code=True)
+            ds = MsDataset.load(did, subset_name="main", split=args.split, trust_remote_code=True)
             if len(ds) > 0:
                 test_data = [{"Q": x["question"], "A": x["answer"]} for x in ds]
-                print(f"  modelscope {did}: {len(test_data)} 题")
+                print(f"  modelscope {did} [{args.split}]: {len(test_data)} 题")
                 break
         except Exception as e:
             print(f"  {did} 失败: {e}")
@@ -69,9 +70,9 @@ except Exception as e:
     print(f"  modelscope 不可用: {e}")
 if test_data is None:
     from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split="test")
+    ds = load_dataset("openai/gsm8k", "main", split=args.split)
     test_data = [{"Q": x["question"], "A": x["answer"].split("####")[-1].strip()} for x in ds]
-    print(f"  datasets: {len(test_data)} 题")
+    print(f"  datasets [{args.split}]: {len(test_data)} 题")
 
 random.seed(args.seed)
 sample = random.sample(test_data, min(args.n, len(test_data)))
