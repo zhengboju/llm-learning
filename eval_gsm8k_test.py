@@ -5,7 +5,7 @@
 #   双卡全自动(单命令跑完6模型): python eval_gsm8k_test.py --n 300 --gpus 0,1 --workers 3 --batch_size 8 \
 #       --tuned grpo200=/path/grpo,dapo200=/path/dapo,rfpp100=/path/100,rfpp200=/path/200,rfpp300=/path/300
 #   --gpus auto(默认)=所有可见卡；--workers=每卡并发模型数；退化成老行为: --gpus 0 --workers 1 --batch_size 1
-import json, os, re, random, argparse, threading
+import json, os, re, random, argparse, threading, traceback
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -130,6 +130,10 @@ print(f"[2/3] 生成并评分 ... （模型数={len(models)}，每卡并发 work
 
 # ---------- 单个模型的评测（线程入口：自带 tokenizer+model，与串行版数学等价） ----------
 print_lock = threading.Lock()
+# 加载串行化：6路并发加载会瞬间把CPU RAM顶到cgroup上限(~60G)→safetensors分配失败→
+# 权重留在meta空壳→.to(dev)报"Cannot copy out of meta tensor"（曾致6路里5路静默加载失败）。
+# 加载只占每模型20-40s，生成才是大头，串行加载几乎不损失并行收益。
+load_lock = threading.Lock()
 
 
 def build_prompt(tok, q):
@@ -143,12 +147,22 @@ def eval_one(name, path, gpu):
     torch.cuda.set_device(dev)  # 线程级当前设备 + 全显式 device，跨线程不串卡
     with print_lock:
         print(f"  [线程启动][GPU{gpu}] {name}: {path}")
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.padding_side = "left"  # 批量生成必须左padding；单题ids与串行版逐字符一致
-    model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16, _attn_implementation=args.attn).to(dev).eval()
+    try:
+        with load_lock:
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            tokenizer.padding_side = "left"  # 批量生成必须左padding；单题ids与串行版逐字符一致
+            model = AutoModelForCausalLM.from_pretrained(
+                path, torch_dtype=torch.bfloat16, _attn_implementation=args.attn).to(dev).eval()
+            # 校验：不允许任何参数留在meta（加载失败的静默降级会留下空壳权重）
+            meta_params = [n for n, p in model.named_parameters() if p.is_meta]
+            assert not meta_params, f"{name} 加载失败，以下权重仍是meta空壳: {meta_params[:5]}..."
+    except Exception:
+        with print_lock:
+            traceback.print_exc()
+            print(f"  [加载失败] {name}: {path}")
+        raise
     try:
         acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
         shown = []
