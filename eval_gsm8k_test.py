@@ -2,13 +2,14 @@
 # 定量评测：GSM8K **test** split 上对比 BASE vs GRPO step_200
 # train 在训练时被反复采样过(有泄漏)，必须用 held-out test 测泛化
 # 用法: CUDA_VISIBLE_DEVICES=1 python eval_gsm8k_test.py
-import json, re, random, argparse
+import json, os, re, random, argparse
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from math_verify import parse, verify, ExprExtractionConfig
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n", type=int, default=100, help="评测题数(test共1319，建议100-200)")
+parser.add_argument("--tuned", default="./step_200", help="逗号分隔的一个或多个 checkpoint 路径(标签自动取路径名)")
 parser.add_argument("--do_sample", action="store_true", help="开启采样(temperature=0.9)；默认greedy更稳定")
 parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
@@ -78,7 +79,8 @@ def build_prompt(q):
 
 print("[2/3] 生成并评分 ...")
 results = {}
-for name, path in [("BASE", base_path), ("GRPO_step200", tuned_path)]:
+models = [("BASE", base_path)] + [(os.path.basename(p.rstrip("/")), p) for p in args.tuned.split(",") if p.strip()]
+for name, path in models:
     print(f"  加载 {name}: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)
     model = AutoModelForCausalLM.from_pretrained(
