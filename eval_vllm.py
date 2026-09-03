@@ -7,7 +7,7 @@
 #   python eval_vllm.py --n 300 --gpus 0,1 --per_gpu 3 \
 #       --tuned grpo200=/path/grpo,dapo200=/path/dapo,rfpp100=/path/100,rfpp200=/path/200,rfpp300=/path/300
 #   （BASE 默认评；--skip_base 跳过；--gpus auto=全部可见卡）
-import argparse, json, os, re, subprocess, sys, threading
+import argparse, json, os, re, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 parser = argparse.ArgumentParser()
@@ -69,21 +69,28 @@ lock = threading.Lock()
 def run_one(idx, name, path):
     gpu = gpus[idx % len(gpus)]
     out_json = f"eval_v_{re.sub(r'[^0-9A-Za-z_.-]+', '_', name)}.json"
+    time.sleep(idx * 3)  # 错峰启动：避免同卡多实例同时剖析显存（vLLM 0.12 的内存自洽断言会撞车）
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
            "--n", str(args.n), "--seed", str(args.seed),
            "--gpu_mem", str(GPU_MEM), "--out", out_json]
     if args.show:
         cmd += ["--show", str(args.show)]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
-    print(f"  [启动][GPU{gpu}] {name} -> {out_json}")
-    proc = subprocess.run(cmd, env=env)
-    with lock:
+    # 竞态兜底：同卡实例退出释放显存撞上另一实例的初始化剖析 → AssertionError。
+    # 该失败只发生在启动窗口期，冷却后重试几乎必成，最多试3次。
+    for attempt in range(1, 4):
+        print(f"  [启动][GPU{gpu}] {name} -> {out_json}" + (f"（第{attempt}次重试）" if attempt > 1 else ""))
+        proc = subprocess.run(cmd, env=env)
         if proc.returncode == 0 and os.path.exists(out_json):
-            with open(out_json, encoding="utf-8") as f:
-                results.update(json.load(f))
-        else:
-            failures.append((name, gpu, proc.returncode))
-            print(f"  [失败][GPU{gpu}] {name} (exit={proc.returncode})，日志见上方输出")
+            with lock:
+                with open(out_json, encoding="utf-8") as f:
+                    results.update(json.load(f))
+            return
+        with lock:
+            print(f"  [失败][GPU{gpu}] {name} (exit={proc.returncode})，第{attempt}次")
+        time.sleep(10 * attempt)
+    with lock:
+        failures.append((name, gpu, proc.returncode))
 
 
 # 子进程承载 vLLM（GIL互不影响），调度线程只 wait，无性能损失
