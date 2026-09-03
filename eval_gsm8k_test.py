@@ -9,7 +9,7 @@ from math_verify import parse, verify, ExprExtractionConfig
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n", type=int, default=100, help="评测题数(test共1319，建议100-200)")
-parser.add_argument("--tuned", default="./step_200", help="逗号分隔的一个或多个 checkpoint 路径(标签自动取路径名)")
+parser.add_argument("--tuned", default="./step_200", help="逗号分隔的一个或多个 checkpoint，可用 name=path 显式命名(推荐)；否则按路径末3段自动命名，同名自动加 #2/#3 后缀")
 parser.add_argument("--do_sample", action="store_true", help="开启采样(temperature=0.9)；默认greedy更稳定")
 parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
@@ -79,7 +79,35 @@ def build_prompt(q):
 
 print("[2/3] 生成并评分 ...")
 results = {}
-models = [("BASE", base_path)] + [(os.path.basename(p.rstrip("/")), p) for p in args.tuned.split(",") if p.strip()]
+
+
+def _auto_label(p, used):
+    parts = [x for x in p.strip().rstrip("/").split("/") if x not in ("", ".")]
+    base = "_".join(parts[-3:]) if len(parts) >= 3 else "_".join(parts)
+    base = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_.-]+", "_", base) or "ckpt"
+    label, i = base, 2
+    while label in used:
+        label = f"{base}#{i}"
+        i += 1
+    return label
+
+
+models = [("BASE", base_path)]
+_used = {"BASE"}
+for _item in args.tuned.split(","):
+    _item = _item.strip()
+    if not _item:
+        continue
+    if "=" in _item:  # 显式命名：--tuned grpo200=/path/to/ckpt
+        _name, _p = _item.split("=", 1)
+        _name, _p = _name.strip(), _p.strip()
+        if _name in _used:  # 显式名撞车也加后缀，禁止静默覆盖
+            _name = _auto_label(_name, _used)
+    else:
+        _p = _item
+        _name = _auto_label(_p, _used)
+    _used.add(_name)
+    models.append((_name, _p))
 for name, path in models:
     print(f"  加载 {name}: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)
