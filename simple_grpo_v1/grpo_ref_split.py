@@ -8,9 +8,9 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 Q_batch_size = 1
 assert Q_batch_size == 1
 
-model_path = "/data2/Qwen/Qwen2.5-7B"
+model_path = "/root/Qwen2.5-3B"  # base版（用户实际在用）；H20 2卡Pod用3B：GPU峰值~60G
 beta = 0.04
-num_pre_Q = 8
+num_pre_Q = 4  # H20上从8改为4，生成显存减半，避免OOM
 all_steps = 1000
 max_prompt_length = 400   
 save_steps = 200
@@ -20,23 +20,15 @@ ref_server = "http://localhost:59875"
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
 
 ds_config = {
-    "train_micro_batch_size_per_gpu": Q_batch_size*num_pre_Q,
-    "gradient_accumulation_steps": 2,
+    "train_micro_batch_size_per_gpu": 4,  # = Q_batch_size(1)*num_pre_Q(4)，一组正好一个micro batch
+    "gradient_accumulation_steps": 4,     # 等效batch=16
     "optimizer": {
         "type": "AdamW",
         "params": { "lr": 1e-6 }
     },
     "bf16": {"enabled": True},
     "zero_optimization": {
-        "stage": 2,
-        "allgather_partitions": True,
-        "allgather_bucket_size": 2e8,
-        "overlap_comm": True,
-        "reduce_scatter": True,
-        "reduce_bucket_size": 2e8,
-        "contiguous_gradients": True,
-        "stage3_gather_16bit_weights_on_model_save": True,
-        "offload_optimizer": {"device": "cpu"}
+        "stage": 0  # 3B全态放GPU(~60G)<96G；不开offload->不占CPU内存(避免-9)，不pin_memory(避免CUDA invalid argument)
     }
 }
 
@@ -56,6 +48,7 @@ def get_batch():
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(model_path, 
         torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
+# 注意：不要全局开gradient_checkpointing+use_cache=False，否则generate没有KV cache会慢10倍以上
 gen_model = model
 
 from datasets import load_dataset
@@ -96,11 +89,15 @@ def reward_correct(item, answer):
     lastnum = nums[-1] # 用answer中最后一个数字和ground_truth做比较
     ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
     ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
-    return 1 if verify(ans, ground_truth) else -1
+    # 【实验改动1/2】正确性权重 1.0 -> 2.0，让"答对" > "格式对"
+    return 2.0 if verify(ans, ground_truth) else -1.0
 def reward_format(item, answer):
     # pattern = r"^<think>(?:(?!</?think>)[\s\S]*?)</think>\s*<answer>(?:(?!</?answer>)[\s\S]*?)</answer><\|im_end\|>$"
     pattern = r"^<think>.*?</think><answer>.*?</answer>$"
-    return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else -1
+    # 【实验改动2/2】格式权重 1.25 -> 1.0，并惩罚"抄模板占位符"的奖励黑客
+    if "reasoning process here" in answer.lower():
+        return -1.0
+    return 1.0 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else -1.0
 
 
 def gen_samples(inputs):
@@ -117,6 +114,14 @@ def gen_samples(inputs):
     prompt_inputs = tokenizer(prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)["input_ids"]
     output_ids = tokenizer(answers, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False)["input_ids"]
     return prompt_inputs, output_ids, torch.tensor(rewards, dtype=torch.float32), answers
+
+def get_per_token_logps(logits, input_ids):
+    per_token_logps = [] # Use a loop to reduce memory peak.
+    for logits_row, input_ids_row in zip(logits, input_ids):
+        log_probs = logits_row.log_softmax(dim=-1)
+        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+        per_token_logps.append(token_log_prob)
+    return torch.stack(per_token_logps)
 
 def generate_mode(num=10, rank=0):
     if rank == 0: print('enter generate mode')
@@ -157,14 +162,6 @@ import deepspeed
 engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, 
                                                model_parameters=model.parameters())
 gen_model = engine
-
-def get_per_token_logps(logits, input_ids):
-    per_token_logps = [] # Use a loop to reduce memory peak.
-    for logits_row, input_ids_row in zip(logits, input_ids):
-        log_probs = logits_row.log_softmax(dim=-1)
-        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-        per_token_logps.append(token_log_prob)
-    return torch.stack(per_token_logps)
 #from kernel.ce_kernel import fast_log_softmax_gather
 #get_per_token_logps = fast_log_softmax_gather
 

@@ -72,28 +72,48 @@ def REINFORCE_plusplus_step(batch):
     return loss
 
 def gen_worker(Q, physics_device):
+    # 【3B适配】清除分布式环境变量，避免vLLM子进程和DeepSpeed冲突
+    cleanup_keys = [
+        'RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT', 'LOCAL_RANK',
+        'LOCAL_WORLD_SIZE', 'GROUP_RANK', 'ROLE_RANK', 'ROLE_NAME',
+        'GROUP_WORLD_SIZE', 'ROLE_WORLD_SIZE',
+        'TORCHELASTIC_RESTART_COUNT', 'TORCHELASTIC_MAX_RESTARTS',
+        'TORCHELASTIC_RUN_ID', 'TORCHELASTIC_USE_AGENT_STORE',
+        'TORCHELASTIC_ERROR_FILE', 'TORCH_NCCL_ASYNC_ERROR_HANDLING',
+        'NCCL_COMM_ID', 'NCCL_DEBUG', 'NCCL_SOCKET_IFNAME',
+    ]
+    for key in cleanup_keys: os.environ.pop(key, None)
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
     from vllm import LLM, SamplingParams
-    vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.7)
+    # 【3B适配】和ref_server共用物理P0，0.4降到0.35给torch gen_logps副本留显存
+    vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.35)
     ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
 
-    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.7, max_tokens=650)
-    gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
+    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.7, max_tokens=512)
 
-    # from datasets import load_dataset
-    # data_path = "/mnt/remote-data/hjy/public_code/GRPO/data/gsm8k_train.json"
-    # with open(data_path, 'r', encoding='utf-8') as file:
-    #     dataset = json.load(file)
-    # QAs = [{'Q': item['question'], 'A': item['answer_only']} for item in dataset]
-    data_path = "/mnt/remote-data/hjy/data/o1/math/train/MATH_train-cleaned_processed.json"
-    with open(data_path, 'r', encoding='utf-8') as file:
-        dataset = json.load(file)
-    QAs = [{'Q': item['question'], 'A': item['answer_detail']} for item in dataset]
+    # 【修复】vLLM 0.10.1.1 + torch2.8(cu12.8) 的 prompt_logprobs 路径会hang，
+    # 改为用 transformers 加载一份模型副本，用 torch 前向算 gen_logps（与simple_grpo_v1同法）
+    from transformers import AutoModelForCausalLM
+    gen_torch = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa").cuda().eval()
+    print("[VLLM PROC] torch gen_logps 副本已加载")
+
+    # 【3B/GSM8K适配】原版是MATH json，改成GSM8K train（与GRPO实验同数据，可公平对比）
+    from datasets import load_dataset
+    try:
+        dataset = load_dataset("openai/gsm8k", "main", split="train")
+        QAs = [{'Q': x, 'A': y.split('####')[-1].strip()} for x, y in zip(dataset['question'], dataset['answer'])]
+    except Exception as e:
+        print("[VLLM PROC] hf gsm8k 加载失败，改走 modelscope:", e)
+        from modelscope.msdatasets import MsDataset
+        ds = MsDataset.load("modelscope/gsm8k", subset_name="main", split="train", trust_remote_code=True)
+        QAs = [{'Q': x['question'], 'A': x['answer'].split('####')[-1].strip()} for x in ds]
+    print(f"[VLLM PROC] GSM8K train 加载 {len(QAs)} 题")
 
     system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
-    The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here. Please ensure that your final answer is enclosed within \\boxed{} </answer>."""
+    The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
     def gen_answers(prompts):
         tip_text = []
         for x in prompts:
@@ -111,25 +131,16 @@ def gen_worker(Q, physics_device):
     from math_verify import parse, verify, ExprExtractionConfig
 
     def reward_correct(ground_truth, answer):
-        pattern = r'\\boxed{([^{}]*(?:\{[^{}]*\}[^{}]*)*)}'
-        boxed_matches_ans =  re.findall(pattern, answer)
-        boxed_matches_ground_truth =  re.findall(pattern, ground_truth)
-        if not boxed_matches_ans or not boxed_matches_ground_truth:
+        # 【3B/GSM8K适配】原版是MATH的\\boxed{}提取，改成GSM8K的"取最后一个数字"
+        pattern = r'\d+\.\d+|\d+/\d+|\d+'
+        nums = re.findall(pattern, answer)
+        if len(nums) == 0: return False
+        try:
+            ans = parse(nums[-1], extraction_config=[ExprExtractionConfig()])
+            gt = parse(ground_truth, extraction_config=[ExprExtractionConfig()])
+            return True if verify(ans, gt) else False
+        except Exception:
             return False
-        boxed_matches_ans = "\\boxed{" + boxed_matches_ans[-1] + "}"
-        boxed_matches_ground_truth =  "\\boxed{" + boxed_matches_ground_truth[-1] + "}"
-
-        if not boxed_matches_ans:
-            return False
-        
-        if boxed_matches_ans == ground_truth:
-            return True
-
-        ans = parse(boxed_matches_ans)
-        print(ans)
-        ground_truth = parse(boxed_matches_ground_truth)
-        print(ground_truth)
-        return True if verify(ans, ground_truth) else False
     
     def reward_format(answer):
         pattern = r"^<think>.*?</think>[\n ]<answer>.*?</answer>$"
@@ -161,6 +172,8 @@ def gen_worker(Q, physics_device):
             print('[VLLM PROC] recving new model ...')
             llm_model = vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model
             llm_model.load_weights(new_state_dict.items())
+            # 【修复】同步torch gen_logps副本，保证和vLLM用的是同一份最新策略权重
+            gen_torch.load_state_dict({k: v.to(torch.bfloat16) for k, v in new_state_dict.items()})
             print('[VLLM PROC] model updated')
             del new_state_dict
         except:
@@ -199,9 +212,11 @@ def gen_worker(Q, physics_device):
             merged_ids = torch.cat([Qrep, output_ids], dim=1)                        
             data = [json.dumps({"plen": plen}).encode(), tensor_to_bytes(merged_ids), tensor_to_bytes(sub_rewards)]       
 
-            zz = vllm_gen.generate(prompt_token_ids=merged_ids.tolist(), sampling_params=gen_logps_sp, use_tqdm=False)
-            zz = [xx.prompt_logprobs[plen:] for xx in zz]
-            gen_logps = torch.tensor([[list(x.values())[0].logprob for x in xx] for xx in zz])
+            # 【修复】用torch前向算gen_logps（vLLM prompt_logprobs路径在此环境会hang）
+            with torch.inference_mode():
+                mids = merged_ids.to(gen_torch.device)
+                logits = gen_torch(mids).logits  # (B, L, V)
+                gen_logps = get_per_token_logps(logits[:, :-1, :], mids[:, 1:])[:, plen-1:].cpu()
             data.append(tensor_to_bytes(gen_logps))
 
             xdata = make_bytes_list(data)

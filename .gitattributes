@@ -1,0 +1,3 @@
+# 统一 LF：这些脚本要在 Linux Pod 上运行
+* text=auto eol=lf
+*.png binary

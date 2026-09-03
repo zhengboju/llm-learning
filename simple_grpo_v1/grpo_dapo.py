@@ -1,0 +1,255 @@
+# DAPO 适配版（基于 grpo_ref_split.py，2026-09）
+# 四个 DAPO 机制，均以【DAPO】标注：
+#   1. clip-higher: 上下 clip 解耦，放宽上界防熵坍缩
+#   2. dynamic sampling: 全同组不再丢弃浪费配额，继续采样直到攒够有效组
+#   3. token-level loss: 全 batch 按 token 归一化，替代样本级平均
+#   4. overlong reward shaping: 接近生成长度上限时线性扣分（软悬崖）
+# 论文去掉了 KL 项(beta=0)，此处保留 beta=0.04 以便与 GRPO step_200 单一变量对比
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import json, os, shutil, re, random, requests, io, sys, time
+import torch
+import torch.nn as nn
+import numpy as np
+import torch.distributed as dist
+os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+Q_batch_size = 1
+assert Q_batch_size == 1
+
+model_path = "/root/Qwen2.5-3B"  # base版（用户实际在用）；H20 2卡Pod用3B：GPU峰值~60G
+beta = 0.04
+num_pre_Q = 4  # H20上从8改为4，生成显存减半，避免OOM
+all_steps = 200        # 【对比实验】设为200，与GRPO step_200 可比；要长训自己调大
+save_steps = 100
+compute_gen_logps = True
+max_prompt_length = 400  # 提示词超长直接放弃本组（防 OOM）
+clip_param = 0.2       # DAPO 下界 epsilon_low
+clip_higher = 0.28     # 【DAPO 1】上界 epsilon_high，论文推荐 0.28
+max_gen_tokens = 512   # 与 generation_config.max_new_tokens 保持一致
+overlong_buffer = 64   # 【DAPO 4】缓冲区：448~512 token 区间线性扣分
+ref_server = "http://localhost:59875"
+from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
+
+ds_config = {
+    "train_micro_batch_size_per_gpu": 4,  # = Q_batch_size(1)*num_pre_Q(4)，一组正好一个micro batch
+    "gradient_accumulation_steps": 4,     # 等效batch=16
+    "optimizer": {
+        "type": "AdamW",
+        "params": { "lr": 1e-6 }
+    },
+    "bf16": {"enabled": True},
+    "zero_optimization": {
+        "stage": 0  # 3B全态放GPU(~60G)<96G；不开offload->不占CPU内存(避免-9)，不pin_memory(避免CUDA invalid argument)
+    }
+}
+
+def get_batch():
+    try:
+        r = requests.get(f"{ref_server}/get").content
+        if r == b'empty': return None
+    except: return None
+    dd = bytes_list_to_list(r)
+    data = json.loads(dd[0])
+    data['inputs'] = bytes_to_tensor(dd[1])
+    data['rewards'] = bytes_to_tensor(dd[2])
+    data['refs'] = bytes_to_tensor(dd[3])
+    if len(dd) == 5: data['gen_logps'] = bytes_to_tensor(dd[4])
+    return data
+
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model = AutoModelForCausalLM.from_pretrained(model_path,
+        torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
+# 注意：不要全局开gradient_checkpointing+use_cache=False，否则generate没有KV cache会慢10倍以上
+gen_model = model
+
+from datasets import load_dataset
+dataset = load_dataset("openai/gsm8k", "main", split="train")
+QAs = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
+
+from transformers import GenerationConfig
+generation_config = GenerationConfig(
+            max_new_tokens=max_gen_tokens,
+            do_sample=True, temperature=0.9,
+            num_return_sequences=num_pre_Q,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
+The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+def gen_answers(prompts):
+    tip_text = []
+    for x in prompts:
+        tip_text.append(tokenizer.apply_chat_template([
+             {"role": "system", "content": system_prompt},
+             {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True))
+    tip_inputs = tokenizer(tip_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
+    prompt_length = tip_inputs["input_ids"].shape[-1]
+    if prompt_length > max_prompt_length: return []
+    tip_inputs = {k: v.to(model.device) for k, v in tip_inputs.items()}
+    with torch.inference_mode():
+        tip_completion_ids = gen_model.generate(**tip_inputs, generation_config=generation_config)
+    completion_ids = tip_completion_ids[:, prompt_length:]
+    answers = [tokenizer.decode(x).replace('<|endoftext|>', '') for x in completion_ids]
+    return answers
+
+from math_verify import parse, verify, ExprExtractionConfig
+def reward_correct(item, answer):
+    pattern = r'\d+\.\d+|\d+/\d+|\d+'
+    nums = re.findall(pattern, answer) # 使用正则表达式在answer中查找所有数字
+    if len(nums) == 0: return -1.0
+    lastnum = nums[-1] # 用answer中最后一个数字和ground_truth做比较
+    ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
+    ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
+    # 【实验改动1/2】正确性权重 1.0 -> 2.0，让"答对" > "格式对"
+    return 2.0 if verify(ans, ground_truth) else -1.0
+def reward_format(item, answer):
+    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
+    # 【实验改动2/2】格式权重 1.25 -> 1.0，并惩罚"抄模板占位符"的奖励黑客
+    if "reasoning process here" in answer.lower():
+        return -1.0
+    return 1.0 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else -1.0
+def overlong_penalty(completion_len):
+    # 【DAPO 4】超过 (max_gen_tokens - overlong_buffer) 后线性扣分，最多扣 1.0
+    trigger = max_gen_tokens - overlong_buffer
+    if completion_len <= trigger: return 0.0
+    return min((completion_len - trigger) / overlong_buffer, 1.0)
+
+
+def gen_samples(inputs):
+    prompts = [x["Q"] for x in inputs]
+    answers = gen_answers(prompts)
+    if len(answers) == 0: return None, None, None, None
+    prompts_text = [tokenizer.apply_chat_template([
+             {"role": "system", "content": system_prompt},
+             {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
+    prompt_inputs = tokenizer(prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)["input_ids"]
+    output_ids = tokenizer(answers, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False)["input_ids"]
+    # 【DAPO 4】先算补全长度，再做奖励（overlong shaping 需要长度）
+    completion_lens = (output_ids != tokenizer.pad_token_id).sum(dim=1).tolist()
+    rewards = []
+    for i, inp in enumerate(inputs):
+        for j, a in enumerate(answers[i*num_pre_Q:(i+1)*num_pre_Q]):
+            r = reward_correct(inp, a) + reward_format(inp, a)
+            r -= overlong_penalty(completion_lens[i*num_pre_Q + j])   # 【DAPO 4】软性截断惩罚
+            rewards.append(r)
+    return prompt_inputs, output_ids, torch.tensor(rewards, dtype=torch.float32), answers
+
+def get_per_token_logps(logits, input_ids):
+    per_token_logps = [] # Use a loop to reduce memory peak.
+    for logits_row, input_ids_row in zip(logits, input_ids):
+        log_probs = logits_row.log_softmax(dim=-1)
+        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+        per_token_logps.append(token_log_prob)
+    return torch.stack(per_token_logps)
+
+def generate_mode(num=10, rank=0):
+    if rank == 0: print('enter generate mode')
+    tic = time.time()
+    # 【DAPO 2】dynamic sampling：攒够 num 个"组内有区分度"的样本才收工。
+    # 被跳过的组不占配额，继续采新题；设尝试上限防止全对时死循环。
+    uploaded = 0; attempts = 0; skipped = 0
+    max_attempts = num * 5
+    while uploaded < num and attempts < max_attempts:
+        attempts += 1
+        inputs = random.sample(QAs, Q_batch_size)
+        prompt_inputs, output_ids, rewards, answers = gen_samples(inputs)
+        if prompt_inputs is None: continue
+        if rank == 0:
+            print('rewards:', rewards)
+            if uploaded == 0 and ii_debug_ok(attempts): print('answers:', answers[0])
+        if (rewards.max() - rewards.min()).item() < 0.01:
+            skipped += 1   # 全同组：dynamic sampling 下不再浪费，计数后重采
+            continue
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+        rep = output_ids.shape[0] // prompt_inputs.shape[0]
+        prompt_length = prompt_inputs.shape[1]
+        Qrep = prompt_inputs.repeat(1, rep).view(-1, prompt_length)
+        merged_ids = torch.cat([Qrep, output_ids], dim=1)
+        data = [json.dumps({"plen": prompt_length}).encode(), tensor_to_bytes(merged_ids), tensor_to_bytes(rewards)]
+
+        if compute_gen_logps:
+            # Reduntant calculations? For modifiability!
+            with torch.inference_mode():
+                mids = merged_ids.to(model.device)
+                gen_logps = get_per_token_logps(model(mids).logits[:, :-1, :], mids[:, 1:])
+            data.append(tensor_to_bytes(gen_logps[:,prompt_length-1:].cpu()))
+
+        xdata = make_bytes_list(data)
+        requests.post(f"{ref_server}/upload", data=xdata)
+        uploaded += 1
+    if rank == 0:
+        rate = skipped / max(attempts, 1) * 100
+        print(f'dynamic sampling: {uploaded}/{num} effective, skipped={skipped}, skip_rate={rate:.0f}%')
+    print(f'{rank}: {time.time()-tic:.3f}s')
+
+def ii_debug_ok(attempts): return attempts <= 6  # 只在开头打印几个样例答案，避免刷屏
+
+if 'genonly' in sys.argv:
+    model.to('cuda')
+    generate_mode(999999)
+    sys.exit()
+
+import deepspeed
+engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model,
+                                               model_parameters=model.parameters())
+gen_model = engine
+#from kernel.ce_kernel import fast_log_softmax_gather
+#get_per_token_logps = fast_log_softmax_gather
+
+def GRPO_step(batch):
+    prompt_length = batch['plen']
+    inputs = batch['inputs'].to(engine.device)
+    advantages = batch['rewards'].to(engine.device).unsqueeze(1)   # normalized in generation
+
+    logits = engine(inputs).logits
+    logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+    input_ids = inputs[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+
+    per_token_logps = get_per_token_logps(logits, input_ids)
+    per_token_logps = per_token_logps[:,prompt_length-1:]
+    ref_per_token_logps = batch['refs'].to(per_token_logps.device)
+
+    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+    completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
+
+    if 'gen_logps' in batch:
+        ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
+        # 【DAPO 1】clip-higher：上下界解耦，上界放宽到 1+clip_higher 保探索
+        clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_higher)
+        per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
+    else:
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
+        assert compute_gen_logps is False
+
+    per_token_loss = -(per_token_loss - beta * per_token_kl)
+    # 【DAPO 3】token-level loss：全 batch 按 token 归一化，替代原来的样本级平均
+    loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+    return loss
+
+generate_mode(rank=torch.distributed.get_rank())
+
+from tqdm import tqdm
+progress = range(1, all_steps+1)
+if torch.distributed.get_rank() == 0: progress = tqdm(progress)
+for step in progress:
+    batch = get_batch()
+    while batch is None:
+        generate_mode(rank=torch.distributed.get_rank())
+        batch = get_batch()
+
+    loss = GRPO_step(batch)
+    engine.backward(loss)
+    engine.step()
+
+    if torch.distributed.get_rank() == 0:
+        progress.set_description(f"Loss: {loss.item():.6f}")
+
+    if step % save_steps == 0:
+        dist.barrier()
+        if torch.distributed.get_rank() == 0:
+            print('saving model')
+            save_name = f"./step_{step}"
+            state_dict = engine.module.state_dict()
+            state_dict = type(state_dict)({k: v.cpu() for k, v in state_dict.items()})
+            engine.module.save_pretrained(save_name, state_dict=state_dict)
+            tokenizer.save_pretrained(save_name)
+        dist.barrier()
