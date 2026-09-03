@@ -1,19 +1,18 @@
-# 【batch128单变量实验版】验证假设：RF++过训滑坡源于macro batch=32太小→批基线方差大
-# 原版(batch32): Q_batch_size=32, gradient_accumulation_steps=8, all_steps=300, save_steps=100, gen_update_steps=16
-# 本版: macro batch = grad_accum(32) × micro(4) = 128；all_steps=1200 使 optimizer 更新数与原版严格配对
-#   (1200/32=37.5 次更新 = 原版 300/8；checkpoint step_400/800/1200 对应原版 step_100/200/300 的更新数)
+# 【KL锚单变量实验版】batch128实验结论：大batch早期更强(74.7@12.5u)但崩得更狠(57.7@37.5u<BASE)，
+# 批基线方差不是滑坡主因；下一嫌疑=KL锚太弱(beta=0.01, GRPO用0.04)。本版回到batch32原始几何，只动beta。
+# 对照链：batch32/beta0.01(72.3→70.7→67.3) vs batch128/beta0.01(74.7→71.3→57.7) vs batch32/beta0.04(本版)
 # 布局：GPU0 = ref_server + vLLM生成(共用)，GPU1 = 训练(单卡)
 base_config={
   "model_path": "/root/Qwen2.5-3B",
   "gen_device": "0",                      # 必须指向 ref_server 所在的卡
   "train_gpu_num": 1,
-  "train_batch_size": 4,                  # micro batch 不变（显存约束，单变量只动 macro）
-  "beta": 0.01,
-  "all_steps": 1200,                      # micro步数；1200/32=37.5次更新，与原版300步(37.5次)配对
-  "Q_batch_size": 128,                    # 【实验变量】32→128，每题仍只采1条(num_pre_Q=1)
+  "train_batch_size": 4,
+  "beta": 0.04,                           # 【实验变量】0.01→0.04，与GRPO对齐
+  "all_steps": 300,                       # 恢复batch32版几何：300步=37.5次更新
+  "Q_batch_size": 32,
   "num_pre_Q": 1,
-  "gen_update_steps": 64,                 # 64 micro步=2次更新同步一次，与原版频率等比
-  "save_steps": 400,                      # step_400/800/1200 三个checkpoint
+  "gen_update_steps": 16,                 # 每2次更新同步一次（与batch32成功run等比）
+  "save_steps": 100,
   "clip_param": 0.2,
   "port": 51414,
   "ref_server": "http://localhost:51414",
@@ -22,7 +21,7 @@ base_config={
 
 ds_config = {
     "train_micro_batch_size_per_gpu": 4,
-    "gradient_accumulation_steps": 32,    # 【实验变量】8→32：macro=4*32=128
+    "gradient_accumulation_steps": 8,     # 恢复batch32版：macro=4*8=32
     "optimizer": {
         "type": "AdamW",
         "params": { "lr": 1e-6 }
