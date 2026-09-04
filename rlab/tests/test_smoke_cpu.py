@@ -200,6 +200,8 @@ def test_reward_and_data():
     print("[F] config preset")
     check("dapo preset clip_higher", ALGO_DEFAULTS["dapo"]["clip_high"] == 0.28)
     check("rfpp preset beta=0", ALGO_DEFAULTS["rfpp"]["beta"] == 0.0)
+    check("top_k=50 与 HF GenerationConfig 默认对齐（防 vLLM 全词表尾部，DAPO 缺口教训）",
+          get_config("dapo", use_wandb=False)["top_k"] == 50)
     cfg = get_config("dapo", use_wandb=False)
     check("preset 覆盖 + BASE 合并",
           cfg["clip_high"] == 0.28 and cfg["clip_low"] == 0.2 and cfg["lr"] == 1e-6)
