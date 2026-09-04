@@ -32,11 +32,45 @@ def load_qas(task: str = "gsm8k", fixture: bool = False):
     raise KeyError(f"未知任务 {task!r}（阶段2/3 扩展 retool/search 任务时在此注册）")
 
 
+def _patch_verification_mode():
+    """兼容垫片（2026-09-04 真机实测）：pod 里 modelscope 老版本仍向 datasets 传
+    verification_mode，但 datasets>=3 已删除该参数，导致 MsDataset.load 在 split
+    生成成功后死于 TypeError。两处调用点都把该 kwarg 丢掉即可，行为无损
+    （该参数只控制校验失败时抛错还是警告）。"""
+    try:
+        from datasets import builder as _bd
+        if not getattr(_bd.Builder.as_dataset, "_rlab_patched", False):
+            _orig = _bd.Builder.as_dataset
+
+            def _as_dataset(self, *a, **k):
+                k.pop("verification_mode", None)
+                return _orig(self, *a, **k)
+
+            _as_dataset._rlab_patched = True
+            _bd.Builder.as_dataset = _as_dataset
+    except Exception:
+        pass
+    try:
+        import datasets as _ds
+        if not getattr(_ds.load_dataset, "_rlab_patched", False):
+            _orig_ld = _ds.load_dataset
+
+            def _load_dataset(*a, **k):
+                k.pop("verification_mode", None)
+                return _orig_ld(*a, **k)
+
+            _load_dataset._rlab_patched = True
+            _ds.load_dataset = _load_dataset
+    except Exception:
+        pass
+
+
 def load_gsm8k_train():
     """GSM8K train split。默认 modelscope，HF 仅作回落（训练机 HF 网络不通）。"""
     ms_err = None
     if DATA_SOURCE in ("ms", "auto"):
         try:
+            _patch_verification_mode()
             from modelscope.msdatasets import MsDataset
             ds = MsDataset.load("modelscope/gsm8k", subset_name="main",
                                 split="train", trust_remote_code=True)

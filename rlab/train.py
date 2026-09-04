@@ -77,9 +77,13 @@ def run_training(cfg, args):
     if cfg["use_wandb"] and dist.get_rank() == 0:
         try:
             import wandb
-            wandb.login(key=os.environ.get("WANDB_API_KEY", ""), relogin=False)
+            # 空 key 时 wandb.login 会弹交互式 prompt 把训练卡住：只在给了 key 才 login；
+            # 无 key 默认离线记录（WANDB_MODE 可覆盖为 online），事后 wandb sync 补传。
+            if os.environ.get("WANDB_API_KEY"):
+                wandb.login(key=os.environ["WANDB_API_KEY"], relogin=False)
             wandb_run = wandb.init(project=cfg["wandb_project"], name=cfg["wandb_name"],
-                                   config={k: v for k, v in cfg.items()})
+                                   config={k: v for k, v in cfg.items()},
+                                   mode=os.environ.get("WANDB_MODE", "offline"))
         except Exception as e:
             print(f"[train] wandb 不可用（{e}），继续训练不记录")
     totals = {"num": 0, "acc": 0.0, "fmt": 0.0}

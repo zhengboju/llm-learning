@@ -22,6 +22,9 @@ TRAIN_GPU=${TRAIN_GPU:-1}
 # 【必带】vLLM 权重同步环境（缺一卡死：apply_model 传输 stall 的教训）
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
+# 训练机无交互终端 + 常无 WANDB_API_KEY：默认离线记录防 wandb login prompt 卡死；
+# 有 key 且想实时上传时 WANDB_MODE=online bash rlab/run_gsm8k.sh ... 覆盖。
+export WANDB_MODE=${WANDB_MODE:-offline}
 
 PORT=59875
 MODE=passthrough
