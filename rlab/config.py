@@ -88,6 +88,12 @@ BASE = dict(
         "<think> </think> and<answer> </answer> tags, respectively, i.e., "
         "<think> reasoning process here </think><answer> answer here </answer>."
     ),
+
+    # ---- 可复现种子（None=旧行为不设种子；设了则抽题顺序与生成采样均可复现）----
+    # 【2026-09-04 教训】dapo 同代码重跑 78.0→74.3(-3.7pp)：±2pp 噪声地板只覆盖
+    # "同 checkpoint 评两次"的评测噪声，从未覆盖训练运行间方差（抽题顺序+生成采样无种子）。
+    # 阶段1 起对比实验一律固定 seed，必要时双 seed 复跑。
+    seed=None,
 )
 
 

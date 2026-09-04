@@ -168,6 +168,8 @@ def main():
     ap.add_argument("--gen_device", type=int, default=None)
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--no-log", action="store_true", help="关闭 wandb")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="固定训练种子（抽题顺序+生成采样），阶段1 起对比实验必带")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -181,6 +183,7 @@ def main():
     if args.gen_device is not None: overrides["gen_device"] = args.gen_device
     if args.port is not None: overrides["ref_server_port"] = args.port
     if args.no_log: overrides["use_wandb"] = False
+    if args.seed is not None: overrides["seed"] = args.seed
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))

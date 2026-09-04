@@ -94,7 +94,18 @@ def gen_worker(Q, cfg: dict):
     print("[rollout] torch gen_logps 副本已加载")
 
     sampling_params = SamplingParams(n=cfg["num_pre_Q"], temperature=cfg["temperature"],
-                                     max_tokens=cfg["max_gen_tokens"], top_p=cfg["top_p"])
+                                     max_tokens=cfg["max_gen_tokens"], top_p=cfg["top_p"],
+                                     seed=cfg.get("seed"))
+
+    # 可复现种子：抽题顺序(random) + 生成采样(vLLM SamplingParams.seed)。
+    # 【2026-09-04 教训】训练运行间方差可达 ±3pp+（dapo 同代码重跑 78.0→74.3），
+    # 对比实验必须固定 seed 才能按"更新数配对"做单变量比较。
+    seed = cfg.get("seed")
+    if seed is not None:
+        import random as _random
+        _random.seed(seed)
+        torch.manual_seed(seed)
+        print(f"[rollout] 已固定训练种子 seed={seed}（抽题顺序 + vLLM 采样）")
 
     QAs = load_qas(cfg["data_task"])
     print(f"[rollout] 数据集 {cfg['data_task']} 共 {len(QAs)} 题")
