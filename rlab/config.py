@@ -11,6 +11,7 @@
 """
 
 import copy
+import os
 
 # 各算法的默认差异项（其余超参全部继承 BASE）
 ALGO_DEFAULTS = {
@@ -103,6 +104,11 @@ def get_config(algo: str, **overrides) -> dict:
         cfg[k] = v
     if cfg["wandb_name"] is None:
         cfg["wandb_name"] = f"{algo}"
+    # 输出目录按算法隔离（防 grpo/dapo 的 step_N checkpoint 与 record 互相覆盖）
+    if "out_dir" not in overrides:
+        cfg["out_dir"] = os.path.join(cfg["out_dir"], algo)
+    if "record_path" not in overrides:
+        cfg["record_path"] = os.path.join(cfg["out_dir"], "record.jsonl")
     cfg["ref_server"] = f"http://{cfg['ref_server_host']}:{cfg['ref_server_port']}"
     return cfg
 

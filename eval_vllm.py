@@ -69,11 +69,25 @@ for i, (nm, _) in enumerate(models):
 print("  分配: " + "；".join(
     f"GPU{g}<-{[nm for _, nm in gpu_queues[g].queue]}" for g in gpus))
 
-results, failures = {}, {}
+results = {}
+failures = []
 lock = threading.Lock()   # per_gpu>1 时同卡多线程共享 results/failures
 
 
+def _assert_local_dir(p: str, what: str):
+    """路径形式的参数必须在启动前确认存在（否则 transformers 会把它当 HF repo id，
+    抛一堆 HFValidationError，难排查）。repo id 形式的名字（含 / 但不以 ./ ~ / 开头）跳过。"""
+    if p.startswith(("./", ".\\", "/", "~")):
+        exp = os.path.expanduser(p)
+        if not os.path.isdir(exp):
+            raise SystemExit(
+                f"[错误] {what} 路径不存在: {p}\n"
+                f"  提示: 训练端把 checkpoint 存到 <启动目录>/{'{out_dir}'}/<algo>/step_N，"
+                f"请核对训练时的 cwd（可用: find ~ -maxdepth 5 -type d -name 'step_*' 2>/dev/null）")
+
+
 def run_one(gpu, idx, name, path):
+    _assert_local_dir(path, f"模型 {name}")
     out_json = f"eval_v_{re.sub(r'[^0-9A-Za-z_.-]+', '_', name)}.json"
     time.sleep(idx * 3)  # 错峰启动：避免同卡多实例同时剖析显存（vLLM 0.12 的内存自洽断言会撞车）
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
