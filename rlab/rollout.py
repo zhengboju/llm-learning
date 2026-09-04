@@ -206,7 +206,8 @@ def gen_worker(Q, cfg: dict):
             uploaded_total += 1
             fout.write(json.dumps({
                 "t": time.time(), "algo": cfg["algo"],
-                "acc": acc_s.tolist(), "fmt": fmt_s.tolist()}, ensure_ascii=False) + "\n")
+                "acc": acc_s.tolist(), "fmt": fmt_s.tolist(),
+                "clen": [len(t) for t in ans_token_ids]}, ensure_ascii=False) + "\n")
         if uploaded_total % 10 == 0:
             fout.flush()
 
