@@ -28,6 +28,19 @@ MODE=passthrough
 if [ "$ALGO" = "rfpp" ]; then MODE=rfpp; fi
 
 echo "[run] algo=$ALGO model=$MODEL ref_server_mode=$MODE ref_gpu=$REF_GPU train_gpu=$TRAIN_GPU"
+
+# 退出清理：无论正常结束、训练崩溃还是 Ctrl+C，都杀掉 ref_server，
+# 防止孤儿进程占着 ~7G 显存（set -e 直接退出会跳过普通 kill 语句）
+REF_PID=""
+cleanup() {
+  if [ -n "$REF_PID" ] && kill -0 "$REF_PID" 2>/dev/null; then
+    echo "[run] stopping ref_server (pid=$REF_PID)"
+    kill "$REF_PID" 2>/dev/null || true
+    wait "$REF_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
 CUDA_VISIBLE_DEVICES=$REF_GPU python -m rlab.ref_server --model_path "$MODEL" \
     --port $PORT --mode $MODE &
 REF_PID=$!
@@ -37,6 +50,3 @@ sleep 15   # 等 ref 模型加载完（首条 /get 会一直 empty，这里只�
 # CUDA_VISIBLE_DEVICES 改回 REF_GPU 的物理卡号（rollout.gen_worker 内置）
 CUDA_VISIBLE_DEVICES=$TRAIN_GPU python -m rlab.train --algo "$ALGO" \
     --model_path "$MODEL" --port $PORT "$@"
-RC=$?
-kill $REF_PID 2>/dev/null || true
-exit $RC
