@@ -74,20 +74,26 @@ failures = []
 lock = threading.Lock()   # per_gpu>1 时同卡多线程共享 results/failures
 
 
-def _assert_local_dir(p: str, what: str):
+def _assert_local_dir(p: str, what: str) -> bool:
     """路径形式的参数必须在启动前确认存在（否则 transformers 会把它当 HF repo id，
-    抛一堆 HFValidationError，难排查）。repo id 形式的名字（含 / 但不以 ./ ~ / 开头）跳过。"""
+    抛一堆 HFValidationError，难排查）。repo id 形式的名字（含 / 但不以 ./ ~ / 开头）跳过。
+    返回 False 而不是 raise：本函数在工作线程里调用，raise SystemExit 会被静默吞掉，
+    且会连带杀死该 GPU 的工作线程（队列里后面的模型直接不跑、无任何报错）。"""
     if p.startswith(("./", ".\\", "/", "~")):
         exp = os.path.expanduser(p)
         if not os.path.isdir(exp):
-            raise SystemExit(
-                f"[错误] {what} 路径不存在: {p}\n"
-                f"  提示: 训练端把 checkpoint 存到 <启动目录>/{'{out_dir}'}/<algo>/step_N，"
-                f"请核对训练时的 cwd（可用: find ~ -maxdepth 5 -type d -name 'step_*' 2>/dev/null）")
+            print(f"[错误] {what} 路径不存在: {p}\n"
+                  f"  提示: 训练端把 checkpoint 存到 <启动目录>/{'{out_dir}'}/<algo>/step_N，"
+                  f"请核对训练时的 cwd（可用: find ~ -maxdepth 5 -type d -name 'step_*' 2>/dev/null）")
+            return False
+    return True
 
 
 def run_one(gpu, idx, name, path):
-    _assert_local_dir(path, f"模型 {name}")
+    if not _assert_local_dir(path, f"模型 {name}"):
+        with lock:
+            failures.append((name, gpu, "path-not-found"))
+        return
     out_json = f"eval_v_{re.sub(r'[^0-9A-Za-z_.-]+', '_', name)}.json"
     time.sleep(idx * 3)  # 错峰启动：避免同卡多实例同时剖析显存（vLLM 0.12 的内存自洽断言会撞车）
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
@@ -115,14 +121,22 @@ def run_one(gpu, idx, name, path):
 
 def gpu_worker(gpu):
     """每 GPU 一条工作线程：从本卡队列逐个取任务，卡内严格串行。
-    per_gpu>1 时同卡起多条线程（并发，旧模式，易 OOM，不推荐）。"""
+    per_gpu>1 时同卡起多条线程（并发，旧模式，易 OOM，不推荐）。
+    兜底：单模型异常只记 failure，绝不允许杀死本线程（否则队列里
+    后面的模型静默消失，正是"总表少结果且无报错"的来源）。"""
     while True:
         try:
             idx, name = gpu_queues[gpu].get_nowait()
         except queue.Empty:
             return
         _, path = models[idx]
-        run_one(gpu, idx, name, path)
+        try:
+            run_one(gpu, idx, name, path)
+        except Exception:
+            import traceback
+            with lock:
+                traceback.print_exc()
+                failures.append((name, gpu, "exception"))
 
 
 threads = [threading.Thread(target=gpu_worker, args=(g,))
