@@ -49,13 +49,22 @@ def run_training(cfg, args):
     deepspeed.init_distributed()
 
     # rank0 在 spawn 出 gen worker 之后再加载训练模型，避免 fork 时的 CUDA 上下文污染
+    gen_proc = None
     Q = None
     if dist.get_rank() == 0:
         print("\n[train] START vLLM generation worker...\n")
         mp.set_start_method("spawn", force=True)
         Q = mp.Queue()
-        p = mp.Process(target=_spawn_gen, args=(Q, cfg), daemon=True)
-        p.start()
+        gen_proc = mp.Process(target=_spawn_gen, args=(Q, cfg), daemon=True)
+        gen_proc.start()
+
+    def _ensure_gen_alive():
+        """fail-fast：生成端进程死亡 = 权重/数据链路已断，继续等只会空转
+        （vLLM 启动 OOM 等故障曾表现为训练端无限 'waiting for batch'）。"""
+        if gen_proc is not None and not gen_proc.is_alive():
+            raise RuntimeError(
+                "[train] 生成端进程已退出（见其 traceback，常见原因：显存不足/"
+                "权重同步失败）-> 训练端中止。检查 run_gsm8k.sh 的卡位与显存编排。")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
     model = AutoModelForCausalLM.from_pretrained(
@@ -82,10 +91,12 @@ def run_training(cfg, args):
     for step in progress:
         batch = get_batch(cfg["ref_server"])
         while batch is None:
+            _ensure_gen_alive()
             if dist.get_rank() == 0:
                 print("waiting for batch...")
             time.sleep(3)
             batch = get_batch(cfg["ref_server"])
+        _ensure_gen_alive()
 
         plen = batch["plen"]
         inputs = batch["inputs"].to(engine.device)

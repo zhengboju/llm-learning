@@ -33,16 +33,20 @@
 
 ## 快速开始（训练机上，2×H20）
 
+**卡位编排（勿全挤一卡，vLLM 启动时 12G free 的 OOM 教训）**：
+- GPU0：ref 模型(~7G) + vLLM 生成 0.35(~33G) + torch gen_logps 副本(~6G) ≈ 46G
+- GPU1：DeepSpeed 训练端 3B ZeRO-0 全态（~60G，含 AdamW fp32 状态）
+
 ```bash
-# 方式一：一键（ref_server + train + 自动 spawn 生成端）
+# 方式一：一键（自动按上述卡位隔离，REF_GPU/TRAIN_GPU 可覆盖）
 bash rlab/run_gsm8k.sh dapo /root/Qwen2.5-3B
 
-# 方式二：分进程
+# 方式二：分进程（手动控制卡位）
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-python -m rlab.ref_server --model_path /root/Qwen2.5-3B --port 59875          # 0号卡
-python -m rlab.train --algo dapo --model_path /root/Qwen2.5-3B                # 1号卡训练
-#   rfpp 需 ref_server --mode rfpp
+CUDA_VISIBLE_DEVICES=0 python -m rlab.ref_server --model_path /root/Qwen2.5-3B --port 59875
+CUDA_VISIBLE_DEVICES=1 python -m rlab.train --algo dapo --model_path /root/Qwen2.5-3B
+#   rfpp 需 ref_server --mode rfpp；生成端进程死亡会触发训练端 fail-fast，不会无限等待
 ```
 
 评测与汇总：
