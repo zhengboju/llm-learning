@@ -123,7 +123,13 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
     print(f"[ref_server] mode={mode} device={device} port={port}", flush=True)
 
     macro_step = grad_accum          # 单 GPU 部署：macro batch = grad_accum 个 micro upload
-    raw_queue, result_queue = queue.Queue(), queue.Queue()
+    # 队列语义与各自原版逐字一致：
+    # passthrough（simple_grpo_v1 原版）：双 Lifo ——训练端吃最新鲜的 batch，贴近 on-policy；
+    # rfpp（simple-reinforce++ 原版）：双 FIFO ——macro batch 按上传顺序攒批、保序下发。
+    if mode == "passthrough":
+        raw_queue, result_queue = queue.LifoQueue(), queue.LifoQueue()
+    else:
+        raw_queue, result_queue = queue.Queue(), queue.Queue()
     app = Bottle()
 
     @app.route("/upload", method="POST")

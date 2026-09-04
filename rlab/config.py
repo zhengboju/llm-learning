@@ -49,6 +49,12 @@ BASE = dict(
     max_gen_tokens=512,      # 生成长度上限
     temperature=0.9,
     top_p=1.0,
+    # 【2026-09-04 缺口根因】HF GenerationConfig 默认 top_k=50，老脚本没显式传就用了 50；
+    # vLLM SamplingParams 默认 top_k=-1（全词表采样，尾部更重、更多退化解）。
+    # 这与 loss 归一化产生算法特异的交互：DAPO 的 token-mean 让长退化样本按 token 数
+    # 拿到更大梯度权重（GRPO 的 sample-mean 每条样本等权，对尾部不敏感）——
+    # 解释了"GRPO 跨实现复现一致、唯独 DAPO 掉 4pp"。必须与老脚本逐字对齐。
+    top_k=50,
     dynamic_max_attempts_mult=5,   # dynamic sampling 尝试上限 = 需要 组数*该倍数
 
     # ---- 训练 ----

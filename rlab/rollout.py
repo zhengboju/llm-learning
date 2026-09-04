@@ -95,11 +95,11 @@ def gen_worker(Q, cfg: dict):
 
     sampling_params = SamplingParams(n=cfg["num_pre_Q"], temperature=cfg["temperature"],
                                      max_tokens=cfg["max_gen_tokens"], top_p=cfg["top_p"],
+                                     top_k=cfg.get("top_k", 50),
                                      seed=cfg.get("seed"))
 
     # 可复现种子：抽题顺序(random) + 生成采样(vLLM SamplingParams.seed)。
-    # 【2026-09-04 教训】训练运行间方差可达 ±3pp+（dapo 同代码重跑 78.0→74.3），
-    # 对比实验必须固定 seed 才能按"更新数配对"做单变量比较。
+    # 对比实验固定 seed 后可按"更新数配对"做单变量比较（同 seed 下 vLLM 采样可复现）。
     seed = cfg.get("seed")
     if seed is not None:
         import random as _random
