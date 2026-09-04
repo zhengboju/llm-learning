@@ -52,27 +52,25 @@ def reward_format(answer):
     return 1.0 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else 0.0
 
 
-# ---------- GSM8K test split（与 eval_gsm8k_test.py 逐字一致） ----------
-print("[1/3] 加载 GSM8K test split ...")
-test_data = None
+# ---------- GSM8K split：仅使用 ModelScope（pod HF 网络不通，禁止回落） ----------
+print(f"[1/3] 加载 GSM8K {args.split} split（ModelScope）...")
 try:
     from modelscope.msdatasets import MsDataset
-    for did in ("modelscope/gsm8k",):
-        try:
-            ds = MsDataset.load(did, subset_name="main", split=args.split, trust_remote_code=True)
-            if len(ds) > 0:
-                test_data = [{"Q": x["question"], "A": x["answer"]} for x in ds]
-                print(f"  modelscope {did} [{args.split}]: {len(test_data)} 题")
-                break
-        except Exception as e:
-            print(f"  {did} 失败: {e}")
+    from rlab.data import _patch_verification_mode
+
+    # 兼容 modelscope 旧版向 datasets>=3 传已删除的 verification_mode
+    _patch_verification_mode()
+
+    ds = MsDataset.load("modelscope/gsm8k", subset_name="main",
+                        split=args.split, trust_remote_code=True)
+    if len(ds) == 0:
+        raise RuntimeError(f"ModelScope GSM8K {args.split} split 为空")
+    test_data = [{"Q": x["question"], "A": x["answer"]} for x in ds]
+    print(f"  modelscope gsm8k [{args.split}]: {len(test_data)} 题")
 except Exception as e:
-    print(f"  modelscope 不可用: {e}")
-if test_data is None:
-    from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split=args.split)
-    test_data = [{"Q": x["question"], "A": x["answer"].split("####")[-1].strip()} for x in ds]
-    print(f"  datasets [{args.split}]: {len(test_data)} 题")
+    raise RuntimeError(
+        f"ModelScope GSM8K {args.split} split 加载失败；"
+        "已禁止回落 Hugging Face（pod HF 网络不通）。") from e
 
 random.seed(args.seed)
 sample = random.sample(test_data, min(args.n, len(test_data)))
@@ -107,7 +105,7 @@ for i, (item, out) in enumerate(zip(sample, outs)):
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid}
-print(f"\n[3/3] {name}（GSM8K test，N={len(sample)}）")
+print(f"\n[3/3] {name}（GSM8K {args.split}，N={len(sample)}）")
 print(f"{name:<16}{result['acc']*100:>9.1f}%{result['fmt']*100:>9.1f}%{result['both']*100:>9.1f}%{result['n']:>10}")
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({name: result}, f, indent=2, ensure_ascii=False)

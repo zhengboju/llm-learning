@@ -62,31 +62,26 @@ def reward_format(answer):
     pattern = r"^<think>.*?</think><answer>.*?</answer>$"
     return 1.0 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else 0.0
 
-# ---------- 加载 GSM8K **test** split ----------
-print("[1/3] 加载 GSM8K test split ...")
-test_data = None
-# 优先 modelscope（hf 不通）
-# trust_remote_code=True：modelscope/gsm8k 是脚本型数据集，需要显式信任其仓库代码（安全已知的可信镜像）
+# ---------- 加载 GSM8K **test** split：仅使用 ModelScope（pod HF 网络不通，禁止回落） ----------
+print("[1/3] 加载 GSM8K test split（ModelScope）...")
 try:
     from modelscope.msdatasets import MsDataset
-    for did in ("modelscope/gsm8k",):
-        try:
-            ds = MsDataset.load(did, subset_name="main", split="test", trust_remote_code=True)
-            if len(ds) > 0:
-                test_data = [{"Q": x["question"], "A": x["answer"]} for x in ds]
-                print(f"  modelscope {did}: {len(test_data)} 题")
-                break
-        except Exception as e:
-            print(f"  {did} 失败: {e}")
-except Exception as e:
-    print(f"  modelscope 不可用: {e}")
+    from rlab.data import _patch_verification_mode
 
-# 兜底：hf（可能已缓存）
-if test_data is None:
-    from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split="test")
-    test_data = [{"Q": x["question"], "A": x["answer"].split("####")[-1].strip()} for x in ds]
-    print(f"  datasets: {len(test_data)} 题")
+    # 兼容 modelscope 旧版向 datasets>=3 传已删除的 verification_mode
+    _patch_verification_mode()
+
+    # trust_remote_code=True：modelscope/gsm8k 是脚本型数据集（安全已知的可信镜像）
+    ds = MsDataset.load("modelscope/gsm8k", subset_name="main",
+                        split="test", trust_remote_code=True)
+    if len(ds) == 0:
+        raise RuntimeError("ModelScope GSM8K test split 为空")
+    test_data = [{"Q": x["question"], "A": x["answer"]} for x in ds]
+    print(f"  modelscope gsm8k [test]: {len(test_data)} 题")
+except Exception as e:
+    raise RuntimeError(
+        "ModelScope GSM8K test split 加载失败；"
+        "已禁止回落 Hugging Face（pod HF 网络不通）。") from e
 
 assert test_data is not None and len(test_data) > 0, "test split 加载失败"
 random.seed(args.seed)
