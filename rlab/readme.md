@@ -9,7 +9,7 @@
 |---|---|
 | `config.py` | 全部超参 + 六算法 preset（`get_config("dapo")` 一行切换） |
 | `protocol.py` | 生成端↔训练端 batch 契约与字节编解码（algo 感知双布局） |
-| `data.py` | 数据加载（GSM8K HF/modelscope 回落 + CPU fixture） |
+| `data.py` | 数据加载（GSM8K 默认 modelscope，HF 仅回落 + CPU fixture；`RLAB_DATA_SOURCE=hf` 可强制 HF） |
 | `reward.py` | acc/format/overlong 三组件（math_verify 线程安全：timeout=None） |
 | `losses.py` | **核心**：advantage 三模式 + 六算法 loss（grpo/dapo/dr_grpo/cispo/gspo/rfpp） |
 | `sync.py` | 权重同步（apply_model 优先 + V0 兜底 + fail-fast） |
