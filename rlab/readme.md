@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=1 python -m rlab.train --algo dapo --model_path /root/Qwen2
 评测与汇总：
 
 ```bash
-python -m rlab.eval --models dapo300=./rlab_out/dapo/step_300 --gpus 0
+python -m rlab.eval --models grpo300=./rlab_out/grpo/step_300 dapo300=./rlab_out/dapo/step_300
 python -m rlab.analysis --eval-json eval_vllm_all.json
 python -m rlab.analysis --record rlab_out/record.jsonl
 ```
