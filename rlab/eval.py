@@ -25,7 +25,8 @@ def main():
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gpus", default="0", help="评测用卡；默认 0 号（与生成端共卡需错峰）")
-    ap.add_argument("--per_gpu", type=int, default=3)
+    ap.add_argument("--per_gpu", type=int, default=1,
+                    help="每卡同时跑的模型进程数；1=卡内串行（默认，防OOM）")
     ap.add_argument("--split", default="test", choices=("test", "train"))
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
     ap.add_argument("--skip_base", action="store_true")

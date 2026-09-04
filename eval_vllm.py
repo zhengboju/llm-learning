@@ -7,15 +7,15 @@
 #   python eval_vllm.py --n 300 --gpus 0,1 --per_gpu 3 \
 #       --tuned grpo200=/path/grpo,dapo200=/path/dapo,rfpp100=/path/100,rfpp200=/path/200,rfpp300=/path/300
 #   （BASE 默认评；--skip_base 跳过；--gpus auto=全部可见卡）
-import argparse, json, os, re, subprocess, sys, threading, time
-from concurrent.futures import ThreadPoolExecutor
+import argparse, json, os, queue, re, subprocess, sys, threading, time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--tuned", default="", help="逗号分隔 checkpoint，支持 name=path；空=只评BASE")
 parser.add_argument("--n", type=int, default=300)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--gpus", type=str, default="auto", help="auto=所有可见卡，或 0,1")
-parser.add_argument("--per_gpu", type=int, default=3, help="每卡同时跑的模型进程数")
+parser.add_argument("--per_gpu", type=int, default=1,
+                    help="每卡同时跑的模型进程数；1=卡内串行（推荐，防OOM）")
 parser.add_argument("--gpu_mem", type=float, default=None, help="单进程vLLM显存占比，默认自动=0.78/per_gpu")
 parser.add_argument("--skip_base", action="store_true")
 parser.add_argument("--base_path", default="/root/Qwen2.5-3B")
@@ -61,14 +61,19 @@ assert gpus, "无可用GPU"
 print(f"[调度] 模型数={len(models)}，GPU={gpus}，每卡并发={args.per_gpu}，单进程gpu_mem={GPU_MEM}")
 
 one_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_vllm_one.py")
-print("  分配: " + "；".join(f"GPU{gpus[i % len(gpus)]}<-{nm}" for i, (nm, _) in enumerate(models)))
+# 分配：模型 round-robin 均匀摊到各 GPU 队列；每 GPU 的任务严格串行处理
+# （同卡多 vLLM 实例并发是 OOM/内存剖析竞态的重灾区，默认 per_gpu=1 卡内串行）
+gpu_queues = {g: queue.Queue() for g in gpus}
+for i, (nm, _) in enumerate(models):
+    gpu_queues[gpus[i % len(gpus)]].put((i, nm))
+print("  分配: " + "；".join(
+    f"GPU{g}<-{[nm for _, nm in gpu_queues[g].queue]}" for g in gpus))
 
-results, failures = {}, []
-lock = threading.Lock()
+results, failures = {}, {}
+lock = threading.Lock()   # per_gpu>1 时同卡多线程共享 results/failures
 
 
-def run_one(idx, name, path):
-    gpu = gpus[idx % len(gpus)]
+def run_one(gpu, idx, name, path):
     out_json = f"eval_v_{re.sub(r'[^0-9A-Za-z_.-]+', '_', name)}.json"
     time.sleep(idx * 3)  # 错峰启动：避免同卡多实例同时剖析显存（vLLM 0.12 的内存自洽断言会撞车）
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
@@ -94,12 +99,24 @@ def run_one(idx, name, path):
         failures.append((name, gpu, proc.returncode))
 
 
-# 子进程承载 vLLM（GIL互不影响），调度线程只 wait，无性能损失
-pool = min(args.per_gpu * len(gpus), len(models))
-with ThreadPoolExecutor(max_workers=pool) as ex:
-    futs = [ex.submit(run_one, i, nm, p) for i, (nm, p) in enumerate(models)]
-    for f in futs:
-        f.result()
+def gpu_worker(gpu):
+    """每 GPU 一条工作线程：从本卡队列逐个取任务，卡内严格串行。
+    per_gpu>1 时同卡起多条线程（并发，旧模式，易 OOM，不推荐）。"""
+    while True:
+        try:
+            idx, name = gpu_queues[gpu].get_nowait()
+        except queue.Empty:
+            return
+        _, path = models[idx]
+        run_one(gpu, idx, name, path)
+
+
+threads = [threading.Thread(target=gpu_worker, args=(g,))
+           for g in gpus for _ in range(args.per_gpu)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
 
 print(f"\n{'='*60}\n[总表]（GSM8K test，N={args.n}，seed={args.seed}）")
 print(f"{'模型':<16}{'准确率':>10}{'格式率':>10}{'双达标':>10}{'有效样本':>10}")
