@@ -33,36 +33,67 @@ def load_qas(task: str = "gsm8k", fixture: bool = False):
 
 
 def _patch_verification_mode():
-    """兼容垫片（2026-09-04 真机实测）：pod 里 modelscope 老版本仍向 datasets 传
-    verification_mode，但 datasets>=3 已删除该参数，导致 MsDataset.load 在 split
-    生成成功后死于 TypeError。两处调用点都把该 kwarg 丢掉即可，行为无损
-    （该参数只控制校验失败时抛错还是警告）。"""
+    """兼容垫片（2026-09-04 真机实测两轮）：
+    pod 里老 modelscope 仍向 datasets 传 verification_mode，但 datasets>=3 已删除
+    该参数，导致 MsDataset.load 在 split 生成成功后死于 TypeError。
+    第一轮垫片只打了 datasets.builder.Builder——datasets>=3 主类已改名
+    DatasetBuilder，且 modelscope 常把 load_dataset 早绑定到自己模块里，
+    所以没打中。本轮三处全打：
+      1) datasets 侧所有 builder 类的 as_dataset（实例方法走 MRO，类上打必生效）；
+      2) datasets.load_dataset 本体；
+      3) 已加载的 modelscope.* 模块里早绑定的同名引用。
+    该参数只控制校验失败时抛错还是警告，丢掉行为无损。"""
+    import functools
+
+    def _wrap(fn):
+        @functools.wraps(fn)
+        def w(*a, **k):
+            k.pop("verification_mode", None)
+            return fn(*a, **k)
+        w._rlab_patched = True
+        return w
+
+    applied = []
+    # 1) builder 类（新旧类名都试）
     try:
         from datasets import builder as _bd
-        if not getattr(_bd.Builder.as_dataset, "_rlab_patched", False):
-            _orig = _bd.Builder.as_dataset
-
-            def _as_dataset(self, *a, **k):
-                k.pop("verification_mode", None)
-                return _orig(self, *a, **k)
-
-            _as_dataset._rlab_patched = True
-            _bd.Builder.as_dataset = _as_dataset
+        for _cls_name in ("DatasetBuilder", "Builder", "GeneratorBasedBuilder"):
+            _cls = getattr(_bd, _cls_name, None)
+            if _cls is not None and not getattr(_cls.as_dataset, "_rlab_patched", False):
+                try:
+                    _cls.as_dataset = _wrap(_cls.as_dataset)
+                    applied.append(f"datasets.builder.{_cls_name}.as_dataset")
+                except Exception:
+                    pass
     except Exception:
         pass
+    # 2) datasets.load_dataset 本体
     try:
         import datasets as _ds
-        if not getattr(_ds.load_dataset, "_rlab_patched", False):
-            _orig_ld = _ds.load_dataset
-
-            def _load_dataset(*a, **k):
-                k.pop("verification_mode", None)
-                return _orig_ld(*a, **k)
-
-            _load_dataset._rlab_patched = True
-            _ds.load_dataset = _load_dataset
+        if callable(getattr(_ds, "load_dataset", None)) \
+                and not getattr(_ds.load_dataset, "_rlab_patched", False):
+            _ds.load_dataset = _wrap(_ds.load_dataset)
+            applied.append("datasets.load_dataset")
     except Exception:
         pass
+    # 3) modelscope 模块里早绑定的引用（from datasets import X 式导入打不到就靠这个）
+    try:
+        import sys as _sys
+        for _name, _mod in list(_sys.modules.items()):
+            if _mod is None or not (_name == "modelscope" or _name.startswith("modelscope.")):
+                continue
+            for _attr in ("load_dataset", "as_dataset"):
+                _fn = getattr(_mod, _attr, None)
+                if callable(_fn) and not getattr(_fn, "_rlab_patched", False) \
+                        and getattr(_fn, "__module__", "").startswith("datasets"):
+                    try:
+                        setattr(_mod, _attr, _wrap(_fn))
+                        applied.append(f"{_name}.{_attr}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    print(f"[data] verification_mode 垫片已应用: {applied or '无（datasets/modelscope 未安装？）'}")
 
 
 def load_gsm8k_train():
@@ -79,7 +110,9 @@ def load_gsm8k_train():
         except Exception as e:
             ms_err = e
             if DATA_SOURCE == "ms":
-                print(f"[data] modelscope gsm8k 加载失败（{e}），改走 HF")
+                import traceback
+                print(f"[data] modelscope gsm8k 加载失败（{e}），改走 HF\n"
+                      + traceback.format_exc())
     try:
         from datasets import load_dataset
         ds = load_dataset("openai/gsm8k", "main", split="train")
