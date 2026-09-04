@@ -44,10 +44,35 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Pre-flight 1：端口必须空闲。孤儿 ref_server 占着端口时，新 server 绑定失败
+# 只在 daemon 线程里报一下就静默消失，训练端会连上【模式错误】的旧 server
+# （如上一个是 rfpp 模式，这次跑 cispo/grpo 拿到的 advantage 全是错的）。
+if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
+  exec 3>&- 3<&-
+  echo "[run] 致命错误: 端口 $PORT 已被占用（疑似孤儿 ref_server）。先执行:"
+  echo "  pkill -f 'rlab.ref_server' ; sleep 2"
+  exit 1
+fi
+
 CUDA_VISIBLE_DEVICES=$REF_GPU python -m rlab.ref_server --model_path "$MODEL" \
     --port $PORT --mode $MODE &
 REF_PID=$!
-sleep 15   # 等 ref 模型加载完（首条 /get 会一直 empty，这里只是避免竞态日志）
+
+# Pre-flight 2：等 /health 且模式匹配（替代盲等 15s；ref 模型加载可能 >15s）
+echo -n "[run] waiting for ref_server(/health, mode=$MODE) "
+for i in $(seq 1 60); do
+  H=$(curl -s --max-time 2 "http://localhost:$PORT/health" 2>/dev/null || true)
+  if echo "$H" | grep -q "\"mode\": *\"$MODE\""; then
+    echo " ok ($H)"; break
+  fi
+  if ! kill -0 "$REF_PID" 2>/dev/null; then
+    echo; echo "[run] 致命错误: ref_server 进程已退出（看上方 traceback）"; exit 1
+  fi
+  echo -n "."; sleep 2
+done
+if ! echo "$H" | grep -q "\"mode\": *\"$MODE\""; then
+  echo; echo "[run] 致命错误: 120s 内 /health 未返回 mode=$MODE（H=$H）"; exit 1
+fi
 
 # CUDA_VISIBLE_DEVICES 限定训练卡；生成 worker 由 train.py spawn 后自行把
 # CUDA_VISIBLE_DEVICES 改回 REF_GPU 的物理卡号（rollout.gen_worker 内置）

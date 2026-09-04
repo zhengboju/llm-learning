@@ -132,6 +132,13 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
         raw_queue, result_queue = queue.Queue(), queue.Queue()
     app = Bottle()
 
+    @app.route("/health", method="GET")
+    def do_health():
+        """启动脚本用：确认端口上活着的是本 run 期望的 server（模式匹配）。
+        防孤儿错配——旧 server 占着端口时，新 server 绑定失败只在一个 daemon
+        线程里报一下就没了，训练端会静默连上模式错误的旧 server。"""
+        return json.dumps({"mode": mode, "port": port})
+
     @app.route("/upload", method="POST")
     def do_upload():
         dd = bytes_list_to_list(request.body.read())
