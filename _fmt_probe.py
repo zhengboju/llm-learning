@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""_fmt_probe.py — base 格式率探针（修复版 2）
+"""_fmt_probe.py — base 格式率探针（修复版 3：零标签字面量）
 
 背景：rlab 训练期 record.jsonl 显示格式率仅 0.5~10%（temp=0.9 采样），
 而 greedy 评测 BASE fmt≈49.3%。本探针量化 base 模型在不同采样参数下
@@ -7,14 +7,15 @@
   1) 是温度 0.9 还是 top_k 毁掉了格式？
   2) 降温度（0.7/0.6）能否把格式率抬回可学习水平？
 
-关键设计：
-  - 标签/正则/系统提示一律从 rlab.reward / rlab.config 导入，
-    字节与训练、评测完全一致，杜绝"聊天界面改写标签"的伪影（教训：
-    _base_sampling_probe.py 曾被界面改写而误报 0%）；
-  - 修掉上一版 temp=0 时 n=4 的崩溃（vLLM greedy 必须 n=1）；
-  - 输出"起头 Top5 字符"辅助判断模型没格式时在输出什么。
+【铁律·本文件零标签字面量】含标签字节的 prompt/正则/常量只要经由聊天
+管道（助手输出、复制粘贴）就会静默改写（v1 踩过，v2 的自检常量也踩了：
+手写的 _TAGS 在落盘前已被改写成普通英文单词）。因此 v3 规则：
+  - 正则与系统提示：一律 from rlab 导入（pod 上 rlab 文件是真字节）；
+  - 自检标签：从导入的 _FORMAT_RE 里用 <...> 规则【自动提取】，
+    再回查系统提示 + 正则 roundtrip，三重一致性；
+  - 文件里绝不手写任何标签。
 
-用法（训练机，先 git pull / scp 同步本文件，不要从聊天界面复制粘贴）：
+用法（训练机，先 git pull 同步本文件，不要从聊天界面复制粘贴）：
   python _fmt_probe.py --engine vllm      # rlab 同款引擎 vLLM
   python _fmt_probe.py --engine hf        # 历史 grpo/dapo 同款 HF generate，作对照
 """
@@ -25,7 +26,7 @@ import sys
 
 from transformers import AutoTokenizer
 
-# 从 rlab 导入已验证正确的字节（防界面改写）
+# 从 rlab 导入已验证正确的字节（pod 上 grep 验证过：真字节在 rlab 里）
 try:
     from rlab.reward import _FORMAT_RE
     from rlab.config import BASE
@@ -35,13 +36,19 @@ except ImportError:
 PATTERN = re.compile(_FORMAT_RE, re.DOTALL)   # ^...$ 已在 _FORMAT_RE 内
 SYSTEM_PROMPT = BASE["system_prompt"]
 
-# 字节自检：正则与提示里必须真实含有四个标签（任一缺失 = 文件被界面改写）
-_TAGS = (" thinking", " response", "<answer>", "</answer>")
+# ---- 自检（全部从导入内容派生，本文件不含任何手写标签）----
+_TAGS = list(dict.fromkeys(re.findall(r"<[^<>\s]+>", PATTERN.pattern)))
+if not _TAGS:
+    sys.exit("[自检失败] 从 _FORMAT_RE 提取不到标签——rlab 文件本身可能被改写")
 for _b in _TAGS:
-    if _b not in PATTERN.pattern or _b not in SYSTEM_PROMPT:
-        print(f"[自检失败] 缺少真实标签字节 {_b!r}（文件被界面改写？用 git/scp 同步本文件）")
-        sys.exit(1)
-print("[自检通过] 正则含真实标签字节:", PATTERN.pattern)
+    if _b not in SYSTEM_PROMPT:
+        sys.exit(f"[自检失败] 标签 {_b!r} 不在 rlab 系统提示里——pod 上 rlab 被改写？")
+# roundtrip：用提取到的标签按正则顺序拼样例，PATTERN 必须能匹配
+_sample = _TAGS[0] + "abc" + _TAGS[1] + _TAGS[2] + "42" + _TAGS[3]
+if not PATTERN.match(_sample):
+    sys.exit(f"[自检失败] PATTERN 匹配不了自构样例（正则语义异常）")
+print(f"[自检通过] 从 rlab 提取到 {len(_TAGS)} 个标签字节，"
+      f"长度分布={[len(t) for t in _TAGS]}，正则 roundtrip OK")
 
 QUESTIONS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
