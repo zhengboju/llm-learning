@@ -130,24 +130,30 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
     return segs, full_text, code_stats
 
 
-def retool_score_flat(inputs, full_texts, code_stats, cfg, steps_elapsed):
+def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed):
     """阶段2 打分（模块级纯函数，CPU 可测）。
 
-    索引契约（2026-09-08 真机 IndexError 教训）：full_texts/code_stats 必须是
+    索引契约（2026-09-08 真机 IndexError 教训）：asst_texts/code_stats 必须是
     Q_batch_size × num_pre_Q 条——即每道题先扩成 num_pre_Q 条独立轨迹再进
-    multi_turn_rollout_group，idx = i*num_pre_Q + j 与 full_texts 一一对应。
+    multi_turn_rollout_group，idx = i*num_pre_Q + j 一一对应。
+
+    打分文本 = 模型自己的 assistant 段拼接（**不含工具段**，2026-09-08 真机
+    fmt=0.0% 教训）：全文含 prompt → 格式正则 ^ 锚定必败 → fmt 恒为常数 →
+    组内归一化后 fmt 梯度信号彻底死亡；全文还含沙箱输出 → "最后一个数字"
+    变成工具 stdout，把工具结果当模型答案发信用。工具段只作上下文，也绝不
+    参与打分——与"工具 token 不进 loss"是同一条原则在奖励端的投影。
 
     返回 (adv, acc_s, fmt_s, code_used, code_ok, phase)。"""
     phase = reward_phase(steps_elapsed, cfg["reward_switch_step"])
     rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
     n = cfg["num_pre_Q"]
-    assert len(full_texts) == len(inputs) * n, \
-        f"轨迹数 {len(full_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
+    assert len(asst_texts) == len(inputs) * n, \
+        f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
             sc = total_reward_retool(
-                inp["A"], full_texts[idx], code_ok=code_stats[idx]["code_ok"],
+                inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
                 phase=phase, code_w=cfg["code_w"],
                 cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"])
             rewards.append(sc["reward"]); acc_s.append(sc["acc"])
@@ -297,6 +303,9 @@ def gen_worker(Q, cfg: dict):
                for k in range(len(group_prompts))]
         segs, full_texts, code_stats = multi_turn_rollout_group(
             vllm_gen, sps, tokenizer, group_prompts, cfg)
+        # 打分文本 = assistant 段拼接（工具段不参与 acc/fmt，见 retool_score_flat）
+        asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
+                      for segs_i in segs]
         merged_ids, mask, per_sample_ids = retool_build_batch(prompt_ids, segs, plen)
         if mask.shape[1] == 0:
             return None
@@ -308,7 +317,7 @@ def gen_worker(Q, cfg: dict):
             return None
         completion_lens = [len(t) for t in per_sample_ids]
         adv, acc_s, fmt_s, cu, ck, phase = retool_score_group(
-            inputs, full_texts, code_stats)
+            inputs, asst_texts, code_stats)
         if not group_ok(adv):
             return None
         gen_logps = compute_gen_logps(merged_ids, plen)

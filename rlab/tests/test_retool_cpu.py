@@ -332,17 +332,26 @@ def test_multi_rollout_and_scoring():
     check("工具段内容 = 沙箱 stdout",
           "42" in segs[0][1]["text"] and "5" in segs[2][1]["text"])
 
-    # 打分索引契约：full_texts 必须 = 题数 × num_pre_Q（真机 IndexError 的回归锁）
+    # 打分索引契约：asst_texts 必须 = 题数 × num_pre_Q（真机 IndexError 的回归锁）
     cfg2 = get_config("retool", use_wandb=False)
+    asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
+                  for segs_i in segs]
     inputs = [{"Q": "q", "A": "42"}]
     adv, acc_s, fmt_s, cu, ck, phase = retool_score_flat(
-        inputs, full_texts, code_stats, cfg2, steps_elapsed=0)
+        inputs, asst_texts, code_stats, cfg2, steps_elapsed=0)
     check("score_flat 输出长度 = Q*n=4", adv.shape[0] == 4 and len(cu) == 4)
     check("cu/ck 与 code_stats 对齐", cu == [2, 0, 1, 0] and ck == [2, 0, 1, 0])
     check("group_std 组内和≈0", abs(float(adv.sum())) < 1e-4)
     check("phase cold（steps_elapsed=0 < 256）", phase == "cold")
+    # 打分文本必须是 assistant 拼接而非全文：全文上 reward_format 必败
+    # （fmt 恒常数 → 组内归一化后信号死亡，2026-09-08 真机 fmt=0.0% 根因）
+    check("asst 文本不含 prompt 前缀", all(not t.startswith("P") for t in asst_texts))
+    check("asst 文本不含工具段", all("[TOOL RESULT]" not in t for t in asst_texts))
+    from rlab.reward import reward_format
+    check("全文上 reward_format 必败（对照实锤）",
+          all(reward_format(p + t) == -1.0 for p, t in zip(prompts, asst_texts)))
     try:
-        retool_score_flat(inputs, full_texts[:1], code_stats[:1], cfg2, 0)
+        retool_score_flat(inputs, asst_texts[:1], code_stats[:1], cfg2, 0)
         ok_flag = False
     except AssertionError:
         ok_flag = True

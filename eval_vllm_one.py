@@ -104,8 +104,13 @@ if args.retool:
     sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens)
     mt_cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
               "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
-    _segs, answers, code_stats = multi_turn_rollout_group(
+    _segs, _full, code_stats = multi_turn_rollout_group(
         llm, sp_mt, tokenizer, prompts, mt_cfg)
+    # 打分只用模型自己的 assistant 段拼接文本：全文含 prompt（格式正则 ^ 锚定
+    # 必败 → fmt 恒 0，2026-09-08 实测）也含沙箱输出（"最后一个数字"会变成
+    # 工具 stdout，把工具结果当模型答案发信用）。
+    answers = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
+               for segs_i in _segs]
     code_used = [s["code_used"] for s in code_stats]
     code_ok = [s["code_ok"] for s in code_stats]
 else:
