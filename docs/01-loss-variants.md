@@ -9,15 +9,73 @@
 |---|---|
 | 模型 | Qwen2.5-3B（2×H20，GPU0=ref+vLLM，GPU1=训练端） |
 | 数据 | GSM8K train split，num_pre_Q=4（组内 4 条同题采样） |
-| 采样 | temperature=0.7，top_k=50（与 HF GenerationConfig 默认对齐，见 §3.1） |
+| 采样 | temperature=0.7，top_k=50（与 HF GenerationConfig 默认对齐，见 §4.1） |
 | 训练 | lr=1e-6 恒定（无 scheduler）、warmup=0、DeepSpeed ZeRO-0 |
 | 奖励 | total = 2.0·acc + fmt ∈ {3, 1, −1, −3}；acc ±1，fmt ±1 |
 | 评测 | GSM8K test N=300 seed=42，贪心，vLLM（同轮配对比较） |
-| 噪声 | 评测方差 ±2pp；**训练 run 间方差可达 4pp**（§4）；>4~5pp 才算单 run 可读差异 |
+| 噪声 | 评测方差 ±2pp；**训练 run 间方差可达 4pp**（§5）；>4~5pp 才算单 run 可读差异 |
 
 格式目标 = "think 起止标签包裹推理过程"的窄路径（起头约 56% 概率直接跳过标签答题）。
 
-## 2. 最终总表（temp0.7 统一协议，acc/fmt，单位 %）
+## 2. 算法理论：六种 loss 变体的统一视角
+
+### 2.1 共同骨架
+
+六个算法共享同一条流水线：每个问题采 G=4 条回答（组内采样）→ 奖励 → advantage → 策略梯度更新。除 rfpp 外，loss 主体都是 PPO-clip 目标：
+
+```
+r_t = π_θ(y_t) / π_old(y_t)          # token 级 importance ratio
+J    = E[ min(r_t·A, clip(r_t, 1−ε, 1+ε)·A) ] − β·KL(π_θ ‖ π_ref)
+```
+
+其中 A 是 advantage，KL 用 k3 无偏估计（exp(d)−d−1），π_ref 由 ref_server 提供。**六算法的全部差异落在三个轴上**：
+
+| 轴 | 问题 | 取值（本骨架） |
+|---|---|---|
+| ① advantage 基线 | 梯度的"信用分配"：和谁比 | 组内 (r−μ)/σ、组内 r−μ、全局 r−μ |
+| ② ratio/信任域处理 | 哪些 token 允许产生梯度、梯度通路怎么走 | token 级 PPO-clip / clip-higher / stop-grad 权重 / sequence 级 |
+| ③ loss 归一化 | 梯度权重在样本/token 间怎么分 | sample_mean / token_mean / token_const / token_items / seq_mean |
+
+外加一个标量旋钮：KL 锚 β（rfpp 取 0，其余 0.04）。
+
+### 2.2 逐算法
+
+**GRPO**（DeepSeekMath，组内对照基线）。A_i = (r_i − μ组) / σ组：每条回答和"同题的另外 3 条"比，同题配对对比天然消掉题目难度。归一化用 sample_mean——每条样本先按自身 token 数平均、再 batch 平均，**每条样本等权**，与长短无关。同题 4 条互为对照是它区别于朴素策略梯度的本质：组内信号保留了"真解出 vs 看起来像解出"的区分度。
+
+**DAPO**（字节，解耦 clip + token 级归一化）。四个机制：①clip-higher——上界放宽到 1+0.28（下界不动），低概率 token 被奖励拉起时不易撞上 clip 天花板，保熵保探索；②dynamic sampling——全对/全错组（σ≈0，组内无对比信号）跳过重采；③token_mean——全 batch 按 token 归一化，长回答的梯度权重与 token 数成正比；④overlong shaping——超长软惩罚。注意 DAPO **不动基线**（仍 group_std），全部改动集中在轴②③。
+
+**Dr.GRPO**（"Dr. GRPO"论文，逐项去偏差）。指认 GRPO 两处系统偏差：①除 σ 会让"答得参差的组"advantage 被放大（隐性的难度加权），改为 A = r − μ组；②token 归一化让长回答每 token 梯度被摊薄——错误回答往往更长，等效鼓励变长，改为除以**固定常数** B·max_len（token_const），与批内实际长度分布无关。
+
+**CISPO**（MiniMax-M1，截断大小不截梯度）。PPO-clip 的本质缺陷：越界 token 的梯度被精确截成 0。对 RLVR 长链推理这是系统性伤害——关键的"反思/转折" token 恰恰是概率快速上升、最容易越界的那批，PPO 会把它们反复丢出训练。CISPO 改写目标：
+
+```
+L = − A · sg( clip(r_t, 1−ε, 1+ε) ) · log π_θ(y_t)
+```
+
+clip 后的 ratio 作 **stop-gradient 标量权重**——它只决定"这个 token 梯度放大多少倍"，梯度本身恒经 logπ 流动，**每个 token 都有梯度**。这是六算法中唯一改变梯度通路结构的（轴②的激进改动）。（本骨架实现曾把该公式写成 keep·clamp 形式导致策略梯度处处为零，见 §4.3——这条 bug 反向证明了"梯度通路"这个轴的分量。）
+
+**GSPO**（Qwen3，序列级信任域）。token 级 ratio 噪声大，长序列上逐 token 独立 clip 的约束过松；GSPO 把 importance ratio 提升到 sequence 级 s_i = exp(mean_t log r_t)，clip 同样作用在 s 上，整条回答共享一个一致的信任域。论文动机是 MoE 训练稳定性；教学规模下可理解为"每条样本一个统一的单调性约束"（seq_mean 归一化随之自然落在序列级目标上）。
+
+**RF++（rfpp 分支）**（REINFORCE++，全局基线）。保留组内采样但基线换成**全局** batch mean：A = r − μ全局，token 级 advantage，loss 除以全局累积有效 token 数（token_items），且 β=0 无 KL。理论上是"最朴素的策略梯度 + 方差缩减基线"——丢掉了同题配对对比。这正是它在实测中退化的理论根源（§3、§4.2）。
+
+### 2.3 配置总表（rlab `ALGO_DEFAULTS` 实测口径）
+
+| 算法 | 轴① 基线 | 轴② 信任域 | 轴③ 归一化 | β |
+|---|---|---|---|---|
+| grpo | 组内 (r−μ)/σ | token PPO-clip（0.2/0.2） | sample_mean | 0.04 |
+| dapo | 组内 (r−μ)/σ | token clip（0.2/**0.28**）+ dynamic + overlong | token_mean | 0.04 |
+| dr_grpo | 组内 r−μ | token PPO-clip（0.2/0.2） | token_const（B·max_len） | 0.04 |
+| cispo | 组内 (r−μ)/σ | clip 作 **stop-grad 权重** | token_mean | 0.04 |
+| gspo | 组内 (r−μ)/σ | **sequence 级** ratio+clip | seq_mean | 0.04 |
+| rfpp | **全局** r−μ | token PPO-clip（0.2/0.2） | token_items | **0** |
+
+### 2.4 理论 → 实测的对照
+
+- 轴①：group_std / group_mean 两个家族全部健康收敛且趋同（§3）——"去不去 σ"在 3B 规模下不是决定性差异；**global_mean（rfpp）独此退化**——丢掉同题配对对比是结构性伤害，与 §4.2 的样本级取证互证。
+- 轴②：cispo 的 stop-grad 公式修复带来 +15pp（§4.3），说明梯度通路设计值得单独审查；gspo 序列级约束与 token 级在本规模无可见差异。
+- 轴③ + 温度：格式率归零事件（§4.1）显示，归一化方式决定"被淹没的信号"能不能浮出来——group_std 的离群放大让 cispo/gspo 勉强点火，group_mean/global_mean 直接归零；但根本解是修温度（信号源），不是挑归一化。
+
+## 3. 最终总表（temp0.7 统一协议，acc/fmt，单位 %）
 
 | 模型 | BASE | rfpp（早停 200） | gspo@200 | dr_grpo@500 | cispo@400 |
 |---|---|---|---|---|---|
@@ -39,9 +97,9 @@
 3. **rfpp 结构性退化复现**：300 步跌破 BASE（53.3，fmt 也掉到 81.3），唯一解是早停。
 4. **格式是"容易"目标**：所有健康 run 的 fmt 都在 200 步内学满并全程稳定在 98~100。
 
-## 3. 三个案例：异常结果的根因链
+## 4. 三个案例：异常结果的根因链
 
-### 3.1 温度杀格式信号（fmt=0% 事件，2026-09-05）
+### 4.1 温度杀格式信号（fmt=0% 事件，2026-09-05）
 
 - **现象**：dr_grpo200 / rfpp200 评测 fmt=0%（acc 却正常 74+），训练期格式率仅 0.5~2.2%（@temp0.9）。
 - **根因链**：格式是窄路径，temp=0.9 下 base 采样格式率仅 ~10%（探针网格：0.9→10.4%、0.7→27.1%、0.6→37.5%、贪心≈49%）。训练期高频"非格式但答对"(+1) 淹没恒为 −1 的格式信号 → group_mean / global_mean 基线（dr_grpo/rfpp）把格式打到 0；group_std（cispo/gspo）靠离群放大勉强点火。
@@ -49,13 +107,13 @@
 - **修复**：`config.py` temperature 0.9→0.7（commit `1e11e10`，测试锁死）。验证：dr_grpo200 77.3/fmt 100。
 - **附带教训（标签改写铁律）**：含 think 标签字节的文本经聊天管道（含本 agent 的工具调用输出）会被静默改写成普通英文单词，已三次发作。诊断/探针脚本必须**零标签字面量**：正则与 prompt 从 rlab 导入、标签从格式正则自动提取再回查 + roundtrip（`_fmt_probe.py` v3）。被改写脚本产出的结论一律作废。
 
-### 3.2 rfpp 结构性退化复现（2026-09-05~07）
+### 4.2 rfpp 结构性退化复现（2026-09-05~07）
 
 - 干净协议（组内 4 条、temp0.7、top_k50、beta=0）下，RF++ 的老毛病原样复现：200 步 74.7 后 300 步崩到 53.3，跌破 BASE。
 - 机制（前一阶段已定案）：单样本 + 全局基线无法区分"真解出"与"看起来像解出"，模型坍缩到表面解题模式（格式完美、算术流畅、逻辑脱锚）；组内同题配对对比（GRPO 系）才是维持语义级信用分配的机制。
 - 温度修复只治格式信号，不治退化。rfpp 最佳实践 = 早停；"修复"它等于改组基线 = 重写成 GRPO，无调参解。
 
-### 3.3 CISPO 策略梯度归零 bug（2026-09-07，commit `604cae7`）
+### 4.3 CISPO 策略梯度归零 bug（2026-09-07，commit `604cae7`）
 
 - **现象**：cispo@temp0.7 重跑仍 67.7/60.7 ≈ BASE（时间戳确认是真跑）。
 - **CPU 梯度探针实锤**：旧实现 `-(keep · clamp(ratio, max=1+hi) · adv - kl)` 的策略梯度**处处为零**——ratio 越上界被 clamp 饱和成常数（梯度 0），未越界被 keep 指示清零（无项）。beta=0 时策略参数梯度严格全 0（grpo 对照组同输入 2.77）。cispo 训练实际只剩 KL 项，模型 ≈ 被轻扰动的 base。
@@ -63,7 +121,7 @@
 - **验证**：67.7（零梯度）→ 80.3@300 → 82.7@400（+15pp），格式 60.7→99+。修复因果闭环。
 - **方法论教训（本阶段最重要）**：旧测试只断言 loss 数值，而"期望值"就是用错误公式算的——测试照样绿。**新 loss 落地必须配梯度探针（backward 后检查参数梯度），forward 数值测试不够。**
 
-## 4. 方法学发现：训练运行方差（2026-09-08）
+## 5. 方法学发现：训练运行方差（2026-09-08）
 
 500 步整跑的中间 checkpoint 与此前 300 步整跑的同名 checkpoint 对比（同 seed、同协议、骨架无 LR scheduler，总步数不改变中途轨迹）：
 
@@ -79,14 +137,14 @@
 - 推论：①基于单 run 的 1~4pp 排序（如 v2 的 cispo300 > drgrpo300）**全部作废**；②单 run 相邻 checkpoint 2~4pp 上下波动是常态，曲线只读得出 >4~5pp 的效应；③"最优 checkpoint"横向比较有选择偏差，报告时应注明。
 - 因此 cispo 82.7 vs dr_grpo 82.3 定论为**打平**；用多 seed × 多 run 分辨 <1pp 无教学意义。
 
-## 5. 阶段1 大结论
+## 6. 阶段1 大结论
 
 1. **主流 loss 变体（group_std / group_mean 基线族）在统一协议下性能趋同**（cispo ≈ dr_grpo ≈ gspo@同预算），变体选择不是 3B 教学规模下的主要杠杆。
 2. **真正拉开差距的是结构性缺陷与实现 bug**：rfpp 全局基线退化（−8pp 且崩）、cispo 零梯度 bug（−15pp）——"实验异常先查实现与信号通路，再谈算法优劣"。
 3. **训练前置条件比算法更致命**：温度差 0.2 可以把格式信号整个抹掉（fmt 0%），采样器/温度/top_k 的协议统一是一切公平对比的前提。
 4. 格式是易学目标（所有健康 run 200 步内 fmt→99+），准确率才是长跑指标。
 
-## 6. 遗留与后续
+## 7. 遗留与后续
 
 - 可选：gspo 拉长到 500 步（当前只有 @200=77.3）。
 - 可选：grpo / dapo 在 temp0.7 下重跑，补全六算法同协议总表（历史值：grpo300 77.3、dapo 78.0 @temp0.9 混杂协议）。
