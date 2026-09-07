@@ -67,6 +67,46 @@ def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64)
     return min((completion_len - trigger) / buffer, 1.0)
 
 
+# ------------------------------------------------- 阶段2 ReTool 奖励 ----
+# 代码可用率小权重：执行成功的代码块数 * code_w（失败/超时不加分）。
+# Auto_Program 原口径 call_python = (python_cnt - error_cnt) * 0.1，
+# 在我们的统计里 = code_ok * 0.1（成功执行次数），cap(max_rounds) 内。
+def reward_code(code_ok: int, code_w: float = 0.1) -> float:
+    return code_ok * code_w
+
+
+def reward_phase(steps_elapsed: int, switch_step: int) -> str:
+    """冷启动/后期权重切换：optimizer step < switch_step 为 "cold"。
+    Auto_Program 用 16 次权重推送(=16*16=256 步)作为阈值——冷启动期代码/格式权重
+    更大，引导模型先学会"写代码+套格式"，正确性权重小；后期翻转（2*acc 主导）。
+    本函数是纯逻辑，训练端/生成端共用（生成端用推送次数*gen_update_steps 近似）。"""
+    return "cold" if steps_elapsed < switch_step else "hot"
+
+
+def total_reward_retool(ground_truth: str, answer: str, *, code_ok: int,
+                        phase: str, code_w: float = 0.1,
+                        cold_w: tuple = (1.0, 2.0, 2.0), hot_w: tuple = (2.0, 1.0, 1.0),
+                        completion_len: int = 0, max_gen_tokens: int = 512,
+                        overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
+    """阶段2 组合口径：w_acc*acc + w_fmt*fmt + w_code*code_ok*code_w。
+
+    cold（冷启动，默认 (1,2,2)）：代码/格式权重大，先学会工具与格式；
+    hot（后期，默认 (2,1,1)）：正确性主导（与阶段1 的 2.0*acc+fmt 对齐）。
+    Auto_Program 的 cold 权重其实等价于 acc + 2*fmt + 2*call_python。
+    返回分量 dict 供 record 记录与监控。"""
+    acc = reward_correct(ground_truth, answer)
+    fmt = reward_format(answer)
+    w_acc, w_fmt, w_code = cold_w if phase == "cold" else hot_w
+    code = reward_code(code_ok, code_w)
+    r = w_acc * acc + w_fmt * fmt + w_code * code
+    pen = 0.0
+    if overlong_shaping:
+        pen = overlong_penalty(completion_len, max_gen_tokens, overlong_buffer)
+        r -= pen
+    return {"reward": r, "acc": acc, "format": fmt, "code": code,
+            "code_ok": code_ok, "overlong": pen}
+
+
 def total_reward(ground_truth: str, answer: str, *, w_acc: float = 2.0,
                  completion_len: int = 0, max_gen_tokens: int = 512,
                  overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:

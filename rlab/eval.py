@@ -30,6 +30,8 @@ def main():
     ap.add_argument("--split", default="test", choices=("test", "train"))
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
     ap.add_argument("--skip_base", action="store_true")
+    ap.add_argument("--retool", action="store_true",
+                    help="阶段2：多轮代码交织评测（透传给 eval_vllm.py）")
     args = ap.parse_args()
     models = ",".join(m.strip() for m in args.models if m.strip())
 
@@ -39,6 +41,8 @@ def main():
            "--base_path", args.base_path]
     if args.skip_base:
         cmd.append("--skip_base")
+    if args.retool:
+        cmd.append("--retool")
     print("[eval]", " ".join(cmd))
     raise SystemExit(subprocess.call(cmd))
 

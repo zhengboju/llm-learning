@@ -7,18 +7,20 @@
 
 | 文件 | 职责 |
 |---|---|
-| `config.py` | 全部超参 + 六算法 preset（`get_config("dapo")` 一行切换） |
-| `protocol.py` | 生成端↔训练端 batch 契约与字节编解码（algo 感知双布局） |
+| `config.py` | 全部超参 + 七算法 preset（`get_config("dapo")` 一行切换；retool=阶段2） |
+| `protocol.py` | 生成端↔训练端 batch 契约与字节编解码（algo 感知多布局 + 工具段 mask 槽位） |
 | `data.py` | 数据加载（GSM8K 默认 modelscope，HF 仅回落 + CPU fixture；`RLAB_DATA_SOURCE=hf` 可强制 HF） |
-| `reward.py` | acc/format/overlong 三组件（math_verify 线程安全：timeout=None） |
-| `losses.py` | **核心**：advantage 三模式 + 六算法 loss（grpo/dapo/dr_grpo/cispo/gspo/rfpp） |
+| `reward.py` | acc/format/overlong 三组件 + 阶段2 retool 奖励（math_verify 线程安全：timeout=None） |
+| `losses.py` | **核心**：advantage 三模式 + 六算法 loss（grpo/dapo/dr_grpo/cispo/gspo/rfpp）+ retool 复用 grpo |
 | `sync.py` | 权重同步（apply_model 优先 + V0 兜底 + fail-fast） |
-| `rollout.py` | 生成端 worker（vLLM 采样 + torch gen_logps 副本 + dynamic sampling） |
+| `rollout.py` | 生成端 worker（vLLM 采样 + torch gen_logps 副本 + dynamic sampling + 阶段2 多轮代码交织） |
+| `sandbox.py` | 阶段2：subprocess 隔离代码沙箱（超时/内存上限/输出截断） |
 | `ref_server.py` | 打分中转服务器，双模式：passthrough（GRPO 家族）/ rfpp（macro-batch per-token advantage） |
-| `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端） |
-| `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42） |
+| `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端；协议 mask 感知） |
+| `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42；--retool 多轮代码评测） |
 | `analysis.py` | eval 汇总表（±2pp 噪声地板判定）+ record.jsonl 曲线 |
-| `tests/test_smoke_cpu.py` | 41 项 CPU 冒烟测试（losses 解析值/协议/reward/数据） |
+| `tests/test_smoke_cpu.py` | 45 项 CPU 冒烟测试（losses 解析值/协议/reward/数据） |
+| `tests/test_retool_cpu.py` | 34 项阶段2 验收（mask 错/对 A/B 是核心学习点） |
 
 ## 算法切换对照
 
@@ -60,10 +62,11 @@ python -m rlab.analysis --record rlab_out/record.jsonl
 CPU 冒烟（本机即可跑，共 81 项）：
 
 ```bash
-python -m rlab.tests.test_smoke_cpu        # 41 项：losses 解析值/协议/reward/数据 ✅
+python -m rlab.tests.test_smoke_cpu        # 45 项：losses 解析值/协议/reward/数据 ✅
 python -m rlab.tests.test_train_step_cpu   #  9 项：tiny 模型端到端 plen 切片/mask/backward ✅
-python -m rlab.tests.test_ref_server_cpu   # 16 项：eos mask/passthrough 布局/rfpp 信用回传数学 ✅
-python -m rlab.tests.test_e2e_http         # 15 项：真实 HTTP 双模式服务器 + 6 算法消费闭环 ✅
+python -m rlab.tests.test_ref_server_cpu   # 17 项：eos mask/passthrough 布局/rfpp 信用回传数学 ✅
+python -m rlab.tests.test_e2e_http         # 15 项：真实 HTTP 双模式服务器 + 算法消费闭环 ✅
+python -m rlab.tests.test_retool_cpu       # 34 项：阶段2 mask 错/对 A/B/沙箱/奖励/协议/logps 对齐 ✅
 ```
 
 注意：e2e 测试中 bottle 的启动 banner 走 stderr，在 PowerShell 管道里可能显示
@@ -77,11 +80,15 @@ NativeCommandError 假象；以退出码为准（stdout/stderr 重定向到文�
   对比时以 rlab 内部同口径重跑的 rfpp 为准。
 - 数据顺序注意：`simple_grpo_v1` 用全随机采样，`Auto_Program` 用顺序遍历；rlab 默认随机采样（与 v1 一致）。
 
-## 阶段2/3 扩展点（先留白，不预埋死代码）
+## 阶段2/3 扩展点
 
-- 多轮工具调用（ReTool）：替换 `rollout.build_prompt` + 在 gen worker 加"代码块检测→沙箱执行→续写"
-  循环；`protocol.py` meta 需加工具段 mask 字段（工具返回 token 不进 loss）。
-- 检索 RL（Search-R1）：新增 `search_backend.py`（BM25 起步），reward 换 EM；数据在 `data.py` 注册。
+- **阶段2 ReTool（已完成开发，待真机验收）**：`sandbox.py`（subprocess 隔离代码沙箱）
+  + `rollout.multi_turn_rollout_group`（多轮：生成→检测代码块→沙箱→回填→续写）
+  + 协议 mask 槽位（工具返回 token 不进 loss，`has_mask` 元数据）+ retool 奖励
+  （acc+fmt+code 小权重，cold/hot 权重切换）。loss 复用 grpo。运行与验收见
+  `docs/02-retool.md`；CPU 验收 `python -m rlab.tests.test_retool_cpu`（34 项）。
+- 检索 RL（Search-R1）：可复用阶段2 的多段轨迹协议与 mask 契约，新增
+  `search_backend.py`（BM25 起步），reward 换 EM；数据在 `data.py` 注册。
 
 ## 验收状态（阶段0）
 

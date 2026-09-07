@@ -110,7 +110,12 @@ def run_training(cfg, args):
 
         logits = engine(inputs).logits[:, :-1, :]
         per_token_logps = get_per_token_logps(logits, inputs[:, 1:])[:, plen - 1:]
-        mask = (inputs[:, plen:] != pad_id).float()
+        if "mask" in batch:
+            # 阶段2 retool：mask 由生成端按段边界给出（assistant=1 / 工具返回段=0 / pad=0），
+            # 训练端直接采用——工具返回 token 不进 loss 是 TIR 的核心契约，不可用 pad 重算。
+            mask = batch["mask"].to(engine.device)
+        else:
+            mask = (inputs[:, plen:] != pad_id).float()
 
         loss, stats = compute_loss(
             cfg["algo"], per_token_logps, gen_logps, advantages, mask, cfg,

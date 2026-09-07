@@ -18,6 +18,9 @@ parser.add_argument("--max_len", type=int, default=1280, help="prompt(~400)+生�
 parser.add_argument("--max_tokens", type=int, default=512)
 parser.add_argument("--split", default="test", choices=["test", "train"], help="test=held-out(默认)；train=训练集内抽样(过拟合诊断：train高test低=过优化实锤)")
 parser.add_argument("--show", type=int, default=0, help="打印前N个原始回答")
+parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（生成→执行代码→续写→最终答案），并记录代码调用率")
+parser.add_argument("--max_rounds", type=int, default=3, help="--retool 时最多代码-执行轮数")
+parser.add_argument("--round_tokens", type=int, default=280, help="--retool 时每轮 assistant 段生成长度上限")
 args = parser.parse_args()
 
 name = args.name or "_".join(args.model.rstrip("/").split("/")[-2:])
@@ -25,6 +28,11 @@ out_path = args.out or f"eval_vllm_{name}.json"
 
 system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
 The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
+
+if args.retool:
+    from rlab.config import system_prompt_retool
+    system_prompt = system_prompt_retool
 
 
 def reward_correct(answer, ground_truth):
@@ -88,11 +96,25 @@ print(f"[2/3] vLLM 生成并评分 ... {name}: {args.model}")
 from vllm import LLM, SamplingParams
 llm = LLM(model=args.model, gpu_memory_utilization=args.gpu_mem,
           max_model_len=args.max_len, dtype="bfloat16")
-outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=args.max_tokens))
+
+code_used = code_ok = None
+if args.retool:
+    # 阶段2：多轮代码交织（贪心）——复用 rollout 的多轮生成逻辑（含沙箱执行）
+    from rlab.rollout import multi_turn_rollout_group
+    sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens)
+    mt_cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
+              "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
+    _segs, answers, code_stats = multi_turn_rollout_group(
+        llm, sp_mt, tokenizer, prompts, mt_cfg)
+    code_used = [s["code_used"] for s in code_stats]
+    code_ok = [s["code_ok"] for s in code_stats]
+else:
+    outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=args.max_tokens))
+    answers = [o.outputs[0].text for o in outs]
+    code_used = code_ok = [0] * len(answers)
 
 acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
-for i, (item, out) in enumerate(zip(sample, outs)):
-    ans = out.outputs[0].text
+for i, (item, ans) in enumerate(zip(sample, answers)):
     if len(ans.strip()) == 0:
         continue
     n_valid += 1
@@ -105,8 +127,14 @@ for i, (item, out) in enumerate(zip(sample, outs)):
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid}
+if args.retool and n_valid:
+    result["code_rate"] = sum(1 for u in code_used if u > 0) / n_valid
+    result["code_ok_rate"] = sum(1 for k in code_ok if k > 0) / n_valid
+    result["avg_rounds"] = sum(code_used) / n_valid
 print(f"\n[3/3] {name}（GSM8K {args.split}，N={len(sample)}）")
 print(f"{name:<16}{result['acc']*100:>9.1f}%{result['fmt']*100:>9.1f}%{result['both']*100:>9.1f}%{result['n']:>10}")
+if args.retool and n_valid:
+    print(f"{name:<16}代码调用率 {result['code_rate']*100:.1f}%  成功率 {result['code_ok_rate']*100:.1f}%  平均轮次 {result['avg_rounds']:.2f}")
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({name: result}, f, indent=2, ensure_ascii=False)
 print(f"结果已存 {out_path}")

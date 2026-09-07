@@ -41,8 +41,10 @@ from torch.nn.utils.rnn import pad_sequence
 from rlab.config import get_config
 from rlab.data import load_qas
 from rlab.losses import compute_advantages, get_per_token_logps
-from rlab.protocol import encode_batch, make_bytes_list, tensor_to_bytes
-from rlab.reward import total_reward
+from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
+                           make_bytes_list, segment_mask_from_spans, tensor_to_bytes)
+from rlab.reward import reward_phase, total_reward, total_reward_retool
+from rlab.sandbox import run_code
 from rlab.sync import sync_weights_into_vllm
 
 # 清除分布式环境变量（gen worker 进程内 vLLM 不允许看到 DeepSpeed 的 WORLD_SIZE 等）
@@ -68,6 +70,56 @@ def build_prompt(question: str, system_prompt: str, tokenizer) -> str:
 def group_ok(scores: torch.Tensor) -> bool:
     """组内有区分度才可用于训练（全同组 advantage 恒 0，白占训练配额）。"""
     return (scores.max() - scores.min()).item() >= 1e-4
+
+
+def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text, cfg,
+                             code_runner=run_code):
+    """阶段2 ReTool：代码交织多轮生成（一组 num_pre_Q 个样本并行走）。
+
+    对每组样本：生成一段 → 检测 python 围栏代码块 → 有则沙箱执行 → 结果按
+    TOOL_START/TOOL_END 回填 → 续生成下一轮；本轮无代码块则该样本结束（后续
+    应给出最终答案）。最多 cfg['max_rounds'] 轮。
+
+    返回 (segs, full_text, code_stats)：
+      segs:      list[list[dict]] —— 每个样本一段段的 {"kind": "assistant"|"tool", "text"}
+      full_text: list[str] —— 每个样本的完整轨迹文本（prompt+全部段）
+      code_stats: list[{"code_used": int, "code_ok": int}]
+    """
+    n = len(prompts_text)
+    segs = [[] for _ in range(n)]
+    code_stats = [{"code_used": 0, "code_ok": 0} for _ in range(n)]
+    ctxs = list(prompts_text)          # 每轮续写的完整上下文
+    active = list(range(n))            # 还在"代码-执行-续写"循环里的样本
+    for _rnd in range(int(cfg.get("max_rounds", 3))):
+        if not active:
+            break
+        outs = vllm_gen.generate([ctxs[i] for i in active],
+                                 sampling_params, use_tqdm=False)
+        new_text = {i: o.outputs[0].text for i, o in zip(active, outs)}
+        results = {}
+        for i in active:
+            segs[i].append({"kind": "assistant", "text": new_text[i]})
+            blocks = extract_python_blocks(new_text[i])
+            if not blocks:
+                continue              # 本轮无代码块 → 样本结束，等待最终答案
+            code = blocks[-1]          # 执行最后一个完整代码块（与 Auto_Program 一致）
+            code_stats[i]["code_used"] += 1
+            res = code_runner(code, timeout=cfg.get("sandbox_timeout", 5.0),
+                              mem_mb=cfg.get("sandbox_mem_mb", 256),
+                              max_chars=cfg.get("tool_result_max_chars", 500))
+            code_stats[i]["code_ok"] += int(res["ok"])
+            tool_text = TOOL_START + res["display"] + TOOL_END
+            segs[i].append({"kind": "tool", "text": tool_text})
+            results[i] = tool_text
+        # 下一轮：只有执行过代码的样本续写（扩展上下文）；其余样本就此定格
+        next_active = [i for i in active if i in results]
+        for i in next_active:
+            ctxs[i] = ctxs[i] + new_text[i] + results[i]
+        active = next_active
+
+    full_text = [p + "".join(s["text"] for s in segs_i)
+                 for p, segs_i in zip(prompts_text, segs)]
+    return segs, full_text, code_stats
 
 
 def gen_worker(Q, cfg: dict):
@@ -97,6 +149,12 @@ def gen_worker(Q, cfg: dict):
                                      max_tokens=cfg["max_gen_tokens"], top_p=cfg["top_p"],
                                      top_k=cfg.get("top_k", 50),
                                      seed=cfg.get("seed"))
+    # 阶段2 retool：多轮续写时每轮 n=1（组内 num_pre_Q 个样本各持不同上下文），
+    # 单段长度上限 round_gen_tokens（总上下文由 max_rounds × 单段约束）
+    retool_sp = SamplingParams(n=1, temperature=cfg["temperature"],
+                               max_tokens=cfg.get("round_gen_tokens", 280),
+                               top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
+                               seed=cfg.get("seed"))
 
     # 可复现种子：抽题顺序(random) + 生成采样(vLLM SamplingParams.seed)。
     # 对比实验固定 seed 后可按"更新数配对"做单变量比较（同 seed 下 vLLM 采样可复现）。
@@ -110,8 +168,10 @@ def gen_worker(Q, cfg: dict):
     QAs = load_qas(cfg["data_task"])
     print(f"[rollout] 数据集 {cfg['data_task']} 共 {len(QAs)} 题")
     ref_server = cfg["ref_server"]
+    pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
 
     def try_update_model():
+        nonlocal pushes
         if Q is None:
             return
         try:
@@ -125,6 +185,7 @@ def gen_worker(Q, cfg: dict):
             gen_torch.load_state_dict(
                 {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
             print(f"[rollout] model updated via {path}, {len(state_dict)} tensors")
+            pushes[0] += 1            # 权重推送计数（用于冷启动/后期奖励切换）
             del state_dict
         except Exception:
             import traceback
@@ -158,15 +219,87 @@ def gen_worker(Q, cfg: dict):
         adv = compute_advantages(rewards, cfg["num_pre_Q"], cfg["adv_mode"])
         return adv, torch.tensor(acc_s), torch.tensor(fmt_s)
 
+    # ------------------- 阶段2 retool 专用：打分 / 打包 -------------------
+    def retool_score_group(inputs, full_texts, code_stats, completion_lens):
+        """多段轨迹打分（阶段2 口径 + 冷启动/后期权重切换）。"""
+        phase = reward_phase(pushes[0] * cfg["gen_update_steps"], cfg["reward_switch_step"])
+        rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
+        n = cfg["num_pre_Q"]
+        for i, inp in enumerate(inputs):
+            for j in range(n):
+                idx = i * n + j
+                sc = total_reward_retool(
+                    inp["A"], full_texts[idx], code_ok=code_stats[idx]["code_ok"],
+                    phase=phase, code_w=cfg["code_w"],
+                    cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"],
+                    completion_len=completion_lens[idx],
+                    max_gen_tokens=cfg["max_gen_tokens"])
+                rewards.append(sc["reward"]); acc_s.append(sc["acc"])
+                fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])
+                ck.append(code_stats[idx]["code_ok"])
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        adv = compute_advantages(rewards, n, cfg["adv_mode"])
+        return (adv, torch.tensor(acc_s), torch.tensor(fmt_s),
+                cu, ck, phase)
+
+    def retool_build_batch(prompt_ids, segs, plen):
+        """由分段轨迹构造 merged_ids + 工具段 mask（assistant=1/tool=0/pad=0）。
+
+        分段 tokenize（add_special_tokens=False）后累计得到 completion 与每样本
+        assistant 区间；mask 由区间纯函数给出——工具返回 token 不进 loss 的契约。"""
+        per_sample_ids, masks = [], []
+        for segs_i in segs:
+            ids, spans = [], []
+            for seg in segs_i:
+                t = tokenizer(seg["text"], add_special_tokens=False)["input_ids"]
+                start = len(ids); ids.extend(t); end = len(ids)
+                if seg["kind"] == "assistant":
+                    spans.append((start, end))
+            per_sample_ids.append(ids)
+            masks.append(segment_mask_from_spans(len(ids), spans))
+        output_ids = pad_sequence([torch.tensor(t) for t in per_sample_ids],
+                                  batch_first=True, padding_value=tokenizer.pad_token_id)
+        mask = pad_sequence(masks, batch_first=True, padding_value=0.0)
+        n = output_ids.shape[0]
+        Qrep = prompt_ids.repeat(1, n).view(-1, plen)
+        merged_ids = torch.cat([Qrep, output_ids], dim=1)
+        return merged_ids, mask, per_sample_ids
+
+    def collect_retool_group(inputs, prompts_text, prompt_ids, plen):
+        """多轮 rollout → 打分 → 上传就绪数据。超长/全同组返回 None（重采）。"""
+        segs, full_texts, code_stats = multi_turn_rollout_group(
+            vllm_gen, retool_sp, tokenizer, prompts_text, cfg)
+        merged_ids, mask, per_sample_ids = retool_build_batch(prompt_ids, segs, plen)
+        if mask.shape[1] == 0:
+            return None
+        # 真实上下文 token 数上限检查（防 OOM：超长整组丢弃重采）
+        total_toks = int(mask.sum().item()) + plen * mask.shape[0]
+        if total_toks > cfg["max_context_tokens"] * mask.shape[0]:
+            print(f"[rollout] 轨迹超长 total={total_toks} > "
+                  f"{cfg['max_context_tokens']*mask.shape[0]}，整组丢弃重采")
+            return None
+        completion_lens = [len(t) for t in per_sample_ids]
+        adv, acc_s, fmt_s, cu, ck, phase = retool_score_group(
+            inputs, full_texts, code_stats, completion_lens)
+        if not group_ok(adv):
+            return None
+        gen_logps = compute_gen_logps(merged_ids, plen)
+        return {"merged": merged_ids, "mask": mask, "gen_logps": gen_logps,
+                "adv": adv, "acc": acc_s, "fmt": fmt_s,
+                "cu": cu, "ck": ck, "phase": phase,
+                "clen": completion_lens}
+
     # ------------------------- 采样主循环 -------------------------
     os.makedirs(os.path.dirname(os.path.abspath(cfg["record_path"])), exist_ok=True)
     fout = open(cfg["record_path"], "a", encoding="utf-8")
     uploaded_total = 0
+    is_retool = cfg["algo"] == "retool"
     while True:
         try_update_model()
         # dynamic sampling（DAPO 机制2）：全同组不占配额，继续采直到攒够 Q_batch_size 组
         need = cfg["Q_batch_size"]
-        groups = []                      # 每元素: (inputs, prompt_text, prompt_ids, ans_ids, adv, acc, fmt, plen)
+        groups = []   # 单轮: (inputs, prompt_text, prompt_ids, ans_ids, adv, acc, fmt, plen)
+                      # retool: (plen, prompt_ids, ready_dict)
         attempts = 0
         max_attempts = need * cfg["dynamic_max_attempts_mult"]
         while len(groups) < need and attempts < max_attempts:
@@ -177,6 +310,13 @@ def gen_worker(Q, cfg: dict):
                                    padding_side="left", add_special_tokens=False)["input_ids"]
             plen = prompt_ids.shape[1]
             if plen > cfg["max_prompt_length"]:
+                continue
+            if is_retool:
+                # 阶段2：多轮代码交织 → 打分 → 上传就绪（mask 已按段边界算好）
+                ready = collect_retool_group(inputs, prompts_text, prompt_ids, plen)
+                if ready is None:
+                    continue  # 全同组/超长：重采
+                groups.append((plen, prompt_ids, ready))
                 continue
             voutputs = vllm_gen.generate(prompts_text, sampling_params, use_tqdm=False)
             answers, ans_token_ids = [], []
@@ -191,7 +331,21 @@ def gen_worker(Q, cfg: dict):
 
             groups.append((inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen))
 
-        for (inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen) in groups:
+        for g in groups:
+            if is_retool:
+                plen, prompt_ids, r = g
+                meta = {"plen": plen, "algo": cfg["algo"], "has_mask": 1}
+                xdata = encode_batch(meta, r["merged"], r["adv"], r["gen_logps"],
+                                     r["mask"], r["acc"], r["fmt"])
+                requests.post(f"{ref_server}/upload", data=xdata)
+                uploaded_total += 1
+                fout.write(json.dumps({
+                    "t": time.time(), "algo": cfg["algo"],
+                    "acc": r["acc"].tolist(), "fmt": r["fmt"].tolist(),
+                    "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
+                    "phase": r["phase"]}, ensure_ascii=False) + "\n")
+                continue
+            inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen = g
             tensor_list = [torch.tensor(t) for t in ans_token_ids]
             output_ids = pad_sequence(tensor_list, batch_first=True,
                                       padding_value=tokenizer.pad_token_id)
@@ -216,7 +370,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="rlab 生成端独立运行（分进程模式）")
     ap.add_argument("--algo", required=True,
-                    choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp"))
+                    choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool"))
     ap.add_argument("--gen_device", type=int, default=0)
     ap.add_argument("--model_path", default=None)
     ap.add_argument("--port", type=int, default=59875)

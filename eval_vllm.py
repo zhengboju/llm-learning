@@ -22,6 +22,7 @@ parser.add_argument("--base_path", default="/root/Qwen2.5-3B")
 parser.add_argument("--show", type=int, default=0)
 parser.add_argument("--split", default="test", choices=["test", "train"], help="train=训练集内抽样(过拟合诊断)")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
+parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（透传给每个单模型进程）")
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -99,6 +100,8 @@ def run_one(gpu, idx, name, path):
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
            "--n", str(args.n), "--seed", str(args.seed), "--split", args.split,
            "--gpu_mem", str(GPU_MEM), "--out", out_json]
+    if args.retool:
+        cmd += ["--retool"]
     if args.show:
         cmd += ["--show", str(args.show)]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))

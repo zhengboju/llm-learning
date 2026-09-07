@@ -33,6 +33,10 @@ ALGO_DEFAULTS = {
     # RF++：全局基线（非组内）、per-token advantage、token 级、无 KL
     "rfpp":    dict(beta=0.0,  clip_low=0.2, clip_high=0.2, adv_mode="global_mean",
                     loss_norm="token_items"),
+    # 阶段2 ReTool：多轮代码交织（loss 与 grpo 同——group_std/sample_mean，
+    # 差异全在 rollout：分段轨迹 + 沙箱 + 工具段 mask 置0，见 docs/02-retool.md）
+    "retool":  dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_std",
+                    loss_norm="sample_mean"),
 }
 
 BASE = dict(
@@ -103,12 +107,36 @@ BASE = dict(
         "<think> reasoning process here </think><answer> answer here </answer>."
     ),
 
+    # ---- 阶段2 ReTool（代码交织多轮）----
+    max_rounds=3,            # assistant+tool 最多成对轮数
+    round_gen_tokens=280,    # 每轮 assistant 段生成长度上限（控制总上下文）
+    tool_result_max_chars=500,  # 沙箱输出截断长度（防输出炸弹）
+    sandbox_timeout=5.0,     # 代码执行超时（秒），超时 SIGKILL 子进程
+    sandbox_mem_mb=256,      # 代码内存上限（Linux RLIMIT_AS，best-effort）
+    max_context_tokens=2200, # 全轨迹（prompt+各段）上限，超限整组丢弃防 OOM
+    code_w=0.1,              # 代码可用率小权重（每个成功代码块 +code_w）
+    reward_switch_step=256,  # 冷启动/后期奖励权重切换点（optimizer step；
+                             # Auto_Program 16次权重推送*16步=256）
+    reward_cold_w=(1.0, 2.0, 2.0),   # 冷启动权重 (w_acc, w_fmt, w_code)：先学格式+代码
+    reward_hot_w=(2.0, 1.0, 1.0),    # 后期权重：正确性主导（与阶段1 的 2*acc+fmt 对齐）
+
     # ---- 可复现种子（None=旧行为不设种子；设了则抽题顺序与生成采样均可复现）----
     # 【2026-09-04 教训】dapo 同代码重跑 78.0→74.3(-3.7pp)：±2pp 噪声地板只覆盖
     # "同 checkpoint 评两次"的评测噪声，从未覆盖训练运行间方差（抽题顺序+生成采样无种子）。
     # 阶段1 起对比实验一律固定 seed，必要时双 seed 复跑。
     seed=None,
 )
+
+# 阶段2 retool 系统提示 = 基础格式提示 + 代码工具说明（复用 BASE["system_prompt"]
+# 保证格式口径与阶段0/1 完全一致；新增部分零标签字面量，规避改写铁律）
+_RETOOL_EXTRA = (
+    "\n\nYou MAY write Python code to help solve the problem. If you do, put each "
+    "piece of code inside a fenced block like: ```python\n<your code>\n```\n"
+    "The environment executes your code automatically and inserts the result "
+    "between [TOOL RESULT] and [/TOOL RESULT]. Read the result and continue "
+    "reasoning until you reach the final answer inside the required answer tags."
+)
+system_prompt_retool = BASE["system_prompt"] + _RETOOL_EXTRA
 
 
 def get_config(algo: str, **overrides) -> dict:
@@ -122,6 +150,9 @@ def get_config(algo: str, **overrides) -> dict:
         if k not in cfg:
             raise KeyError(f"未知配置项 {k!r}")
         cfg[k] = v
+    # retool 专用系统提示（除非用户显式覆盖）
+    if algo == "retool" and "system_prompt" not in overrides:
+        cfg["system_prompt"] = system_prompt_retool
     if cfg["wandb_name"] is None:
         cfg["wandb_name"] = f"{algo}"
     # 输出目录按算法隔离（防 grpo/dapo 的 step_N checkpoint 与 record 互相覆盖）
