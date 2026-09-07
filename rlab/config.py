@@ -47,7 +47,15 @@ BASE = dict(
     num_pre_Q=4,             # 每题采样条数；H20 显存实测 4 安全
     max_prompt_length=400,   # 提示词超长直接放弃本组（防 OOM）
     max_gen_tokens=512,      # 生成长度上限
-    temperature=0.9,
+    # 【2026-09-05 格式率根因修复】temp=0.9 下 base 格式率仅 ~10%（探针 48条/组：
+    # 0.9→10.4%, 0.7→27.1%, 0.6→37.5%, greedy≈49%大样本）。起头分布显示 56% 概率
+    # 直接跳过 think 标签答题（'T' 开头）——格式是"窄路径"，采样温度放大跳过率。
+    # 后果：训练期格式信号被高频的"非格式但对"(+1) 淹没 → group_mean/global_mean
+    # (dr_grpo/rfpp) 把格式打到 eval 0%；仅 group_std 靠离群放大勉强点火
+    # (cispo 训练期 2.2%→eval 63%, gspo 10.1%→71%)。
+    # 老 RF++ temp=0.7+topk=-1 格式率 ~35% 故能学到 99%——统一降 0.7：
+    # 与老 rf++ 可比 + 格式信号充足 + 保留探索性。eval 用 greedy，不受影响。
+    temperature=0.7,
     top_p=1.0,
     # 【2026-09-04 缺口根因】HF GenerationConfig 默认 top_k=50，老脚本没显式传就用了 50；
     # vLLM SamplingParams 默认 top_k=-1（全词表采样，尾部更重、更多退化解）。

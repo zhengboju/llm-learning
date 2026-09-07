@@ -54,8 +54,12 @@ if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
   exit 1
 fi
 
+# rfpp 无 KL：config beta=0.0，但 ref_server 默认 --beta 0.04，不显式传会矛盾
+REF_BETA_ARGS=""
+if [ "$ALGO" = "rfpp" ]; then REF_BETA_ARGS="--beta 0.0"; fi
+
 CUDA_VISIBLE_DEVICES=$REF_GPU python -m rlab.ref_server --model_path "$MODEL" \
-    --port $PORT --mode $MODE &
+    --port $PORT --mode $MODE $REF_BETA_ARGS &
 REF_PID=$!
 
 # Pre-flight 2：等 /health 且模式匹配（替代盲等 15s；ref 模型加载可能 >15s）
