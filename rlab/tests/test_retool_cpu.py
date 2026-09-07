@@ -277,6 +277,78 @@ def test_trajectory_logps():
               and bool(pol.grad[0, len(a1) + len(tl):].abs().sum() > 0))
 
 
+# --------------------------------- H. 多轮循环 + 打分索引契约（FakeGen） ----
+def test_multi_rollout_and_scoring():
+    print("[H] multi_turn_rollout_group 多轮循环 + retool_score_flat 索引契约")
+    from rlab.rollout import multi_turn_rollout_group, retool_score_flat
+
+    class _C:
+        def __init__(self, text): self.text = text
+
+    class _O:
+        def __init__(self, text): self.outputs = [_C(text)]
+
+    class FakeGen:
+        """按轮次回放 canned 文本，记录每轮收到的 prompts。"""
+        def __init__(self, rounds):
+            self.rounds = rounds
+            self.r = 0
+            self.seen = []
+
+        def generate(self, prompts, sps, use_tqdm=False):
+            self.seen.append(list(prompts))
+            texts = self.rounds[self.r]
+            self.r += 1
+            assert len(texts) == len(prompts)
+            return [_O(t) for t in texts]
+
+    # 1 题 × num_pre_Q=4 条独立轨迹（修复后的扩样形态）
+    prompts = ["P0", "P1", "P2", "P3"]
+    r1 = ["```python\nprint(6*7)\n```", "no code",
+          "```python\nprint(2+3)\n```", "none"]
+    r2 = ["```python\nprint(99)\n```", "final text here"]       # 仅 active=[0,2]
+    r3 = ["done"]                                               # 仅 active=[0]
+    fg = FakeGen([r1, r2, r3])
+    cfg_mt = {"max_rounds": 3, "sandbox_timeout": 5.0,
+              "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
+    sps = [object() for _ in prompts]   # 每样本独立请求参数（FakeGen 不检查内容）
+    segs, full_texts, code_stats = multi_turn_rollout_group(fg, sps, None, prompts, cfg_mt)
+
+    check("轨迹数 = 组内样本数 (4)", len(full_texts) == 4 and len(segs) == 4)
+    check("第2轮只续写执行过代码的样本 (0,2)", len(fg.seen[1]) == 2)
+    check("第3轮只续写第2轮又执行了代码的样本 (0)", len(fg.seen[2]) == 1)
+    check("续写上下文含首轮文本+工具输出(42)",
+          "42" in fg.seen[1][0] and "[TOOL RESULT]" in fg.seen[1][0])
+    check("s0 段序列 [a,tool,a,tool,a]",
+          [s["kind"] for s in segs[0]] ==
+          ["assistant", "tool", "assistant", "tool", "assistant"])
+    check("s1/s3 无代码即结束 [a]",
+          [s["kind"] for s in segs[1]] == ["assistant"]
+          and [s["kind"] for s in segs[3]] == ["assistant"])
+    check("code_used/ok 统计正确",
+          code_stats[0] == {"code_used": 2, "code_ok": 2}
+          and code_stats[1] == {"code_used": 0, "code_ok": 0}
+          and code_stats[2] == {"code_used": 1, "code_ok": 1})
+    check("工具段内容 = 沙箱 stdout",
+          "42" in segs[0][1]["text"] and "5" in segs[2][1]["text"])
+
+    # 打分索引契约：full_texts 必须 = 题数 × num_pre_Q（真机 IndexError 的回归锁）
+    cfg2 = get_config("retool", use_wandb=False)
+    inputs = [{"Q": "q", "A": "42"}]
+    adv, acc_s, fmt_s, cu, ck, phase = retool_score_flat(
+        inputs, full_texts, code_stats, cfg2, steps_elapsed=0)
+    check("score_flat 输出长度 = Q*n=4", adv.shape[0] == 4 and len(cu) == 4)
+    check("cu/ck 与 code_stats 对齐", cu == [2, 0, 1, 0] and ck == [2, 0, 1, 0])
+    check("group_std 组内和≈0", abs(float(adv.sum())) < 1e-4)
+    check("phase cold（steps_elapsed=0 < 256）", phase == "cold")
+    try:
+        retool_score_flat(inputs, full_texts[:1], code_stats[:1], cfg2, 0)
+        ok_flag = False
+    except AssertionError:
+        ok_flag = True
+    check("漏扩样（轨迹数=题数）直接 AssertionError", ok_flag)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -285,5 +357,6 @@ if __name__ == "__main__":
     test_protocol_mask()
     test_config_retool()
     test_trajectory_logps()
+    test_multi_rollout_and_scoring()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

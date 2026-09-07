@@ -74,11 +74,16 @@ def group_ok(scores: torch.Tensor) -> bool:
 
 def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text, cfg,
                              code_runner=run_code):
-    """阶段2 ReTool：代码交织多轮生成（一组 num_pre_Q 个样本并行走）。
+    """阶段2 ReTool：代码交织多轮生成（一组样本并行走）。
 
     对每组样本：生成一段 → 检测 python 围栏代码块 → 有则沙箱执行 → 结果按
     TOOL_START/TOOL_END 回填 → 续生成下一轮；本轮无代码块则该样本结束（后续
     应给出最终答案）。最多 cfg['max_rounds'] 轮。
+
+    sampling_params: 单个 SamplingParams（所有请求共用，eval 贪心用）或与
+      prompts_text 等长的列表——**训练时必须是列表且每样本 seed 不同**：
+      同题 num_pre_Q 条是独立请求，共用 seed 会让 vLLM 生成 n 条完全相同的
+      轨迹（组内零方差 → group_ok 永假 → 无限重采）。
 
     返回 (segs, full_text, code_stats)：
       segs:      list[list[dict]] —— 每个样本一段段的 {"kind": "assistant"|"tool", "text"}
@@ -93,8 +98,11 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
     for _rnd in range(int(cfg.get("max_rounds", 3))):
         if not active:
             break
-        outs = vllm_gen.generate([ctxs[i] for i in active],
-                                 sampling_params, use_tqdm=False)
+        if isinstance(sampling_params, list):
+            sps = [sampling_params[i] for i in active]
+        else:
+            sps = sampling_params
+        outs = vllm_gen.generate([ctxs[i] for i in active], sps, use_tqdm=False)
         new_text = {i: o.outputs[0].text for i, o in zip(active, outs)}
         results = {}
         for i in active:
@@ -120,6 +128,34 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
     full_text = [p + "".join(s["text"] for s in segs_i)
                  for p, segs_i in zip(prompts_text, segs)]
     return segs, full_text, code_stats
+
+
+def retool_score_flat(inputs, full_texts, code_stats, cfg, steps_elapsed):
+    """阶段2 打分（模块级纯函数，CPU 可测）。
+
+    索引契约（2026-09-08 真机 IndexError 教训）：full_texts/code_stats 必须是
+    Q_batch_size × num_pre_Q 条——即每道题先扩成 num_pre_Q 条独立轨迹再进
+    multi_turn_rollout_group，idx = i*num_pre_Q + j 与 full_texts 一一对应。
+
+    返回 (adv, acc_s, fmt_s, code_used, code_ok, phase)。"""
+    phase = reward_phase(steps_elapsed, cfg["reward_switch_step"])
+    rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
+    n = cfg["num_pre_Q"]
+    assert len(full_texts) == len(inputs) * n, \
+        f"轨迹数 {len(full_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
+    for i, inp in enumerate(inputs):
+        for j in range(n):
+            idx = i * n + j
+            sc = total_reward_retool(
+                inp["A"], full_texts[idx], code_ok=code_stats[idx]["code_ok"],
+                phase=phase, code_w=cfg["code_w"],
+                cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"])
+            rewards.append(sc["reward"]); acc_s.append(sc["acc"])
+            fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])
+            ck.append(code_stats[idx]["code_ok"])
+    rewards = torch.tensor(rewards, dtype=torch.float32)
+    adv = compute_advantages(rewards, n, cfg["adv_mode"])
+    return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 
 def gen_worker(Q, cfg: dict):
@@ -149,12 +185,10 @@ def gen_worker(Q, cfg: dict):
                                      max_tokens=cfg["max_gen_tokens"], top_p=cfg["top_p"],
                                      top_k=cfg.get("top_k", 50),
                                      seed=cfg.get("seed"))
-    # 阶段2 retool：多轮续写时每轮 n=1（组内 num_pre_Q 个样本各持不同上下文），
-    # 单段长度上限 round_gen_tokens（总上下文由 max_rounds × 单段约束）
-    retool_sp = SamplingParams(n=1, temperature=cfg["temperature"],
-                               max_tokens=cfg.get("round_gen_tokens", 280),
-                               top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
-                               seed=cfg.get("seed"))
+    # 阶段2 retool：每题先扩成 num_pre_Q 条独立轨迹再进 multi_turn_rollout_group，
+    # 每条一个独立请求（n=1）且 seed 各不相同——共用 seed 会让同题各条生成完全
+    # 相同的轨迹（组内零方差 → group_ok 永假 → 无限重采）。单段长度上限
+    # round_gen_tokens，总上下文由 max_rounds × 单段约束。
 
     # 可复现种子：抽题顺序(random) + 生成采样(vLLM SamplingParams.seed)。
     # 对比实验固定 seed 后可按"更新数配对"做单变量比较（同 seed 下 vLLM 采样可复现）。
@@ -220,27 +254,10 @@ def gen_worker(Q, cfg: dict):
         return adv, torch.tensor(acc_s), torch.tensor(fmt_s)
 
     # ------------------- 阶段2 retool 专用：打分 / 打包 -------------------
-    def retool_score_group(inputs, full_texts, code_stats, completion_lens):
-        """多段轨迹打分（阶段2 口径 + 冷启动/后期权重切换）。"""
-        phase = reward_phase(pushes[0] * cfg["gen_update_steps"], cfg["reward_switch_step"])
-        rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
-        n = cfg["num_pre_Q"]
-        for i, inp in enumerate(inputs):
-            for j in range(n):
-                idx = i * n + j
-                sc = total_reward_retool(
-                    inp["A"], full_texts[idx], code_ok=code_stats[idx]["code_ok"],
-                    phase=phase, code_w=cfg["code_w"],
-                    cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"],
-                    completion_len=completion_lens[idx],
-                    max_gen_tokens=cfg["max_gen_tokens"])
-                rewards.append(sc["reward"]); acc_s.append(sc["acc"])
-                fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])
-                ck.append(code_stats[idx]["code_ok"])
-        rewards = torch.tensor(rewards, dtype=torch.float32)
-        adv = compute_advantages(rewards, n, cfg["adv_mode"])
-        return (adv, torch.tensor(acc_s), torch.tensor(fmt_s),
-                cu, ck, phase)
+    def retool_score_group(inputs, full_texts, code_stats):
+        """多段轨迹打分（委托模块级 retool_score_flat，索引契约见其 docstring）。"""
+        return retool_score_flat(inputs, full_texts, code_stats, cfg,
+                                 steps_elapsed=pushes[0] * cfg["gen_update_steps"])
 
     def retool_build_batch(prompt_ids, segs, plen):
         """由分段轨迹构造 merged_ids + 工具段 mask（assistant=1/tool=0/pad=0）。
@@ -266,9 +283,20 @@ def gen_worker(Q, cfg: dict):
         return merged_ids, mask, per_sample_ids
 
     def collect_retool_group(inputs, prompts_text, prompt_ids, plen):
-        """多轮 rollout → 打分 → 上传就绪数据。超长/全同组返回 None（重采）。"""
+        """多轮 rollout → 打分 → 上传就绪数据。超长/全同组返回 None（重采）。
+
+        每题扩成 num_pre_Q 条独立轨迹（独立请求 + 独立 seed）——这是组内
+        对比的前提，也是 2026-09-08 真机 IndexError（轨迹数<打分索引）的根因。"""
+        n = cfg["num_pre_Q"]
+        group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
+        seed0 = cfg.get("seed")
+        sps = [SamplingParams(n=1, temperature=cfg["temperature"],
+                              max_tokens=cfg.get("round_gen_tokens", 280),
+                              top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
+                              seed=(seed0 + k if seed0 is not None else None))
+               for k in range(len(group_prompts))]
         segs, full_texts, code_stats = multi_turn_rollout_group(
-            vllm_gen, retool_sp, tokenizer, prompts_text, cfg)
+            vllm_gen, sps, tokenizer, group_prompts, cfg)
         merged_ids, mask, per_sample_ids = retool_build_batch(prompt_ids, segs, plen)
         if mask.shape[1] == 0:
             return None
@@ -280,7 +308,7 @@ def gen_worker(Q, cfg: dict):
             return None
         completion_lens = [len(t) for t in per_sample_ids]
         adv, acc_s, fmt_s, cu, ck, phase = retool_score_group(
-            inputs, full_texts, code_stats, completion_lens)
+            inputs, full_texts, code_stats)
         if not group_ok(adv):
             return None
         gen_logps = compute_gen_logps(merged_ids, plen)
