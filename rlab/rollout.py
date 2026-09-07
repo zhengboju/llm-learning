@@ -229,14 +229,14 @@ def gen_worker(Q, cfg: dict):
                 {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
             print(f"[rollout] model updated via {path}, {len(state_dict)} tensors")
             pushes[0] += 1            # 权重推送计数（用于冷启动/后期奖励切换）
-            # 权重指纹：两次推送指纹完全相同 = 训练端权重没在变（优化器未步进/
-            # LR=0/推了旧权重）——同步静默失败的变体签名（首跑废跑教训家族）
-            keys = list(state_dict.keys())
-            fp = (float(state_dict[keys[0]].float().abs().sum()),
-                  float(state_dict[keys[-1]].float().abs().sum()))
+            # 权重指纹（float64，位级敏感）：两次推送指纹完全相同 = 训练端权重
+            # 位级未变（优化器未步进/更新全被 bf16 舍入吞掉）。float32 求和会在
+            # 3e8 元素上分辨率 ~0.5，淹没 bf16 单权重翻转 ~1e-4 → 假阳性（教训）。
+            fp = _health.weight_fingerprint(state_dict)
             if fp == last_fp[0]:
-                print("[健康检查] 本次推送权重指纹与上次完全相同 → 训练端权重未变化，"
-                      "请核查训练端优化器是否在步进", flush=True)
+                print("[健康检查] 本次推送权重指纹（float64）与上次完全相同 → 训练端"
+                      "权重位级未变；若连续 2+ 次推送均如此，判定权重冻结，停止排查"
+                      "训练端优化器路径", flush=True)
             last_fp[0] = fp
             del state_dict
         except Exception:

@@ -429,6 +429,17 @@ def test_health_monitor():
     check("Monitor 触发告警一次",
           "[健康检查]" in buf1.getvalue() and buf2.getvalue() == "")
 
+    # 权重指纹：float64 位级敏感——单权重翻转一个 bf16 ULP 必须被识别
+    from rlab.health import weight_fingerprint
+    sd1 = {"a": torch.randn(2048).bfloat16(),
+           "b": torch.randn(1 << 21).bfloat16()}
+    fp1 = weight_fingerprint(sd1)
+    sd2 = {k: v.clone() for k, v in sd1.items()}
+    check("权重未变 → 指纹相同", weight_fingerprint(sd2) == fp1)
+    bits = sd2["b"][123:124].view(torch.int16)   # 位模式 +1 = 翻转一个 bf16 ULP
+    bits += 1
+    check("单权重翻转 1 ULP → 指纹必变", weight_fingerprint(sd2) != fp1)
+
 
 if __name__ == "__main__":
     test_extract()

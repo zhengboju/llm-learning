@@ -78,6 +78,27 @@ def window_check(hist, *, retool=False, max_clen=None):
     return alerts
 
 
+def _fp64_sum(t):
+    """float64 分块 |w| 求和（避免 3e8 元素整块 .double() 的内存尖峰）。"""
+    flat = t.detach().reshape(-1)
+    s = 0.0
+    for i in range(0, flat.numel(), 1 << 20):
+        s += float(flat[i:i + (1 << 20)].double().abs().sum())
+    return s
+
+
+def weight_fingerprint(state_dict):
+    """推送权重的位级敏感指纹（首/中/尾三个张量的 float64 |w| 和）。
+
+    【2026-09-08 真机假阳性教训】指纹必须用 float64：float32 求和在 3e8 元素
+    （embed_tokens）上分辨率约 0.5，而 lr=1e-6 下 16 步的 bf16 单权重翻转只有
+    ~1e-4，完全淹没在分辨率以下——float32 指纹会对"权重在正常更新"误报
+    "权重未变化"。float64 分辨率 ~1e-9，任何一个 bf16 位翻转都能确证。"""
+    keys = list(state_dict.keys())
+    picks = [keys[0], keys[len(keys) // 2], keys[-1]]
+    return tuple(_fp64_sum(state_dict[k]) for k in picks)
+
+
 class HealthMonitor:
     """滚动收集组级摘要 → 周期性窗口检查 → 同一告警只报一次。"""
 
