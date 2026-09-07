@@ -358,6 +358,78 @@ def test_multi_rollout_and_scoring():
     check("漏扩样（轨迹数=题数）直接 AssertionError", ok_flag)
 
 
+# --------------------------------- I. 训练期健康检查（窗口签名） ----
+def test_health_monitor():
+    print("[I] rlab.health 窗口签名（历史 bug 的训练期探测）")
+    from rlab.health import HealthMonitor, window_check
+
+    def mk(n, acc_fn, fmt_fn, clen=100.0, code_rate=0.5):
+        return [{"acc": acc_fn(i), "fmt": fmt_fn(i), "clen": clen,
+                 "code_rate": code_rate} for i in range(n)]
+
+    # 签名①：fmt 恒为常数（retool 打分域 bug 的签名）
+    hist = mk(40, lambda i: 0.3 + 0.1 * (i % 2), lambda i: -1.0)
+    codes = {c for c, _ in window_check(hist)}
+    check("fmt 恒常数 → fmt_const", "fmt_const" in codes and "acc_const" not in codes)
+
+    # 签名②：100 组后格式率仍 <25%（温度混杂事件签名）
+    hist = mk(110, lambda i: 0.3 + 0.1 * (i % 2), lambda i: -1.0)
+    codes = {c for c, _ in window_check(hist)}
+    check("fmt 低位持续 → fmt_low + fmt_const", {"fmt_low", "fmt_const"} <= codes)
+
+    # 对照：fmt 恒 +1.0（格式学满）是健康收敛，不是信号死亡
+    hist = mk(40, lambda i: 0.3 + 0.1 * (i % 2), lambda i: 1.0)
+    codes = {c for c, _ in window_check(hist)}
+    check("fmt 恒 +1（学满）不误报 fmt_const", "fmt_const" not in codes)
+
+    # 签名③a：256 组净提升 <1pp（零梯度/没有学习签名）——acc 有波动但均值不动
+    hist = mk(256, lambda i: 0.5 + (0.05 if i % 2 else -0.05), lambda i: 0.5)
+    codes = {c for c, _ in window_check(hist)}
+    check("长期平坦 → flat", "flat" in codes and "acc_const" not in codes)
+
+    # 签名③b：开局 0.5 → 尾窗 0.3（rfpp 退化签名）
+    def acc_decline(i):
+        return 0.5 if i < 128 else (0.3 + (0.04 if i % 2 else -0.04))
+    hist = mk(256, acc_decline, lambda i: 0.9)
+    codes = {c for c, _ in window_check(hist)}
+    check("单调下滑 → decline（不误报 flat）", "decline" in codes and "flat" not in codes)
+
+    # 签名④：completion 顶满上限（截断坍缩）
+    hist = mk(40, lambda i: 0.3, lambda i: 0.9, clen=99.0)
+    codes = {c for c, _ in window_check(hist, max_clen=100.0)}
+    check("长度顶满 → trunc", "trunc" in codes)
+
+    # 签名⑤：retool 128 组后 code_rate 恒 0
+    hist = mk(130, lambda i: 0.3, lambda i: 0.9, code_rate=0.0)
+    codes = {c for c, _ in window_check(hist, retool=True)}
+    check("代码信号未出现 → no_code", "no_code" in codes)
+
+    # 健康 曲线：acc 上升 / fmt 从低位学到高位 → 无致命告警
+    def acc_rise(i):
+        return -0.2 + 1.0 * i / 300
+    def fmt_rise(i):
+        # 学满后带微小抖动（真实训练 fmt 率在 99~100% 间抖动，不会是精确常数）
+        return -0.4 + 1.3 * min(1.0, i / 150) + (0.01 if i % 2 else -0.01)
+    hist = mk(300, acc_rise, fmt_rise, clen=120.0, code_rate=0.4)
+    codes = {c for c, _ in window_check(hist, retool=True, max_clen=200.0)}
+    check("健康曲线 → 无任何告警", codes == set())
+
+    # 32 组不足 → 不检查；Monitor 同一告警只报一次
+    check("样本不足 32 组 → 不告警", window_check(mk(31, lambda i: 0.0, lambda i: 0.0)) == [])
+    m = HealthMonitor()
+    for _ in range(64):
+        m.observe([-1.0, 1.0], [-1.0, -1.0], [100, 100])
+    import io
+    import contextlib
+    buf1, buf2 = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf1):
+        m.maybe_check(max_clen=200)
+    with contextlib.redirect_stdout(buf2):
+        m.maybe_check(max_clen=200)
+    check("Monitor 触发告警一次",
+          "[健康检查]" in buf1.getvalue() and buf2.getvalue() == "")
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -367,5 +439,6 @@ if __name__ == "__main__":
     test_config_retool()
     test_trajectory_logps()
     test_multi_rollout_and_scoring()
+    test_health_monitor()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

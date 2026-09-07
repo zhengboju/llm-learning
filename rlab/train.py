@@ -87,6 +87,7 @@ def run_training(cfg, args):
         except Exception as e:
             print(f"[train] wandb 不可用（{e}），继续训练不记录")
     totals = {"num": 0, "acc": 0.0, "fmt": 0.0}
+    zero_grad_streak = 0   # 连续全零梯度计数（cispo 零梯度 bug 的直接签名）
 
     from tqdm import tqdm
     progress = tqdm(range(1, cfg["all_steps"] + 1)) if dist.get_rank() == 0 \
@@ -122,6 +123,22 @@ def run_training(cfg, args):
             ref_logps=ref_logps,
             num_items_in_batch=batch.get("num_items_in_batch"))
         engine.backward(loss)
+        # 梯度健康探针：策略梯度全零 = 零梯度 bug 的直接签名（cispo 教训：
+        # 300 步 loss 数值"正常"但梯度处处为零，训完评测才发现）。连续 3 次
+        # 全零直接 fail-fast，不在废训上继续烧 GPU。
+        if step % 10 == 0:
+            gsum = sum(float(p.grad.abs().sum()) for p in engine.module.parameters()
+                       if p.grad is not None)
+            if gsum == 0.0:
+                zero_grad_streak += 1
+                print(f"[健康检查] 第{step}步策略梯度全零（连续 {zero_grad_streak}/3 次）",
+                      flush=True)
+                if zero_grad_streak >= 3:
+                    raise RuntimeError(
+                        "[健康检查] 连续 3 次策略梯度全零 → 零梯度 bug 签名"
+                        "（loss 数值可能仍'正常'），训练中止排查 losses.py 梯度路径")
+            else:
+                zero_grad_streak = 0
         engine.step()
 
         if dist.get_rank() == 0:

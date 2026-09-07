@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+"""rlab/health.py — 训练期健康检查：窗口签名 → 异常报警。
+
+【设计依据】本项目四次"训完评测才发现"的 bug 全部存在训练期可观测签名：
+  - cispo 策略梯度归零 → 训练 acc 百步平坦（0→300 步纹丝不动）；
+  - rfpp 表面解题模式退化 → 训练 acc 见顶后单调下滑；
+  - retool 打分域 bug → fmt 信号窗口内恒为常数（组内归一化后梯度恒零）；
+  - 权重同步静默失败 → 权重指纹推送间不变 / "model updated" 迟迟不出现。
+原则："信号恒为常数"是系统性 bug 的签名；"长期平坦/单调下滑"是浪费 GPU
+的签名——两者都该当场停下排查，而不是跑完全程再评测。
+
+用法：生成端每上传一组就 HealthMonitor.observe(...) 聚合一条组级摘要，
+每 check_every 组调 maybe_check() 打印一次新告警（同一告警只报一次）。
+规则全部在纯函数 window_check 里，CPU 可测。
+"""
+
+
+def _wmean(vals):
+    return sum(vals) / len(vals)
+
+
+def _wsd(vals):
+    m = _wmean(vals)
+    return (sum((x - m) ** 2 for x in vals) / len(vals)) ** 0.5
+
+
+def window_check(hist, *, retool=False, max_clen=None):
+    """对组级摘要序列做一次窗口检查。hist: list[dict(acc, fmt, clen, code_rate)]，
+    一条 = 一个组（训练 acc/fmt 为 ±1 口径）。返回 [(code, msg)]。"""
+    alerts = []
+    n = len(hist)
+    if n < 32:
+        return alerts
+    k = 32
+    fmt_m, fmt_sd = _wmean([h["fmt"] for h in hist[-k:]]), _wsd([h["fmt"] for h in hist[-k:]])
+    acc_m, acc_sd = _wmean([h["acc"] for h in hist[-k:]]), _wsd([h["acc"] for h in hist[-k:]])
+
+    # --- 签名①：信号死亡（恒定且低位）——retool 打分域 bug 的 fmt 恒 -1。
+    # 注意：fmt 恒 +1.0 是格式学满（收敛，健康）；只有"恒定且低位"才是死亡。
+    if fmt_sd < 1e-6 and fmt_m < -0.5:
+        alerts.append(("fmt_const",
+                       f"fmt 信号最近 32 组恒为 {fmt_m:.1f}（低位常数）→ 格式信号死亡"
+                       "（打分域/温度 bug 签名，组内归一化后无梯度），建议停止排查打分逻辑"))
+    if acc_sd < 1e-6:
+        alerts.append(("acc_const",
+                       "acc 信号最近 32 组恒为常数 → 正确性信号死亡（组内对比失效？），建议停止排查"))
+
+    # --- 签名②：格式学不动（起步低位且 100 组不涨）——温度混杂事件
+    if n >= 100 and fmt_m < -0.5:
+        alerts.append(("fmt_low",
+                       f"100 组后格式率窗口均值仍 <25%（{fmt_m:.2f} ±1口径）→ 格式学不动，"
+                       "查温度/打分域（temp0.9 事件签名）"))
+
+    # --- 签名③：长期平坦 / 单调下滑 —— 零梯度 bug / rfpp 退化
+    if n >= 256:
+        first_m = _wmean([h["acc"] for h in hist[:k]])
+        if acc_m < first_m - 0.10:
+            alerts.append(("decline",
+                           f"训练 acc 较开局下滑 >5pp（{first_m:.2f}→{acc_m:.2f}）"
+                           "→ 退化签名（rfpp 表面解题模式），建议早停"))
+        elif acc_m - first_m < 0.02:
+            alerts.append(("flat",
+                           f"{n} 组后训练 acc 净提升 <1pp（{first_m:.2f}→{acc_m:.2f} ±1口径）"
+                           "→ 没有学习签名（梯度死亡/信号死亡），建议停止排查"))
+
+    # --- 签名④：截断坍缩
+    if max_clen and _wmean([h["clen"] for h in hist[-k:]]) > 0.95 * max_clen:
+        alerts.append(("trunc",
+                       f"completion 长度窗口均值顶满上限（>{0.95 * max_clen:.0f}）"
+                       "→ 截断坍缩（答案被切、奖励学不到），查生成长度预算"))
+
+    # --- 签名⑤：retool 代码信号未出现（提示性，非致命）
+    if retool and n >= 128 and _wmean([h["code_rate"] for h in hist[-k:]]) == 0.0:
+        alerts.append(("no_code",
+                       "128 组后代码调用率仍为 0 → 代码信号未出现（冷启动权重过稀疏？"
+                       "模型从未被奖励写代码），记录在案，验收时 code_rate 指标必然为 0"))
+
+    return alerts
+
+
+class HealthMonitor:
+    """滚动收集组级摘要 → 周期性窗口检查 → 同一告警只报一次。"""
+
+    def __init__(self, check_every: int = 16):
+        self.hist = []
+        self.check_every = check_every
+        self.fired = set()
+
+    def observe(self, acc_list, fmt_list, clen_list, code_used_list=None):
+        """聚合一个组的标量摘要（acc/fmt 为 ±1 口径列表）。"""
+        e = {"acc": _wmean(list(acc_list)), "fmt": _wmean(list(fmt_list)),
+             "clen": _wmean(list(clen_list)),
+             "code_rate": (sum(1 for u in code_used_list if u > 0) / len(code_used_list))
+             if code_used_list else 0.0}
+        self.hist.append(e)
+
+    def maybe_check(self, retool: bool = False, max_clen=None):
+        """每 check_every 组检查一次；新告警打印（带 [健康检查] 前缀，只报一次）。"""
+        if len(self.hist) < 32 or len(self.hist) % self.check_every != 0:
+            return
+        for code, msg in window_check(self.hist, retool=retool, max_clen=max_clen):
+            if code not in self.fired:
+                self.fired.add(code)
+                print(f"\n[健康检查] {msg}\n", flush=True)

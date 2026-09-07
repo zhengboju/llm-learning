@@ -40,6 +40,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from rlab.config import get_config
 from rlab.data import load_qas
+from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.losses import compute_advantages, get_per_token_logps
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, segment_mask_from_spans, tensor_to_bytes)
@@ -209,6 +210,8 @@ def gen_worker(Q, cfg: dict):
     print(f"[rollout] 数据集 {cfg['data_task']} 共 {len(QAs)} 题")
     ref_server = cfg["ref_server"]
     pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
+    last_fp = [None]   # 上次推送的权重指纹（两次相同 = 训练端权重没在变）
+    health = _HealthMonitor()
 
     def try_update_model():
         nonlocal pushes
@@ -226,6 +229,15 @@ def gen_worker(Q, cfg: dict):
                 {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
             print(f"[rollout] model updated via {path}, {len(state_dict)} tensors")
             pushes[0] += 1            # 权重推送计数（用于冷启动/后期奖励切换）
+            # 权重指纹：两次推送指纹完全相同 = 训练端权重没在变（优化器未步进/
+            # LR=0/推了旧权重）——同步静默失败的变体签名（首跑废跑教训家族）
+            keys = list(state_dict.keys())
+            fp = (float(state_dict[keys[0]].float().abs().sum()),
+                  float(state_dict[keys[-1]].float().abs().sum()))
+            if fp == last_fp[0]:
+                print("[健康检查] 本次推送权重指纹与上次完全相同 → 训练端权重未变化，"
+                      "请核查训练端优化器是否在步进", flush=True)
+            last_fp[0] = fp
             del state_dict
         except Exception:
             import traceback
@@ -381,6 +393,7 @@ def gen_worker(Q, cfg: dict):
                     "acc": r["acc"].tolist(), "fmt": r["fmt"].tolist(),
                     "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
+                health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"])
                 continue
             inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen = g
             tensor_list = [torch.tensor(t) for t in ans_token_ids]
@@ -399,8 +412,15 @@ def gen_worker(Q, cfg: dict):
                 "t": time.time(), "algo": cfg["algo"],
                 "acc": acc_s.tolist(), "fmt": fmt_s.tolist(),
                 "clen": [len(t) for t in ans_token_ids]}, ensure_ascii=False) + "\n")
+            health.observe(acc_s.tolist(), fmt_s.tolist(),
+                           [len(t) for t in ans_token_ids])
         if uploaded_total % 10 == 0:
             fout.flush()
+        # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/代码信号缺失）
+        health.maybe_check(
+            retool=is_retool,
+            max_clen=(cfg["max_context_tokens"] - cfg["max_prompt_length"])
+            if is_retool else cfg["max_gen_tokens"])
 
 
 def main():
