@@ -444,6 +444,32 @@ def test_health_monitor():
     check("单权重翻转 1 ULP → 指纹必变", weight_fingerprint(sd2) != fp1)
 
 
+# --------------------------------- J. 静态未定义名检查（运行时 NameError 防线） ----
+def test_pyflakes_undefined():
+    print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
+          "未定义名（_health 别名事故教训）")
+    try:
+        from pyflakes.api import checkPath
+        from pyflakes.reporter import Reporter
+    except ImportError:
+        print("  skip: pyflakes 未安装（pip install pyflakes 后本检查生效）")
+        return
+    import contextlib
+    import io
+    files = ["rlab/rollout.py", "rlab/train.py", "rlab/health.py", "rlab/config.py",
+             "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
+             "rlab/sandbox.py", "rlab/analysis.py", "eval_vllm_one.py", "eval_vllm.py"]
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        for f in files:
+            checkPath(f, Reporter(buf, buf))
+    undefined = [l for l in buf.getvalue().splitlines() if "undefined name" in l]
+    check("无未定义名", undefined == [])
+    if undefined:
+        for l in undefined:
+            print(f"  !! {l}")
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -454,5 +480,6 @@ if __name__ == "__main__":
     test_trajectory_logps()
     test_multi_rollout_and_scoring()
     test_health_monitor()
+    test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

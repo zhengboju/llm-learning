@@ -41,6 +41,7 @@ from torch.nn.utils.rnn import pad_sequence
 from rlab.config import get_config
 from rlab.data import load_qas
 from rlab.health import HealthMonitor as _HealthMonitor
+from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, get_per_token_logps
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, segment_mask_from_spans, tensor_to_bytes)
@@ -232,7 +233,7 @@ def gen_worker(Q, cfg: dict):
             # 权重指纹（float64，位级敏感）：两次推送指纹完全相同 = 训练端权重
             # 位级未变（优化器未步进/更新全被 bf16 舍入吞掉）。float32 求和会在
             # 3e8 元素上分辨率 ~0.5，淹没 bf16 单权重翻转 ~1e-4 → 假阳性（教训）。
-            fp = _health.weight_fingerprint(state_dict)
+            fp = _weight_fingerprint(state_dict)
             if fp == last_fp[0]:
                 print("[健康检查] 本次推送权重指纹（float64）与上次完全相同 → 训练端"
                       "权重位级未变；若连续 2+ 次推送均如此，判定权重冻结，停止排查"
