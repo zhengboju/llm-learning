@@ -14,6 +14,13 @@
 
 import re
 
+# 围栏正则复用协议层（与 extract_python_blocks 同一条），用于打分前剥离代码块
+from rlab.protocol import _PY_FENCE_RE
+
+# 剥离专用正则：与 _PY_FENCE_RE 同结构，但额外吞掉围栏后的空白——
+# 代码块被移除后若残留换行，^ 锚定的格式正则依旧必败（2026-09-08 实测）。
+_STRIP_FENCE_RE = re.compile(r"```python\s*(.*?)```\s*", re.DOTALL)
+
 # math_verify 导入失败时（纯 CPU 冒烟环境）退化为纯文本比对
 try:
     from math_verify import parse, verify, ExprExtractionConfig
@@ -59,6 +66,28 @@ def reward_format(answer: str) -> float:
     return 1.0 if ok else -1.0
 
 
+def strip_code_blocks(text: str) -> str:
+    """去掉 ```python``` 围栏代码块——打分域只认模型自己的"回答文本"。
+
+    代码是脚手架：其内容可含中间计算/沙箱相关数字，不参与 acc/fmt 打分
+    （与"工具段只作上下文、不进 loss 不进打分"同一条原则在文本域的投影）。
+    只剥离**完整**围栏块（与 extract_python_blocks 同一正则），并连同其后的
+    空白一起移除（否则残留换行会让 ^ 锚定的格式正则依旧失败）；
+    未闭合围栏 = 模型没写完代码，结构仍算不合格，保留原文。"""
+    return _STRIP_FENCE_RE.sub("", text)
+
+
+def reward_format_retool(answer: str) -> float:
+    """retool 格式口径：先剥离代码块，再按阶段0/1 的 reward_format 判结构。
+
+    【2026-09-08 第三轮真机教训】MUST 提示让模型"先写代码"（围栏开局），
+    而 _FORMAT_RE 以 ^ 锚定要求回答文本以 thinking 开头——两者冲突导致所有
+    代码先行样本格式结构性失败：训练期 fmt 恒 -1 信号死亡（代码再次被灭绝），
+    eval 端 BASE fmt 48.7→4.7、retool300 fmt 0.0%（精确 0/300 系统性签名）。
+    剥离代码后格式检查回到"回答文本本身结构"的语义：代码在哪都不影响格式。"""
+    return reward_format(strip_code_blocks(answer))
+
+
 def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64) -> float:
     """DAPO overlong shaping：超过 (max-buffer) 后线性扣分，封顶 1.0。"""
     trigger = max_gen_tokens - buffer
@@ -93,9 +122,16 @@ def total_reward_retool(ground_truth: str, answer: str, *, code_ok: int,
     cold（冷启动，默认 (1,2,2)）：代码/格式权重大，先学会工具与格式；
     hot（后期，默认 (2,1,1)）：正确性主导（与阶段1 的 2.0*acc+fmt 对齐）。
     Auto_Program 的 cold 权重其实等价于 acc + 2*fmt + 2*call_python。
-    返回分量 dict 供 record 记录与监控。"""
-    acc = reward_correct(ground_truth, answer)
-    fmt = reward_format(answer)
+    返回分量 dict 供 record 记录与监控。
+
+    【打分域】acc/fmt 一律在剥离代码块后的回答文本上判（strip_code_blocks）：
+    ①MUST 提示下模型"代码先行"，^ 锚定的格式正则若直接判会结构性失败——
+      fmt 恒 -1 → 训练信号死亡、eval 恒 0%（第三轮真机实锤，见 reward_format_retool）；
+    ②代码里的数字（中间计算/打印）不能当"模型答案"（与"工具 stdout 不是答案"
+      同一原则）；③代码放哪段（thinking 前/中间/答案后）都不影响格式与取数。"""
+    clean = strip_code_blocks(answer)
+    acc = reward_correct(ground_truth, clean)
+    fmt = reward_format(clean)
     w_acc, w_fmt, w_code = cold_w if phase == "cold" else hot_w
     code = reward_code(code_ok, code_w)
     r = w_acc * acc + w_fmt * fmt + w_code * code

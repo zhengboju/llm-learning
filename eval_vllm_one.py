@@ -14,14 +14,28 @@ parser.add_argument("--n", type=int, default=300)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out", default=None, help="结果json路径，默认 eval_vllm_<name>.json")
 parser.add_argument("--gpu_mem", type=float, default=0.26, help="vLLM显存占比(占总显存)；同卡并行N个进程就各给≈1/N")
-parser.add_argument("--max_len", type=int, default=1280, help="prompt(~400)+生成(≤512)上限，1280足够")
+parser.add_argument("--max_len", type=int, default=None, help="prompt+全轨迹上限；None=自动（retool 用 400+2200，其余 1280）")
 parser.add_argument("--max_tokens", type=int, default=512)
 parser.add_argument("--split", default="test", choices=["test", "train"], help="test=held-out(默认)；train=训练集内抽样(过拟合诊断：train高test低=过优化实锤)")
 parser.add_argument("--show", type=int, default=0, help="打印前N个原始回答")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（生成→执行代码→续写→最终答案），并记录代码调用率")
 parser.add_argument("--max_rounds", type=int, default=3, help="--retool 时最多代码-执行轮数")
-parser.add_argument("--round_tokens", type=int, default=280, help="--retool 时每轮 assistant 段生成长度上限")
+parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置 round_gen_tokens(400)")
 args = parser.parse_args()
+
+# 【2026-09-08 第三轮教训】eval 必须与训练同协议：
+#   round_tokens 280→400（训练 round_gen_tokens，280 会把代码围栏+尾随答案标签截断，
+#   代码调用率被低估、格式被误判）；max_len 1280→2600（400 prompt + 2200 全轨迹预算，
+#   1280 下代码率一涨就会撞 vLLM max_model_len 报错）。
+if args.retool:
+    from rlab.config import get_config as _get_config
+    _rcfg = _get_config("retool")
+    if args.round_tokens is None:
+        args.round_tokens = _rcfg["round_gen_tokens"]
+    if args.max_len is None:
+        args.max_len = _rcfg["max_prompt_length"] + _rcfg["max_context_tokens"]
+if args.max_len is None:
+    args.max_len = 1280
 
 name = args.name or "_".join(args.model.rstrip("/").split("/")[-2:])
 out_path = args.out or f"eval_vllm_{name}.json"
@@ -109,7 +123,12 @@ if args.retool:
     # 打分只用模型自己的 assistant 段拼接文本：全文含 prompt（格式正则 ^ 锚定
     # 必败 → fmt 恒 0，2026-09-08 实测）也含沙箱输出（"最后一个数字"会变成
     # 工具 stdout，把工具结果当模型答案发信用）。
-    answers = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
+    # 【2026-09-08 第三轮教训】再剥离 ```python``` 代码块：MUST 提示下模型
+    # "代码先行"，不剥离则 ^ 锚定的格式正则对代码开头一律失败（fmt 恒 0）且
+    # 代码里的数字会污染"最后一个数字"。与训练端 rlab.total_reward_retool
+    # 同一条打分域约定（与 rlab.reward 复用同一 strip 函数，保证两边口径一致）。
+    from rlab.reward import strip_code_blocks
+    answers = [strip_code_blocks("".join(s["text"] for s in segs_i if s["kind"] == "assistant"))
                for segs_i in _segs]
     code_used = [s["code_used"] for s in code_stats]
     code_ok = [s["code_ok"] for s in code_stats]

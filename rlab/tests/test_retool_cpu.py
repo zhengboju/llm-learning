@@ -157,6 +157,38 @@ def test_reward_retool():
           sc["format"] == 1.0 and sc["acc"] == 1.0)
 
 
+def test_strip_code_scoring():
+    """【2026-09-08 第三轮真机教训】打分域 = 剥离代码块后的回答文本。
+
+    MUST 提示让模型"代码先行"（围栏开局），而 _FORMAT_RE ^ 锚定要求以思考标签
+    开头——冲突导致所有代码先行样本 fmt 结构性失败（训练 fmt 恒 -1 死亡、
+    eval 精确 0/300）。修复：acc/fmt 一律在 strip_code_blocks 后的文本上判。
+    本组把这些契约锁死（零标签字面量：格式串一律经 fmt_answer/_FORMAT_RE 派生）。"""
+    print("[D2] 打分域：剥离代码块（MUST 代码先行 vs 格式锚定冲突）")
+    from rlab.reward import reward_format_retool, strip_code_blocks
+    good = fmt_answer("72")   # 由 _FORMAT_RE 派生的合法格式串
+    code_first = "```python\nprint(70+2)\n```\n\n" + good   # 模型典型开头：代码先行
+    check("剥离代码块：围栏与内容整体移除", strip_code_blocks(code_first) == good)
+    check("代码先行 + 尾随合法格式 → 格式 1.0（修复前必 -1）",
+          reward_format_retool(code_first) == 1.0)
+    p = _FORMAT_RE.replace("^", "").replace("$", "").split(".*?")
+    mid = p[0] + "x```python\nprint(1)\n```y" + p[1] + "72" + p[2]
+    check("代码夹在思考与答案之间 → 格式 1.0", reward_format_retool(mid) == 1.0)
+    check("未闭合围栏不剥离 → 结构仍不合格 -1",
+          reward_format_retool("```python\nx = 1\n" + good) == -1.0)
+    check("只有代码没有答案标签 → 格式 -1",
+          reward_format_retool("```python\nprint(1)\n```") == -1.0)
+    # acc 取数域：代码在答案标签之后，其数字不得当"模型答案"
+    code_after = good + "\n```python\nprint(99)\n```"
+    sc = total_reward_retool("72", code_after, code_ok=1, phase="hot", code_w=0.1)
+    check("代码在答案后（剥离后取 72；不剥离会取到 99）", sc["acc"] == 1.0)
+    sc2 = total_reward_retool("72", code_first, code_ok=1, phase="hot", code_w=0.1)
+    check("代码先行 + 正确答案：acc/fmt 双 1", sc2["acc"] == 1.0 and sc2["format"] == 1.0)
+    sc3 = total_reward_retool("72", good, code_ok=0, phase="hot", code_w=0.1)
+    check("无代码文本剥离是恒等（阶段0/1 口径不变）",
+          abs(sc3["reward"] - 3.0) < 1e-9 and sc3["format"] == 1.0)
+
+
 # ---------------------------------------------------------------- E. 协议 ----
 def test_protocol_mask():
     print("[E] 协议 mask 槽位与向后兼容")
@@ -475,6 +507,7 @@ if __name__ == "__main__":
     test_mask_ab()
     test_sandbox()
     test_reward_retool()
+    test_strip_code_scoring()
     test_protocol_mask()
     test_config_retool()
     test_trajectory_logps()

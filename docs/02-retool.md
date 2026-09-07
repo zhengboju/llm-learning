@@ -64,14 +64,14 @@ mask 契约里，不在 loss 里**，这正是它作为教学阶段的价值：�
 |---|---|
 | `rlab/sandbox.py` | **新**。`run_code()`：subprocess `-I -E` 隔离执行 + 超时 SIGKILL + Linux RLIMIT_AS 内存上限 + stdout/stderr 截断。返回 `{ok, returncode, timed_out, duration, display, stderr}` |
 | `rlab/protocol.py` | `TOOL_START/TOOL_END`、`extract_python_blocks`、`segment_mask_from_spans` 纯函数；`encode/decode_batch` 增 mask 槽位（`has_mask` 元数据，向后兼容） |
-| `rlab/reward.py` | `reward_code`（成功执行次数 × 0.1 小权重）、`reward_phase`（cold/hot 切换纯逻辑）、`total_reward_retool`（acc+fmt+code 组合，cold=(1,2,2) / hot=(2,1,1)） |
-| `rlab/config.py` | `retool` preset（loss 同 grpo）+ 阶段2 超参（max_rounds=3 / round_gen_tokens=280 / sandbox 超时与内存 / code_w=0.1 / reward_switch_step=256）+ retool 系统提示（复用 BASE 提示 + 代码工具说明，零标签字面量） |
+| `rlab/reward.py` | `reward_code`（成功执行次数 × 0.1 小权重）、`reward_phase`（cold/hot 切换纯逻辑）、`total_reward_retool`（acc+fmt+code 组合，cold=(1,2,2) / hot=(2,1,1)）、`strip_code_blocks`/`reward_format_retool`（**打分域=剥离代码块后的回答文本**，2026-09-08 第三轮修复） |
+| `rlab/config.py` | `retool` preset（loss 同 grpo）+ 阶段2 超参（max_rounds=3 / round_gen_tokens=400（280→400 防围栏截断灭绝）/ sandbox 超时与内存 / code_w=0.1 / reward_switch_step=256）+ retool 系统提示（复用 BASE 提示 + **MUST** 代码指令（MAY→MUST 防采样率过低灭绝），零标签字面量） |
 | `rlab/losses.py` | `retool` 映射进 grpo loss 分支；ALGOS 注册 |
 | `rlab/rollout.py` | `multi_turn_rollout_group`（组内并行多轮生成→检测→沙箱→回填→续写）+ 分段 tokenize 构造 mask + 全序列 gen_logps + record 增 code_used/code_ok/phase |
 | `rlab/train.py` | 有 `has_mask` 时用协议下发的 mask，否则按 pad 重算（兼容） |
 | `eval_vllm_one.py` | `--retool`：多轮贪心生成（复用 `multi_turn_rollout_group`）+ 代码调用率/成功率/平均轮次指标 |
 | `eval_vllm.py` / `rlab/eval.py` | `--retool` 透传 |
-| `rlab/tests/test_retool_cpu.py` | **34 项 CPU 验收**（见 §4） |
+| `rlab/tests/test_retool_cpu.py` | **71 项 CPU 验收**（见 §4） |
 
 设计要点（省掉了规划文档担心的"logps 按段拼接"）：训练端与生成端都做**全序列
 一次前向**——因果注意力保证第 t 个 token 的 logp 只依赖前缀，与逐段前向严格等价
@@ -79,7 +79,7 @@ mask 契约里，不在 loss 里**，这正是它作为教学阶段的价值：�
 
 ---
 
-## 4. CPU 验收测试（34 项，本机可跑）
+## 4. CPU 验收测试（71 项，本机可跑）
 
 ### 4.1 【学习点】工具 token mask 错/对对照 A/B
 
@@ -120,6 +120,10 @@ hot （step≥256）: (2, 1, 1)   # 正确性主导（与阶段1 的 2·acc+fmt 
 
 - `code_ok` = 执行成功（exit 0 且有输出）的代码块次数，上限 3 轮 → 代码项最大 0.3，
   保持"小权重引导"不淹没主信号；
+- **打分域铁律（第三轮实锤）**：acc/fmt 一律在 `strip_code_blocks(assistant拼接文本)`
+  上判——代码是脚手架：①MUST 提示下代码先行会撞 ^ 锚定格式正则（结构性失败→
+  fmt 恒 -1→信号死亡+代码灭绝）；②代码里的数字/打印不能当"模型答案"（与"工具
+  stdout 不是答案"同一原则）。剥离后格式语义回到"回答文本本身结构"；
 - 切换阈值沿用 Auto_Program 的语义：16 次权重推送 × gen_update_steps(16) = 256 步；
   生成端用"推送次数×gen_update_steps"近似 optimizer step（记录在 record.phase）；
 - **消融钩子**：`reward_switch_step` 设超大值（如 10**9）即等价于"全程 cold"，
@@ -150,25 +154,61 @@ python -m rlab.analysis --record rlab_out/retool/record.jsonl
    验证权重切换的必要性。
 
 显存预算：多段轨迹总长上限 `max_context_tokens=2200`（prompt ~400 + 3 轮 ×
-(280 生成 + ≤150 工具输出)），超限整组丢弃重采；比阶段1 的 512 长约 3×，H20
-单卡 ZeRO-0 3B 可承受，若 OOM 先降 `round_gen_tokens` 或 `max_rounds`。
+(400 生成 + ≤500 工具输出)，典型 1-2 轮远低于上限，极端 3 轮全满会超限丢弃重采），
+比阶段1 的 512 长约 3×，H20 单卡 ZeRO-0 3B 可承受，若 OOM 先降
+`round_gen_tokens` 或 `max_rounds`。
+
+> 评测必须与训练同协议（第三轮教训）：`eval_vllm_one.py` 的 `--round_tokens` 默认
+> 取训练 `round_gen_tokens`(400)、`--max_len` 默认取 400+2200=2600（1280 装不下
+> 完整多轮轨迹，代码率一涨就会撞 vLLM max_model_len 报错）；两者均已自动对齐，
+> 无需手动传参。
 
 ---
 
-## 7. 实测结果（待真机填）
+## 7. 实测结果（GSM8K test，N=300，seed=42，--retool 同协议）
 
-| 模型 | acc | fmt | 代码调用率 | 成功率 | 平均轮次 |
+三轮回合逐次修复后的真机记录（每轮都对应一个被实锤的机制缺陷，见 §7.1）：
+
+| 轮次 | 协议 | BASE acc/fmt/both | retool300 acc/fmt/both | code_rate(300) | avg_rounds |
 |---|---|---|---|---|---|
-| BASE（--retool 同协议） | 待填 | 待填 | 待填 | 待填 | 待填 |
-| retool_step200 | 待填 | 待填 | 待填 | 待填 | 待填 |
-| retool_step300 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| 1 | 全文打分 bug（fdbb915 前） | 64.0/0.0/0.0 | 77.3/0.0/0.0 | 0.0% | 0.0 |
+| 2 | assistant 打分修复，round=280, MAY | 65.0/48.7/37.3 | 72.0/97.7/72.0 | 0.0% | 0.0 |
+| 3 | round=400, MUST（4f00008） | 61.3/4.7/3.7 | 72.0/0.0/0.0 | 0.67% | 0.007 |
 
-预期与判读：
-- **验收硬指标 1**：acc 显著超 BASE（>3pp 噪声地板）；
-- **验收硬指标 2**：代码调用率随训练上升（record 窗口滑动平均），且 hot 阶段
-  "会用代码"的样本 acc 更高；
-- mask 错误版预期：loss 中 KL 项虚高、acc 曲线明显劣化——若不劣化反而说明
-  3B/小 batch 下工具 token 的 KL 污染可被组内标准化吸收（这本身也是有价值的结论）。
+判读（每轮都是"结构性 bug 的精确签名"，非模型行为）：
+- 轮1 fmt 精确 0/300 → 打分域 bug（全文含 prompt，^ 锚定必败），fdbb915 修复；
+- 轮2 fmt 97.7% → assistant 打分域修复验证通过；code_rate 仍 0 → round 280 截断
+  灭绝 + MAY 提示采样率 ~0.3% 进不了分布，4f00008 修复；
+- 轮3 MUST 提示"先写代码"反而让 BASE fmt 48.7→4.7、retool300 fmt 精确 0.0%：
+  **MUST 诱导的代码先行文本撞上 ^ 锚定的格式正则 → 所有代码样本 fmt 结构性失败**
+  → 训练 fmt 信号再次死亡、代码再次被惩罚灭绝（第三类灭绝机制，见 §7.1）。
+  eval 还暴露两个协议错位：round_tokens 280（训练是 400）把代码围栏+尾随标签截断、
+  max_len 1280 装不下完整多轮轨迹。
+
+验收硬指标（本轮修复后待重跑）：
+- **硬指标1**：acc 显著超 BASE（>3pp 噪声地板；BASE 取单轮 512 协议 ~68 为参照，
+  --retool 协议的 BASE 被 MUST 强迫写代码，只能同协议内比较）；
+- **硬指标2**：code_rate 随训练上升（MUST 已把代码写进采样分布——轮3 的 fmt 归零
+  恰好证明 base 在 MUST 下确实大量开围栏，只是 280 轮长+锚定冲突让它们既没被算成
+  代码也没拿到格式分），且 hot 阶段"会用代码"的样本 acc 更高；
+- 训练期盯 `[健康检查]`：no_code 告警应消失、fmt 不再恒常数、权重指纹 fp64 连续
+  两次推送相同才算真冻结。
+
+### 7.1 三轮三次"代码灭绝/信号死亡"的根因链（本阶段最重要教训）
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 训练期 fmt 恒 -1 / eval 精确 0.0% | 打分域=全文：^ 锚定在 prompt 开头必败 | assistant 段拼接打分（fdbb915） |
+| 2 | code_rate 恒 0.0% | round 280 截断围栏→写代码结构性惩罚 + MAY 采样率 ~0.3% 组内无代码→code 项常数无梯度 | round→400 + 提示 MUST（4f00008） |
+| 3 | MUST 后 BASE fmt 48.7→4.7、retool300 fmt 精确 0.0% | MUST"先写代码"→回答文本以 ```python 开局，撞上 ^ 锚定格式正则→所有代码样本 fmt=-1（结构冲突灭绝） | 打分域=剥离代码块后的回答文本（本 commit） |
+
+**元教训**：一个协议里"引入新行为"（写代码）时，必须先查该行为是否违反既有
+**验证规则的锚定假设**——MUST 提示与格式正则的 ^ 锚定是同一份设计里互相打架的两条
+指令，代码先行样本从生成那一刻起就注定格式不合格、被结构性惩罚。结构化惩罚会把
+行为在探索之前就灭绝（第二轮是截断、第三轮是锚定冲突），比"激励不够"更难发现——
+两者的共同签名都是**精确的 0%/恒常数**。
+
+---
 
 ## 8. 已知局限与后续
 
