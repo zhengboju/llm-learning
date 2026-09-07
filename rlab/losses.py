@@ -7,7 +7,7 @@ compute_advantages() / compute_loss() 里产生差异：
   grpo    : 对称 clip、样本级 token-mean 归一化（simple_grpo_v1/grpo_ref_split 原版）
   dapo    : clip-higher 解耦（上界放宽）+ 全 batch token 级归一化
   dr_grpo : advantage 不除 std（去 1/std 偏差）+ loss 除固定常数（去长度归一化偏差）
-  cispo   : 截断方向只截上升、被截 token 保留 min(ratio, 1+eps) 梯度
+  cispo   : clip(ratio) 作 stop-gradient 权重、梯度经 logπ 流动（MiniMax-M1 CISPO）
   gspo    : importance ratio 与 clip 从 token 级提升到 sequence 级
   rfpp    : 全局基线 per-token advantage + token 级（num_items 全局计数）、无 KL
 
@@ -128,10 +128,15 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
 
     elif algo == "cispo":
         assert norm == "token_mean"
-        # CISPO：只截上升方向；被截断 token 保留 min(ratio, 1+eps) 的梯度
-        # L = -1/|e| Σ sg(1(ratio > 1+ε)) · min(ratio, 1+ε) · A
-        keep = (ratio > 1 + hi).detach().float()
-        per_token_loss = -(keep * torch.clamp(ratio, max=1 + hi) * adv - kl_term)
+        # CISPO（MiniMax-M1, arXiv:2506.13585；NeMo-RL 同款公式）：
+        #   L = -1/|e| Σ A_t · sg(clip(r_t, 1-lo, 1+hi)) · logπ_θ(t)
+        # clip 后的 ratio 作 stop-gradient 标量权重，梯度经 log π_θ 流动——
+        # 每个 token 都有梯度（对比 PPO-clip 会把过界 token 的梯度截成 0）。
+        # 【2026-09-07 修复】旧实现 -(keep·clamp(ratio)·adv) 的策略梯度处处为零
+        # （过界 token 被 clamp 饱和成常数、未过界 token 被 keep 清零），cispo
+        # 实际只剩 KL——实测 acc 67.7≈BASE 68.0 的根因（CPU 梯度探针实锤）。
+        w = torch.clamp(ratio, 1 - lo, 1 + hi).detach()
+        per_token_loss = -(adv * w * policy_logps - kl_term)
         loss = (per_token_loss * mask).sum() / mask.sum()
 
     elif algo == "gspo":

@@ -94,15 +94,23 @@ def test_losses():
     expect = (-adv.unsqueeze(1).expand(4, 8).sum()) / (4 * cfg["max_gen_tokens"])
     check("dr_grpo 固定常数归一化", math.isclose(loss_c.item(), expect.item(), rel_tol=1e-5))
 
-    # --- cispo: ratio<=1+hi 时目标为0；ratio>1+hi 时 = -clamp(ratio)*adv
+    # --- cispo: clip(ratio) 作 sg 权重，梯度经 logπ 流动（每个 token 有梯度）
     cfg = get_config("cispo", use_wandb=False)
-    pol, gen, mask = _mk()          # ratio=1 -> keep=0 -> loss=0
+    pol, gen, mask = _mk()          # ratio=1 -> w=1 -> loss = -A·logπ 的 token 均值
     loss_z, _ = compute_loss("cispo", pol, gen, adv, mask, cfg)
-    check("cispo ratio=1 处目标为0", math.isclose(loss_z.item(), 0.0, abs_tol=1e-6))
-    pol_hi = (gen + 0.5).requires_grad_(True)      # ratio = e^0.5 ≈ 1.649 > 1.2
+    expect_z = -(adv.unsqueeze(1) * pol.detach() * mask).sum() / mask.sum()
+    check("cispo ratio=1 处 = -A·logπ token 均值", math.isclose(loss_z.item(), expect_z.item(), rel_tol=1e-5))
+    loss_z.backward()
+    check("cispo ratio=1 梯度 = -A/|e|（每 token 有梯度）",
+          torch.allclose(pol.grad, -adv.unsqueeze(1).expand(4, 8) / 32, atol=1e-6))
+    # 过界 token（ratio=e^0.5≈1.65>1.2）梯度仍非零——锁死 2026-09-07 梯度归零 bug
+    pol_hi = (gen + 0.5).requires_grad_(True)
     loss_h, _ = compute_loss("cispo", pol_hi, gen, adv, mask, cfg)
-    expect = -(torch.clamp(torch.exp(torch.tensor(0.5)), max=1.2) * adv).sum() / (4 * 8)
-    check("cispo 截断保留 min(ratio,1+eps) 梯度", math.isclose(loss_h.item(), expect.item(), rel_tol=1e-4))
+    expect_h = -(adv.unsqueeze(1) * 1.2 * pol_hi.detach() * mask).sum() / mask.sum()
+    check("cispo 过界 token 用 sg(clip(ratio)) 权重", math.isclose(loss_h.item(), expect_h.item(), rel_tol=1e-4))
+    loss_h.backward()
+    check("cispo 过界 token 梯度非零（修复锁死：旧实现 keep·clamp 梯度恒 0）",
+          pol_hi.grad.abs().sum() > 0)
 
     # --- gspo: 序列级 ratio；ratio=1 时 = -mean(adv)
     cfg = get_config("gspo", use_wandb=False)

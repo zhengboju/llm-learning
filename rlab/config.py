@@ -24,7 +24,7 @@ ALGO_DEFAULTS = {
     # Dr.GRPO：去掉 1/std 偏差（group_mean），去掉长度归一化偏差（固定常数除）
     "dr_grpo": dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_mean",
                     loss_norm="token_const"),
-    # CISPO：截断保留 min(ratio, 1+eps) 梯度，token 级
+    # CISPO：clip(ratio) 作 sg 权重、梯度经 logπ 流动（MiniMax-M1）；token 级
     "cispo":   dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_std",
                     loss_norm="token_mean"),
     # GSPO：sequence 级 importance ratio 与 clip
