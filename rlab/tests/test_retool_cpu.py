@@ -195,10 +195,13 @@ def test_config_retool():
     check("retool 复用 grpo loss（group_std/sample_mean）",
           cfg["adv_mode"] == "group_std" and cfg["loss_norm"] == "sample_mean")
     check("retool beta=0.04（有 KL）", cfg["beta"] == 0.04)
-    check("retool 阶段2 超参", cfg["max_rounds"] == 3 and cfg["round_gen_tokens"] == 280
+    check("retool 阶段2 超参（round=400：280 会截断代码围栏→写代码被结构性惩罚）",
+          cfg["max_rounds"] == 3 and cfg["round_gen_tokens"] == 400
           and cfg["reward_switch_step"] == 256)
-    check("retool 系统提示含代码工具说明", "```python" in cfg["system_prompt"]
-          and "[TOOL RESULT]" in cfg["system_prompt"])
+    check("retool 系统提示含代码工具说明（MUST 冷启动：MAY 采样率仅~0.3%进不了分布）",
+          "```python" in cfg["system_prompt"]
+          and "[TOOL RESULT]" in cfg["system_prompt"]
+          and "You MUST write Python code" in cfg["system_prompt"])
 
 
 # --------------------------------- G. tiny GPT2：logps 对齐 + mask 排除 ----

@@ -109,7 +109,11 @@ BASE = dict(
 
     # ---- 阶段2 ReTool（代码交织多轮）----
     max_rounds=3,            # assistant+tool 最多成对轮数
-    round_gen_tokens=280,    # 每轮 assistant 段生成长度上限（控制总上下文）
+    # 【2026-09-08 代码灭绝教训】280 太紧：代码块约占 80-150 token，写代码的样本
+    # 极易在轮内写不完围栏 → 完整块检测不到 → 残缺结尾 → fmt=-1 且无答案——
+    # "写代码"被结构性惩罚、几步内灭绝（真机两轮 code_rate=0 的根因）。
+    # 400 下 3 轮×400+工具输出 ≈ 1650 仍在 max_context_tokens=2200 预算内。
+    round_gen_tokens=400,    # 每轮 assistant 段生成长度上限（控制总上下文）
     tool_result_max_chars=500,  # 沙箱输出截断长度（防输出炸弹）
     sandbox_timeout=5.0,     # 代码执行超时（秒），超时 SIGKILL 子进程
     sandbox_mem_mb=256,      # 代码内存上限（Linux RLIMIT_AS，best-effort）
@@ -129,12 +133,19 @@ BASE = dict(
 
 # 阶段2 retool 系统提示 = 基础格式提示 + 代码工具说明（复用 BASE["system_prompt"]
 # 保证格式口径与阶段0/1 完全一致；新增部分零标签字面量，规避改写铁律）
+# 【2026-09-08 代码灭绝教训】"MAY"（可以写）在 base 模型上的采样率仅 ~0.3%
+# （greedy code_rate 实测），组内 4 条几乎必有 0 人写代码 → 代码奖励项为常数
+# 无梯度，代码永远进不了采样分布。冷启动必须用 "MUST" 把代码写进分布，
+# 之后 RL 再用 code_ok（执行成功）去区分好坏代码。
 _RETOOL_EXTRA = (
-    "\n\nYou MAY write Python code to help solve the problem. If you do, put each "
-    "piece of code inside a fenced block like: ```python\n<your code>\n```\n"
+    "\n\nYou MUST write Python code to help solve the problem: when the question "
+    "involves any calculation, first write the computation as code, then reason "
+    "from the result. Put each piece of code inside a fenced block like: "
+    "```python\n<your code>\n```\n"
     "The environment executes your code automatically and inserts the result "
     "between [TOOL RESULT] and [/TOOL RESULT]. Read the result and continue "
-    "reasoning until you reach the final answer inside the required answer tags."
+    "reasoning until you reach the final answer inside the required answer tags. "
+    "Always finish your code block before continuing."
 )
 system_prompt_retool = BASE["system_prompt"] + _RETOOL_EXTRA
 
