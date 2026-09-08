@@ -314,58 +314,107 @@ def test_trajectory_logps():
 
 # --------------------------------- H. 多轮循环 + 打分索引契约（FakeGen） ----
 def test_multi_rollout_and_scoring():
-    print("[H] multi_turn_rollout_group 多轮循环 + retool_score_flat 索引契约")
-    from rlab.rollout import multi_turn_rollout_group, retool_score_flat
+    print("[H] multi_turn_rollout_group 多轮循环 + 同序列契约 + retool_score_flat")
+    from rlab.rollout import (multi_turn_rollout_group, retool_build_batch,
+                              retool_context_overlong, retool_score_flat)
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    tok.pad_token = tok.eos_token          # H 组内部需要 padding
+    tok.padding_side = "left"
+
+    def tids(s):
+        return tok(s, add_special_tokens=False)["input_ids"]
 
     class _C:
-        def __init__(self, text): self.text = text
+        def __init__(self, text):
+            self.text = text
+            self.token_ids = tids(text)    # 模拟 vLLM：token_ids 与 text 对应
 
     class _O:
         def __init__(self, text): self.outputs = [_C(text)]
 
     class FakeGen:
-        """按轮次回放 canned 文本，记录每轮收到的 prompts。"""
+        """按轮次回放 canned 文本（带 token_ids），记录每轮收到的 prompt_token_ids。"""
         def __init__(self, rounds):
             self.rounds = rounds
             self.r = 0
-            self.seen = []
+            self.seen = []   # list[list[list[int]]] —— 每轮收到的 token id prompt
 
         def generate(self, prompts, sps, use_tqdm=False):
-            self.seen.append(list(prompts))
+            self.seen.append([list(p["prompt_token_ids"]) for p in prompts])
             texts = self.rounds[self.r]
             self.r += 1
             assert len(texts) == len(prompts)
             return [_O(t) for t in texts]
 
-    # 1 题 × num_pre_Q=4 条独立轨迹（修复后的扩样形态）
-    prompts = ["P0", "P1", "P2", "P3"]
+    # 1 题 × num_pre_Q=4 条独立轨迹（真机扩样形态：**同一 prompt 重复 4 份**，
+    # retool_build_batch 的契约是 Q 行 prompt × Q*n 条轨迹）
+    prompts = ["PA", "PA", "PA", "PA"]
     r1 = ["```python\nprint(6*7)\n```", "no code",
           "```python\nprint(2+3)\n```", "none"]
     r2 = ["```python\nprint(99)\n```", "final text here"]       # 仅 active=[0,2]
-    r3 = ["done"]                                               # 仅 active=[0]
+    r3 = ["```python\nprint(1)\n```"]                           # 仅 active=[0]——末轮仍写代码！
     fg = FakeGen([r1, r2, r3])
     cfg_mt = {"max_rounds": 3, "sandbox_timeout": 5.0,
               "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
     sps = [object() for _ in prompts]   # 每样本独立请求参数（FakeGen 不检查内容）
-    segs, full_texts, code_stats = multi_turn_rollout_group(fg, sps, None, prompts, cfg_mt)
+    segs, full_texts, code_stats = multi_turn_rollout_group(fg, sps, tok, prompts, cfg_mt)
 
     check("轨迹数 = 组内样本数 (4)", len(full_texts) == 4 and len(segs) == 4)
+    # 【发现1 修复锁】生成端必须收到 token id prompt（不再收整串文本）
+    check("生成端收到 prompt_token_ids（token id 续写）",
+          len(fg.seen[0]) == 4 and all(isinstance(x, list) for x in fg.seen[0]))
     check("第2轮只续写执行过代码的样本 (0,2)", len(fg.seen[1]) == 2)
     check("第3轮只续写第2轮又执行了代码的样本 (0)", len(fg.seen[2]) == 1)
-    check("续写上下文含首轮文本+工具输出(42)",
-          "42" in fg.seen[1][0] and "[TOOL RESULT]" in fg.seen[1][0])
-    check("s0 段序列 [a,tool,a,tool,a]",
+    # 【发现1 修复锁·核心契约】续写上下文 = 前轮 prompt+assistant ids+工具段 ids
+    # 逐 token 拼接（生成序列 == 训练序列；旧版整串文本续写时 BPE 跨界合并
+    # "```"+"`\n" 会让两序列分叉——实测 whole=67 vs split=68）
+    tool42 = tids(TOOL_START + "42" + TOOL_END)   # print(6*7) 的沙箱输出
+    expect_r2 = tids(prompts[0]) + tids(r1[0]) + tool42
+    check("续写上下文 = prompt+assistant+工具段 ids 逐 token 拼接",
+          fg.seen[1][0] == expect_r2)    # 【发现3 修复锁】末轮（第 max_rounds 轮）写了代码也不执行：
+    # code_used 停在 2、segs 末尾无第 3 个 tool 段（修复前为 3/3 + 多一个 tool 段）
+    check("s0 段序列 [a,tool,a,tool,a]（末轮代码不执行→无第3个tool）",
           [s["kind"] for s in segs[0]] ==
           ["assistant", "tool", "assistant", "tool", "assistant"])
     check("s1/s3 无代码即结束 [a]",
           [s["kind"] for s in segs[1]] == ["assistant"]
           and [s["kind"] for s in segs[3]] == ["assistant"])
-    check("code_used/ok 统计正确",
+    check("code_used/ok 统计正确（末轮代码不计入）",
           code_stats[0] == {"code_used": 2, "code_ok": 2}
           and code_stats[1] == {"code_used": 0, "code_ok": 0}
           and code_stats[2] == {"code_used": 1, "code_ok": 1})
     check("工具段内容 = 沙箱 stdout",
           "42" in segs[0][1]["text"] and "5" in segs[2][1]["text"])
+    check("每段带 ids（assistant 段 ids = 生成 token）",
+          segs[0][0]["ids"] == tids(r1[0]) and segs[0][1]["ids"] == tool42)
+
+    # 【发现1 修复锁】retool_build_batch：per_sample_ids = 各段 ids 拼接（含工具段），
+    # merged 序列与生成序列逐 token 一致；mask 工具段=0。
+    # 契约：prompt_ids 是 Q=1 行（一道题），segs 是 Q*n=4 条（扩样后共享该 prompt）
+    prompt_ids = tok([prompts[0]], return_tensors="pt", padding=True,
+                     add_special_tokens=False)["input_ids"]
+    plen = prompt_ids.shape[1]
+    merged, mask, per_sample_ids = retool_build_batch(
+        prompt_ids, segs, plen, tok.pad_token_id)
+    check("per_sample_ids = 各段 ids 拼接（含工具段，与生成同序列）",
+          per_sample_ids[0] == tids(r1[0]) + tool42 + tids(r2[0])
+          + tids(TOOL_START + "99" + TOOL_END) + tids(r3[0]))
+    check("merged 形状 = (B, plen+T) 且 T=max 完成长", merged.shape[0] == 4
+          and merged.shape[1] == plen + max(len(t) for t in per_sample_ids))
+    m0 = mask[0].tolist()
+    a1, tl1 = len(tids(r1[0])), len(tool42)
+    check("mask：assistant 段=1 / 工具段=0（s0 首两段）",
+          m0[:a1] == [1.0] * a1 and m0[a1:a1 + tl1] == [0.0] * tl1)
+
+    # 【发现2 修复锁】超长检查按全长（assistant+工具段）计——旧 mask.sum 口径漏算工具段
+    # （[[0]*5 是"长 5 的轨迹"，不是 token 值 5）
+    check("超长检查：全长口径（含工具段）触发",
+          retool_context_overlong([[0] * 5, [0] * 5], 3, 7))      # 5+5+3*2=16 > 7*2=14
+    check("超长检查：预算内不触发",
+          not retool_context_overlong([[0] * 5, [0] * 5], 3, 10))  # 16 < 20
+    check("超长检查：工具段撑爆预算（纯 assistant 口径会漏放行）",
+          retool_context_overlong([[0] * 10, [0] * (10 + 6)], 3, 15))  # 10+16+6=32 > 30，工具段6是关键
 
     # 打分索引契约：asst_texts 必须 = 题数 × num_pre_Q（真机 IndexError 的回归锁）
     cfg2 = get_config("retool", use_wandb=False)
