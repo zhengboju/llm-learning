@@ -531,7 +531,6 @@ def gen_worker(Q, cfg: dict):
         # （retool 家族 uniform 丢弃已由题目级过滤大幅削减，剩余部分是模型学不动的
         #  "边缘题"——正常训练中随通过率上升自然回落）
         samp_stats["attempts"] += attempts
-        samp_stats["dropped"] += attempts - len(groups)
         for g in groups:
             if is_retool:
                 plen, prompt_ids, r = g
