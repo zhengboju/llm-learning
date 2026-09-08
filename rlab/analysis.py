@@ -13,6 +13,7 @@ import argparse
 import glob
 import json
 import os
+import time
 
 NOISE_FLOOR_PP = 2.0   # 公共协议：±2pp 内视为噪声，>3pp 才算真差异
 SESS_GAP_S = 120.0     # record 时间戳间隔 >120s = 新训练会话（进程重启/新 run 追加同文件）
@@ -49,6 +50,7 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
     >120s 切会话，逐会话聚合 stats——"崩盘点在哪个会话、各会话的冷热阶段"
     一眼可辨，避免把跨会话曲线误读成单次训练的动力学。"""
     accs, fmts, codes, clens, phases, sess_ids = [], [], [], [], [], []
+    sess_span = {}   # sess -> [first_t, last_t]（墙钟，便于对 Shell 历史核对是哪次 run）
     with open(path, encoding="utf-8") as f:
         prev_t, sess = None, 0
         for line in f:
@@ -64,6 +66,7 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
                 sess += 1
             if t is not None:
                 prev_t = t
+                sess_span.setdefault(sess, [t, t])[1] = t
             accs.extend(a > 0 for a in rec["acc"])
             fmts.extend(v > 0 for v in rec["fmt"])
             codes.extend(u > 0 for u in rec.get("code_used", []))
@@ -81,9 +84,14 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
             c = (sum(codes[i] for i in idx) / len(idx) * 100
                  if codes else float("nan"))
             lo, hi = idx[0], idx[-1] + 1
+            span = sess_span.get(s)
+            when = ""
+            if span:
+                fmt_t = lambda x: time.strftime("%m-%d %H:%M:%S", time.localtime(x))
+                when = f" [{fmt_t(span[0])} ~ {fmt_t(span[1])}]"
             sess_lines.append(
                 f"会话{s}: 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/16:.0f}步）"
-                f" acc={a:.1f}% fmt={ff:.1f}% code={c:.1f}%")
+                f" acc={a:.1f}% fmt={ff:.1f}% code={c:.1f}%{when}")
     out = ["| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap | 阶段 | 会话 |",
            "|---|---|---|---|---|---|---|---|"]
     for i in range(0, len(accs), window):
