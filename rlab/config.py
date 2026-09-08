@@ -79,6 +79,13 @@ BASE = dict(
     # 解释了"GRPO 跨实现复现一致、唯独 DAPO 掉 4pp"。必须与老脚本逐字对齐。
     top_k=50,
     dynamic_max_attempts_mult=5,   # dynamic sampling 尝试上限 = 需要 组数*该倍数
+    # 题目级动态采样（仅 retool 家族启用，单轮路径不用以保持阶段0/1 协议可比）：
+    # 连续 q_skip_streak 次产出零方差组（全错/全对，无梯度）的题跳过；
+    # 过滤后池子 < q_pool_reset_floor 时全部重置（难题随模型变强重新入场）。
+    # 动机：retool_math 实测丢弃率 81%（p≈5%），且动态采样的期望轨迹成本 ≈1/p
+    # 与 num_pre_Q 无关——只有题目级过滤能真正削减白跑。
+    q_skip_streak=2,
+    q_pool_reset_floor=64,
 
     # ---- 训练 ----
     all_steps=300,

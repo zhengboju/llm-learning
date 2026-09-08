@@ -572,6 +572,20 @@ def test_retool_math_fixes():
           [r["Q"] for r in dapo_exclude_dev(pool, [{"question": "q", "answer": "0"}])]
           == ["q1", "q2", "q3"])
 
+    # 题目级动态采样（丢弃率 81% 根因修复的契约锁）
+    from rlab.rollout import filter_question_pool
+    QAs = [{"Q": f"q{i}", "A": "1"} for i in range(10)]
+    q_stat = {f"q{i}": 2 for i in range(5)}          # 5 题连败到阈值
+    cand, reset = filter_question_pool(QAs, q_stat, streak_max=2, floor=3)
+    check("题目过滤：达到 streak 阈值的题被跳过",
+          not reset and {c["Q"] for c in cand} == {f"q{i}" for i in range(5, 10)})
+    q_stat2 = {f"q{i}": 2 for i in range(9)}          # 只剩 1 题 < floor=3
+    cand2, reset2 = filter_question_pool(QAs, q_stat2, 2, 3)
+    check("题目过滤：池子低于下限 → 全量重置（难题重新入场）",
+          reset2 and len(cand2) == 10)
+    cand3, reset3 = filter_question_pool(QAs, {}, 2, 3)
+    check("题目过滤：无统计 → 全池可用", not reset3 and len(cand3) == 10)
+
 
 # --------------------------------- J. 静态未定义名检查（运行时 NameError 防线） ----
 def test_pyflakes_undefined():
