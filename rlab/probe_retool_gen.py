@@ -10,11 +10,11 @@ round-4 eval 仍 fmt≈0、code_rate≈2%。怀疑 base+3B 在"写代码"压力�
   ③ 剥离代码后格式到底差在哪（没标签 / 标签顺序乱 / 被截断）。
 
 用法（pod，约 2-3 分钟）：
-    CUDA_VISIBLE_DEVICES=0 python rlab/probe_retool_gen.py --n 8 --show_prompt new
+    看 base 在训练温度下的生成（temp 0.7 才会触发代码分支，greedy 下 base 代码率=0%）：
+    CUDA_VISIBLE_DEVICES=0 python rlab/probe_retool_gen.py --n 8 --temp 0.7 --show_prompt new
 
-输出：
-    --show_prompt new  打印"新提示"下每个样本的逐段原始文本（repr 截断）
-    三种提示各输出一组汇总：fmt_raw / fmt_strip / code_rate / code_ok_rate
+    看训练后模型（checkpoint）的代码轨迹——训练期 code率 20-50% 但 greedy 看不到：
+    CUDA_VISIBLE_DEVICES=0 python rlab/probe_retool_gen.py --n 8 --model ./rlab_out/retool/step_200 --temp 0.7 --show_prompt new
 """
 import argparse
 import json
@@ -34,7 +34,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=8, help="每种提示抽样题数")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--model", default="/root/Qwen2.5-3B")
+    ap.add_argument("--model", default="/root/Qwen2.5-3B", help="可指 checkpoint")
+    ap.add_argument("--temp", type=float, default=0.7,
+                    help="采样温度：0.7 与训练一致（能触发代码分支）；0=greedy")
     ap.add_argument("--gpu_mem", type=float, default=0.22)
     ap.add_argument("--round_tokens", type=int, default=400, help="每轮 assistant 段上限")
     ap.add_argument("--max_rounds", type=int, default=3)
@@ -70,7 +72,8 @@ def main():
         "old": BASE["system_prompt"] + _OLD_EXTRA,
         "new": system_prompt_retool,
     }
-    print(f"== 三路提示（{args.n} 题/路, seed={args.seed}, greedy, round_tokens={args.round_tokens}）==")
+    print(f"== 三路提示（{args.n} 题/路, seed={args.seed}, temp={args.temp}, "
+          f"round_tokens={args.round_tokens}）==")
 
     # ---- 数据（与评测同源：modelscope gsm8k test, seed 抽样）----
     from modelscope.msdatasets import MsDataset
@@ -88,7 +91,7 @@ def main():
               max_model_len=2600, dtype="bfloat16")
     from rlab.rollout import multi_turn_rollout_group
     from rlab.reward import reward_format, strip_code_blocks
-    sp = SamplingParams(temperature=0, max_tokens=args.round_tokens)
+    sp = SamplingParams(temperature=args.temp, max_tokens=args.round_tokens)
     cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
            "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
 

@@ -41,9 +41,9 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
     clen_cap ≈ max_context_tokens(2200) - 典型 prompt(~400) = 1800：接近上限
     说明轨迹在撞上下文预算（会被整组丢弃或标签被截断）——2026-09-08 第四轮
     "格式学到 75-95% 后崩回 0"的嫌疑机制，需 clen/code 趋势佐证。"""
-    accs, fmts, codes, clens = [], [], [], []
-    out = ["| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap |",
-           "|---|---|---|---|---|---|"]
+    accs, fmts, codes, clens, phases = [], [], [], [], []
+    out = ["| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap | 阶段 |",
+           "|---|---|---|---|---|---|---|"]
     with open(path, encoding="utf-8") as f:
         for line in f:
             try:
@@ -52,6 +52,9 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
                 fmts.extend(v > 0 for v in rec.get("fmt", []))
                 codes.extend(u > 0 for u in rec.get("code_used", []))
                 clens.extend(rec.get("clen", []))
+                ph = rec.get("phase")
+                if ph:
+                    phases.extend([ph] * len(rec.get("acc", [])))
             except json.JSONDecodeError:
                 continue
     for i in range(0, len(accs), window):
@@ -66,9 +69,10 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
             len_col = f"{avg_l:.0f} | {near * 100:.0f}%"
         else:
             len_col = "— | —"
+        ph_col = phases[i] if i < len(phases) else "—"
         out.append(f"| {i}~{i + len(chunk_a)} | {sum(chunk_a) / len(chunk_a) * 100:.1f}% "
                    f"| {sum(chunk_f) / len(chunk_f) * 100:.1f}% | {code_col} "
-                   f"| {len_col} |")
+                   f"| {len_col} | {ph_col} |")
     return "\n".join(out)
 
 
