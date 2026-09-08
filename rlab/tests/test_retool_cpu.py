@@ -246,6 +246,13 @@ def test_config_retool_math():
           cfg["num_pre_Q"] == 8 and cfg["train_micro_batch_size_per_gpu"] == 8)
     check("retool_math adv 不除 std（参考组内减均值，group_mean）",
           cfg["adv_mode"] == "group_mean")
+    # 【2026-09-10 训练变慢修复锁】并采 4 题（vLLM 并发 4×8=32）+ 题目过滤走
+    # QuestionScheduler 队列路径；GSM8K 家族保持 1（旧逐题协议可比性）
+    check("retool_math 并采 4 题 + 沙箱并发 8",
+          cfg["gen_questions_per_attempt"] == 4 and cfg["sandbox_workers"] == 8)
+    check("BASE 默认并采 1 题 + 沙箱并发 4（GSM8K 家族协议不变）",
+          get_config("retool", use_wandb=False)["gen_questions_per_attempt"] == 1
+          and get_config("retool", use_wandb=False)["sandbox_workers"] == 4)
     # 联动锁：num_pre_Q=8 必须配 group_mean（两处一起改，缺一即错）
     from rlab.losses import compute_advantages
     from rlab.rollout import group_ok
@@ -614,6 +621,121 @@ def test_retool_math_fixes():
     check("题目过滤：无统计 → 全池可用", not reset3 and len(cand3) == 10)
 
 
+# --------------------- L. QuestionScheduler（题目过滤死代码修复） ---------------------
+def test_question_scheduler():
+    print("[L] QuestionScheduler：队列走池 + 同题重试 + 拉黑 + floor 重置")
+    from rlab.rollout import QuestionScheduler
+
+    class _NoShuffle:   # 确定性 rng：shuffle 恒等（顺序可预期）
+        def shuffle(self, x): pass
+
+    QAs = [{"Q": f"q{i}", "A": "1"} for i in range(8)]
+    sched = QuestionScheduler(QAs, streak_max=2, floor=4, rng=_NoShuffle())
+    drawn = sched.draw(4)
+    check("draw 顺序走池", [q["Q"] for q in drawn] == ["q0", "q1", "q2", "q3"])
+    sched.report(drawn[0], "uniform")
+    check("uniform 一次：streak=1 且插回队首（下一 draw 最先重试同题）",
+          sched.q_stat["q0"] == 1 and sched.draw(1)[0]["Q"] == "q0")
+    sched.report({"Q": "q0", "A": "1"}, "uniform")
+    d2 = sched.draw(4)
+    check("uniform 达标：拉黑（后续 draw 不再出现 q0）",
+          sched.q_stat["q0"] == 2 and "q0" not in [q["Q"] for q in d2])
+    q1 = {"Q": "q1", "A": "1"}
+    sched.report(q1, "ok")
+    check("ok 清零 streak", sched.q_stat["q1"] == 0)
+    sched.report(q1, "uniform")
+    sched.report(q1, "overlong")
+    check("overlong 不计 streak（uniform 后超长不会误拉黑）", sched.q_stat["q1"] == 1)
+    check("blacklisted_count 只算达标（拉黑）题", sched.blacklisted_count() == 1)
+    # 拉黑到候选 < floor → draw 自动全量重置（难题重新入场）
+    for i in range(2, 8):
+        for _ in range(2):
+            sched.report({"Q": f"q{i}", "A": "1"}, "uniform")
+    d3 = sched.draw(4)
+    check("候选低于 floor → draw 自动重置（q_stat 清空、全池重新入场）",
+          len(d3) == 4 and sched.q_stat == {})
+
+
+# ------------- M. collect_retool_group：多题并采 + 按题拆分（不连坐） -------------
+def test_collect_retool_group_split():
+    print("[M] collect_retool_group：多题并采（vLLM 并发=题数×n）+ 按题拆分")
+    from rlab.rollout import collect_retool_group
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+
+    def tids(s):
+        return tok(s, add_special_tokens=False)["input_ids"]
+
+    class _C:
+        def __init__(self, text):
+            self.text = text
+            self.token_ids = tids(text)    # 模拟 vLLM：token_ids 与 text 对应
+
+    class _O:
+        def __init__(self, text): self.outputs = [_C(text)]
+
+    class FakeGen:
+        def __init__(self, rounds):
+            self.rounds = rounds; self.r = 0
+            self.batch_sizes = []
+        def generate(self, prompts, sps, use_tqdm=False):
+            self.batch_sizes.append(len(prompts))
+            texts = self.rounds[self.r]; self.r += 1
+            assert len(texts) == len(prompts)
+            return [_O(t) for t in texts]
+
+    cfg = get_config("retool", use_wandb=False)   # num_pre_Q=4 / max_rounds=3 / ctx 2200
+    good72, good99 = fmt_answer("72"), fmt_answer("99")
+    # 2 题 × 4 条：q0 混合结果（对/错各半 → 有梯度）；q1 无码全错（零方差 → uniform）
+    # q1 文本刻意放长（第二段用小 max_context 验证超长按题隔离）
+    r1 = [good72, good99, good72, good99,
+          "filler " * 60, "filler " * 60, "filler " * 60, "filler " * 60]
+    fg = FakeGen([r1])
+    qs = [{"Q": f"q{i}", "A": "72"} for i in range(2)]
+    prompts_text = [f"prompt{i}" for i in range(2)]
+    prompt_ids = tok(prompts_text, return_tensors="pt", padding=True,
+                     add_special_tokens=False)["input_ids"]   # padding_side 已设 left
+    plen = prompt_ids.shape[1]
+    sps = [object() for _ in range(8)]   # 每轨迹独立请求参数（FakeGen 不检查内容）
+    gl_calls = []
+
+    def fake_gl(merged, plen_):
+        gl_calls.append(merged.shape[0])
+        return torch.zeros(merged.shape[0], merged.shape[1] - plen_)
+
+    results = collect_retool_group(fg, tok, cfg, fake_gl, qs, prompts_text,
+                                   prompt_ids, plen, sps, steps_elapsed=0)
+    check("一次并采 2 题全部轨迹（vLLM 单轮 batch = 题数×n = 8）",
+          fg.batch_sizes == [8])
+    check("返回 per-question 结果（每题一项）", len(results) == 2)
+    check("q0 混合 → ok；q1 全错 → uniform（零方差按题判定）",
+          results[0]["status"] == "ok" and results[1]["status"] == "uniform")
+    ok = results[0]
+    check("ok 项：merged 4 行、adv/acc/fmt/clen/trunc 形状正确",
+          ok["merged"].shape[0] == 4 and ok["adv"].shape[0] == 4
+          and len(ok["clen"]) == 4 and len(ok["trunc"]) == 4
+          and ok["merged"].shape[1] == plen + max(ok["clen"]))
+    check("ok 项：gen_logps 每题独立一次（uniform 题不算，省 GPU0 前向）",
+          gl_calls == [4])
+    check("ok 项：plen 记入（上传 meta 用）", ok["plen"] == plen)
+
+    # 按题拆分·超长不连坐：q1 轨迹更长，压低 max_context → q1 overlong、q0 照常 ok
+    # （旧整批口径 = 整组丢弃，多题并采下会放大丢弃损失）
+    q0_comp_max = max(len(tids(t)) for t in r1[:4])
+    q1_comp_min = min(len(tids(t)) for t in r1[4:])
+    check("前提：q1 轨迹 token 数确比 q0 长", q1_comp_min > q0_comp_max)
+    cfg2 = dict(cfg)
+    cfg2["max_context_tokens"] = plen + q0_comp_max   # 严格 > 判超长：q0 恰好放行
+    results2 = collect_retool_group(FakeGen([r1]), tok, cfg2, fake_gl, qs,
+                                    prompts_text, prompt_ids, plen, sps, steps_elapsed=0)
+    check("超长按题隔离：q0 ok / q1 overlong", 
+          results2[0]["status"] == "ok" and results2[1]["status"] == "overlong")
+    check("丢弃项不含上传字段（uniform/overlong 零上传成本）",
+          "merged" not in results[1] and "merged" not in results2[1])
+
+
 # --------------------------------- J. 静态未定义名检查（运行时 NameError 防线） ----
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
@@ -655,6 +777,8 @@ if __name__ == "__main__":
     test_multi_rollout_and_scoring()
     test_health_monitor()
     test_retool_math_fixes()
+    test_question_scheduler()
+    test_collect_retool_group_split()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

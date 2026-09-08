@@ -29,6 +29,7 @@ import os
 import queue as _queue
 import random
 import time
+from collections import deque
 
 # vLLM 相关环境变量必须在实际 import vllm 之前设置（教训：RPC 模式权重同步会 stall）
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -89,6 +90,73 @@ def filter_question_pool(QAs, q_stat: dict, streak_max: int, floor: int):
     if len(cand) < floor:
         return list(QAs), True
     return cand, False
+
+
+class QuestionScheduler:
+    """题目级调度器（2026-09-10 训练变慢根因修复）。
+
+    【旧实现为何是死代码】主循环 random.sample 从全池抽题——16.5k 题的池子
+    同题被再次抽中的概率 1/16500，q_skip_streak=2 的"两次零方差"条件几乎
+    永远无法对同一题累计 → 黑名单永远建不起来 → 丢弃率维持裸 P(uniform)≈64%，
+    "81%→20-30%" 的预期落空（真机"训练更慢"的第一根因）。
+
+    【新语义】shuffle 队列顺序走池：
+    - 每题一次 attempt；uniform 组 → streak+1 且插回队首（尽快重试），
+      streak 达到 streak_max 即拉黑（不再入队，filter_question_pool 在补给时排除）；
+    - 有效组 → streak 清零；超长组 → 与题目难度无关，不计 streak 随队列轮转；
+    - 队列耗尽时按 filter_question_pool 补充；候选低于 floor 全量重置
+      （难题随模型变强重新入场）。
+    "连续"按"自上次成功以来累计 uniform 数"计——两次 attempt 之间可能隔一次
+    补给重排，语义近似但不影响黑名单的收敛速度（队首插入保证难题两轮内出局）。
+    rng 默认用全局 random（gen_worker 已按 seed 播种 → 抽题顺序可复现）。"""
+
+    def __init__(self, QAs, streak_max, floor, rng=None):
+        self.QAs = QAs
+        self.streak_max = max(1, int(streak_max))
+        self.floor = max(1, int(floor))
+        self.rng = rng if rng is not None else random
+        self.q_stat = {}
+        self.queue = deque()
+
+    def _refill(self):
+        cand, reset = filter_question_pool(
+            self.QAs, self.q_stat, self.streak_max, self.floor)
+        if reset:
+            self.q_stat.clear()
+            print("[rollout] 题目级过滤池低于下限，全部重置（难题重新入场）", flush=True)
+        pool = cand[:]
+        self.rng.shuffle(pool)
+        self.queue = deque(pool)
+
+    def draw(self, k):
+        """取 k 道题；跳过已达拉黑阈值却仍留在队列里的残留（首 uniform 插队
+        后第二次也 uniform 的题，队列里已无它——此分支只防极端交错）。"""
+        out = []
+        for _ in range(3):        # 补给上限：重置后为全池，两轮必够
+            while len(out) < k and self.queue:
+                q = self.queue.popleft()
+                if self.q_stat.get(q["Q"], 0) >= self.streak_max:
+                    continue
+                out.append(q)
+            if len(out) >= k:
+                break
+            self._refill()
+        return out
+
+    def report(self, q, status):
+        """attempt 结果回填：status ∈ {"uniform", "ok", "overlong"}。"""
+        key = q["Q"]
+        if status == "uniform":
+            self.q_stat[key] = self.q_stat.get(key, 0) + 1
+            if self.q_stat[key] < self.streak_max:
+                self.queue.appendleft(q)   # 未达标：插队首，下一 attempt 尽快重试
+            # 达标：不入队 = 拉黑（blacklisted_count / 下次补给排除）
+        elif status == "ok":
+            self.q_stat[key] = 0
+        # "overlong"：不动 streak
+
+    def blacklisted_count(self):
+        return sum(1 for v in self.q_stat.values() if v >= self.streak_max)
 
 
 def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text, cfg,
@@ -289,6 +357,64 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 
+def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
+                         inputs, prompts_text, prompt_ids, plen,
+                         sampling_params, steps_elapsed=0):
+    """多轮 rollout → 打分 → 按题拆分的上传就绪结果（模块级，FakeGen CPU 可测）。
+
+    【2026-09-10 结构修改·采样并发与按题拆分】一次调用处理 len(inputs) 道题
+    （每题 num_pre_Q 条），vLLM 每轮并发 = 题数×num_pre_Q——retool_math 为
+    4×8=32（旧版 Q_batch_size=1 恒为 8，H20 上 vLLM 严重欠利用，是训练变慢
+    的第二根因）。打分后**按题拆分**：每题独立过超长/零方差检查、独立构造
+    num_pre_Q 行批上传——训练端 micro-batch 契约（=num_pre_Q 行）不变、
+    DeepSpeed/grad_accum/有效 batch 全部零改动，且单题 uniform/超长只丢弃
+    该题不再连坐整批（整批连坐在多题并采下会放大丢弃损失）。
+
+    sampling_params: 与 Q*num_pre_Q 条轨迹等长的列表（gen_worker 构造，每条
+      独立 seed；拆出来是为了让本函数不依赖 vllm import，FakeGen 可直接测）。
+
+    返回 per-question list，每项 {"status": "ok"|"uniform"|"overlong"}；
+    ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen
+    （plen = prompt_ids 的左 pad 宽度，跨题统一——上传 meta 与 gen_logps/
+    训练前向共用同一基准，与旧 Q=1 路径的逐批 plen 语义一致）。"""
+    n = int(cfg["num_pre_Q"])
+    nq = len(inputs)
+    group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
+    segs, _full_texts, code_stats = multi_turn_rollout_group(
+        vllm_gen, sampling_params, tokenizer, group_prompts, cfg)
+    asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
+                  for segs_i in segs]
+    results = []
+    for i in range(nq):
+        segs_i = segs[i * n:(i + 1) * n]
+        merged_i, mask_i, per_ids_i = retool_build_batch(
+            prompt_ids[i:i + 1], segs_i, plen, tokenizer.pad_token_id)
+        clen_i = [len(t) for t in per_ids_i]
+        # 逐样本全长预算检查（按题：单题超长不再连坐其他题，2026-09-10）
+        if mask_i.shape[1] == 0 or retool_context_overlong(
+                per_ids_i, plen, cfg["max_context_tokens"]):
+            results.append({"status": "overlong"})
+            continue
+        adv_i, acc_i, fmt_i, cu_i, ck_i, phase = retool_score_flat(
+            [inputs[i]], asst_texts[i * n:(i + 1) * n],
+            code_stats[i * n:(i + 1) * n], cfg, steps_elapsed=steps_elapsed,
+            completion_lens=clen_i)
+        # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
+        # 与超长分流；2026-09-10 起不再连坐同批其他题）
+        if not group_ok(adv_i):
+            results.append({"status": "uniform"})
+            continue
+        gen_logps_i = compute_gen_logps(merged_i, plen)
+        results.append({"status": "ok", "merged": merged_i, "mask": mask_i,
+                        "gen_logps": gen_logps_i, "adv": adv_i, "acc": acc_i,
+                        "fmt": fmt_i, "cu": cu_i, "ck": ck_i, "phase": phase,
+                        "clen": clen_i,
+                        "trunc": [int(s["trunc_final"])
+                                  for s in code_stats[i * n:(i + 1) * n]],
+                        "plen": plen})
+    return results
+
+
 def gen_worker(Q, cfg: dict):
     """生成端主入口（由 train.py rank0 spawn，或分进程模式独立运行）。
 
@@ -410,56 +536,17 @@ def gen_worker(Q, cfg: dict):
         adv = compute_advantages(rewards, cfg["num_pre_Q"], cfg["adv_mode"])
         return adv, torch.tensor(acc_s), torch.tensor(fmt_s)
 
-    # ------------------- 阶段2 retool 专用：打分 / 打包 -------------------
-    def retool_score_group(inputs, full_texts, code_stats, completion_lens=None):
-        """多段轨迹打分（委托模块级 retool_score_flat，索引契约见其 docstring）。"""
-        return retool_score_flat(inputs, full_texts, code_stats, cfg,
-                                 steps_elapsed=pushes[0] * cfg["gen_update_steps"],
-                                 completion_lens=completion_lens)
-
-    def collect_retool_group(inputs, prompts_text, prompt_ids, plen, seed_salt=0):
-        """多轮 rollout → 打分 → 上传就绪数据。超长/全同组返回 None（重采）。
-
-        每题扩成 num_pre_Q 条独立轨迹（独立请求 + 独立 seed）——这是组内
-        对比的前提，也是 2026-09-08 真机 IndexError（轨迹数<打分索引）的根因。
-        seed_salt：随重采次数递增的盐——旧版丢组重采后复用同一批 seed，同题
-        再现时会生成完全相同的轨迹、必然再被丢（2026-09-09 审查修复）。"""
-        n = cfg["num_pre_Q"]
-        group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
+    def make_retool_sps(n_req, seed_salt):
+        """retool 家族每轨迹独立 SamplingParams（每条一个请求且 seed 各不相同
+        ——共用 seed 会让同题各条生成完全相同的轨迹，组内零方差 → group_ok
+        永假无限重采）。seed_salt：随重采/轮次递增的盐，防同 seed 复采同轨迹。"""
         seed0 = cfg.get("seed")
-        sps = [SamplingParams(n=1, temperature=cfg["temperature"],
-                              max_tokens=cfg.get("round_gen_tokens", 400),
-                              top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
-                              seed=(seed0 + seed_salt + k if seed0 is not None else None))
-               for k in range(len(group_prompts))]
-        segs, full_texts, code_stats = multi_turn_rollout_group(
-            vllm_gen, sps, tokenizer, group_prompts, cfg)
-        # 打分文本 = assistant 段拼接（工具段不参与 acc/fmt，见 retool_score_flat）
-        asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
-                      for segs_i in segs]
-        merged_ids, mask, per_sample_ids = retool_build_batch(
-            prompt_ids, segs, plen, tokenizer.pad_token_id)
-        if mask.shape[1] == 0:
-            return None
-        completion_lens = [len(t) for t in per_sample_ids]
-        # 真实上下文 token 数上限检查（防 OOM：逐样本全长口径，任一超限整组
-        # 丢弃重采——2026-09-09 审查修复，旧版组均值口径会放行单条超长尖峰）
-        if retool_context_overlong(per_sample_ids, plen, cfg["max_context_tokens"]):
-            print(f"[rollout] 轨迹超长（逐样本全长口径，max={cfg['max_context_tokens']}/条），"
-                  "整组丢弃重采")
-            return None
-        adv, acc_s, fmt_s, cu, ck, phase = retool_score_group(
-            inputs, asst_texts, code_stats, completion_lens=completion_lens)
-        # 零方差组（全对/全错，组内归一化后 adv 恒 0）不再与超长混在同一返回值：
-        # 显式返回 uniform 标记，调用方做题目级统计（2026-09-09 丢弃率 81% 根因修复）
-        if not group_ok(adv):
-            return {"uniform": True}
-        gen_logps = compute_gen_logps(merged_ids, plen)
-        return {"merged": merged_ids, "mask": mask, "gen_logps": gen_logps,
-                "adv": adv, "acc": acc_s, "fmt": fmt_s,
-                "cu": cu, "ck": ck, "phase": phase, "clen": completion_lens,
-                "trunc": [int(s["trunc_final"]) for s in code_stats],
-                "uniform": False}
+        return [SamplingParams(n=1, temperature=cfg["temperature"],
+                               max_tokens=cfg.get("round_gen_tokens", 400),
+                               top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
+                               seed=(seed0 + seed_salt + k
+                                     if seed0 is not None else None))
+                for k in range(n_req)]
 
     # ------------------------- 采样主循环 -------------------------
     os.makedirs(os.path.dirname(os.path.abspath(cfg["record_path"])), exist_ok=True)
@@ -468,28 +555,44 @@ def gen_worker(Q, cfg: dict):
     is_retool = cfg["algo"] in ("retool", "retool_math")
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
     samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0}
-    # 题目级动态采样状态：Q 文本 -> 连续零方差组次数（仅 retool 家族启用，
-    # 单轮路径保持旧行为以不扰动阶段0/1 协议可比性）
-    q_stat = {}
+    # 题目级调度两条路径（2026-09-10 重构）：
+    # - 队列路径（gen_questions_per_attempt>1，当前仅 retool_math）：QuestionScheduler
+    #   顺序走池 + 同题重试 + 拉黑——旧 random.sample 全池抽题下同题重抽概率
+    #   1/16500，streak 永不累计，过滤器是死代码（丢弃率维持 ~64% 的根因）。
+    # - 旧路径（gen_questions_per_attempt=1，GSM8K retool 家族）：random.sample
+    #   + q_stat 原样保留——阶段2 GSM8K 协议可比性不破坏。
+    multi_q = max(1, int(cfg.get("gen_questions_per_attempt", 1) or 1))
+    use_qqueue = is_retool and multi_q > 1 and bool(cfg.get("q_skip_streak"))
+    sched = (QuestionScheduler(QAs, cfg["q_skip_streak"], cfg["q_pool_reset_floor"])
+             if use_qqueue else None)
+    q_stat = {}   # 旧路径专用：Q 文本 -> 连续零方差组次数
     while True:
         try_update_model()
         # dynamic sampling（DAPO 机制2）：全同组不占配额，继续采直到攒够 Q_batch_size 组
         need = cfg["Q_batch_size"]
         groups = []   # 单轮: (inputs, prompt_text, prompt_ids, ans_ids, adv, acc, fmt, plen)
-                      # retool: (plen, prompt_ids, ready_dict)
-        attempts = 0
+                      # retool: ready_dict（含 plen，见 collect_retool_group）
+        attempts = 0   # 按题计数（丢弃率口径 = 白跑的题次数）
         max_attempts = need * cfg["dynamic_max_attempts_mult"]
+        if use_qqueue:
+            max_attempts *= multi_q   # 队列路径一次并采 multi_q 题，上限按题数等比放大
         while len(groups) < need and attempts < max_attempts:
-            attempts += 1
-            if is_retool and cfg.get("q_skip_streak"):
-                cand, _reset = filter_question_pool(
-                    QAs, q_stat, cfg["q_skip_streak"], cfg["q_pool_reset_floor"])
-                if _reset:
-                    print("[rollout] 题目级过滤池低于下限，全部重置（难题重新入场）")
-                inputs = random.sample(cand, cfg["Q_batch_size"])
+            if use_qqueue:
+                inputs = sched.draw(multi_q)
+                if not inputs:
+                    break
+                attempts += len(inputs)
             else:
-                inputs = random.sample(QAs, cfg["Q_batch_size"])
-            qkey = inputs[0]["Q"] if cfg["Q_batch_size"] == 1 else None
+                attempts += 1
+                if is_retool and cfg.get("q_skip_streak"):
+                    cand, _reset = filter_question_pool(
+                        QAs, q_stat, cfg["q_skip_streak"], cfg["q_pool_reset_floor"])
+                    if _reset:
+                        print("[rollout] 题目级过滤池低于下限，全部重置（难题重新入场）")
+                    inputs = random.sample(cand, need)
+                else:
+                    inputs = random.sample(QAs, need)
+            qkey = inputs[0]["Q"] if need == 1 else None
             prompts_text = [build_prompt(x["Q"], cfg["system_prompt"], tokenizer) for x in inputs]
             prompt_ids = tokenizer(prompts_text, return_tensors="pt", padding=True,
                                    padding_side="left", add_special_tokens=False)["input_ids"]
@@ -497,22 +600,30 @@ def gen_worker(Q, cfg: dict):
             if plen > cfg["max_prompt_length"]:
                 continue
             if is_retool:
-                # 阶段2：多轮代码交织 → 打分 → 上传就绪（mask 已按段边界算好）
-                ready = collect_retool_group(inputs, prompts_text, prompt_ids, plen,
-                                             seed_salt=rollout_seq[0])
-                rollout_seq[0] += 1
-                if ready is None:
-                    samp_stats["overlong"] += 1
-                    continue  # 超长：重采（seed 盐已递增，不会复采同轨迹）
-                if ready["uniform"]:
-                    samp_stats["uniform"] += 1
-                    # 题目级过滤：零方差组（全错/全对）当前无梯度，连续多次则跳过该题
-                    if cfg.get("q_skip_streak") and qkey is not None:
-                        q_stat[qkey] = q_stat.get(qkey, 0) + 1
-                    continue
-                if qkey is not None:
-                    q_stat[qkey] = 0   # 有梯度组：重置该题连败计数
-                groups.append((plen, prompt_ids, ready))
+                # 阶段2：多轮代码交织（并采 multi_q 题，vLLM 并发 = 题数×num_pre_Q）
+                # → 按题打分/拆分 → 每题独立上传批（mask 已按段边界算好）
+                sps = make_retool_sps(len(inputs) * cfg["num_pre_Q"], rollout_seq[0])
+                results = collect_retool_group(
+                    vllm_gen, tokenizer, cfg, compute_gen_logps,
+                    inputs, prompts_text, prompt_ids, plen, sps,
+                    steps_elapsed=pushes[0] * cfg["gen_update_steps"])
+                rollout_seq[0] += 1   # 盐递增：uniform/超长题重试时不会复采同轨迹
+                for q, res in zip(inputs, results):
+                    if res["status"] == "uniform":
+                        samp_stats["uniform"] += 1
+                        # 题目级过滤：零方差组（全错/全对）当前无梯度，累计达标拉黑
+                        if sched is not None:
+                            sched.report(q, "uniform")
+                        elif qkey is not None:
+                            q_stat[qkey] = q_stat.get(qkey, 0) + 1
+                    elif res["status"] == "overlong":
+                        samp_stats["overlong"] += 1   # 超长与难度无关：不计 streak
+                    else:
+                        if sched is not None:
+                            sched.report(q, "ok")
+                        elif qkey is not None:
+                            q_stat[qkey] = 0   # 有梯度组：重置该题连败计数
+                        groups.append(res)
                 continue
             voutputs = vllm_gen.generate(prompts_text, sampling_params, use_tqdm=False)
             answers, ans_token_ids = [], []
@@ -533,7 +644,8 @@ def gen_worker(Q, cfg: dict):
         samp_stats["attempts"] += attempts
         for g in groups:
             if is_retool:
-                plen, prompt_ids, r = g
+                r = g
+                plen = r["plen"]
                 meta = {"plen": plen, "algo": cfg["algo"], "has_mask": 1}
                 xdata = encode_batch(meta, r["merged"], r["adv"], r["gen_logps"],
                                      r["mask"], r["acc"], r["fmt"])
@@ -572,9 +684,13 @@ def gen_worker(Q, cfg: dict):
         if uploaded_total and uploaded_total % 16 == 0:
             _a = samp_stats["attempts"]
             _u, _o = samp_stats["uniform"], samp_stats["overlong"]
+            # "被跳过"口径：队列路径 = 已拉黑题（streak 达标，未来不会再采）；
+            # 旧路径 = 出现过 uniform 的题（旧语义保留）
+            _skipped = (sched.blacklisted_count() if sched is not None
+                        else sum(1 for v in q_stat.values() if v > 0))
             print(f"[rollout] 采样统计: 累计尝试 {_a} 次 / 有效上传 {uploaded_total} 组"
                   f"（丢弃率 {(_u + _o) / max(1, _a) * 100:.0f}% = 零方差 {_u} + 超长 {_o}；"
-                  f"题目过滤中 {sum(1 for v in q_stat.values() if v > 0)}/{len(QAs)} 题被跳过）",
+                  f"题目过滤中 {_skipped}/{len(QAs)} 题被跳过）",
                   flush=True)
         # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/代码信号缺失）
         # retool 家族的 clen 上限按"轮数×每轮预算"计——旧版用

@@ -51,10 +51,15 @@ ALGO_DEFAULTS = {
     # 预算：每轮上限 round_gen_tokens=1024 × max_rounds=3 ≈ 3072 token，
     # 远小于名义 max_gen_tokens/max_context_tokens=8192——后者留作保险丝；
     # 真正要紧的轮长截断见 health 的 retool_trunc。
+    # 【2026-09-10 训练变慢修复】gen_questions_per_attempt=4：一次 attempt 并采
+    # 4 题×8 条（vLLM 并发 32）+ 题目过滤走 QuestionScheduler（旧 random.sample
+    # 全池抽题使 q_skip_streak 永不达标，过滤器死代码，丢弃率卡在 ~64%）。
+    # 沙箱并发同步 8：单轮最多 32 条待执行代码，4 并发时 spawn 串行段 ~2s/轮。
     "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
                         loss_norm="sample_mean", data_task="dapo_math",
                         num_pre_Q=8, train_micro_batch_size_per_gpu=8,
                         temperature=1.0, top_k=-1,
+                        gen_questions_per_attempt=4, sandbox_workers=8,
                         max_context_tokens=8192, round_gen_tokens=1024,
                         max_gen_tokens=8192, max_prompt_length=1024,
                         code_w=0.0, reward_switch_step=1000000000),
@@ -96,6 +101,12 @@ BASE = dict(
     # 与 num_pre_Q 无关——只有题目级过滤能真正削减白跑。
     q_skip_streak=2,
     q_pool_reset_floor=64,
+    # 生成端每次 attempt 并采题数（2026-09-10 vLLM 利用率修复）。=1 保持旧
+    # 逐题协议（GSM8K 家族可比性）；>1 时走 QuestionScheduler 队列路径（题目
+    # 过滤真正生效，见 rollout.py）并按题拆分上传——训练端 micro-batch 契约
+    # （=num_pre_Q 行/批）不变。retool_math=4 → vLLM 每轮并发 4×8=32
+    # （旧值 8，H20 3B 严重欠利用；参考实现为 8 题×8 条=64）。
+    gen_questions_per_attempt=1,
 
     # ---- 训练 ----
     all_steps=300,
@@ -150,6 +161,8 @@ BASE = dict(
     # （预算按全长口径计，含工具段 token，2026-09-09 修复）。
     round_gen_tokens=400,    # 每轮 assistant 段生成长度上限（控制总上下文）
     tool_result_max_chars=500,  # 沙箱输出截断长度（防输出炸弹）
+    sandbox_workers=4,       # 沙箱线程池并发（subprocess 线程安全；retool_math
+                             # 并采 32 条/轮，覆盖为 8 防 spawn 串行段）
     sandbox_timeout=5.0,     # 代码执行超时（秒），超时 SIGKILL 子进程
     sandbox_mem_mb=256,      # 代码内存上限（Linux RLIMIT_AS，best-effort）
     max_context_tokens=2200, # 全轨迹（prompt+各段）上限，超限整组丢弃防 OOM
