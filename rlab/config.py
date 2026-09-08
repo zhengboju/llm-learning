@@ -91,6 +91,9 @@ BASE = dict(
 
     # ---- 基础设施 ----
     gen_device=0,            # vLLM 生成 + torch gen_logps 副本所在物理卡
+    gen_gpu_mem=0.45,        # 生成端 vLLM 显存占比（GPU0 = ref~7G + vLLM + 副本~7G
+                             # + logits 瞬时峰~12G，0.45×96 总计 ~70G < 96G；2026-09-09
+                             # 提速：旧 0.35 的 KV 池对 3B+GQA 大量闲置）
     ref_server_host="localhost",
     ref_server_port=59875,
     wandb_project="rlab",

@@ -124,7 +124,7 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
             sps = sampling_params
         outs = vllm_gen.generate([{"prompt_token_ids": ctx_ids[i]} for i in active],
                                  sps, use_tqdm=False)
-        new_ids_map, results = {}, {}
+        new_ids_map, results, exec_jobs = {}, {}, []
         for i, o in zip(active, outs):
             new_ids = list(o.outputs[0].token_ids)
             new_text = o.outputs[0].text
@@ -143,14 +143,30 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
             code = blocks[-1]          # 执行最后一个完整代码块（最新计算意图；
                                         # Auto_Program 原版取第一个——并非一致，是有意改进）
             code_stats[i]["code_used"] += 1
-            res = code_runner(code, timeout=cfg.get("sandbox_timeout", 5.0),
-                              mem_mb=cfg.get("sandbox_mem_mb", 256),
-                              max_chars=cfg.get("tool_result_max_chars", 500))
-            code_stats[i]["code_ok"] += int(res["ok"])
-            tool_text = TOOL_START + res["display"] + TOOL_END
-            tool_ids = tokenizer(tool_text, add_special_tokens=False)["input_ids"]
-            segs[i].append({"kind": "tool", "text": tool_text, "ids": tool_ids})
-            results[i] = tool_ids
+            exec_jobs.append((i, code))
+
+        # 沙箱并行执行（2026-09-09 提速）：run_code 是 subprocess，线程池并发安全。
+        # 旧版逐个串行：每个 subprocess 启动 ~0.1-0.3s，一条 5s 超时的死循环代码
+        # 会让同轮其余样本全部干等——4 条并行最多省 ~4x 的沙箱墙钟时间。
+        if exec_jobs:
+            workers = max(1, int(cfg.get("sandbox_workers", 4)))
+            def _run(pair):
+                i, code = pair
+                return i, code_runner(code, timeout=cfg.get("sandbox_timeout", 5.0),
+                                      mem_mb=cfg.get("sandbox_mem_mb", 256),
+                                      max_chars=cfg.get("tool_result_max_chars", 500))
+            if len(exec_jobs) > 1 and workers > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(workers, len(exec_jobs))) as ex:
+                    done = list(ex.map(_run, exec_jobs))
+            else:
+                done = [_run(p) for p in exec_jobs]
+            for i, res in done:
+                code_stats[i]["code_ok"] += int(res["ok"])
+                tool_text = TOOL_START + res["display"] + TOOL_END
+                tool_ids = tokenizer(tool_text, add_special_tokens=False)["input_ids"]
+                segs[i].append({"kind": "tool", "text": tool_text, "ids": tool_ids})
+                results[i] = tool_ids
         # 下一轮：只有执行过代码的样本续写（扩展上下文）；其余样本就此定格
         next_active = [i for i in active if i in results]
         for i in next_active:
@@ -273,7 +289,12 @@ def gen_worker(Q, cfg: dict):
     from vllm import LLM, SamplingParams
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
-    vllm_gen = LLM(model=cfg["model_path"], gpu_memory_utilization=0.35)
+    # 显存占比 0.35→0.45（2026-09-09 提速）：GPU0 = ref(~7G) + vLLM + torch副本(~7G)
+    # + gen_logps logits 瞬时峰(~6-12G)，0.45×96=43G 总计 ~70G < 96G，安全。
+    # 3B+GQA 的 KV 极小（每条 5k token 才 ~370MB），旧 0.35 的 KV 池大量闲置——
+    # 多给 vLLM 显存主要扩大 continuous batching 的调度余量。
+    vllm_gen = LLM(model=cfg["model_path"],
+                   gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)))
     # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）
     gen_torch = AutoModelForCausalLM.from_pretrained(
         cfg["model_path"], torch_dtype=torch.bfloat16,
@@ -427,6 +448,7 @@ def gen_worker(Q, cfg: dict):
     uploaded_total = 0
     is_retool = cfg["algo"] in ("retool", "retool_math")
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
+    samp_stats = {"attempts": 0, "dropped": 0}   # 丢弃重采可见性（丢弃率是速度杀手）
     while True:
         try_update_model()
         # dynamic sampling（DAPO 机制2）：全同组不占配额，继续采直到攒够 Q_batch_size 组
@@ -466,6 +488,10 @@ def gen_worker(Q, cfg: dict):
 
             groups.append((inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen))
 
+        # 丢弃重采可见性：outcome-only/难题下"全错组整组白跑"是最大的隐形时间黑洞，
+        # 丢弃率高就该调 num_pre_Q/难度分布，而不是让它悄悄吃掉一半 GPU 时间
+        samp_stats["attempts"] += attempts
+        samp_stats["dropped"] += attempts - len(groups)
         for g in groups:
             if is_retool:
                 plen, prompt_ids, r = g
@@ -504,6 +530,10 @@ def gen_worker(Q, cfg: dict):
                            [len(t) for t in ans_token_ids])
         if uploaded_total % 10 == 0:
             fout.flush()
+        if uploaded_total and uploaded_total % 16 == 0:
+            _a, _d = samp_stats["attempts"], samp_stats["dropped"]
+            print(f"[rollout] 采样统计: 累计尝试 {_a} 次 / 有效上传 {uploaded_total} 组"
+                  f"（丢弃率 {_d / max(1, _a) * 100:.0f}%，全同组/超长整组重采）", flush=True)
         # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/代码信号缺失）
         # retool 家族的 clen 上限按"轮数×每轮预算"计——旧版用
         # max_context_tokens-max_prompt_length（8192-1024=7168），而轨迹实际上限
