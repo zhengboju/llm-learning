@@ -15,6 +15,9 @@ round-4 eval 仍 fmt≈0、code_rate≈2%。怀疑 base+3B 在"写代码"压力�
 
     看训练后模型（checkpoint）的代码轨迹——训练期 code率 20-50% 但 greedy 看不到：
     CUDA_VISIBLE_DEVICES=0 python rlab/probe_retool_gen.py --n 8 --model ./rlab_out/retool/step_200 --temp 0.7 --show_prompt new
+
+    采样参数默认与训练完全一致（temp 0.7 / top_k 50 / top_p 1.0），
+    对照全词表行为用 --top_k -1。
 """
 import argparse
 import json
@@ -37,6 +40,12 @@ def main():
     ap.add_argument("--model", default="/root/Qwen2.5-3B", help="可指 checkpoint")
     ap.add_argument("--temp", type=float, default=0.7,
                     help="采样温度：0.7 与训练一致（能触发代码分支）；0=greedy")
+    # 【2026-09-08 探针对齐教训】训练端 SamplingParams 显式 top_k=50/top_p=1.0
+    # （collect_retool_group），探针此前漏传 top_k → vLLM 默认 -1 全词表采样——
+    # 采样分布与训练不一致，训练 record 的 code率不能直接对照探针。默认值必须
+    # 与训练完全一致，需要看全词表行为时再显式 --top_k -1。
+    ap.add_argument("--top_k", type=int, default=50, help="与训练一致；-1=全词表")
+    ap.add_argument("--top_p", type=float, default=1.0)
     ap.add_argument("--gpu_mem", type=float, default=0.22)
     ap.add_argument("--round_tokens", type=int, default=400, help="每轮 assistant 段上限")
     ap.add_argument("--max_rounds", type=int, default=3)
@@ -73,6 +82,7 @@ def main():
         "new": system_prompt_retool,
     }
     print(f"== 三路提示（{args.n} 题/路, seed={args.seed}, temp={args.temp}, "
+          f"top_k={args.top_k}, top_p={args.top_p}, "
           f"round_tokens={args.round_tokens}）==")
 
     # ---- 数据（与评测同源：modelscope gsm8k test, seed 抽样）----
@@ -91,7 +101,8 @@ def main():
               max_model_len=2600, dtype="bfloat16")
     from rlab.rollout import multi_turn_rollout_group
     from rlab.reward import reward_format, strip_code_blocks
-    sp = SamplingParams(temperature=args.temp, max_tokens=args.round_tokens)
+    sp = SamplingParams(temperature=args.temp, max_tokens=args.round_tokens,
+                        top_p=args.top_p, top_k=args.top_k)
     cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
            "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
 
