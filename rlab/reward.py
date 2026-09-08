@@ -216,8 +216,15 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
                              completion_len: int = 0, max_gen_tokens: int = 8192,
                              overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
     """retool-math outcome-only：与 total_reward_math 同 reward（±1），
-    工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。"""
-    base = total_reward_math(ground_truth, answer, completion_len=completion_len,
+    工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。
+
+    【2026-09-09 审查修复·打分域与 eval 统一】先剥离代码块再提取 boxed：
+    旧版直接在 assistant 拼接上取 boxed——模型在最终 boxed 之后补一段验证代码
+    （或码内含 boxed）时，训练端 rfind 会取到码内 boxed、eval 端（先剥离）取不到，
+    同一轨迹两边对错判定漂移。剥离后代码是脚手架（与 retool 口径一致）：
+    码内 boxed 不当答案，末 300 字符窗口也作用于剥离后的真实回答文本。"""
+    base = total_reward_math(ground_truth, strip_code_blocks(answer),
+                             completion_len=completion_len,
                              max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
                              overlong_shaping=overlong_shaping)
     # 保留 code 字段供 record 监控，但 reward 不含它

@@ -37,7 +37,9 @@ def normalize_row(idx, row):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "datasets" / "dapo_math")
-    ap.add_argument("--dev-size", type=int, default=50)
+    # dev=500（2026-09-09 审查修复）：原 50 题的二项噪声在 acc≈0.7 处约 ±6.5pp，
+    # 比项目 ±2pp 评测噪声地板大 3 倍，支撑不了任何结论；500 题约 ±2pp。
+    ap.add_argument("--dev-size", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)

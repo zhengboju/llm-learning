@@ -104,7 +104,8 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                  {"kind": "assistant"|"tool", "text": str, "ids": list[int]}
                  （ids = 该段真实 token 序列，assistant 段即 vLLM 采样 token）
       full_text: list[str] —— 每个样本的完整轨迹文本（prompt+全部段，日志用）
-      code_stats: list[{"code_used": int, "code_ok": int}]
+      code_stats: list[{"code_used": int, "code_ok": int, "trunc_final": int}]
+                  （trunc_final=1 表示末个 assistant 段被轮长上限切断）
     """
     n = len(prompts_text)
     # 每条请求的无 pad prompt token（与批量左 pad prompt_ids 同源：去 pad 即得）
@@ -127,7 +128,12 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
         for i, o in zip(active, outs):
             new_ids = list(o.outputs[0].token_ids)
             new_text = o.outputs[0].text
-            segs[i].append({"kind": "assistant", "text": new_text, "ids": new_ids})
+            # finish_reason（"length"=被轮长上限切断，"stop"=自然停；FakeGen 等测试
+            # 替身无此属性时按 None≈stop 处理——末段截断是 retool 答案被切的直接签名，
+            # 训练期不记录就永远看不见（2026-09-09 审查发现6）
+            fin = getattr(o.outputs[0], "finish_reason", None)
+            segs[i].append({"kind": "assistant", "text": new_text, "ids": new_ids,
+                            "finish_reason": fin})
             new_ids_map[i] = new_ids
             blocks = extract_python_blocks(new_text)
             if not blocks:
@@ -153,6 +159,11 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
 
     full_text = [p + "".join(s["text"] for s in segs_i)
                  for p, segs_i in zip(prompts_text, segs)]
+    # 末段截断标记：最后一个 assistant 段 finish_reason=="length" → final 答案
+    # 很可能被 round_gen_tokens 切断（acc 必 -1 的直接原因，训练期可见）
+    for i in range(n):
+        last_a = next((s for s in reversed(segs[i]) if s["kind"] == "assistant"), None)
+        code_stats[i]["trunc_final"] = int(bool(last_a) and last_a.get("finish_reason") == "length")
     return segs, full_text, code_stats
 
 
@@ -184,19 +195,21 @@ def retool_build_batch(prompt_ids, segs, plen, pad_token_id):
 
 
 def retool_context_overlong(per_sample_ids, plen, max_context_tokens):
-    """全轨迹 token 预算检查（模块级纯函数，CPU 可测）。
+    """逐样本全长 token 预算检查（模块级纯函数，CPU 可测）。任一样本超限即超。
 
-    【2026-09-09 修复】按 per_sample_ids **全长**（assistant+工具段）计——
-    旧版用 mask.sum() 只数 assistant token，工具段（每轮 ≤500 字符 ≈150-200
-    token，3 轮 ≈600）被漏算：防 OOM 防线可被超出 ~25%，且与 eval
-    max_len（max_prompt_length+max_context_tokens）联动错位——训练放行的
-    最长轨迹会撞 eval 的 vLLM max_model_len。"""
-    b = len(per_sample_ids)
-    total = sum(len(t) for t in per_sample_ids) + plen * b
-    return total > max_context_tokens * b
+    【2026-09-09 修复·两级】
+    ①全长口径（assistant+工具段一起计）——旧版用 mask.sum() 只数 assistant
+      token，工具段（每轮 ≤500 字符 ≈150-200 token，3 轮 ≈600）被漏算：防 OOM
+      防线可被超出 ~25%，且与 eval max_len（max_prompt_length+max_context_tokens）
+      联动错位——训练放行的最长轨迹会撞 eval 的 vLLM max_model_len。
+    ②逐样本口径——旧版按组均值（total > max*b）判定，单条超长样本可被组内短
+      样本均摊掩盖而放行；但 padded batch 按【最长样本】计激活显存，均值检查
+      挡不住单条尖峰。改为任一样本 len(ids)+plen > max_context_tokens 即整组丢弃。"""
+    return any(len(t) + plen > max_context_tokens for t in per_sample_ids)
 
 
-def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed):
+def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
+                      completion_lens=None):
     """阶段2 打分（模块级纯函数，CPU 可测）。
 
     索引契约（2026-09-08 真机 IndexError 教训）：asst_texts/code_stats 必须是
@@ -208,6 +221,11 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed):
     组内归一化后 fmt 梯度信号彻底死亡；全文还含沙箱输出 → "最后一个数字"
     变成工具 stdout，把工具结果当模型答案发信用。工具段只作上下文，也绝不
     参与打分——与"工具 token 不进 loss"是同一条原则在奖励端的投影。
+
+    completion_lens（可选）：每条轨迹的 token 全长（collect_retool_group 传入），
+    供 math 分支的 overlong shaping 使用——不传则 shaping 静默无效
+    （2026-09-09 审查发现12：旧版调用点从不传 completion_len，开了
+    overlong_shaping 也不生效）。
 
     返回 (adv, acc_s, fmt_s, code_used, code_ok, phase)。"""
     phase = reward_phase(steps_elapsed, cfg["reward_switch_step"])
@@ -221,7 +239,11 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed):
             idx = i * n + j
             if is_math:
                 sc = total_reward_retool_math(
-                    inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"])
+                    inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
+                    completion_len=(completion_lens[idx] if completion_lens is not None else 0),
+                    max_gen_tokens=cfg["max_gen_tokens"],
+                    overlong_buffer=cfg["overlong_buffer"],
+                    overlong_shaping=cfg.get("overlong_shaping", False))
             else:
                 sc = total_reward_retool(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
@@ -352,23 +374,26 @@ def gen_worker(Q, cfg: dict):
         return adv, torch.tensor(acc_s), torch.tensor(fmt_s)
 
     # ------------------- 阶段2 retool 专用：打分 / 打包 -------------------
-    def retool_score_group(inputs, full_texts, code_stats):
+    def retool_score_group(inputs, full_texts, code_stats, completion_lens=None):
         """多段轨迹打分（委托模块级 retool_score_flat，索引契约见其 docstring）。"""
         return retool_score_flat(inputs, full_texts, code_stats, cfg,
-                                 steps_elapsed=pushes[0] * cfg["gen_update_steps"])
+                                 steps_elapsed=pushes[0] * cfg["gen_update_steps"],
+                                 completion_lens=completion_lens)
 
-    def collect_retool_group(inputs, prompts_text, prompt_ids, plen):
+    def collect_retool_group(inputs, prompts_text, prompt_ids, plen, seed_salt=0):
         """多轮 rollout → 打分 → 上传就绪数据。超长/全同组返回 None（重采）。
 
         每题扩成 num_pre_Q 条独立轨迹（独立请求 + 独立 seed）——这是组内
-        对比的前提，也是 2026-09-08 真机 IndexError（轨迹数<打分索引）的根因。"""
+        对比的前提，也是 2026-09-08 真机 IndexError（轨迹数<打分索引）的根因。
+        seed_salt：随重采次数递增的盐——旧版丢组重采后复用同一批 seed，同题
+        再现时会生成完全相同的轨迹、必然再被丢（2026-09-09 审查修复）。"""
         n = cfg["num_pre_Q"]
         group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
         seed0 = cfg.get("seed")
         sps = [SamplingParams(n=1, temperature=cfg["temperature"],
                               max_tokens=cfg.get("round_gen_tokens", 400),
                               top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
-                              seed=(seed0 + k if seed0 is not None else None))
+                              seed=(seed0 + seed_salt + k if seed0 is not None else None))
                for k in range(len(group_prompts))]
         segs, full_texts, code_stats = multi_turn_rollout_group(
             vllm_gen, sps, tokenizer, group_prompts, cfg)
@@ -380,28 +405,28 @@ def gen_worker(Q, cfg: dict):
         if mask.shape[1] == 0:
             return None
         completion_lens = [len(t) for t in per_sample_ids]
-        # 真实上下文 token 数上限检查（防 OOM：超长整组丢弃重采）——全长口径
-        # （assistant+工具段一起计）：旧版 mask.sum() 只数 assistant token，
-        # 工具段每轮最多 500 字符≈150-200 token 被漏算（2026-09-09 审查发现2）
+        # 真实上下文 token 数上限检查（防 OOM：逐样本全长口径，任一超限整组
+        # 丢弃重采——2026-09-09 审查修复，旧版组均值口径会放行单条超长尖峰）
         if retool_context_overlong(per_sample_ids, plen, cfg["max_context_tokens"]):
-            print(f"[rollout] 轨迹超长 total={sum(completion_lens) + plen * len(per_sample_ids)}"
-                  f" > {cfg['max_context_tokens'] * len(per_sample_ids)}，整组丢弃重采")
+            print(f"[rollout] 轨迹超长（逐样本全长口径，max={cfg['max_context_tokens']}/条），"
+                  "整组丢弃重采")
             return None
         adv, acc_s, fmt_s, cu, ck, phase = retool_score_group(
-            inputs, asst_texts, code_stats)
+            inputs, asst_texts, code_stats, completion_lens=completion_lens)
         if not group_ok(adv):
             return None
         gen_logps = compute_gen_logps(merged_ids, plen)
         return {"merged": merged_ids, "mask": mask, "gen_logps": gen_logps,
                 "adv": adv, "acc": acc_s, "fmt": fmt_s,
-                "cu": cu, "ck": ck, "phase": phase,
-                "clen": completion_lens}
+                "cu": cu, "ck": ck, "phase": phase, "clen": completion_lens,
+                "trunc": [int(s["trunc_final"]) for s in code_stats]}
 
     # ------------------------- 采样主循环 -------------------------
     os.makedirs(os.path.dirname(os.path.abspath(cfg["record_path"])), exist_ok=True)
     fout = open(cfg["record_path"], "a", encoding="utf-8")
     uploaded_total = 0
     is_retool = cfg["algo"] in ("retool", "retool_math")
+    rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
     while True:
         try_update_model()
         # dynamic sampling（DAPO 机制2）：全同组不占配额，继续采直到攒够 Q_batch_size 组
@@ -421,9 +446,11 @@ def gen_worker(Q, cfg: dict):
                 continue
             if is_retool:
                 # 阶段2：多轮代码交织 → 打分 → 上传就绪（mask 已按段边界算好）
-                ready = collect_retool_group(inputs, prompts_text, prompt_ids, plen)
+                ready = collect_retool_group(inputs, prompts_text, prompt_ids, plen,
+                                             seed_salt=rollout_seq[0])
+                rollout_seq[0] += 1
                 if ready is None:
-                    continue  # 全同组/超长：重采
+                    continue  # 全同组/超长：重采（seed 盐已递增，不会复采同轨迹）
                 groups.append((plen, prompt_ids, ready))
                 continue
             voutputs = vllm_gen.generate(prompts_text, sampling_params, use_tqdm=False)
@@ -451,8 +478,10 @@ def gen_worker(Q, cfg: dict):
                     "t": time.time(), "algo": cfg["algo"],
                     "acc": r["acc"].tolist(), "fmt": r["fmt"].tolist(),
                     "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
+                    "trunc_final": r["trunc"],
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
-                health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"])
+                health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"],
+                               r["trunc"])
                 continue
             inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen = g
             tensor_list = [torch.tensor(t) for t in ans_token_ids]
@@ -476,9 +505,13 @@ def gen_worker(Q, cfg: dict):
         if uploaded_total % 10 == 0:
             fout.flush()
         # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/代码信号缺失）
+        # retool 家族的 clen 上限按"轮数×每轮预算"计——旧版用
+        # max_context_tokens-max_prompt_length（8192-1024=7168），而轨迹实际上限
+        # ≈3×1024+工具段，永远摸不到 0.95×上限，trunc 签名形同虚设
+        # （2026-09-09 审查发现6；真正的截断签名另见 trunc_final/retool_trunc）
         health.maybe_check(
             retool=is_retool,
-            max_clen=(cfg["max_context_tokens"] - cfg["max_prompt_length"])
+            max_clen=(cfg["max_rounds"] * cfg.get("round_gen_tokens", 400))
             if is_retool else cfg["max_gen_tokens"])
 
 

@@ -381,9 +381,9 @@ def test_multi_rollout_and_scoring():
           [s["kind"] for s in segs[1]] == ["assistant"]
           and [s["kind"] for s in segs[3]] == ["assistant"])
     check("code_used/ok 统计正确（末轮代码不计入）",
-          code_stats[0] == {"code_used": 2, "code_ok": 2}
-          and code_stats[1] == {"code_used": 0, "code_ok": 0}
-          and code_stats[2] == {"code_used": 1, "code_ok": 1})
+          code_stats[0] == {"code_used": 2, "code_ok": 2, "trunc_final": 0}
+          and code_stats[1] == {"code_used": 0, "code_ok": 0, "trunc_final": 0}
+          and code_stats[2] == {"code_used": 1, "code_ok": 1, "trunc_final": 0})
     check("工具段内容 = 沙箱 stdout",
           "42" in segs[0][1]["text"] and "5" in segs[2][1]["text"])
     check("每段带 ids（assistant 段 ids = 生成 token）",
@@ -408,13 +408,18 @@ def test_multi_rollout_and_scoring():
           m0[:a1] == [1.0] * a1 and m0[a1:a1 + tl1] == [0.0] * tl1)
 
     # 【发现2 修复锁】超长检查按全长（assistant+工具段）计——旧 mask.sum 口径漏算工具段
-    # （[[0]*5 是"长 5 的轨迹"，不是 token 值 5）
+    # （[[0]*5 是"长 5 的轨迹"，不是 token 值 5）。【2026-09-09 改逐样本口径】任一
+    # 样本 len+plen 超预算即超——组均值口径会放行单条超长尖峰（padded batch 按最长算）
     check("超长检查：全长口径（含工具段）触发",
-          retool_context_overlong([[0] * 5, [0] * 5], 3, 7))      # 5+5+3*2=16 > 7*2=14
+          retool_context_overlong([[0] * 5, [0] * 5], 3, 7))       # 逐样本 5+3=8 > 7
     check("超长检查：预算内不触发",
-          not retool_context_overlong([[0] * 5, [0] * 5], 3, 10))  # 16 < 20
+          not retool_context_overlong([[0] * 5, [0] * 5], 3, 10))  # 8 < 10
     check("超长检查：工具段撑爆预算（纯 assistant 口径会漏放行）",
-          retool_context_overlong([[0] * 10, [0] * (10 + 6)], 3, 15))  # 10+16+6=32 > 30，工具段6是关键
+          retool_context_overlong([[0] * 10, [0] * (10 + 6)], 3, 15))  # 19 > 15
+    check("超长检查：逐样本口径抓住组均值漏放行的单条尖峰",
+          retool_context_overlong([[0] * 18, [0] * 2], 2, 10))     # 20>10；旧组均值 (20+4)/2=12≤20 会放行
+    check("超长检查：逐样本口径——短样本不救长样本",
+          not retool_context_overlong([[0] * 5, [0] * 5], 2, 7))   # 7 ≤ 7 恰好放行
 
     # 打分索引契约：asst_texts 必须 = 题数 × num_pre_Q（真机 IndexError 的回归锁）
     cfg2 = get_config("retool", use_wandb=False)
@@ -525,6 +530,49 @@ def test_health_monitor():
     check("单权重翻转 1 ULP → 指纹必变", weight_fingerprint(sd2) != fp1)
 
 
+# --------------------------------- K. retool_math 审查修复回归锁（2026-09-09） ----
+def test_retool_math_fixes():
+    print("[K] retool_math 审查修复回归锁：math 打分域剥离 / retool_trunc / dev 剔除")
+    from rlab.reward import total_reward_retool_math
+    from rlab.health import window_check
+
+    # 打分域统一：码内 boxed 不得覆盖最终答案（训练端剥离口径与 eval 端一致，
+    # 修复前训练端 rfind 会取到码内 \boxed 导致同轨迹两端判定漂移）
+    ans_good = "reasoning ... \\boxed{42}"
+    ans_code_last = ans_good + "\n```python\nprint('\\boxed{99}')\n```"
+    check("math 打分域：码内 boxed 不覆盖最终答案（与无码版同判）",
+          total_reward_retool_math("42", ans_good)["acc"] == 1.0
+          and total_reward_retool_math("42", ans_code_last)["acc"] == 1.0)
+    ans_wrong = "reasoning \\boxed{42}\n```python\nprint(1)\n```"
+    check("math 打分域：剥离不影响最终答案对错判定",
+          total_reward_retool_math("42", ans_wrong)["acc"] == 1.0
+          and total_reward_retool_math("43", ans_wrong)["acc"] == -1.0)
+
+    # retool_trunc 签名：末段截断率 >20% 告警；无截断不误报
+    hist = [{"acc": 0.3, "fmt": 0.9, "clen": 300.0, "code_rate": 0.5,
+             "trunc_rate": 0.5} for _ in range(40)]
+    codes = {c for c, _ in window_check(hist, retool=True)}
+    check("retool 末段截断 >20% → retool_trunc", "retool_trunc" in codes)
+    hist_ok = [{"acc": 0.3, "fmt": 0.9, "clen": 300.0, "code_rate": 0.5,
+                "trunc_rate": 0.0} for _ in range(40)]
+    codes = {c for c, _ in window_check(hist_ok, retool=True)}
+    check("retool 末段未截断 → 不误报 retool_trunc", "retool_trunc" not in codes)
+    codes = {c for c, _ in window_check(hist_ok, retool=False)}
+    check("非 retool 不查 retool_trunc（旧 hist 无 trunc_rate 字段也兼容）",
+          "retool_trunc" not in codes)
+
+    # dev 剔除纯函数：训练池与 held-out 必须不相交（同池污染修复的契约锁）
+    from rlab.data import dapo_exclude_dev
+    pool = [{"Q": "q1", "A": "1"}, {"Q": "q2", "A": "2"}, {"Q": "q3", "A": "3"}]
+    dev = [{"question": "q2", "answer": "2"}]
+    kept = dapo_exclude_dev(pool, dev)
+    check("dev 剔除：dev 题从训练池移除", [r["Q"] for r in kept] == ["q1", "q3"])
+    check("dev 剔除：dev 为空 → 训练池不变", len(dapo_exclude_dev(pool, [])) == 3)
+    check("dev 剔除：匹配按题面全文（部分匹配不误删）",
+          [r["Q"] for r in dapo_exclude_dev(pool, [{"question": "q", "answer": "0"}])]
+          == ["q1", "q2", "q3"])
+
+
 # --------------------------------- J. 静态未定义名检查（运行时 NameError 防线） ----
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
@@ -540,6 +588,7 @@ def test_pyflakes_undefined():
     files = ["rlab/rollout.py", "rlab/train.py", "rlab/health.py", "rlab/config.py",
              "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
              "rlab/sandbox.py", "rlab/analysis.py", "rlab/probe_retool_gen.py",
+             "rlab/data.py", "rlab/prepare_dapo_math.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
@@ -563,6 +612,7 @@ if __name__ == "__main__":
     test_trajectory_logps()
     test_multi_rollout_and_scoring()
     test_health_monitor()
+    test_retool_math_fixes()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

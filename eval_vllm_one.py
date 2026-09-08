@@ -19,7 +19,9 @@ parser.add_argument("--out", default=None, help="结果json路径，默认 eval_
 parser.add_argument("--gpu_mem", type=float, default=0.26, help="vLLM显存占比(占总显存)；同卡并行N个进程就各给≈1/N")
 parser.add_argument("--max_len", type=int, default=None, help="prompt+全轨迹上限；None=自动（retool 用 400+2200，其余 1280）")
 parser.add_argument("--max_tokens", type=int, default=None, help="单轮/单次生成长度；None=自动取配置")
-parser.add_argument("--split", default="test", choices=["test", "train"], help="test=held-out(默认)；train=训练集内抽样(过拟合诊断：train高test低=过优化实锤)")
+parser.add_argument("--split", default="test", choices=["test", "train"],
+                    help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；"
+                         "train=训练池内抽样（过拟合诊断：train高test低=过优化实锤）")
 parser.add_argument("--show", type=int, default=0, help="打印前N个原始回答")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/dapo/retool/retool_math 等；指定后自动决定 prompt/预算/奖励口径。未指定时由 --retool 推断")
@@ -145,47 +147,27 @@ if args.eval_task == "gsm8k":
             f"ModelScope GSM8K {args.split} split 加载失败；"
             "已禁止回落 Hugging Face（pod HF 网络不通）。") from e
 elif args.eval_task == "dapo_math":
-    # 优先本地 jsonl（prepare_dapo_math 产物），失败回落 MsDataset/HF
-    local_candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "rlab", "datasets", "dapo_math", "dev.jsonl"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "rlab", "datasets", "dapo_math", "train.jsonl"),
-        "./rlab/datasets/dapo_math/dev.jsonl",
-        "./rlab/datasets/dapo_math/train.jsonl",
-    ]
-    test_data = None
-    for cand in local_candidates:
-        if os.path.exists(cand):
-            rows = []
-            with open(cand, encoding="utf-8") as f:
-                for line in f:
-                    line=line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r=json.loads(line)
-                        q=r.get("question") or r.get("Q")
-                        a=r.get("answer") or r.get("A")
-                        if q and a:
-                            rows.append({"Q": q, "A": a})
-                    except Exception:
-                        continue
-            if rows:
-                test_data = rows
-                print(f"  本地 dapo_math {cand}: {len(test_data)} 题")
-                break
-    if test_data is None:
-        try:
-            from rlab.data import load_dapo_math_train
-            rows = load_dapo_math_train()
-            test_data = rows
-            print(f"  rlab.data DAPO-Math-17k: {len(test_data)} 题")
-        except Exception as e:
-            raise RuntimeError(f"DAPO-Math 加载失败: {e}") from e
+    # 【2026-09-09 审查修复·split 强制生效】test=dev.jsonl(held-out)，train=训练池。
+    # 旧版两个 split 都回落全量 17k train pool（训练/评测同池污染）且 dev 缺失时
+    # 静默用训练池充当 held-out——现在 dev 缺失直接报错。
+    from rlab.data import load_dapo_math_dev, load_dapo_math_train
+    if args.split == "test":
+        test_data = load_dapo_math_dev()   # 缺失时 FileNotFoundError 带指引
+    else:
+        test_data = load_dapo_math_train()
+    print(f"  dapo_math [{args.split}]: {len(test_data)} 题")
 else:
     raise ValueError(f"未知 eval_task {args.eval_task}")
 
 random.seed(args.seed)
-sample = random.sample(test_data, min(args.n, len(test_data)))
+_n_take = min(args.n, len(test_data))
+if _n_take < args.n:
+    # 【2026-09-09 审查修复】n 大于池子时旧版静默缩水：dev=50 时请求 300 实评 50，
+    # 二项噪声 ±6.5pp 却当 300 题的精度用。现在大字告警 + 写进结果 json。
+    _noise = 1.96 * (0.5 ** 0.5) / (_n_take ** 0.5) * 100
+    print(f"  [警告] 请求 n={args.n} 但池仅 {len(test_data)} 题 → 实际评测 {_n_take} 题"
+          f"（最坏二项噪声 ±{_noise:.1f}pp，结论慎读）")
+sample = random.sample(test_data, _n_take)
 print(f"  固定 seed={args.seed}，抽 {len(sample)} 题  algo={args.algo} eval_task={args.eval_task} max_len={args.max_len} round_tokens={args.round_tokens}")
 
 # ---------- 建 prompt ----------
@@ -194,6 +176,29 @@ prompts = [tokenizer.apply_chat_template(
     [{"role": "system", "content": system_prompt},
      {"role": "user", "content": item["Q"]}], tokenize=False, add_generation_prompt=True)
     for item in sample]
+
+# 【2026-09-09 审查修复·prompt 长度防线】训练端 plen>max_prompt_length 跳组，eval
+# 旧版没有任何防线：长题多轮 ctx 增长后撞 vLLM max_model_len → 整个 eval 进程崩溃。
+# 规则与训练对齐：prompt + 生成预算 + 工具段余量 > max_len 的题剔除（训练端同规则
+# 根本采不到这些题，剔除后口径反而更一致），剔除数进结果 json。
+_gen_budget = (args.max_rounds * args.round_tokens + 512) if is_retool_family \
+    else (args.max_tokens + 64)
+_kept, _dropped_long = [], 0
+for _item, _p in zip(sample, prompts):
+    _pl = len(tokenizer(_p, add_special_tokens=False)["input_ids"])
+    if _pl + _gen_budget > args.max_len:
+        _dropped_long += 1
+        continue
+    _kept.append((_item, _p))
+if _dropped_long:
+    print(f"  [警告] {_dropped_long} 题 prompt+生成预算超 max_len={args.max_len}，已剔除"
+          "（与训练端跳组规则对齐）")
+if not sample:
+    raise RuntimeError(
+        f"所有抽中题目的 prompt+生成预算都超 max_len={args.max_len}，无题可评；"
+        "请调大 --max_len 或检查数据")
+sample = [it for it, _ in _kept]
+prompts = [p for _, p in _kept]
 
 # ---------- vLLM 批量生成 ----------
 print(f"[2/3] vLLM 生成并评分 ... {name}: {args.model}")
@@ -225,11 +230,13 @@ else:
     code_used = code_ok = [0] * len(answers)
 
 # ---------- 评分 ----------
+# 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
+# 把"只写代码没写答案/输出为空"的样本剔出分母，模型退化时反而美化 acc。
 acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
 for i, (item, ans) in enumerate(zip(sample, answers)):
-    if len(ans.strip()) == 0:
-        continue
     n_valid += 1
+    if len(ans.strip()) == 0:
+        continue    # 空答案：计入分母，acc/fmt 记 0
     # ground_truth 归一：gsm8k 带 ####，dapo 直接答案
     if args.eval_task == "gsm8k":
         gt = item["A"].split("####")[-1].strip()
@@ -245,7 +252,8 @@ for i, (item, ans) in enumerate(zip(sample, answers)):
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid,
-          "algo": args.algo, "eval_task": args.eval_task}
+          "n_requested": args.n, "n_dropped_long": _dropped_long,
+          "algo": args.algo, "eval_task": args.eval_task, "split": args.split}
 if is_retool_family and n_valid:
     result["code_rate"] = sum(1 for u in code_used if u > 0) / n_valid
     result["code_ok_rate"] = sum(1 for k in code_ok if k > 0) / n_valid

@@ -37,8 +37,12 @@ ALGO_DEFAULTS = {
     # 差异全在 rollout：分段轨迹 + 沙箱 + 工具段 mask 置0，见 docs/02-retool.md）
     "retool":  dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_std",
                     loss_norm="sample_mean"),
-    # 方案1：retool-math（对齐 agentic-rl-lab/05-retool）—— DAPO-Math-17k + outcome-only
-    # boxed + 8192 预算 + clip-higher（0.2/0.28）
+    # 方案1：retool-math（借鉴 agentic-rl-lab/05-retool）—— DAPO-Math-17k + outcome-only
+    # boxed + clip-higher（0.2/0.28）。注意这是【混血配方】而非逐项对齐：loss_norm 保持
+    # sample_mean、保留 KL β=0.04（原 DAPO 是 token_mean+无 KL）；对比实验写报告时
+    # 须注明。预算：每轮上限 round_gen_tokens=1024 × max_rounds=3 ≈ 3072 token，
+    # 远小于名义 max_gen_tokens/max_context_tokens=8192——后者的防 OOM 检查在此
+    # preset 下基本不触发（留作保险丝；真正要紧的轮长截断见 health 的 retool_trunc）。
     "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_std",
                         loss_norm="sample_mean", data_task="dapo_math",
                         max_context_tokens=8192, round_gen_tokens=1024,
@@ -165,7 +169,7 @@ _RETOOL_EXTRA = (
 )
 system_prompt_retool = BASE["system_prompt"] + _RETOOL_EXTRA
 
-# 方案1：retool-math 系统提示（对齐 agentic-rl-lab/05-retool）—— outcome-only \boxed{}
+# 方案1：retool-math 系统提示（借鉴 agentic-rl-lab/05-retool）—— outcome-only \boxed{}
 _RETOOL_MATH_SYSTEM = (
     "You solve math problems step by step with help from a Python code interpreter.\n"
     "Use the code_interpreter tool when calculation, symbolic manipulation, or enumeration helps you solve the problem accurately and quickly.\n\n"

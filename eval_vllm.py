@@ -28,7 +28,8 @@ parser.add_argument("--gpu_mem", type=float, default=None, help="单进程vLLM�
 parser.add_argument("--skip_base", action="store_true")
 parser.add_argument("--base_path", default="/root/Qwen2.5-3B")
 parser.add_argument("--show", type=int, default=0)
-parser.add_argument("--split", default="test", choices=["test", "train"], help="train=训练集内抽样(过拟合诊断)")
+parser.add_argument("--split", default="test", choices=["test", "train"],
+                    help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math；自动决定 prompt/预算/奖励口径")

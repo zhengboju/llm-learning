@@ -6,6 +6,7 @@
 fixture 模式供 CPU 冒烟测试，不触网。
 """
 
+import json
 import os
 
 # 数据源选择：默认 ms（训练机 HF 网络不通）；RLAB_DATA_SOURCE=hf 可强制只走 HF，
@@ -134,18 +135,69 @@ _DAPO_PROMPT_PREFIX = (
 )
 _DAPO_PROMPT_SUFFIX = '\n\nRemember to put your answer on its own line after "Answer:".'
 
-
-def _strip_dapo_template(q: str) -> str:
-    if q.startswith(_DAPO_PROMPT_PREFIX):
-        q = q[len(_DAPO_PROMPT_PREFIX):]
-    if q.endswith(_DAPO_PROMPT_SUFFIX):
-        q = q[:-len(_DAPO_PROMPT_SUFFIX)]
-    return q.strip()
+# 本地 prepare_dapo_math 产物目录（train.jsonl 已剔除 dev、dev.jsonl 为 held-out）
+_DAPO_LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "dapo_math")
 
 
-def load_dapo_math_train():
-    """DAPO-Math-17k train。清洗逻辑与 agentic-rl-lab/05-retool/prepare_data.py 一致。"""
+def _read_qa_jsonl(path: str) -> list:
+    """读 prepare 脚本产物的 jsonl（question/Q + answer/A 键名都兼容）。"""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            q = r.get("question") or r.get("Q")
+            a = r.get("answer") or r.get("A")
+            if q and a:
+                rows.append({"Q": str(q), "A": str(a)})
+    return rows
+
+
+def load_dapo_math_dev() -> list:
+    """held-out 评测池 = dev.jsonl（prepare_dapo_math 产物）。
+
+    【2026-09-09 审查修复·训练/评测同池污染】原 eval 端 dev.jsonl 缺失时静默回落
+    全量 17k train split——评的全是训练池内的题。现在 dev 缺失直接报错并给出
+    指引，绝不静默用训练池充当 held-out。"""
+    path = os.path.join(_DAPO_LOCAL_DIR, "dev.jsonl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"[data] dapo_math held-out 集缺失: {path}\n"
+            "  先运行: python -m rlab.prepare_dapo_math --dev-size 500\n"
+            "  （不要用训练池充当 held-out——那是 2026-09-09 审查发现的同池污染）")
+    rows = _read_qa_jsonl(path)
+    if not rows:
+        raise RuntimeError(f"[data] dev.jsonl 存在但清洗后为空: {path}")
+    print(f"[data] dapo_math dev.jsonl (held-out): {len(rows)} 题")
+    return rows
+
+
+def dapo_exclude_dev(rows: list, dev_rows: list) -> list:
+    """纯函数：从全量池中剔除 dev 题（按题面文本匹配，兼容 dev/train.jsonl 与
+    全量加载两种行格式）。训练/评测不相交的契约所在，CPU 可测。"""
+    dev_qs = {str(r.get("question") or r.get("Q") or "").strip() for r in dev_rows}
+    return [r for r in rows if str(r.get("Q") or "").strip() not in dev_qs]
+
+
+def load_dapo_math_train() -> list:
+    """训练池。优先本地 train.jsonl（prepare 产物，已剔除 dev）；否则加载全量
+    17k 并按 dev.jsonl 剔除 dev 题——保证训练池与 held-out 不相交。
+
+    【2026-09-09 审查修复】旧版直接返回全量 17k：即使跑了 prepare 脚本，dev 题
+    依然在训练池里（prepare 只写文件、训练路径根本不读 train.jsonl），dev=50 题
+    被完整训过还拿来当评测集。"""
     ms_err = None
+    train_jsonl = os.path.join(_DAPO_LOCAL_DIR, "train.jsonl")
+    if os.path.exists(train_jsonl):
+        rows = _read_qa_jsonl(train_jsonl)
+        if rows:
+            print(f"[data] DAPO-Math 训练池 via 本地 train.jsonl（已剔除 dev）: {len(rows)} 条")
+            return rows
     # 1) 尝试 modelscope（训练机默认；HF 镜像也可能通）
     if DATA_SOURCE in ("ms", "auto"):
         try:
@@ -169,7 +221,7 @@ def load_dapo_math_train():
                             rows.append({"Q": q, "A": a})
                     if rows:
                         print(f"[data] DAPO-Math-17k via modelscope {ms_id}: {len(rows)} 条")
-                        return rows
+                        return _dapo_strip_dev(rows)
                 except Exception:
                     continue
             raise RuntimeError("modelscope DAPO-Math-17k 均未命中")
@@ -195,6 +247,30 @@ def load_dapo_math_train():
         if not rows:
             raise RuntimeError("HF DAPO-Math-17k 清洗后为空")
         print(f"[data] DAPO-Math-17k via HF: {len(rows)} 条")
-        return rows
+        return _dapo_strip_dev(rows)
     except Exception as e:
         raise RuntimeError(f"[data] DAPO-Math-17k 加载失败：modelscope 错误={ms_err}，HF 错误={e}") from e
+
+
+def _dapo_strip_dev(rows: list) -> list:
+    """全量池剔除 dev 题；dev.jsonl 缺失时打大字警告（此时评测协议已破坏）。"""
+    dev_path = os.path.join(_DAPO_LOCAL_DIR, "dev.jsonl")
+    if os.path.exists(dev_path):
+        dev_rows = _read_qa_jsonl(dev_path)
+        kept = dapo_exclude_dev(rows, dev_rows)
+        print(f"[data] 训练池剔除 dev 题: {len(rows)} -> {len(kept)}（dev {len(dev_rows)} 题）")
+        return kept
+    print("\n" + "!" * 70)
+    print(f"[data] 警告: dev.jsonl 缺失（{dev_path}），训练池无法剔除 held-out 题！")
+    print("[data] 此训练池跑出的模型将没有可信的 held-out 评测。")
+    print("[data] 请运行: python -m rlab.prepare_dapo_math --dev-size 500")
+    print("!" * 70 + "\n")
+    return rows
+
+
+def _strip_dapo_template(q: str) -> str:
+    if q.startswith(_DAPO_PROMPT_PREFIX):
+        q = q[len(_DAPO_PROMPT_PREFIX):]
+    if q.endswith(_DAPO_PROMPT_SUFFIX):
+        q = q[:-len(_DAPO_PROMPT_SUFFIX)]
+    return q.strip()

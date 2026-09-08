@@ -29,7 +29,8 @@ def main():
     ap.add_argument("--gpus", default="0", help="评测用卡；默认 0 号（与生成端共卡需错峰）")
     ap.add_argument("--per_gpu", type=int, default=1,
                     help="每卡同时跑的模型进程数；1=卡内串行（默认，防OOM）")
-    ap.add_argument("--split", default="test", choices=("test", "train"))
+    ap.add_argument("--split", default="test", choices=("test", "train"),
+                    help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
     ap.add_argument("--skip_base", action="store_true")
     ap.add_argument("--retool", action="store_true",

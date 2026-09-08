@@ -69,6 +69,13 @@ def window_check(hist, *, retool=False, max_clen=None):
                        f"completion 长度窗口均值顶满上限（>{0.95 * max_clen:.0f}）"
                        "→ 截断坍缩（答案被切、奖励学不到），查生成长度预算"))
 
+    # --- 签名④b：retool 末段截断（轮长上限切断 final 答案——retool 家族真正的
+    # 截断失败模式；clen 顶满上限检查探不到它，因为每轮各自 cap 在 round_gen_tokens）
+    if retool and _wmean([h.get("trunc_rate", 0.0) for h in hist[-k:]]) > 0.2:
+        alerts.append(("retool_trunc",
+                       "最近 32 组 >20% 样本的末段被轮长上限切断 → final 答案被截、"
+                       "acc 结构性受损，建议调大 round_gen_tokens 或 max_rounds"))
+
     # --- 签名⑤：retool 代码信号未出现（提示性，非致命）
     if retool and n >= 128 and _wmean([h["code_rate"] for h in hist[-k:]]) == 0.0:
         alerts.append(("no_code",
@@ -107,12 +114,15 @@ class HealthMonitor:
         self.check_every = check_every
         self.fired = set()
 
-    def observe(self, acc_list, fmt_list, clen_list, code_used_list=None):
-        """聚合一个组的标量摘要（acc/fmt 为 ±1 口径列表）。"""
+    def observe(self, acc_list, fmt_list, clen_list, code_used_list=None,
+                trunc_list=None):
+        """聚合一个组的标量摘要（acc/fmt 为 ±1 口径列表）。trunc_list：每条轨迹
+        末段是否被轮长上限切断（0/1，retool 家族；缺省按 0 记）。"""
         e = {"acc": _wmean(list(acc_list)), "fmt": _wmean(list(fmt_list)),
              "clen": _wmean(list(clen_list)),
              "code_rate": (sum(1 for u in code_used_list if u > 0) / len(code_used_list))
-             if code_used_list else 0.0}
+             if code_used_list else 0.0,
+             "trunc_rate": (_wmean(list(trunc_list)) if trunc_list else 0.0)}
         self.hist.append(e)
 
     def maybe_check(self, retool: bool = False, max_clen=None):
