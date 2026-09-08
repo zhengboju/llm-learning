@@ -236,6 +236,33 @@ def test_config_retool():
           and "You MUST write Python code" in cfg["system_prompt"])
 
 
+def test_config_retool_math():
+    print("[F2] config retool_math preset（对齐 agentic-rl-lab/05-retool 采样与组配置）")
+    cfg = get_config("retool_math", use_wandb=False)
+    check("retool_math 采样 temperature=1.0（GSM8K 的 0.7 是格式学习遗产，math 无格式压力）",
+          cfg["temperature"] == 1.0)
+    check("retool_math 无 top_k（vLLM top_k=-1=全词表，与参考一致）", cfg["top_k"] == -1)
+    check("retool_math 组 8 条（参考 group_size=8，micro batch 同步 8）",
+          cfg["num_pre_Q"] == 8 and cfg["train_micro_batch_size_per_gpu"] == 8)
+    check("retool_math adv 不除 std（参考组内减均值，group_mean）",
+          cfg["adv_mode"] == "group_mean")
+    # 联动锁：num_pre_Q=8 必须配 group_mean（两处一起改，缺一即错）
+    from rlab.losses import compute_advantages
+    from rlab.rollout import group_ok
+    r = torch.tensor([1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0])
+    adv = compute_advantages(r, 8, cfg["adv_mode"])
+    check("group_mean：8 条组 adv=r-mean（形状/除零安全）",
+          adv.shape == (8,) and bool(((adv - (r - r.mean())).abs() < 1e-6).all()))
+    check("group_mean 下非均匀组 group_ok 照常通过", bool(group_ok(adv)))
+    check("group_mean 下全同组 group_ok 照常拒绝（零方差丢弃语义不变）",
+          not bool(group_ok(compute_advantages(torch.ones(8), 8, cfg["adv_mode"]))))
+    # BASE 隔离锁：retool_math preset 不得污染其他算法
+    g = get_config("grpo", use_wandb=False)
+    check("BASE 隔离：grpo 仍是 0.7/top_k=50/4 条/group_std",
+          g["temperature"] == 0.7 and g["top_k"] == 50
+          and g["num_pre_Q"] == 4 and g["adv_mode"] == "group_std")
+
+
 # --------------------------------- G. tiny GPT2：logps 对齐 + mask 排除 ----
 def _save_tiny_gpt2(tmpdir):
     from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
@@ -623,6 +650,7 @@ if __name__ == "__main__":
     test_strip_code_scoring()
     test_protocol_mask()
     test_config_retool()
+    test_config_retool_math()
     test_trajectory_logps()
     test_multi_rollout_and_scoring()
     test_health_monitor()

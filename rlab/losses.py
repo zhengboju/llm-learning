@@ -152,7 +152,8 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
             loss = loss + (kl_term * mask).sum(dim=1).div(mask.sum(dim=1)).mean()
 
     elif algo == "retool_math":
-        # 方案1：与 retool 同 loss（group_std/sample_mean），差异在数据/奖励/预算
+        # 方案1：与 retool 同 loss 形状（sample_mean），adv 用 group_mean（不除 std，
+        # 对齐参考实现的组内减均值；4 条小 group 除 std 放大噪声，8 条组才用此形态）
         per_token_loss = -(pg_term - kl_term)
         # 复用 sample_mean 逻辑（与 grpo/retool 同）
         loss = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1)).mean()

@@ -38,13 +38,23 @@ ALGO_DEFAULTS = {
     "retool":  dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_std",
                     loss_norm="sample_mean"),
     # 方案1：retool-math（借鉴 agentic-rl-lab/05-retool）—— DAPO-Math-17k + outcome-only
-    # boxed + clip-higher（0.2/0.28）。注意这是【混血配方】而非逐项对齐：loss_norm 保持
-    # sample_mean、保留 KL β=0.04（原 DAPO 是 token_mean+无 KL）；对比实验写报告时
-    # 须注明。预算：每轮上限 round_gen_tokens=1024 × max_rounds=3 ≈ 3072 token，
-    # 远小于名义 max_gen_tokens/max_context_tokens=8192——后者的防 OOM 检查在此
-    # preset 下基本不触发（留作保险丝；真正要紧的轮长截断见 health 的 retool_trunc）。
-    "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_std",
+    # boxed + clip-higher（0.2/0.28）+ 参考实现的采样与组配置：
+    # temperature=1.0、无 top_k（vLLM top_k=-1=全词表）、组 8 条、adv 不除 std。
+    # 【2026-09-09 对齐修改，两处联动】①0.7/top_k=50 是 GSM8K 格式学习时代的遗产
+    # （当时为把格式信号从 10% 抬到 27%），math 系 outcome-only 毫无格式压力，
+    # 保守采样只剩副作用（压探索→组内更易全错→零方差丢弃）；②num_pre_Q 4→8 必须
+    # 配 adv group_std→group_mean（参考组内减均值不除 std；4 条小 group 下除 std
+    # 放大噪声，8 条才配用不除 std 的形态）。
+    # 仍与参考不同的三处（报告须注明）：loss_norm 保持 sample_mean、保留 KL β=0.04、
+    # Q_batch_size=1（参考每 step 8 题×8 条=64 条；我们每 upload 1 题×8 条，
+    # 有效 batch=8×grad_accum4=32 样本/optimizer step，旧协议是 16）。
+    # 预算：每轮上限 round_gen_tokens=1024 × max_rounds=3 ≈ 3072 token，
+    # 远小于名义 max_gen_tokens/max_context_tokens=8192——后者留作保险丝；
+    # 真正要紧的轮长截断见 health 的 retool_trunc。
+    "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
                         loss_norm="sample_mean", data_task="dapo_math",
+                        num_pre_Q=8, train_micro_batch_size_per_gpu=8,
+                        temperature=1.0, top_k=-1,
                         max_context_tokens=8192, round_gen_tokens=1024,
                         max_gen_tokens=8192, max_prompt_length=1024,
                         code_w=0.0, reward_switch_step=1000000000),
