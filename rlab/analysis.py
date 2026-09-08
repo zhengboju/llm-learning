@@ -35,22 +35,40 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
     return "\n".join(lines)
 
 
-def summarize_record(path: str, window: int = 20) -> str:
-    """按 upload 批次滑动平均 acc/format 正确率。"""
-    accs, fmts, out = [], [], ["| 批次窗口 | acc率 | fmt率 |", "|---|---|---|"]
+def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
+    """按 upload 批次滑动平均 acc/fmt/code 率与完成长度（retool 诊断用）。
+
+    clen_cap ≈ max_context_tokens(2200) - 典型 prompt(~400) = 1800：接近上限
+    说明轨迹在撞上下文预算（会被整组丢弃或标签被截断）——2026-09-08 第四轮
+    "格式学到 75-95% 后崩回 0"的嫌疑机制，需 clen/code 趋势佐证。"""
+    accs, fmts, codes, clens = [], [], [], []
+    out = ["| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap |",
+           "|---|---|---|---|---|---|"]
     with open(path, encoding="utf-8") as f:
         for line in f:
             try:
                 rec = json.loads(line)
                 accs.extend(a > 0 for a in rec.get("acc", []))
                 fmts.extend(v > 0 for v in rec.get("fmt", []))
+                codes.extend(u > 0 for u in rec.get("code_used", []))
+                clens.extend(rec.get("clen", []))
             except json.JSONDecodeError:
                 continue
     for i in range(0, len(accs), window):
-        chunk_a, chunk_f = accs[i:i + window], fmts[i:i + window]
-        if chunk_a:
-            out.append(f"| {i}~{i+len(chunk_a)} | {sum(chunk_a)/len(chunk_a)*100:.1f}% "
-                       f"| {sum(chunk_f)/len(chunk_f)*100:.1f}% |")
+        chunk_a, chunk_f, chunk_c = accs[i:i + window], fmts[i:i + window], codes[i:i + window]
+        chunk_l = clens[i:i + window]
+        if not chunk_a:
+            continue
+        code_col = f"{sum(chunk_c) / len(chunk_c) * 100:.1f}%" if chunk_c else "—"
+        if chunk_l:
+            avg_l = sum(chunk_l) / len(chunk_l)
+            near = sum(1 for l in chunk_l if l >= 0.9 * clen_cap) / len(chunk_l)
+            len_col = f"{avg_l:.0f} | {near * 100:.0f}%"
+        else:
+            len_col = "— | —"
+        out.append(f"| {i}~{i + len(chunk_a)} | {sum(chunk_a) / len(chunk_a) * 100:.1f}% "
+                   f"| {sum(chunk_f) / len(chunk_f) * 100:.1f}% | {code_col} "
+                   f"| {len_col} |")
     return "\n".join(out)
 
 

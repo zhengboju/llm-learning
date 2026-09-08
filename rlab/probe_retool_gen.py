@@ -18,8 +18,14 @@ round-4 eval 仍 fmt≈0、code_rate≈2%。怀疑 base+3B 在"写代码"压力�
 """
 import argparse
 import json
+import os
 import random
 import subprocess
+import sys
+
+# 允许 `python rlab/probe_retool_gen.py` 直接跑（sys.path[0] 会变成 rlab/ 目录，
+# 找不到 rlab 包）；`python -m rlab.probe_retool_gen` 时该插入无害。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformers import AutoTokenizer
 
