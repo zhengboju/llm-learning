@@ -32,6 +32,23 @@ if [ "$ALGO" = "rfpp" ]; then MODE=rfpp; fi
 
 echo "[run] algo=$ALGO model=$MODEL ref_server_mode=$MODE ref_gpu=$REF_GPU train_gpu=$TRAIN_GPU"
 
+# 【record 防混跑】record.jsonl 是追加写，多次 run 混进同一文件会让曲线跨 run
+# 误读（2026-09-08 五会话混排把"会话边界"读成"训练中崩溃"的教训）。
+# 启动前归档旧 record（纯文本很小，直接 mv）。
+OUT_DIR="rlab_out/$ALGO"
+if [ -f "$OUT_DIR/record.jsonl" ]; then
+  TS=$(date +%m%d-%H%M%S)
+  mv "$OUT_DIR/record.jsonl" "$OUT_DIR/record.jsonl.bak-$TS"
+  echo "[run] 已归档旧 record -> $OUT_DIR/record.jsonl.bak-$TS"
+fi
+# 【旧 checkpoint 提示】out_dir 按 algo 共享，新 run 到 save_steps 会覆盖同名
+# step_* 目录（9/8 step_200 被静默覆盖、评测到旧 run 模型的教训）。不自动移动
+# （每个 ~6.7G）；新 run 写的 checkpoint 内含 run_info.json（git_head+时刻）可自证出处。
+if ls "$OUT_DIR"/step_* >/dev/null 2>&1; then
+  echo "[run] 注意: $OUT_DIR 下已有旧 checkpoint: $(ls -d "$OUT_DIR"/step_* | tr '\n' ' ')"
+  echo "[run]       新 run 会覆盖同名目录；评测前核对 checkpoint 内 run_info.json"
+fi
+
 # 退出清理：无论正常结束、训练崩溃还是 Ctrl+C，都杀掉 ref_server，
 # 防止孤儿进程占着 ~7G 显存（set -e 直接退出会跳过普通 kill 语句）
 REF_PID=""

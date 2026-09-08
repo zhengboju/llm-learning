@@ -42,6 +42,30 @@ def get_batch(ref_server):
     return decode_batch(r)
 
 
+def _git_head() -> str:
+    try:
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return subprocess.check_output(["git", "log", "-1", "--oneline"],
+                                       text=True, cwd=root).strip()
+    except Exception:
+        return "unknown"
+
+
+def write_run_info(path: str, cfg: dict) -> None:
+    """把 run 身份（git head/开始时刻/完整配置）落成 json——checkpoint 与 record
+    从此自证出处。（2026-09-08 教训：out_dir 按 algo 共享，多次 run 会静默覆盖
+    step_* 同名 checkpoint，评测可能在测旧 run 的模型而毫不知情。）"""
+    info = {"git_head": _git_head(), "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "algo": cfg["algo"], "model_path": cfg["model_path"],
+            "all_steps": cfg["all_steps"], "seed": cfg.get("seed"),
+            "reward_switch_step": cfg.get("reward_switch_step"),
+            "round_gen_tokens": cfg.get("round_gen_tokens"),
+            "temperature": cfg.get("temperature")}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+
+
 def run_training(cfg, args):
     import deepspeed
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -52,6 +76,8 @@ def run_training(cfg, args):
     gen_proc = None
     Q = None
     if dist.get_rank() == 0:
+        os.makedirs(cfg["out_dir"], exist_ok=True)
+        write_run_info(os.path.join(cfg["out_dir"], "run_info.json"), cfg)
         print("\n[train] START vLLM generation worker...\n")
         mp.set_start_method("spawn", force=True)
         Q = mp.Queue()
@@ -172,6 +198,7 @@ def run_training(cfg, args):
                 sd = type(sd)({k: v.cpu() for k, v in sd.items()})
                 engine.module.save_pretrained(save_name, state_dict=sd)
                 tokenizer.save_pretrained(save_name)
+                write_run_info(os.path.join(save_name, "run_info.json"), cfg)
                 print(f"[train] saved -> {save_name}")
             dist.barrier()
 
