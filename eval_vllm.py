@@ -7,7 +7,15 @@
 #   python eval_vllm.py --n 300 --gpus 0,1 --per_gpu 3 \
 #       --tuned grpo200=/path/grpo,dapo200=/path/dapo,rfpp100=/path/100,rfpp200=/path/200,rfpp300=/path/300
 #   （BASE 默认评；--skip_base 跳过；--gpus auto=全部可见卡）
-import argparse, json, os, queue, re, subprocess, sys, threading, time
+import argparse
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--tuned", default="", help="逗号分隔 checkpoint，支持 name=path；空=只评BASE")
@@ -22,7 +30,9 @@ parser.add_argument("--base_path", default="/root/Qwen2.5-3B")
 parser.add_argument("--show", type=int, default=0)
 parser.add_argument("--split", default="test", choices=["test", "train"], help="train=训练集内抽样(过拟合诊断)")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
-parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（透传给每个单模型进程）")
+parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
+parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math；自动决定 prompt/预算/奖励口径")
+parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"], help="评测数据集；None=自动")
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -59,7 +69,7 @@ assert models, "没有可评模型"
 gpus = list(range(os.cpu_count() and __import__("torch").cuda.device_count())) \
     if args.gpus.strip().lower() == "auto" else [int(x) for x in args.gpus.split(",") if x.strip()]
 assert gpus, "无可用GPU"
-print(f"[调度] 模型数={len(models)}，GPU={gpus}，每卡并发={args.per_gpu}，单进程gpu_mem={GPU_MEM}")
+print(f"[调度] 模型数={len(models)}，GPU={gpus}，每卡并发={args.per_gpu}，单进程gpu_mem={GPU_MEM}  algo={args.algo} eval_task={args.eval_task}")
 
 one_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_vllm_one.py")
 # 分配：模型 round-robin 均匀摊到各 GPU 队列；每 GPU 的任务严格串行处理
@@ -102,6 +112,10 @@ def run_one(gpu, idx, name, path):
            "--gpu_mem", str(GPU_MEM), "--out", out_json]
     if args.retool:
         cmd += ["--retool"]
+    if args.algo is not None:
+        cmd += ["--algo", args.algo]
+    if args.eval_task is not None:
+        cmd += ["--eval_task", args.eval_task]
     if args.show:
         cmd += ["--show", str(args.show)]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
@@ -149,7 +163,7 @@ for t in threads:
 for t in threads:
     t.join()
 
-print(f"\n{'='*60}\n[总表]（GSM8K test，N={args.n}，seed={args.seed}）")
+print(f"\n{'='*60}\n[总表]（N={args.n}，seed={args.seed} algo={args.algo} task={args.eval_task}）")
 print(f"{'模型':<16}{'准确率':>10}{'格式率':>10}{'双达标':>10}{'有效样本':>10}")
 for name, r in results.items():
     print(f"{name:<16}{r['acc']*100:>9.1f}%{r['fmt']*100:>9.1f}%{r['both']*100:>9.1f}%{r['n']:>10}")

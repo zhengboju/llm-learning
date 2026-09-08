@@ -8,6 +8,8 @@
     python -m rlab.eval --models grpo300=./rlab_out/grpo/step_300 dapo300=./rlab_out/dapo/step_300
     python -m rlab.eval --models "grpo300=./x, dapo300=./y"   # 引号+逗号亦可
     python -m rlab.eval --models ./rlab_out/grpo/step_300      # 不带 name 自动取路径末3段
+    python -m rlab.eval --retool --models retool300=./rlab_out/retool/step_300
+    python -m rlab.eval --algo retool_math --models m20=./rlab_out/retool_math/step_20  # 自动切 dapo_math+boxed
 """
 import argparse
 import os
@@ -31,8 +33,17 @@ def main():
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
     ap.add_argument("--skip_base", action="store_true")
     ap.add_argument("--retool", action="store_true",
-                    help="阶段2：多轮代码交织评测（透传给 eval_vllm.py）")
+                    help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
+    ap.add_argument("--algo", type=str, default=None,
+                    help="算法名：grpo/retool/retool_math；指定后自动决定 prompt/预算/奖励口径与数据集")
+    ap.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"],
+                    help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
     args = ap.parse_args()
+
+    # 兼容旧 --retool
+    algo = args.algo
+    if algo is None and args.retool:
+        algo = "retool"
     models = ",".join(m.strip() for m in args.models if m.strip())
 
     cmd = [sys.executable, os.path.join(ROOT, "eval_vllm.py"),
@@ -43,6 +54,10 @@ def main():
         cmd.append("--skip_base")
     if args.retool:
         cmd.append("--retool")
+    if algo is not None:
+        cmd += ["--algo", algo]
+    if args.eval_task is not None:
+        cmd += ["--eval_task", args.eval_task]
     print("[eval]", " ".join(cmd))
     raise SystemExit(subprocess.call(cmd))
 
