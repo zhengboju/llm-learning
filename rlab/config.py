@@ -133,19 +133,24 @@ BASE = dict(
 
 # 阶段2 retool 系统提示 = 基础格式提示 + 代码工具说明（复用 BASE["system_prompt"]
 # 保证格式口径与阶段0/1 完全一致；新增部分零标签字面量，规避改写铁律）
-# 【2026-09-08 代码灭绝教训】"MAY"（可以写）在 base 模型上的采样率仅 ~0.3%
-# （greedy code_rate 实测），组内 4 条几乎必有 0 人写代码 → 代码奖励项为常数
-# 无梯度，代码永远进不了采样分布。冷启动必须用 "MUST" 把代码写进分布，
-# 之后 RL 再用 code_ok（执行成功）去区分好坏代码。
+# 【2026-09-08 第三/四轮教训·生成层冲突】"MAY"（可以写）在 base 上的代码采样率
+# 仅 ~0.3%（greedy 实测）→ 组内 0 人写代码 → code 奖励项常数无梯度。改 MUST 后
+# 代码采样有了，但 MUST"first write the computation as code, then reason"把输出
+# 顺序改成"代码先行"→ base 开围栏后不再产出思考/回答标签 → 即便打分剥离代码，
+# 没有标签就是没有格式 → fmt 恒 -1 信号死亡（健康检查 32 组实锤，128 样本 ~0 合规）。
+# 修复：指令顺序改为"先打开思考段推理 → 计算写代码 → 继续推理 → 答案标签收尾"，
+# 与格式契约（thinking 先行 / answer 收尾）对齐——代码留在思考段内，剥离后格式
+# 语义天然成立，代码探索（MUST）与格式生成（先思考）两者兼得。
 _RETOOL_EXTRA = (
-    "\n\nYou MUST write Python code to help solve the problem: when the question "
-    "involves any calculation, first write the computation as code, then reason "
-    "from the result. Put each piece of code inside a fenced block like: "
+    "\n\nYou MUST write Python code to help solve the problem. Follow this order: "
+    "first open the thinking section and do your reasoning there; whenever the "
+    "question involves a calculation, write that computation as code inside a "
+    "fenced block like: "
     "```python\n<your code>\n```\n"
     "The environment executes your code automatically and inserts the result "
     "between [TOOL RESULT] and [/TOOL RESULT]. Read the result and continue "
-    "reasoning until you reach the final answer inside the required answer tags. "
-    "Always finish your code block before continuing."
+    "reasoning in the thinking section, then finish with the final answer "
+    "inside the required answer tags. Always finish your code block before continuing."
 )
 system_prompt_retool = BASE["system_prompt"] + _RETOOL_EXTRA
 
