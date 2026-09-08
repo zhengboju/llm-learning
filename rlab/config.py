@@ -37,6 +37,13 @@ ALGO_DEFAULTS = {
     # 差异全在 rollout：分段轨迹 + 沙箱 + 工具段 mask 置0，见 docs/02-retool.md）
     "retool":  dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_std",
                     loss_norm="sample_mean"),
+    # 方案1：retool-math（对齐 agentic-rl-lab/05-retool）—— DAPO-Math-17k + outcome-only
+    # boxed + 8192 预算 + clip-higher（0.2/0.28）
+    "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_std",
+                        loss_norm="sample_mean", data_task="dapo_math",
+                        max_context_tokens=8192, round_gen_tokens=1024,
+                        max_gen_tokens=8192, max_prompt_length=1024,
+                        code_w=0.0, reward_switch_step=1000000000),
 }
 
 BASE = dict(
@@ -158,6 +165,23 @@ _RETOOL_EXTRA = (
 )
 system_prompt_retool = BASE["system_prompt"] + _RETOOL_EXTRA
 
+# 方案1：retool-math 系统提示（对齐 agentic-rl-lab/05-retool）—— outcome-only \boxed{}
+_RETOOL_MATH_SYSTEM = (
+    "You solve math problems step by step with help from a Python code interpreter.\n"
+    "Use the code_interpreter tool when calculation, symbolic manipulation, or enumeration helps you solve the problem accurately and quickly.\n\n"
+    "How to use the code_interpreter tool:\n"
+    "- Call it with Python code inside a fenced block like: ```python\n<your code>\n```\n"
+    "  The environment executes your code automatically and inserts the result between [TOOL RESULT] and [/TOOL RESULT].\n"
+    "- Results are captured from what your code prints with print(). Always print the values you want to see.\n"
+    "- Each execution is independent: no variables, files, or state carry over between calls. Redefine everything you need in each piece of code.\n"
+    "- Code must finish within a few seconds and use little memory. Do not read or write files. If you enumerate or brute-force, keep the search space small.\n"
+    "- If the execution returns an error, analyze it and retry with corrected code when useful.\n\n"
+    "When you have the final answer, end with exactly one line in this format:\n"
+    "\\boxed{<your final answer>}\n"
+    "Do not put the final answer inside the code block."
+)
+system_prompt_retool_math = _RETOOL_MATH_SYSTEM
+
 
 def get_config(algo: str, **overrides) -> dict:
     """合并 BASE + 算法 preset + 显式覆盖，返回冻结配置 dict。"""
@@ -173,6 +197,8 @@ def get_config(algo: str, **overrides) -> dict:
     # retool 专用系统提示（除非用户显式覆盖）
     if algo == "retool" and "system_prompt" not in overrides:
         cfg["system_prompt"] = system_prompt_retool
+    if algo == "retool_math" and "system_prompt" not in overrides:
+        cfg["system_prompt"] = system_prompt_retool_math
     if cfg["wandb_name"] is None:
         cfg["wandb_name"] = f"{algo}"
     # 输出目录按算法隔离（防 grpo/dapo 的 step_N checkpoint 与 record 互相覆盖）

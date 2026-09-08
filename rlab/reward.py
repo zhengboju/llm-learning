@@ -31,6 +31,44 @@ except ImportError:  # pragma: no cover - 冒烟环境
 _NUM_RE = r"\d+\.\d+|\d+/\d+|\d+"
 _FORMAT_RE = r"^<think>.*?</think><answer>.*?</answer>$"
 
+# ---- 方案1：DAPO-Math / AIME 口径（对齐 agentic-rl-lab/05-retool） ----
+_MATH_BOXED_WINDOW = 300  # 官方只看末尾 300字符
+
+
+def extract_last_boxed(text: str) -> str | None:
+    """提取最后一个 \\boxed{...} 的内容，花括号配平（对齐 agentic/reward.py）。"""
+    marker = "\\boxed{"
+    idx = text.rfind(marker)
+    if idx < 0:
+        return None
+    start = idx + len(marker)
+    depth = 1
+    for pos in range(start, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:pos]
+    return None
+
+
+def reward_correct_boxed(ground_truth: str, answer: str) -> float:
+    """DAPO-Math/AIME 口径：取回答末 300字符里最后一个 \\boxed{} 与 gt 数学等价判定（±1）。"""
+    boxed = extract_last_boxed(answer[-_MATH_BOXED_WINDOW:])
+    if boxed is None:
+        return -1.0
+    if not HAS_MATH_VERIFY:
+        return 1.0 if boxed.strip() == ground_truth.strip() else -1.0
+    try:
+        # agentic 用 parse(f"${x}$") 包一层；我们复用 _mv_parse 但带 $ 前缀以对齐
+        # _mv_parse 内部已用 ExprExtractionConfig，$ 前缀不影响数字/表达式提取
+        ans = _mv_parse(f"${boxed.strip()}$")
+        gt = _mv_parse(f"${ground_truth.strip()}$")
+        return 1.0 if verify(ans, gt, timeout_seconds=None) else -1.0
+    except Exception:
+        return -1.0
+
 
 def _mv_parse(text: str):
     """math_verify 解析，线程安全（禁用其内部 signal 超时）。"""
@@ -156,3 +194,33 @@ def total_reward(ground_truth: str, answer: str, *, w_acc: float = 2.0,
         pen = overlong_penalty(completion_len, max_gen_tokens, overlong_buffer)
         r -= pen
     return {"reward": r, "acc": acc, "format": fmt, "overlong": pen}
+
+
+# ---- 方案1：DAPO-Math / AIME outcome-only（对齐 agentic-rl-lab/05-retool） ----
+def total_reward_math(ground_truth: str, answer: str, *,
+                      completion_len: int = 0, max_gen_tokens: int = 8192,
+                      overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
+    """数学 outcome-only：只看末尾 \\boxed{} 是否与 gt 数学等价（±1），无格式分。"""
+    acc = reward_correct_boxed(ground_truth, answer)
+    # fmt 沿用 boxed 是否存在作监控（1=抽到 boxed，-1=无），但不进 reward
+    fmt = 1.0 if extract_last_boxed(answer[-_MATH_BOXED_WINDOW:]) is not None else -1.0
+    r = acc
+    pen = 0.0
+    if overlong_shaping:
+        pen = overlong_penalty(completion_len, max_gen_tokens, overlong_buffer)
+        r -= pen
+    return {"reward": r, "acc": acc, "format": fmt, "overlong": pen}
+
+
+def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0,
+                             completion_len: int = 0, max_gen_tokens: int = 8192,
+                             overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
+    """retool-math outcome-only：与 total_reward_math 同 reward（±1），
+    工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。"""
+    base = total_reward_math(ground_truth, answer, completion_len=completion_len,
+                             max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
+                             overlong_shaping=overlong_shaping)
+    # 保留 code 字段供 record 监控，但 reward 不含它
+    base["code"] = reward_code(code_ok, 0.0)
+    base["code_ok"] = code_ok
+    return base

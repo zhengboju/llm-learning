@@ -151,10 +151,16 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
         if isinstance(kl_term, torch.Tensor):  # KL 回到 token 级按序列平均
             loss = loss + (kl_term * mask).sum(dim=1).div(mask.sum(dim=1)).mean()
 
+    elif algo == "retool_math":
+        # 方案1：与 retool 同 loss（group_std/sample_mean），差异在数据/奖励/预算
+        per_token_loss = -(pg_term - kl_term)
+        # 复用 sample_mean 逻辑（与 grpo/retool 同）
+        loss = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1)).mean()
+
     else:
         raise KeyError(f"未知算法 {algo!r}")
 
     return _finalize(loss, None, ratio, mask)
 
 
-ALGOS = ("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool")
+ALGOS = ("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool", "retool_math")

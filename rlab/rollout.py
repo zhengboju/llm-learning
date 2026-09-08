@@ -45,7 +45,8 @@ from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, get_per_token_logps
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, segment_mask_from_spans, tensor_to_bytes)
-from rlab.reward import reward_phase, total_reward, total_reward_retool
+from rlab.reward import (reward_phase, total_reward, total_reward_math,
+                           total_reward_retool, total_reward_retool_math)
 from rlab.sandbox import run_code
 from rlab.sync import sync_weights_into_vllm
 
@@ -214,13 +215,18 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed):
     n = cfg["num_pre_Q"]
     assert len(asst_texts) == len(inputs) * n, \
         f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
+    is_math = cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo")
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
-            sc = total_reward_retool(
-                inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
-                phase=phase, code_w=cfg["code_w"],
-                cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"])
+            if is_math:
+                sc = total_reward_retool_math(
+                    inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"])
+            else:
+                sc = total_reward_retool(
+                    inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
+                    phase=phase, code_w=cfg["code_w"],
+                    cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"])
             rewards.append(sc["reward"]); acc_s.append(sc["acc"])
             fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])
             ck.append(code_stats[idx]["code_ok"])
@@ -326,11 +332,18 @@ def gen_worker(Q, cfg: dict):
         n = cfg["num_pre_Q"]
         for i, inp in enumerate(inputs):
             for j, a in enumerate(answers[i * n:(i + 1) * n]):
-                sc = total_reward(inp["A"], a, w_acc=2.0,
-                                  completion_len=completion_lens[i * n + j],
-                                  max_gen_tokens=cfg["max_gen_tokens"],
-                                  overlong_buffer=cfg["overlong_buffer"],
-                                  overlong_shaping=cfg["overlong_shaping"])
+                if cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo"):
+                    sc = total_reward_math(inp["A"], a,
+                                           completion_len=completion_lens[i * n + j],
+                                           max_gen_tokens=cfg["max_gen_tokens"],
+                                           overlong_buffer=cfg["overlong_buffer"],
+                                           overlong_shaping=cfg["overlong_shaping"])
+                else:
+                    sc = total_reward(inp["A"], a, w_acc=2.0,
+                                      completion_len=completion_lens[i * n + j],
+                                      max_gen_tokens=cfg["max_gen_tokens"],
+                                      overlong_buffer=cfg["overlong_buffer"],
+                                      overlong_shaping=cfg["overlong_shaping"])
                 rewards.append(sc["reward"]); acc_s.append(sc["acc"]); fmt_s.append(sc["format"])
         rewards = torch.tensor(rewards, dtype=torch.float32)
         if cfg["algo"] == "rfpp":
@@ -388,7 +401,7 @@ def gen_worker(Q, cfg: dict):
     os.makedirs(os.path.dirname(os.path.abspath(cfg["record_path"])), exist_ok=True)
     fout = open(cfg["record_path"], "a", encoding="utf-8")
     uploaded_total = 0
-    is_retool = cfg["algo"] == "retool"
+    is_retool = cfg["algo"] in ("retool", "retool_math")
     while True:
         try_update_model()
         # dynamic sampling（DAPO 机制2）：全同组不占配额，继续采直到攒够 Q_batch_size 组
@@ -473,7 +486,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="rlab 生成端独立运行（分进程模式）")
     ap.add_argument("--algo", required=True,
-                    choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool"))
+                    choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool", "retool_math"))
     ap.add_argument("--gen_device", type=int, default=0)
     ap.add_argument("--model_path", default=None)
     ap.add_argument("--port", type=int, default=59875)

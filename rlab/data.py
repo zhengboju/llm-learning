@@ -29,6 +29,8 @@ def load_qas(task: str = "gsm8k", fixture: bool = False):
         return list(FIXTURE_QAS)
     if task == "gsm8k":
         return load_gsm8k_train()
+    if task in ("dapo_math", "dapo-math-17k", "math_dapo"):
+        return load_dapo_math_train()
     raise KeyError(f"未知任务 {task!r}（阶段2/3 扩展 retool/search 任务时在此注册）")
 
 
@@ -122,3 +124,77 @@ def load_gsm8k_train():
         raise RuntimeError(
             f"[data] GSM8K train 加载失败：modelscope 错误={ms_err}，HF 错误={e}；"
             "可设置 RLAB_DATA_SOURCE=ms/hf 切换数据源") from e
+
+
+# ---- DAPO-Math-17k（方案1：对齐 agentic-rl-lab/05-retool） ----
+_DAPO_PROMPT_PREFIX = (
+    "Solve the following math problem step by step. The last line of your response "
+    "should be of the form Answer: $Answer (without quotes) where $Answer is the "
+    "answer to the problem.\n\n"
+)
+_DAPO_PROMPT_SUFFIX = '\n\nRemember to put your answer on its own line after "Answer:".'
+
+
+def _strip_dapo_template(q: str) -> str:
+    if q.startswith(_DAPO_PROMPT_PREFIX):
+        q = q[len(_DAPO_PROMPT_PREFIX):]
+    if q.endswith(_DAPO_PROMPT_SUFFIX):
+        q = q[:-len(_DAPO_PROMPT_SUFFIX)]
+    return q.strip()
+
+
+def load_dapo_math_train():
+    """DAPO-Math-17k train。清洗逻辑与 agentic-rl-lab/05-retool/prepare_data.py 一致。"""
+    ms_err = None
+    # 1) 尝试 modelscope（训练机默认；HF 镜像也可能通）
+    if DATA_SOURCE in ("ms", "auto"):
+        try:
+            _patch_verification_mode()
+            # modelscope 上该数据集 id 可能是 BytedTsinghua-SIA/DAPO-Math-17k
+            from modelscope.msdatasets import MsDataset
+            # 先试 modelscope 官方 id；失败再试 HF id 的 ms 镜像
+            for ms_id in ("BytedTsinghua-SIA/DAPO-Math-17k", "dapo-math-17k"):
+                try:
+                    ds = MsDataset.load(ms_id, split="train", trust_remote_code=True)
+                    rows = []
+                    for idx, row in enumerate(ds):
+                        prompt = row.get("prompt")
+                        q = _strip_dapo_template(str(prompt[0].get("content") or "")) if isinstance(prompt, list) and prompt else ""
+                        rm = row.get("reward_model") or {}
+                        gt = rm.get("ground_truth") if isinstance(rm, dict) else None
+                        if isinstance(gt, list):
+                            gt = gt[0] if gt else None
+                        a = str(gt or "").strip()
+                        if q and a:
+                            rows.append({"Q": q, "A": a})
+                    if rows:
+                        print(f"[data] DAPO-Math-17k via modelscope {ms_id}: {len(rows)} 条")
+                        return rows
+                except Exception:
+                    continue
+            raise RuntimeError("modelscope DAPO-Math-17k 均未命中")
+        except Exception as e:
+            ms_err = e
+            import traceback
+            print(f"[data] modelscope DAPO-Math-17k 加载失败（{e}），改走 HF\n" + traceback.format_exc())
+    # 2) 回落 HF datasets
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
+        rows = []
+        for idx, row in enumerate(ds):
+            prompt = row.get("prompt")
+            q = _strip_dapo_template(str(prompt[0].get("content") or "")) if isinstance(prompt, list) and prompt else ""
+            rm = row.get("reward_model") or {}
+            gt = rm.get("ground_truth") if isinstance(rm, dict) else None
+            if isinstance(gt, list):
+                gt = gt[0] if gt else None
+            a = str(gt or "").strip()
+            if q and a:
+                rows.append({"Q": q, "A": a})
+        if not rows:
+            raise RuntimeError("HF DAPO-Math-17k 清洗后为空")
+        print(f"[data] DAPO-Math-17k via HF: {len(rows)} 条")
+        return rows
+    except Exception as e:
+        raise RuntimeError(f"[data] DAPO-Math-17k 加载失败：modelscope 错误={ms_err}，HF 错误={e}") from e
