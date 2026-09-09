@@ -34,6 +34,22 @@ TOOL_END = "\n[/TOOL RESULT]"
 # python 围栏代码块提取（```python ... ```，DOTALL 跨行）
 _PY_FENCE_RE = re.compile(r"```python\s*(.*?)```", re.DOTALL)
 
+# 特殊 token 字面量（<|im_end|> / <|endoftext|> 等，Qwen 系通用形态）
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
+
+
+def sanitize_tool_text(text: str) -> str:
+    """沙箱输出拼回模型上下文前的无害化消毒（对齐 agentic-rl-lab/05-retool 教训：
+    "tool 返回不消毒会污染 observation 结构"）。
+
+    沙箱 stdout 是模型经 print() 间接可控的通道——若模型打印 <|im_end|> 类
+    特殊 token 字面量，分段 tokenize 时会被 Qwen tokenizer 还原成真的 special
+    token id，往训练序列注入非模型生成的 EOS/边界 token（gen_logps/mask/训练
+    全被污染）；打印 [TOOL RESULT] 字面量则可伪造嵌套工具边界混淆上下文。
+    两类字节一律剥除——与 mask 契约同一条原则：凡"非模型生成但要拼进模型
+    上下文"的字节流，都是训练序列的信任边界。"""
+    return _SPECIAL_TOKEN_RE.sub("", text).replace(TOOL_START, "").replace(TOOL_END, "")
+
 
 def extract_python_blocks(text: str):
     """返回文本里所有完整 ```python``` 代码块（去围栏与首尾空白）。"""

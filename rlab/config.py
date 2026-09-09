@@ -108,6 +108,17 @@ BASE = dict(
     # （旧值 8，H20 3B 严重欠利用；参考实现为 8 题×8 条=64）。
     gen_questions_per_attempt=1,
 
+    # ---- 离线难度预探测（2026-09-10，probe_difficulty.py 配套，仅生成端消费）----
+    # 训练前用 base 模型对全池每题采 k 条估计通过率（rlab/probe_difficulty.py，
+    # 产出 jsonl 表）；difficulty_path 设置后生成端只保留通过率在 band 内的题。
+    # 动机：丢弃率 81% 的主体是全错组 (1-p)^8——期望轨迹成本 ≈1/p 只能靠改分布
+    # 切割；与在线 QuestionScheduler 互补（静态出清"base 从未做对过的题"，在线
+    # 出清"当前学不动的题"，两级都不碰 loss 协议）。
+    # 注意：静态过滤随模型变强会误伤（难题永久出局）——模型显著变强后用新
+    # checkpoint 重跑探针即可刷新表；过期的表不自动失效，换模型训练时留意。
+    difficulty_path=None,        # 探针表路径；None=不过滤（阶段0/1 与旧 run 行为不变）
+    difficulty_band=(0.0, 1.0),  # 保留 n_correct/k 严格落在开区间 (lo, hi) 的题
+
     # ---- 训练 ----
     all_steps=300,
     save_steps=100,

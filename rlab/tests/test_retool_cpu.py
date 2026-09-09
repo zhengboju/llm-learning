@@ -736,6 +736,108 @@ def test_collect_retool_group_split():
           "merged" not in results[1] and "merged" not in results2[1])
 
 
+# ------------- N. 离线难度预探测过滤 + 探针聚合（2026-09-10） -------------
+def test_difficulty_filter():
+    print("[N1] filter_qas_by_difficulty：band 过滤口径（丢弃率 81% 的静态出清层）")
+    from rlab.data import filter_qas_by_difficulty, load_difficulty_table
+    qas = [{"Q": f"q{i}", "A": "72"} for i in range(6)]
+    # k=4：q0 全错(0)、q1 半对(2)、q2 全对(4)、q3 一条对(1)、q4 三条对(3)、q5 不在表
+    table = {"q0": {"k": 4, "n_correct": 0}, "q1": {"k": 4, "n_correct": 2},
+             "q2": {"k": 4, "n_correct": 4}, "q3": {"k": 4, "n_correct": 1},
+             "q4": {"k": 4, "n_correct": 3}}
+    kept, st = filter_qas_by_difficulty(qas, table)
+    check("默认 band (0,1)：全错/全对/缺失题全部出清，保留 1<=nc<=k-1",
+          [x["Q"] for x in kept] == ["q1", "q3", "q4"])
+    check("stats 口径齐全（p_zero/p_one/missing/kept/total）",
+          st == {"kept": 3, "p_zero": 1, "p_one": 1, "band_out": 0,
+                 "missing": 1, "total": 6})
+    kept2, st2 = filter_qas_by_difficulty(qas, table, lo=0.0, hi=0.5)
+    check("窄 band (0,0.5)：通过率 0.5/0.75 的题都落在开区间外（band_out=2）",
+          [x["Q"] for x in kept2] == ["q3"] and st2["band_out"] == 2
+          and st2["p_one"] == 1)
+    kept3, st3 = filter_qas_by_difficulty(qas, table, lo=0.0, hi=0.0)
+    check("空 band：结果为空但 missing/总数口径不变（供 gen_worker fail-fast）",
+          kept3 == [] and st3["total"] == 6 and st3["missing"] == 1)
+
+    # 表加载：坏行/非法行静默跳过（探针逐题追加写，崩溃可能留截断行）
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "t.jsonl")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"Q": "q0", "k": 4, "n_correct": 1}\n')
+            f.write('{"Q": "bad1", "k": 4}\n')            # 缺 n_correct
+            f.write('{"Q": "bad2", "k": 0, "n_correct": 0}\n')   # k<=0
+            f.write('{"Q": "bad3", "k": 4, "n_correct": 5}\n')   # nc>k
+            f.write('{"Q": "bad4", "k": 4, "n_correct": -1}\n')  # nc<0
+            f.write('{"Q": "q1", "k": 8, "n_correct": 3, "fmt_rate": 0.9}\n')  # 合法
+            f.write('{"Q": "trunc", "k": 4, "n_cor')      # 截断行
+        tbl = load_difficulty_table(p)
+    check("表加载：合法行收录、非法/截断行静默跳过",
+          set(tbl) == {"q0", "q1"} and tbl["q1"]["k"] == 8)
+    print()
+
+
+def test_probe_aggregate():
+    print("[N2] probe_difficulty.aggregate_rows/summarize：逐轨迹 -> 逐题统计")
+    from rlab.probe_difficulty import aggregate_rows, summarize
+    rows = [
+        {"Q": "a", "A": "7", "acc": 1, "fmt": 1, "trunc": 0, "clen": 100, "code_ok": 1},
+        {"Q": "a", "A": "7", "acc": -1, "fmt": 1, "trunc": 1, "clen": 200, "code_ok": 0},
+        {"Q": "b", "A": "9", "acc": -1, "fmt": -1, "trunc": 0, "clen": 50, "code_ok": 0},
+        {"Q": "b", "A": "9", "acc": -1, "fmt": -1, "trunc": 1, "clen": 60, "code_ok": 2},
+    ]
+    per_q = aggregate_rows(rows)
+    check("题顺序 = 首次出现顺序", [r["Q"] for r in per_q] == ["a", "b"])
+    a, b = per_q
+    check("a: k=2 / n_correct=1 / pass_rate=0.5 / fmt_rate=1.0 / trunc_rate=0.5",
+          a["k"] == 2 and a["n_correct"] == 1 and a["pass_rate"] == 0.5
+          and a["fmt_rate"] == 1.0 and a["trunc_rate"] == 0.5)
+    check("b: fmt_rate=0（无 boxed）→ 协议失败签名可见", b["fmt_rate"] == 0.0)
+    check("avg 口径：a.avg_clen=150 / b.avg_code_ok=1.0",
+          a["avg_clen"] == 150 and b["avg_code_ok"] == 1.0)
+    s = summarize(rows, per_q)
+    check("summarize：含难度分布与判别统计（无 boxed 率 = 2/4 = 50%）",
+          "难度分布" in s and "50.0%" in s and isinstance(s, str))
+    print()
+
+
+# ------------- O. 沙箱加固：auto-print + 工具输出消毒（2026-09-10，对齐 05-retool） -------------
+def test_sandbox_hardening():
+    print("[O1] auto_print：没写 print 的代码末行纯表达式自动补 print（verl 官方技巧）")
+    from rlab.sandbox import auto_print
+    c, p = auto_print("1+1")
+    check("纯表达式 1+1 → print(1+1)", c == "print(1+1)" and p is True)
+    c, p = auto_print("x = 1\nx")
+    check("多行代码末行是表达式 x → print(x)，赋值行不动", c == "x = 1\nprint(x)" and p)
+    check("已含 print 的代码原样返回", auto_print("x=1\nprint(x)") == ("x=1\nprint(x)", False))
+    check("末行是赋值 → 不包裹（打印无意义对象）",
+          auto_print("x = compute()") == ("x = compute()", False))
+    check("末行是块开头/控制流 → 不包裹（防语法错误）",
+          auto_print("for i in range(3):") == ("for i in range(3):", False)
+          and auto_print("if x > 0:") == ("if x > 0:", False))
+    check("空代码 → 原样返回", auto_print("   ") == ("   ", False))
+    check("多行+末行表达式（真实形态）：调用代码补在最后一行",
+          auto_print("import math\nmath.sqrt(2)")[1] is True)
+
+    ok = run_code("1+1", timeout=5)
+    check("run_code 集成：忘 print 的表达式代码能拿到 stdout（display='2'）",
+          ok["ok"] and ok["display"] == "2" and ok["auto_printed"] == 1)
+    ok2 = run_code("x = 2 + 3\nprint(x)", timeout=5)
+    check("run_code 集成：已有 print 不触发（auto_printed=0）",
+          ok2["ok"] and ok2["auto_printed"] == 0)
+
+    print("[O2] sanitize_tool_text：特殊 token / 工具标记字面量剥除（注入封堵）")
+    from rlab.protocol import sanitize_tool_text
+    im_end = chr(60) + "|im_end|" + chr(62)   # 零标签字面量：<|im_end|> 不手写裸字节
+    check("特殊 token 字面量剥除", im_end not in sanitize_tool_text("res " + im_end + " val"))
+    check("工具标记字面量剥除（防伪造嵌套边界）",
+          TOOL_START not in sanitize_tool_text("x" + TOOL_START + "y")
+          and TOOL_END not in sanitize_tool_text("x" + TOOL_END + "y"))
+    check("正常输出原样通过", sanitize_tool_text("42\n[1, 2, 3]") == "42\n[1, 2, 3]")
+    check("混合：两种注入同现时全部剥除",
+          sanitize_tool_text("a" + im_end + TOOL_END + "b") == "ab")
+    print()
+
+
 # --------------------------------- J. 静态未定义名检查（运行时 NameError 防线） ----
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
@@ -751,6 +853,7 @@ def test_pyflakes_undefined():
     files = ["rlab/rollout.py", "rlab/train.py", "rlab/health.py", "rlab/config.py",
              "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
              "rlab/sandbox.py", "rlab/analysis.py", "rlab/probe_retool_gen.py",
+             "rlab/probe_difficulty.py",
              "rlab/data.py", "rlab/prepare_dapo_math.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
@@ -779,6 +882,9 @@ if __name__ == "__main__":
     test_retool_math_fixes()
     test_question_scheduler()
     test_collect_retool_group_split()
+    test_difficulty_filter()
+    test_probe_aggregate()
+    test_sandbox_hardening()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

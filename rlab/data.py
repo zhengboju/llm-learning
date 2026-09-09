@@ -274,3 +274,57 @@ def _strip_dapo_template(q: str) -> str:
     if q.endswith(_DAPO_PROMPT_SUFFIX):
         q = q[:-len(_DAPO_PROMPT_SUFFIX)]
     return q.strip()
+
+
+# ---- 离线难度预探测过滤（2026-09-10，probe_difficulty.py 配套） ----
+# 动机：retool_math 丢弃率 81% 的主体是全错组 (1-p)^8；题目级 QuestionScheduler
+# 只能出清"在线观察到连续零方差"的题（每题先烧 streak×n 条轨迹才出局），而离线
+# 探针用 k 条短样本把 p≈0 / p≈1 的题在训练开始前一次性出清。两级过滤互补：
+# 静态过滤出清"base 从未做对过的题"，在线调度出清"当前学不动的题"。
+
+
+def load_difficulty_table(path: str) -> dict:
+    """读 probe_difficulty.py 产出的 jsonl -> {Q: 行dict}（含 k/n_correct/fmt_rate…）。
+
+    坏行静默跳过（探针是逐行追加写，崩溃可能留下截断行）；缺 k/n_correct 或
+    k<=0 的行视为无效——过滤宁可保守（题进不了表 = 被丢弃，见 filter 的
+    missing 口径），不允许半行数据混进训练池。"""
+    table = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            q = r.get("Q")
+            k, nc = r.get("k"), r.get("n_correct")
+            if q and isinstance(k, int) and k > 0 and isinstance(nc, int) and 0 <= nc <= k:
+                table[str(q)] = r
+    return table
+
+
+def filter_qas_by_difficulty(qas: list, table: dict, lo: float = 0.0, hi: float = 1.0):
+    """纯函数（CPU 可测）：保留通过率 n_correct/k 严格落在开区间 (lo, hi) 的题。
+
+    默认 (0,1) = DAPO "accuracy neither 0 nor 1" 的离线版。表中缺失的题按
+    丢弃计（missing）——过滤即选择，半覆盖的表不该让未探测题混进训练分布。
+    返回 (kept, stats)；stats 口径：kept/p_zero/p_one/band_out/missing/total。"""
+    kept, stats = [], {"kept": 0, "p_zero": 0, "p_one": 0, "band_out": 0,
+                       "missing": 0, "total": len(qas)}
+    for x in qas:
+        row = table.get(str(x["Q"]))
+        if row is None:
+            stats["missing"] += 1
+            continue
+        rate = row["n_correct"] / row["k"]
+        if rate <= lo:
+            stats["p_zero" if rate == 0 else "band_out"] += 1
+        elif rate >= hi:
+            stats["p_one" if rate == 1 else "band_out"] += 1
+        else:
+            kept.append(x)
+            stats["kept"] += 1
+    return kept, stats

@@ -17,7 +17,7 @@
 用法（生成端 worker 每轮代码调用一次，串行安全）：
     from rlab.sandbox import run_code
     res = run_code(code, timeout=cfg["sandbox_timeout"], mem_mb=cfg["sandbox_mem_mb"])
-    # res = {ok, returncode, timed_out, duration, display, stderr}
+    # res = {ok, returncode, timed_out, duration, display, stderr, auto_printed}
     # display = 成功时的 stdout（截断）或 "Error! <类型>: <摘要>"
 """
 
@@ -28,6 +28,37 @@ import tempfile
 import time
 
 _IS_LINUX = sys.platform.startswith("linux")
+
+# auto-print 的"不可包裹行"判定：块开头/赋值/控制流语句补 print() 轻则打印出
+# 无意义对象、重则语法错误把原本能跑的代码变成 Error——拿不准就不包（宁可
+# 输出为空让模型收到 "No output" 反馈，也不引入新的失败模式）。
+_STMT_KEYWORDS = ("def ", "class ", "for ", "while ", "if ", "elif ", "else",
+                  "try", "except", "finally", "with ", "import ", "from ",
+                  "return", "yield", "pass", "break", "continue", "global",
+                  "assert", "del ", "raise", "lambda", "async ", "await ")
+
+
+def auto_print(code: str) -> tuple[str, bool]:
+    """纯函数（对齐 verl 官方 recipe 的 auto-print 技巧）：代码完全没写 print 时，
+    给最后一个非空行（若为"纯表达式"）补一层 print()。
+
+    动机：模型常忘 print，而结果只从 stdout 捕获——没 print 的代码必然返回
+    "No output"，工具调用白跑还可能被模型误读为失败。base 模型（3B）忘 print
+    的概率最高，收益也最大。返回 (处理后的代码, 是否补了 print)。"""
+    if "print" in code:
+        return code, False
+    all_lines = code.rstrip().splitlines()
+    nonempty = [i for i, ln in enumerate(all_lines) if ln.strip()]
+    if not nonempty:
+        return code, False
+    last_i = nonempty[-1]
+    last = all_lines[last_i].strip()
+    if (last.endswith((":", "\\", ",")) or "=" in last
+            or last.startswith(_STMT_KEYWORDS)):
+        return code, False
+    out = list(all_lines)
+    out[last_i] = f"print({last})"
+    return "\n".join(out), True
 
 
 def _limit_resources(mem_mb: int):
@@ -49,12 +80,19 @@ def run_code(code: str, *, timeout: float = 5.0, mem_mb: int = 256,
         timeout: 秒；超时即 SIGKILL 整个子进程组。
         mem_mb: 内存上限（仅 Linux 生效）。
         max_chars: stdout/stderr 截断长度（防输出炸弹）。
+
+    代码完全没写 print 且末行是纯表达式时自动补 print（auto-print，
+    对齐官方 recipe；res["auto_printed"]=1 可观察触发率）。
     """
     t0 = time.time()
     res = {"ok": False, "returncode": None, "timed_out": False,
-           "duration": 0.0, "display": "Error! Empty code block", "stderr": ""}
+           "duration": 0.0, "display": "Error! Empty code block", "stderr": "",
+           "auto_printed": 0}
     if not code or not code.strip():
         return res
+
+    code, printed = auto_print(code)
+    res["auto_printed"] = int(printed)
 
     with tempfile.TemporaryDirectory(prefix="rlab_sandbox_") as td:
         path = os.path.join(td, "user_code.py")

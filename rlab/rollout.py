@@ -40,12 +40,13 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from rlab.config import get_config
-from rlab.data import load_qas
+from rlab.data import filter_qas_by_difficulty, load_difficulty_table, load_qas
 from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, get_per_token_logps
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
-                           make_bytes_list, segment_mask_from_spans, tensor_to_bytes)
+                           make_bytes_list, sanitize_tool_text,
+                           segment_mask_from_spans, tensor_to_bytes)
 from rlab.reward import (reward_phase, total_reward, total_reward_math,
                            total_reward_retool, total_reward_retool_math)
 from rlab.sandbox import run_code
@@ -247,7 +248,9 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                 done = [_run(p) for p in exec_jobs]
             for i, res in done:
                 code_stats[i]["code_ok"] += int(res["ok"])
-                tool_text = TOOL_START + res["display"] + TOOL_END
+                # 消毒后再拼回（2026-09-10）：沙箱 stdout 模型间接可控，
+                # 特殊 token/工具标记字面量必须剥除——见 protocol.sanitize_tool_text
+                tool_text = TOOL_START + sanitize_tool_text(res["display"]) + TOOL_END
                 tool_ids = tokenizer(tool_text, add_special_tokens=False)["input_ids"]
                 segs[i].append({"kind": "tool", "text": tool_text, "ids": tool_ids})
                 results[i] = tool_ids
@@ -463,6 +466,23 @@ def gen_worker(Q, cfg: dict):
 
     QAs = load_qas(cfg["data_task"])
     print(f"[rollout] 数据集 {cfg['data_task']} 共 {len(QAs)} 题")
+    # 离线难度预探测过滤（2026-09-10）：必须在 QuestionScheduler 构造之前——
+    # scheduler 的黑名单只覆盖"在线观察到连续零方差"的题，base 从未做对过的题
+    # （p≈0，丢弃率 81% 的主体）由静态过滤在训练开始前一次性出清。
+    if cfg.get("difficulty_path"):
+        _table = load_difficulty_table(cfg["difficulty_path"])
+        _lo, _hi = cfg.get("difficulty_band", (0.0, 1.0))
+        QAs, _dstat = filter_qas_by_difficulty(QAs, _table, lo=_lo, hi=_hi)
+        print(f"[rollout] 难度过滤 band=({_lo},{_hi}): {_dstat['total']} -> {_dstat['kept']} 题"
+              f"（全错 {_dstat['p_zero']} / 全对 {_dstat['p_one']} / 区间外 {_dstat['band_out']}"
+              f" / 表中缺失 {_dstat['missing']}）")
+        if not QAs:
+            raise RuntimeError(
+                "[rollout] 难度过滤后训练池为空——重跑 rlab.probe_difficulty 刷新探针表，"
+                "放宽 difficulty_band，或去掉 --difficulty_path")
+        if len(QAs) < cfg["q_pool_reset_floor"]:
+            print(f"[rollout] 警告: 过滤后池子 {len(QAs)} 题 < q_pool_reset_floor="
+                  f"{cfg['q_pool_reset_floor']}（QuestionScheduler 的重置机制会很活跃）")
     ref_server = cfg["ref_server"]
     pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
     last_fp = [None]   # 上次推送的权重指纹（两次相同 = 训练端权重没在变）
@@ -711,10 +731,16 @@ def main():
     ap.add_argument("--gen_device", type=int, default=0)
     ap.add_argument("--model_path", default=None)
     ap.add_argument("--port", type=int, default=59875)
+    ap.add_argument("--difficulty_path", default=None,
+                    help="probe_difficulty.py 产出的通过率表（离线难度预过滤）")
     args = ap.parse_args()
-    cfg = get_config(args.algo, gen_device=args.gen_device, ref_server_port=args.port)
+    overrides = {}
     if args.model_path:
-        cfg["model_path"] = args.model_path
+        overrides["model_path"] = args.model_path
+    if args.difficulty_path:
+        overrides["difficulty_path"] = args.difficulty_path
+    cfg = get_config(args.algo, gen_device=args.gen_device, ref_server_port=args.port,
+                     **overrides)
     gen_worker(None, cfg)
 
 
