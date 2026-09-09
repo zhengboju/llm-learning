@@ -125,6 +125,14 @@ def main():
     ap.add_argument("--chat_template_kwargs", default=None,
                     help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
                          '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
+    # 预算三件套（4B 探针 v2 实锤：3 轮×1024 下截断 86.2%，可学带被预算压瘪——
+    # 探针必须先过"轨迹完整"关，难度分布才有意义；对齐参考 6 轮×1024 重测）
+    ap.add_argument("--round_gen_tokens", type=int, default=None,
+                    help="覆盖单轮生成预算（默认取 preset；截断率高时放宽）")
+    ap.add_argument("--max_rounds", type=int, default=None,
+                    help="覆盖工具轮数上限（默认取 preset；参考实现 6 轮）")
+    ap.add_argument("--max_context_tokens", type=int, default=None,
+                    help="覆盖总上下文上限（默认取 preset）")
     args = ap.parse_args()
 
     from rlab.config import get_config
@@ -136,6 +144,12 @@ def main():
         cfg["temperature"] = args.temp
     if args.chat_template_kwargs:
         cfg["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)
+    if args.round_gen_tokens is not None:
+        cfg["round_gen_tokens"] = args.round_gen_tokens
+    if args.max_rounds is not None:
+        cfg["max_rounds"] = args.max_rounds
+    if args.max_context_tokens is not None:
+        cfg["max_context_tokens"] = args.max_context_tokens
 
     from rlab.data import load_qas, load_difficulty_table
     from rlab.reward import total_reward_retool_math
@@ -152,7 +166,8 @@ def main():
     if args.max_questions > 0:
         todo = todo[:args.max_questions]
     print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
-          f"| 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
+          f"| 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
+          f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
     if not todo:
         print("[probe] 无剩余题，直接输出统计")
         per_q = list(load_difficulty_table(args.out).values())
