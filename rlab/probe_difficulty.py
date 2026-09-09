@@ -122,6 +122,9 @@ def main():
                     help="覆盖采样温度（默认与训练一致 = retool_math 1.0）")
     ap.add_argument("--gpu_mem", type=float, default=0.85, help="vLLM 显存占比")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--chat_template_kwargs", default=None,
+                    help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
+                         '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
     args = ap.parse_args()
 
     from rlab.config import get_config
@@ -131,6 +134,8 @@ def main():
         cfg["data_task"] = args.data_task
     if args.temp is not None:
         cfg["temperature"] = args.temp
+    if args.chat_template_kwargs:
+        cfg["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)
 
     from rlab.data import load_qas, load_difficulty_table
     from rlab.reward import total_reward_retool_math
@@ -168,7 +173,8 @@ def main():
         wave = todo[w0:w0 + wq]
         group_prompts, rows = [], []
         for x in wave:
-            p = build_prompt(x["Q"], cfg["system_prompt"], tokenizer)
+            p = build_prompt(x["Q"], cfg["system_prompt"], tokenizer,
+                             cfg.get("chat_template_kwargs"))
             group_prompts.extend([p] * k)   # 每题扩成 k 条独立轨迹（与训练扩样同构）
         sps = [SamplingParams(n=1, temperature=cfg["temperature"],
                               max_tokens=cfg["round_gen_tokens"], top_p=cfg["top_p"],

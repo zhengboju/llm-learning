@@ -23,9 +23,13 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty \
 
 ## 1. 协议层（决定成败，最优先）
 
-- [ ] **`enable_thinking=False`**：`build_prompt` 的 apply_chat_template 必须显式
+- [x] **`enable_thinking=False`**：`build_prompt` 的 apply_chat_template 必须显式
   关闭思考模式。官方实测 Qwen3 系思考模式下"很少写代码、训练效果差"；不关，
   thinking 长链还会爆 round_gen_tokens=1024 的单轮预算。
+  **已落地（2026-09-11）**：`config.chat_template_kwargs`（BASE 默认 None，Qwen2.5
+  路径零变化）+ train.py/probe_difficulty.py 的 `--chat_template_kwargs` JSON CLI。
+  4B 探针实测未关 thinking：截断 98.9%/无 boxed 99.2%/可学带仅 6/490——协议失败
+  非能力失败，**该探针数据作废，必须带开关重探**。
 - [ ] **chat template 差异重验**：Qwen3.5 模板会 strip assistant 内容，采样文本含
   `</think>` 时模板把消息重构成 reasoning/content 两段（05-retool 踩坑实录）。
   rlab 是 token id 续写 + 分段拼接，理论上绕开了文本往返，但

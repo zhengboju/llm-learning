@@ -71,6 +71,12 @@ BASE = dict(
     data_task="gsm8k",                       # gsm8k（阶段0/1）；阶段2/3 扩展
     out_dir="./rlab_out",
     record_path="./rlab_out/record.jsonl",   # 生成数据得分记录（analysis.py 消费）
+    # 【2026-09-10 4B 探针实锤】apply_chat_template 附加 kwargs（None=不传，Qwen2.5 行为不变）。
+    # Qwen3.5 系必须 {"enable_thinking": false}：thinking 模式把单轮 1024 token 预算
+    # 烧在 <think> 长链上（4B 探针实测：末段截断 98.9% / 无 boxed 99.2% / 全错 484/490，
+    # 换算可学带仅 1.2%——全是协议失败不是能力失败）。官方实测思考模式下"很少写代码"。
+    # Qwen2.5 模板不引用该 jinja 变量，传入无副作用。
+    chat_template_kwargs=None,
 
     # ---- 数据采集 ----
     Q_batch_size=1,          # 每次 rollout 的题目数（grpo_dapo 断言=1）

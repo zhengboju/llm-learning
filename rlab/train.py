@@ -226,6 +226,9 @@ def main():
                          "通过率在 difficulty_band 内的题（离线难度预过滤）")
     ap.add_argument("--seed", type=int, default=None,
                     help="固定训练种子（抽题顺序+生成采样），阶段1 起对比实验必带")
+    ap.add_argument("--chat_template_kwargs", default=None,
+                    help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
+                         '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -241,6 +244,8 @@ def main():
     if args.no_log: overrides["use_wandb"] = False
     if args.difficulty_path: overrides["difficulty_path"] = args.difficulty_path
     if args.seed is not None: overrides["seed"] = args.seed
+    if args.chat_template_kwargs:
+        overrides["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))

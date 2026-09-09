@@ -64,12 +64,17 @@ _DEEPSPEED_ENV_KEYS = [
 ]
 
 
-def build_prompt(question: str, system_prompt: str, tokenizer) -> str:
-    """单轮 prompt 模板。阶段2 多轮工具调用时替换本函数。"""
+def build_prompt(question: str, system_prompt: str, tokenizer,
+                 chat_template_kwargs: dict | None = None) -> str:
+    """单轮 prompt 模板。阶段2 多轮工具调用时替换本函数。
+
+    chat_template_kwargs 透传 apply_chat_template（Qwen3.5 系需
+    {"enable_thinking": false}，见 config.chat_template_kwargs 注释）。"""
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": system_prompt},
          {"role": "user", "content": question}],
-        tokenize=False, add_generation_prompt=True)
+        tokenize=False, add_generation_prompt=True,
+        **(chat_template_kwargs or {}))
 
 
 def group_ok(scores: torch.Tensor) -> bool:
@@ -613,7 +618,8 @@ def gen_worker(Q, cfg: dict):
                 else:
                     inputs = random.sample(QAs, need)
             qkey = inputs[0]["Q"] if need == 1 else None
-            prompts_text = [build_prompt(x["Q"], cfg["system_prompt"], tokenizer) for x in inputs]
+            prompts_text = [build_prompt(x["Q"], cfg["system_prompt"], tokenizer,
+                                         cfg.get("chat_template_kwargs")) for x in inputs]
             prompt_ids = tokenizer(prompts_text, return_tensors="pt", padding=True,
                                    padding_side="left", add_special_tokens=False)["input_ids"]
             plen = prompt_ids.shape[1]

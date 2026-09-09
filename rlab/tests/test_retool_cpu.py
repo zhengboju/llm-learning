@@ -14,6 +14,7 @@
 
 运行：python -m rlab.tests.test_retool_cpu
 """
+import json
 import os
 import sys
 import tempfile
@@ -839,6 +840,37 @@ def test_sandbox_hardening():
 
 
 # --------------------------------- J. 静态未定义名检查（运行时 NameError 防线） ----
+def test_chat_template_kwargs():
+    print("[P] chat_template_kwargs 透传：Qwen3.5 系需 enable_thinking=false"
+          "（4B 探针实测不关 thinking：截断 98.9%/无 boxed 99.2%，协议失败非能力失败）")
+    from rlab.rollout import build_prompt
+
+    seen = {}
+
+    class FakeTok:
+        """记录 apply_chat_template 收到 kwargs 的最小 stub（模板行为在真机验收）。"""
+
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, **kw):
+            seen["msgs"], seen["kw"] = msgs, kw
+            return "PROMPT"
+
+    tok = FakeTok()
+    p = build_prompt("Q1", "SYS", tok)
+    check("默认不传附加 kwargs（Qwen2.5 路径零变化）",
+          seen["kw"] == {} and p == "PROMPT")
+    check("消息结构 system+user",
+          seen["msgs"] == [{"role": "system", "content": "SYS"},
+                           {"role": "user", "content": "Q1"}])
+    build_prompt("Q1", "SYS", tok, {"enable_thinking": False})
+    check("kwargs 透传模板上下文", seen["kw"] == {"enable_thinking": False})
+    cfg = get_config("retool_math", use_wandb=False)
+    check("BASE 默认 chat_template_kwargs=None（阶段0-2 行为不变）",
+          cfg["chat_template_kwargs"] is None)
+    # CLI 以 JSON 字符串进 overrides（train.py / probe_difficulty.py 同一解析形态）
+    check("CLI JSON 反序列化形态",
+          json.loads('{"enable_thinking": false}') == {"enable_thinking": False})
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -885,6 +917,7 @@ if __name__ == "__main__":
     test_difficulty_filter()
     test_probe_aggregate()
     test_sandbox_hardening()
+    test_chat_template_kwargs()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
