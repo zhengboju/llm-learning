@@ -213,6 +213,11 @@ def run_training(cfg, args):
                         "（loss 数值可能仍'正常'），训练中止排查 losses.py 梯度路径")
             else:
                 zero_grad_streak = 0
+        # 【2026-09-11 4B】step 前清缓存：DS fused optimizer 要一次性物化全参数
+        # 梯度平坦副本(~8G bf16)，行循环的缓存块尺寸各异不会被它复用——不归还
+        # 驱动就在第 N 步顶满卡（实测第 4 步 94.99G OOM 于 80M 分配）。代价仅是
+        # 下一步重新分配（对 84s/it 可忽略）。
+        torch.cuda.empty_cache()
         engine.step()
 
         if dist.get_rank() == 0:
