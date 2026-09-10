@@ -95,6 +95,13 @@ BASE = dict(
     # 共存"。sample_mean 归一下 Σ chunk_loss×(k/R) 梯度与整批严格等价；
     # 其他 loss_norm 会在 train.py fail-fast（批内归一跨 chunk 不等价）。
     micro_rows=0,
+    # 【2026-09-11 4B OOM】8-bit 优化器（bitsandbytes AdamW8bit，需 pip install）。
+    # 本机约束下的最后一条路：GPU 上 stage0 fused（静态 64G+step 临时 32G=96G>95G
+    # 数学无解）；CPU offload RAM 60G 也爆（态 48G + step 梯度拷贝 16G 被 OOM-kill）。
+    # 8bit 态 32G->8G 留 GPU：静态 ~40G + 动态 ~15G ≈ 55G ✓。代价：优化器数值
+    # 与 3B 的 fp32 AdamW 不严格同口径（8bit 状态量化），4B 实验系列内自洽即可
+    # （lr 1e-6 × 200 步的教学规模下偏差可忽略，需在报告里声明）。
+    optim_8bit=False,
 
     # ---- 数据采集 ----
     Q_batch_size=1,          # 每次 rollout 的题目数（grpo_dapo 断言=1）
@@ -288,7 +295,9 @@ def ds_config(cfg: dict) -> dict:
         "train_micro_batch_size_per_gpu": cfg["train_micro_batch_size_per_gpu"],
         "gradient_accumulation_steps": cfg["gradient_accumulation_steps"],
         "steps_per_print": 5,
-        "optimizer": {"type": "AdamW", "params": {"lr": cfg["lr"]}},
+        # optim_8bit 时省略 optimizer 段——DS 由调用方传入 bitsandbytes 优化器对象
+        **({} if cfg.get("optim_8bit") else
+           {"optimizer": {"type": "AdamW", "params": {"lr": cfg["lr"]}}}),
         "bf16": {"enabled": True},
         # stage 2 + offload：fp32 优化器态驻 CPU（4B 专用；stage 0 路径零变化）。
         # 【为什么必须 offload】GPU 上无论怎么省都不够：静态 64G（fp32 master 16

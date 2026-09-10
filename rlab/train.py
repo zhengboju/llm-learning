@@ -95,6 +95,13 @@ def run_training(cfg, args):
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
     model = AutoModelForCausalLM.from_pretrained(
         cfg["model_path"], torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
+    # 【2026-09-11 4B】8-bit 优化器在 DS initialize 前构建并传入（ds_config 相应
+    # 省略 optimizer 段）：bnb AdamW8bit 把 m/v 量化到 8bit（32G->8G），step 全程
+    # GPU、无 offload、无 RAM 压力。数值口径声明见 config.optim_8bit 注释。
+    user_optimizer = None
+    if cfg.get("optim_8bit"):
+        import bitsandbytes as bnb
+        user_optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=cfg["lr"])
     # 【2026-09-11 4B 显存】backbone 激活检查点：B=8×T~5.4k 的层内激活 ~80G 量级
     # （3B 实测 ~20G × T 3.2× H 1.25×），不开必 OOM；只存层输入、backward 重算。
     # use_reentrant=False 与分块 logps 的 checkpoint 重算兼容。
@@ -102,7 +109,8 @@ def run_training(cfg, args):
         gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False   # 训练不用 KV cache，关掉防 HF 告警/缓存分支
     engine, optimizer, _, _ = deepspeed.initialize(
-        config=ds_config(cfg), model=model, model_parameters=model.parameters())
+        config=ds_config(cfg), model=model, model_parameters=model.parameters(),
+        optimizer=user_optimizer)
     # 【2026-09-11 4B OOM 根因】from_pretrained 默认 eval 模式，而 transformers
     # 激活检查点在 DecoderLayer.__call__ 里要求 self.training 为真——不进 train
     # 模式则 gradient_checkpointing_enable() 静默失效，backbone 全量激活保留
@@ -302,6 +310,10 @@ def main():
     ap.add_argument("--micro_rows", type=int, default=None,
                     help="训练步按行拆 micro-backward（0=整批；4B 用 1：前向 1 行->"
                          "backward->释放图，动态峰值降到单行；仅支持 sample_mean）")
+    ap.add_argument("--optim_8bit", action="store_true",
+                    help="bitsandbytes AdamW8bit 优化器（4B 显存：8bit 态留 GPU，"
+                         "规避 fused fp32 的 96G 无解与 CPU offload 的 RAM 爆；"
+                         "需 pip install bitsandbytes）")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -326,6 +338,7 @@ def main():
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows
+    if args.optim_8bit: overrides["optim_8bit"] = True
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
