@@ -913,8 +913,8 @@ def test_chunked_logps():
               return_tensors="pt").input_ids
     with torch.inference_mode():
         ref = get_per_token_logps(model(ids).logits[:, :-1, :], ids[:, 1:])
-        chunked = forward_per_token_logps(model, ids, seq_chunk=3)
-    check("分块 == 全量（seq_chunk=3 覆盖非对齐边界）",
+        chunked = forward_per_token_logps(model, ids, seq_chunk=3, batch_chunk=1)
+    check("分块 == 全量（seq_chunk=3 + batch_chunk=1 覆盖双维非对齐边界）",
           torch.allclose(ref, chunked, atol=1e-5))
     model.config.use_cache = False
     model.train()   # dropout 已置 0，train 模式确定性与 eval 一致

@@ -39,40 +39,46 @@ def _gather_logps(lm_head, h_chunk: torch.Tensor,
 
 
 def forward_per_token_logps(model, input_ids: torch.Tensor,
-                            seq_chunk: int = 512,
+                            seq_chunk: int = 512, batch_chunk: int | None = None,
                             use_checkpoint: bool = False) -> torch.Tensor:
-    """显存有界的前向 + 逐 token logps：全长 logits 不物化。
+    """显存有界的前向 + 逐 token logps：全长 logits 与 T² 注意力矩阵都不物化。
 
-    【2026-09-11 4B logits 峰】gen/ref/train 三处全量前向的 logits
-    (8, ~5.4k, 248320) 单次 ~22G——生成端实测 OOM（GPU0 三方共居后余量 ~16G），
-    ref/训练端同构更险。解法：backbone 只产 hidden states（配合 train 侧激活
-    检查点，激活也有界），再沿时间维分块 lm_head+log_softmax+gather——
-    logits/log_softmax 均按位置独立，分块数学等价于全量（CPU 数值对拍测试）。
-
-    use_checkpoint=False（生成端/ref 的 inference 路径）：逐块直算，每块峰值
-      O(B×seq_chunk×V)，块间即释。
-    use_checkpoint=True（训练端 grad 路径）：log_softmax 反向会保存输出，朴素
-      分块的总保留量仍是 O(B×T×V)——每块必须过 torch.utils.checkpoint，
-      backward 时逐块重算，激活峰值才真正降到 O(B×seq_chunk×V)。
+    【2026-09-11 4B 双炸弹】gen/ref/train 三处全量前向的两类峰值：
+      ① logits (8, ~5.4k, 248320) 单次 ~22G；
+      ② SDPA 对 head_dim=256 的门控注意力回退 math 路径，T² 矩阵
+         (8, 32, 6503, 6503) 单次 ~20G（ref 进程还因缓存池滞留三批瞬态到 47G）。
+    3B 时代（vocab 152k、T~1.7k）两个都能塞下纯属侥幸。
+    解法（均按独立因子分块，数学等价，CPU 对拍测试）：
+      batch_chunk：按行分块过 backbone——因果注意力按行独立，T² 瞬态 ÷B；
+      seq_chunk  ：hidden states 出来后按时间维分块 lm_head+log_softmax+gather。
+    use_checkpoint=False（gen/ref 的 inference 路径）：逐块直算，块间即释。
+    use_checkpoint=True（训练端 grad 路径）：log_softmax 反向保存输出，朴素
+      分块的总保留量仍 O(B×T×V)——每块过 torch.utils.checkpoint 重算。
     返回 (B, T-1)：对 input_ids[:, 1:] 的每 token logps，调用方再按 plen 切。
     """
     from torch.utils.checkpoint import checkpoint
     backbone = model.base_model            # GPT2→transformer / Qwen→model（HF 标准）
     lm_head = model.get_output_embeddings()
-    h = backbone(input_ids).last_hidden_state
-    h_pred, targets = h[:, :-1], input_ids[:, 1:]
-    rows = []
-    t_total = h_pred.shape[1]
-    for t0 in range(0, t_total, seq_chunk):
-        t1 = min(t0 + seq_chunk, t_total)
-        hc, tc = h_pred[:, t0:t1], targets[:, t0:t1]
-        if use_checkpoint:
-            rows.append(checkpoint(
-                lambda a, b: _gather_logps(lm_head, a, b), hc, tc,
-                use_reentrant=False))
-        else:
-            rows.append(_gather_logps(lm_head, hc, tc))
-    return torch.cat(rows, dim=1)
+    b_total = input_ids.shape[0]
+    bc = batch_chunk or b_total
+    out_rows = []
+    for b0 in range(0, b_total, bc):
+        ids = input_ids[b0:b0 + bc]
+        h = backbone(ids).last_hidden_state
+        h_pred, targets = h[:, :-1], ids[:, 1:]
+        rows = []
+        t_total = h_pred.shape[1]
+        for t0 in range(0, t_total, seq_chunk):
+            t1 = min(t0 + seq_chunk, t_total)
+            hc, tc = h_pred[:, t0:t1], targets[:, t0:t1]
+            if use_checkpoint:
+                rows.append(checkpoint(
+                    lambda a, b: _gather_logps(lm_head, a, b), hc, tc,
+                    use_reentrant=False))
+            else:
+                rows.append(_gather_logps(lm_head, hc, tc))
+        out_rows.append(torch.cat(rows, dim=1))
+    return torch.cat(out_rows, dim=0)
 
 
 def compute_advantages(rewards: torch.Tensor, group_size: int, mode: str,

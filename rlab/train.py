@@ -155,7 +155,7 @@ def run_training(cfg, args):
         # 量级，96G 卡放不下。分块走 checkpoint 重算，激活峰值 O(B×chunk×V)。
         per_token_logps = forward_per_token_logps(
             engine.module if hasattr(engine, "module") else engine, inputs,
-            use_checkpoint=True)[:, plen - 1:]
+            batch_chunk=1, use_checkpoint=True)[:, plen - 1:]
         if "mask" in batch:
             # 阶段2 retool：mask 由生成端按段边界给出（assistant=1 / 工具返回段=0 / pad=0），
             # 训练端直接采用——工具返回 token 不进 loss 是 TIR 的核心契约，不可用 pad 重算。

@@ -539,7 +539,8 @@ def gen_worker(Q, cfg: dict):
         # 【2026-09-11】改走分块 logps：全长 logits (8, ~5.4k, 248320) ~22G 实测 OOM。
         with torch.inference_mode():
             logps = forward_per_token_logps(
-                gen_torch, merged_ids.to(gen_torch.device), seq_chunk=512)
+                gen_torch, merged_ids.to(gen_torch.device),
+                seq_chunk=512, batch_chunk=1)
             return logps[:, plen - 1:].cpu()
 
     def score_group(inputs, answers, completion_lens):
