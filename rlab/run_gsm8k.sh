@@ -22,6 +22,9 @@ TRAIN_GPU=${TRAIN_GPU:-1}
 # 【必带】vLLM 权重同步环境（缺一卡死：apply_model 传输 stall 的教训）
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
+# 显存碎片治理（4B logits 峰时代起默认开：分块前向的频繁 alloc/free 在
+# 三方共居的卡上易碎片化，OOM 提示官推 expandable_segments）
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 # 训练机无交互终端 + 常无 WANDB_API_KEY：默认离线记录防 wandb login prompt 卡死；
 # 有 key 且想实时上传时 WANDB_MODE=online bash rlab/run_gsm8k.sh ... 覆盖。
 export WANDB_MODE=${WANDB_MODE:-offline}

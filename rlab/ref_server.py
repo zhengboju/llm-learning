@@ -38,7 +38,7 @@ def get_per_token_logps(model, input_ids):
     """ref per-token logps（打分路径）。【2026-09- logits 峰】改走分块实现：
     全量 logits (8, ~5.4k, 248320) ~22G 会把 ref 进程（GPU0 三方共居）炸掉，
     且 ref 是 eval 前向无梯度——朴素分块即可，无需 checkpoint。"""
-    return forward_per_token_logps(model, input_ids, seq_chunk=512)
+    return forward_per_token_logps(model, input_ids, seq_chunk=256)
 
 
 def get_eos_mask(completion_mask):
