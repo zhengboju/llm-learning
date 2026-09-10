@@ -40,10 +40,15 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty \
 
 ## 2. 预算重审（3B 时代的行为假设全部失效）
 
-- [ ] `round_gen_tokens=1024` / `max_rounds=3`：参考实现给 6 轮×1024、总预算 8192；
-  rlab 现预算 ≈3.4k 比参考紧一倍。3B 下超长丢弃占比小是被全错组掩盖的，
-  4B 下截断丢弃会浮出成为主要矛盾。建议对齐参考（6 轮/8192）后用
-  `trunc_final` 率校准。
+- [x] `round_gen_tokens`：**v4 探针实锤（2026-09-11）必须 3072**。机制：4B 关
+  thinking 后推理全走 content 通道、极啰嗦（答"8 选 7"也烧 ~900 tok），第一轮
+  1024 被 prose 烧断→无完整代码围栏→命中"本轮无代码即终局"→**max_rounds 是
+  虚假预算，有效单轨迹预算=round_gen_tokens**（v3 实测 max_rounds 翻倍截断不动）。
+  3072 下：正确轨迹 10.4%→36.7%、全对题 7→80、可学带 99→194(k=4 低估，n=8
+  修正后 ≈60%)、完成题正确率 ≈82%。**训练必须与探针同口径**（--round_gen_tokens 3072）。
+  备注：4B 样本 code_ok≈0，纯 prose 直接解——TIR 协议对 4B 可能不必要，留观。
+- [ ] `max_rounds=3` 保持即可（对 4B 无效预算，见上；若后续 prompt 约束让模型
+  写代码，再按参考 6 轮重审）。
 - [ ] `max_prompt_length=1024`：4B 下 prompt 变长（模板+工具定义），确认不误杀。
 - [ ] 采样配置 temp=1.0/top_p=1.0/top_k=-1 保持（与参考对齐）；eval 端参考用
   top_p=0.7，AIME 评测时对齐。

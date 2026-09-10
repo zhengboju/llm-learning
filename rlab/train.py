@@ -229,6 +229,14 @@ def main():
     ap.add_argument("--chat_template_kwargs", default=None,
                     help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
                          '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
+    # 预算三件套（与 probe_difficulty 同名参数同语义：探针与训练必须同口径，
+    # 否则难度表描述的是另一个采样分布、过滤失真。4B v4 探针实锤 3072）
+    ap.add_argument("--round_gen_tokens", type=int, default=None,
+                    help="覆盖单轮生成预算（默认取 preset；须与探针口径一致）")
+    ap.add_argument("--max_rounds", type=int, default=None,
+                    help="覆盖工具轮数上限（默认取 preset）")
+    ap.add_argument("--max_context_tokens", type=int, default=None,
+                    help="覆盖总上下文上限（默认取 preset）")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -246,6 +254,9 @@ def main():
     if args.seed is not None: overrides["seed"] = args.seed
     if args.chat_template_kwargs:
         overrides["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)
+    if args.round_gen_tokens is not None: overrides["round_gen_tokens"] = args.round_gen_tokens
+    if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
+    if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
