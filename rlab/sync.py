@@ -13,25 +13,35 @@
 
 
 def vllm_load_weights(model, sd_items):
-    """由 apply_model RPC 到 EngineCore 进程内就地执行。"""
-    model.load_weights(sd_items)
-    return "loaded"
+    """由 apply_model RPC 到 EngineCore 进程内就地执行。
+
+    返回 loaded/sent 计数（stacked 融合如 q/k/v->qkv_proj 会让 loaded<sent，
+    属正常；此计数只作观测，防静默漏同步靠 AutoWeightsLoader 对未知键报错）。"""
+    loaded = model.load_weights(sd_items)
+    return f"loaded {len(loaded or [])}/{len(sd_items)} tensors"
 
 
-def remap_text_to_multimodal(sd_items, lm_prefix="model.language_model."):
+def remap_text_to_multimodal(sd_items, lm_prefix="model.language_model.",
+                             drop_tied_lm_head=True):
     """纯文本 torch 键名 -> vLLM 多模态 Qwen3.5 实现的键名（同名张量搬运）。
 
     【2026-09-11 多模态 Qwen3.5 分裂加载】vLLM 只认多模态 Qwen3.5 checkpoint
     （纯文本 qwen3_5_text 被它路由到多模态实现、processor 崩），torch 侧只能
     加载抽取的纯文本模型（AutoModelForCausalLM 对复合 config 崩）→ 两端用
-    不同目录，同步时做键名映射。HF ForConditionalGeneration 布局：
+    不同目录，同步时做键名映射。已按 vLLM qwen3_5.py 源码核实（2026-09-11）：
+    wrapper 的 load_weights = AutoWeightsLoader(+hf_to_vllm_mapper)，原始
+    checkpoint 的 "model.language_model.X" 键名验证可被加载——映射产出同形态：
       "model.X"       -> "model.language_model.X"
-      "lm_head.*"     -> 保持顶层（两布局同名）
+      "lm_head.*"     -> 丢弃（Qwen3.5-4B tie_word_embeddings=True，原
+                         checkpoint 无此键；torch state_dict 的 lm_head 是共享
+                         张量重复键，发给 AutoWeightsLoader 会报未知参数）
     未知键名 fail-fast：映射表必须与真实布局核对过，静默漏同步 = 生成端用旧权重。
     """
     out = []
     for name, tensor in sd_items:
         if name.startswith("lm_head."):
+            if drop_tied_lm_head:
+                continue
             out.append((name, tensor))
         elif name.startswith("model."):
             out.append((lm_prefix + name[len("model."):], tensor))
@@ -52,8 +62,9 @@ def sync_weights_into_vllm(vllm_gen, state_dict, name_remap=None) -> str:
         sd_items = name_remap(sd_items)
     if hasattr(vllm_gen, "apply_model"):
         import functools
-        vllm_gen.apply_model(functools.partial(vllm_load_weights, sd_items=sd_items))
-        return "apply_model"
+        res = vllm_gen.apply_model(
+            functools.partial(vllm_load_weights, sd_items=sd_items))
+        return f"apply_model [{res}]"   # 计数进日志：loaded<sent 常态（stacked 融合）
     if hasattr(vllm_gen.llm_engine, "model_executor"):  # V0 引擎兜底
         vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model \
             .load_weights(sd_items)

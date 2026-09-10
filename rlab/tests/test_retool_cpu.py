@@ -880,11 +880,15 @@ def test_split_load_remap():
           ("model.norm.weight", "t2"),
           ("lm_head.weight", "t3")]
     out = dict(remap_text_to_multimodal(sd))
-    check("model.* -> model.language_model.*（HF ForConditionalGeneration 布局）",
+    check("model.* -> model.language_model.*（HF ForConditionalGeneration 布局，"
+          "vLLM AutoWeightsLoader+hf_to_vllm_mapper 已核实吃这个形态）",
           out["model.language_model.embed_tokens.weight"] == "t0"
           and out["model.language_model.layers.0.self_attn.q_proj.weight"] == "t1"
           and out["model.language_model.norm.weight"] == "t2")
-    check("lm_head 保持顶层（两布局同名）", out["lm_head.weight"] == "t3")
+    check("tied lm_head 丢弃（Qwen3.5-4B tie=True，原 checkpoint 无此键，"
+          "torch 侧是共享张量重复键）", "lm_head.weight" not in out)
+    out2 = dict(remap_text_to_multimodal(sd, drop_tied_lm_head=False))
+    check("非 tied 目标可保留 lm_head（参数化退路）", out2.get("lm_head.weight") == "t3")
     check("张量对象原样搬运（不 copy 数据）",
           all(isinstance(t, str) for t in out.values()))
     try:
