@@ -290,10 +290,16 @@ def ds_config(cfg: dict) -> dict:
         "steps_per_print": 5,
         "optimizer": {"type": "AdamW", "params": {"lr": cfg["lr"]}},
         "bf16": {"enabled": True},
-        # stage 2 + offload：fp32 优化器态驻 CPU（4B 专用；stage 0 路径零变化）
+        # stage 2 + offload：fp32 优化器态驻 CPU（4B 专用；stage 0 路径零变化）。
+        # 【为什么必须 offload】GPU 上无论怎么省都不够：静态 64G（fp32 master 16
+        # + m/v 32 + bf16 权重/梯度 16）+ fused optimizer step 的临时分配 32G
+        # （p.grad.to(fp32) 全参拷贝 + flatten 缓冲）= 96G > 95G，数学上无解。
+        # 【pin_memory=False】本机容器锁页上限实测撞死（cudaErrorInvalidValue），
+        # 走 pageable 内存慢一点但能过；RAM 预算 fp32 态 48G + 运行时 ~6G
+        # ≈ 54G < 60G 上限。
         "zero_optimization": {
             "stage": cfg.get("zero_stage", 0),
-            **({"offload_optimizer": {"device": "cpu"}}
+            **({"offload_optimizer": {"device": "cpu", "pin_memory": False}}
                if cfg.get("zero_stage", 0) >= 2 else {}),
         },
     }
