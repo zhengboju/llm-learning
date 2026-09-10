@@ -885,7 +885,7 @@ def test_pyflakes_undefined():
     files = ["rlab/rollout.py", "rlab/train.py", "rlab/health.py", "rlab/config.py",
              "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
              "rlab/sandbox.py", "rlab/analysis.py", "rlab/probe_retool_gen.py",
-             "rlab/probe_difficulty.py",
+             "rlab/probe_difficulty.py", "rlab/extract_text_model.py",
              "rlab/data.py", "rlab/prepare_dapo_math.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()

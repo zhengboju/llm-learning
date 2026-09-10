@@ -23,6 +23,17 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty \
 
 ## 1. 协议层（决定成败，最优先）
 
+- [x] **模型资产：先抽取纯文本 checkpoint**（2026-09-11 实锤）。官方 Qwen3.5-4B 是
+  原生多模态（`Qwen3_5ForConditionalGeneration`，vocab_size 在 text_config 里），
+  rlab 全链路按纯文本 causal LM 设计——`AutoModelForCausalLM` 对复合 config 直接
+  崩（Qwen3_5Config.vocab_size MISSING）。不适配多模态包装的原因：权重名多一层
+  前缀打崩 sync.py 权重同步 + vision tower 白占优化器显存。用
+  `python -m rlab.extract_text_model --src /root/Qwen3.5-4B --dst /root/Qwen3.5-4B-text`
+  一次性抽取（内置 logits 对拍自检），此后 model_path 一律用 dst。
+  已核对：pad=`<|endoftext|>`(248044)/eos=`<|im_end|>`(248046)，语义模式与
+  Qwen2.5 相同，代码零硬编码 id，协议无需改；vocab 248k 比 2.5 大 63%，
+  gen_logps logits 峰值相应上浮（§3 显存注意项）。
+
 - [x] **`enable_thinking=False`**：`build_prompt` 的 apply_chat_template 必须显式
   关闭思考模式。官方实测 Qwen3 系思考模式下"很少写代码、训练效果差"；不关，
   thinking 长链还会爆 round_gen_tokens=1024 的单轮预算。
