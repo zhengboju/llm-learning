@@ -50,7 +50,7 @@ from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_bl
 from rlab.reward import (reward_phase, total_reward, total_reward_math,
                            total_reward_retool, total_reward_retool_math)
 from rlab.sandbox import run_code
-from rlab.sync import sync_weights_into_vllm
+from rlab.sync import remap_text_to_multimodal, sync_weights_into_vllm
 
 # 清除分布式环境变量（gen worker 进程内 vLLM 不允许看到 DeepSpeed 的 WORLD_SIZE 等）
 _DEEPSPEED_ENV_KEYS = [
@@ -443,7 +443,7 @@ def gen_worker(Q, cfg: dict):
     # + gen_logps logits 瞬时峰(~6-12G)，0.45×96=43G 总计 ~70G < 96G，安全。
     # 3B+GQA 的 KV 极小（每条 5k token 才 ~370MB），旧 0.35 的 KV 池大量闲置——
     # 多给 vLLM 显存主要扩大 continuous batching 的调度余量。
-    vllm_gen = LLM(model=cfg["model_path"],
+    vllm_gen = LLM(model=cfg.get("vllm_model_path") or cfg["model_path"],
                    gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)))
     # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）
     gen_torch = AutoModelForCausalLM.from_pretrained(
@@ -492,6 +492,11 @@ def gen_worker(Q, cfg: dict):
     pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
     last_fp = [None]   # 上次推送的权重指纹（两次相同 = 训练端权重没在变）
     health = _HealthMonitor()
+    # 分裂加载判定：vLLM 用另一份 checkpoint（多模态）时，同步需做键名映射
+    _split_load = bool(cfg.get("vllm_model_path"))
+    if _split_load:
+        print(f"[rollout] 分裂加载: vLLM={cfg['vllm_model_path']} | torch={cfg['model_path']}"
+              "（同步走 remap_text_to_multimodal 键名映射）")
 
     def try_update_model():
         nonlocal pushes
@@ -504,7 +509,10 @@ def gen_worker(Q, cfg: dict):
         print("[rollout] recving new model ...")
         try:
             # 顺序强制：先 vLLM 后 torch 副本，两者必须保持同一份权重
-            path = sync_weights_into_vllm(vllm_gen, state_dict)
+            # 分裂加载（多模态 vLLM + 纯文本 torch）时同步走键名映射
+            path = sync_weights_into_vllm(
+                vllm_gen, state_dict,
+                name_remap=remap_text_to_multimodal if _split_load else None)
             gen_torch.load_state_dict(
                 {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
             print(f"[rollout] model updated via {path}, {len(state_dict)} tensors")

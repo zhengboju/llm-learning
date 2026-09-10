@@ -18,9 +18,38 @@ def vllm_load_weights(model, sd_items):
     return "loaded"
 
 
-def sync_weights_into_vllm(vllm_gen, state_dict) -> str:
-    """把训练端 state_dict 推进 vLLM。返回实际使用的同步路径，失败抛异常。"""
+def remap_text_to_multimodal(sd_items, lm_prefix="model.language_model."):
+    """纯文本 torch 键名 -> vLLM 多模态 Qwen3.5 实现的键名（同名张量搬运）。
+
+    【2026-09-11 多模态 Qwen3.5 分裂加载】vLLM 只认多模态 Qwen3.5 checkpoint
+    （纯文本 qwen3_5_text 被它路由到多模态实现、processor 崩），torch 侧只能
+    加载抽取的纯文本模型（AutoModelForCausalLM 对复合 config 崩）→ 两端用
+    不同目录，同步时做键名映射。HF ForConditionalGeneration 布局：
+      "model.X"       -> "model.language_model.X"
+      "lm_head.*"     -> 保持顶层（两布局同名）
+    未知键名 fail-fast：映射表必须与真实布局核对过，静默漏同步 = 生成端用旧权重。
+    """
+    out = []
+    for name, tensor in sd_items:
+        if name.startswith("lm_head."):
+            out.append((name, tensor))
+        elif name.startswith("model."):
+            out.append((lm_prefix + name[len("model."):], tensor))
+        else:
+            raise KeyError(
+                f"remap_text_to_multimodal: 未知键名 {name!r}——映射表与模型布局"
+                "不匹配，先核对 vLLM qwen3_5.py load_weights 的期望键名再扩展")
+    return out
+
+
+def sync_weights_into_vllm(vllm_gen, state_dict, name_remap=None) -> str:
+    """把训练端 state_dict 推进 vLLM。返回实际使用的同步路径，失败抛异常。
+
+    name_remap: 可选 (sd_items)->sd_items 键名映射（多模态 vLLM + 纯文本 torch
+    分裂加载时传 remap_text_to_multimodal）。"""
     sd_items = list(state_dict.items())
+    if name_remap is not None:
+        sd_items = name_remap(sd_items)
     if hasattr(vllm_gen, "apply_model"):
         import functools
         vllm_gen.apply_model(functools.partial(vllm_load_weights, sd_items=sd_items))

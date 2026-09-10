@@ -77,6 +77,12 @@ BASE = dict(
     # 换算可学带仅 1.2%——全是协议失败不是能力失败）。官方实测思考模式下"很少写代码"。
     # Qwen2.5 模板不引用该 jinja 变量，传入无副作用。
     chat_template_kwargs=None,
+    # 【2026-09-11 多模态 Qwen3.5 分裂加载】vLLM 生成用的 checkpoint 路径
+    # （None=model_path 同一份）。Qwen3.5-4B 官方权重是多模态复合体：vLLM 只认
+    # 多模态版（纯文本 qwen3_5_text 被它路由到多模态实现崩），torch 侧只能加载
+    # extract_text_model.py 抽出的纯文本版 → model_path=纯文本（torch 三处加载）、
+    # vllm_model_path=原多模态，权重同步经 sync.remap_text_to_multimodal 映射键名。
+    vllm_model_path=None,
 
     # ---- 数据采集 ----
     Q_batch_size=1,          # 每次 rollout 的题目数（grpo_dapo 断言=1）

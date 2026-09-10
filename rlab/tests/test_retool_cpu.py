@@ -871,6 +871,32 @@ def test_chat_template_kwargs():
           json.loads('{"enable_thinking": false}') == {"enable_thinking": False})
 
 
+def test_split_load_remap():
+    print("[Q] 分裂加载键名映射：多模态 vLLM + 纯文本 torch（Qwen3.5 实锤）")
+    from rlab.sync import remap_text_to_multimodal, sync_weights_into_vllm
+
+    sd = [("model.embed_tokens.weight", "t0"),
+          ("model.layers.0.self_attn.q_proj.weight", "t1"),
+          ("model.norm.weight", "t2"),
+          ("lm_head.weight", "t3")]
+    out = dict(remap_text_to_multimodal(sd))
+    check("model.* -> model.language_model.*（HF ForConditionalGeneration 布局）",
+          out["model.language_model.embed_tokens.weight"] == "t0"
+          and out["model.language_model.layers.0.self_attn.q_proj.weight"] == "t1"
+          and out["model.language_model.norm.weight"] == "t2")
+    check("lm_head 保持顶层（两布局同名）", out["lm_head.weight"] == "t3")
+    check("张量对象原样搬运（不 copy 数据）",
+          all(isinstance(t, str) for t in out.values()))
+    try:
+        remap_text_to_multimodal([("visual.weight", "t")])
+        check("未知键名 fail-fast", False)
+    except KeyError:
+        check("未知键名 fail-fast（静默漏同步=生成端旧权重）", True)
+    cfg = get_config("retool_math", use_wandb=False)
+    check("BASE 默认 vllm_model_path=None（单 checkpoint 路径零变化）",
+          cfg["vllm_model_path"] is None)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -918,6 +944,7 @@ if __name__ == "__main__":
     test_probe_aggregate()
     test_sandbox_hardening()
     test_chat_template_kwargs()
+    test_split_load_remap()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

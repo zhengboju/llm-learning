@@ -213,6 +213,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--algo", required=True, choices=ALGOS)
     ap.add_argument("--model_path", default=None)
+    ap.add_argument("--vllm_model_path", default=None,
+                    help="vLLM 生成用的 checkpoint 路径（多模态 Qwen3.5 分裂加载："
+                         "model_path=纯文本给 torch，本参数=原多模态给 vLLM）")
     ap.add_argument("--steps", type=int, default=None, help="覆盖 all_steps")
     ap.add_argument("--save_steps", type=int, default=None)
     ap.add_argument("--gen_update_steps", type=int, default=None)
@@ -242,6 +245,7 @@ def main():
 
     overrides = {}
     if args.model_path: overrides["model_path"] = args.model_path
+    if args.vllm_model_path: overrides["vllm_model_path"] = args.vllm_model_path
     if args.steps: overrides["all_steps"] = args.steps
     if args.save_steps: overrides["save_steps"] = args.save_steps
     if args.gen_update_steps: overrides["gen_update_steps"] = args.gen_update_steps
