@@ -21,6 +21,15 @@ import time
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+# 【2026-09-11 IPC 坑，4B 首跑死在第 16 步权重同步】run_gsm8k.sh 全局 export 的
+# expandable_segments:True 与 CUDA IPC 互斥：gen_update_steps 推 state_dict（CUDA
+# bf16 张量）过 mp.Queue 时，expandable 段的跨进程共享要走 pidfd_open 系统调用，
+# 容器内核不支持 -> 生成端反序列化直接 RuntimeError（3B 时代不炸是因为当时还没
+# 这个全局 export）。训练进程强制普通段分配（GPU1 的碎片治理靠 micro_rows/
+# empty_cache，不依赖该开关）；生成端在 gen_worker 入口自行改回 True（GPU0 三方
+# 共居的碎片治理仍需要）。两个变量名都覆盖（不同 torch 版本读不同名字）。
+for _alloc_k in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+    os.environ[_alloc_k] = "expandable_segments:False"
 
 import torch
 import torch.distributed as dist

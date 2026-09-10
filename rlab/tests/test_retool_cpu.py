@@ -934,6 +934,36 @@ def test_chunked_logps():
           and model.transformer.wte.weight.grad is not None)
 
 
+def test_alloc_conf_ipc():
+    """【S】expandable_segments 与 CUDA IPC 互斥的环境契约（源码级检查）。
+
+    4B 首跑死在第 16 步权重同步：训练进程在 expandable_segments:True 下分配的
+    state_dict 张量过 mp.Queue，跨进程共享走 pidfd_open（容器内核不支持）->
+    生成端反序列化 RuntimeError。契约：train.py 顶层强制 False（两个变量名），
+    gen_worker 入口改回 True（GPU0 碎片治理仍需要），脚本全局 export 不动。
+    环境行为无法在 CPU 测试进程验证，退化为源码契约断言。"""
+    print("[S] allocator env 契约：expandable_segments 与 CUDA IPC 互斥的分层配置")
+    with open("rlab/train.py", encoding="utf-8") as f:
+        train_src = f.read()
+    with open("rlab/rollout.py", encoding="utf-8") as f:
+        rollout_src = f.read()
+    with open("rlab/run_gsm8k.sh", encoding="utf-8") as f:
+        sh_src = f.read()
+    check("train.py 顶层对两个 allocator 变量名强制 expandable_segments:False",
+          'for _alloc_k in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):' in train_src
+          and 'os.environ[_alloc_k] = "expandable_segments:False"' in train_src)
+    check("gen_worker 入口改回 True（生成端碎片治理仍需要；且在 set_device 前生效）",
+          'os.environ[_alloc_k] = "expandable_segments:True"' in rollout_src
+          and rollout_src.index('expandable_segments:True')
+          < rollout_src.index("torch.cuda.set_device"))
+    check("run_gsm8k.sh 全局 export 保留（ref_server 独立进程只能靠 shell 环境拿到 True）",
+          "expandable_segments:True" in sh_src)
+    check("train.py 的 False 覆盖发生在 import torch 之前（allocator 首次解析 env 前生效）",
+          train_src.index('expandable_segments:False') < train_src.index("import torch"))
+    check("gen_worker 收侧无需特殊处理（经典 cudaIpcMemHandle 路径不用 pidfd，"
+          "关键只在发送端张量在普通段分配）", True)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -984,6 +1014,7 @@ if __name__ == "__main__":
     test_chat_template_kwargs()
     test_split_load_remap()
     test_chunked_logps()
+    test_alloc_conf_ipc()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

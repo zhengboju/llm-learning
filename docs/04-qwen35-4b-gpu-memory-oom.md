@@ -50,6 +50,7 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 | B7 | 训练端 step | **94.94G** OOM 于 `engine.step()`（差 90M），且 **empty_cache 无效** | 真账：静态 64G + fused optimizer step **临时分配 32G**（`p.grad.to(fp32)` 全参拷贝 16G + flatten 缓冲 16G）= **96G > 95G，数学上无解**。93G 是活张量不是缓存——empty_cache 只能还缓存块 | 单卡 stage0 无解，必须 offload（→B8） | `0c1bf92`+`47f0ff8` |
 | B8 | CPU RAM | 进程被 **OS OOM-kill**（无 traceback，`Killed`），死在第 4 步 | offload 后 RAM：fp32 态 48G + **CPU step 梯度拷贝 16G** ≈ 64G > 60G 上限 | **bitsandbytes AdamW8bit**：m/v 量化 8bit（32G→8G）留 GPU，无 offload 无 RAM 依赖。GPU 静态 ~40G ✅ | `b36929c` |
 | B9 | 训练动态 | backward/step 期间动态峰值 ~30G | 8 行批的检查点包+图共存（~10G）+ 重算瞬态 | `--micro_rows 1`：**按行拆 micro-backward**（前向 1 行→backward→图释放）。sample_mean 归一下 `Σ chunk_loss×(k/R)` 梯度与整批**严格等价**；其他 loss_norm fail-fast | `c1f85f5` |
+| B10 | 第 16 步权重同步（**非 OOM，资源类**） | 生成端 `rebuild_cuda_tensor` → `RuntimeError: kernel does not support the pidfd_open syscall ... when expandable_segments:True is set`，训练端随之 fail-fast 中止；此前的 16 步全部正常（首次跨过第 4 步） | `expandable_segments:True`（B2 修复全局 export）与 **CUDA IPC 互斥**：expandable 段跨进程共享走 `pidfd_open`，容器内核太旧不支持。`gen_update_steps=16` 第一次推 state_dict（CUDA bf16 张量过 mp.Queue）即触发。3B 时代不炸是因为当时还没这个全局 export | **分层覆盖**：train.py 顶层强制 `expandable_segments:False`（发送端张量落普通段→经典 `cudaIpcMemHandle` 不需要 pidfd；GPU1 碎片治理靠 micro_rows/empty_cache 不依赖它）；gen_worker 入口改回 `True`（GPU0 三方共居碎片治理仍需要）；ref_server 独立进程靠 shell 环境拿到 `True` | 本次 |
 
 时序注：B5-B8 是同一条优化器显存线的四轮迭代（offload 尝试 → pin_memory →
 误诊缓存 → 真账无解 → RAM 爆 → 8bit 定案）；B9 与 B7/B8 并行（动态/静态两条线）。
@@ -85,6 +86,10 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
    （多模态实现超支 ~15G）。共居卡的预算按 nvidia-smi 实测定，不按 config 抄。
 4. **8bit 优化器的口径代价**：m/v 8bit 量化与 3B fp32 AdamW 不严格同口径——
    4B 实验系列内自洽，跨系列对比须声明（lr 1e-6 × 200 步教学规模下偏差可忽略）。
+5. **`expandable_segments:True` 与 CUDA IPC 互斥**（B10）：它通过 pidfd_open 共享
+   段内存，旧内核容器直接崩——且炸点不在设置时，而在第一次跨进程传 CUDA 张量时
+   （本例：第 16 步权重同步）。修法是分层覆盖而不是全局开关：发送端必须普通段，
+   接收端与旁路进程按需保留。
 
 ## 4. 最终配置逐项解释
 

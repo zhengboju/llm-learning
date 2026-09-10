@@ -430,6 +430,13 @@ def gen_worker(Q, cfg: dict):
     """
     for key in _DEEPSPEED_ENV_KEYS:
         os.environ.pop(key, None)
+    # 【2026-09-11 IPC 坑】train.py 顶层把 allocator 环境强制成 False（CUDA IPC
+    # 过 mp.Queue 需要普通段，见 train.py 注释），spawn 子进程会原样继承——生成端
+    # 入口改回 True：GPU0 三方共居（vLLM 0.30 池 + ref + torch 副本）的碎片治理
+    # 仍依赖 expandable_segments。必须在首个 CUDA 分配前改（此处只 set_device，
+    # 尚无 caching-allocator 分配，env 语义来得及生效）。
+    for _alloc_k in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        os.environ[_alloc_k] = "expandable_segments:True"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg["gen_device"])
     torch.cuda.set_device(0)
     print(f"[rollout] generation worker on GPU {cfg['gen_device']}")
