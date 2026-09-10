@@ -150,12 +150,14 @@ def run_training(cfg, args):
         gen_logps = batch["gen_logps"].to(engine.device)
         ref_logps = batch["refs"].to(engine.device)
 
-        # 【2026-09-11 4B 显存】分块 logps + backbone 激活检查点（模型初始化处开启）：
-        # 全量 logits (8, ~5.4k, 248320) ~22G + 未开检查点的 backbone 激活 ~80G
-        # 量级，96G 卡放不下。分块走 checkpoint 重算，激活峰值 O(B×chunk×V)。
-        per_token_logps = forward_per_token_logps(
-            engine.module if hasattr(engine, "module") else engine, inputs,
-            batch_chunk=1, use_checkpoint=True)[:, plen - 1:]
+        # 【2026-09-11 4B 显存】分块 logps + backbone 激活检查点（模型初始化处开启）。
+        # micro_rows>0 再按行拆 micro-backward（前向 1 行 -> backward -> 图释放）：
+        # DS bf16 优化器全态（fp32 master+m+v ≈ params×12B）把 GPU1 静态逼到
+        # ~80G，本机 RAM 60G 上不去 offload（DS pin_memory 还撞容器锁页上限）
+        # ——唯一可砍的是"8 行检查点包共存"。sample_mean 归一下
+        # Σ chunk_loss×(k/R) 与整批 loss 梯度严格等价（DS 的统一缩放两条路径
+        # 同乘相消）；其他 loss_norm 在下面 fail-fast（批内归一跨 chunk 变义）。
+        _mmod = engine.module if hasattr(engine, "module") else engine
         if "mask" in batch:
             # 阶段2 retool：mask 由生成端按段边界给出（assistant=1 / 工具返回段=0 / pad=0），
             # 训练端直接采用——工具返回 token 不进 loss 是 TIR 的核心契约，不可用 pad 重算。
@@ -163,11 +165,38 @@ def run_training(cfg, args):
         else:
             mask = (inputs[:, plen:] != pad_id).float()
 
-        loss, stats = compute_loss(
-            cfg["algo"], per_token_logps, gen_logps, advantages, mask, cfg,
-            ref_logps=ref_logps,
-            num_items_in_batch=batch.get("num_items_in_batch"))
-        engine.backward(loss)
+        micro_rows = int(cfg.get("micro_rows", 0) or 0)
+        R = inputs.shape[0]
+        if micro_rows and micro_rows < R:
+            if cfg.get("loss_norm") != "sample_mean":
+                raise RuntimeError(
+                    f"[train] micro_rows 拆行仅支持 loss_norm=sample_mean"
+                    f"（当前 {cfg.get('loss_norm')}）——批内归一跨 chunk 变义，"
+                    "禁止静默改语义")
+            loss_total, stats_list = 0.0, []
+            for c0 in range(0, R, micro_rows):
+                sl = slice(c0, min(c0 + micro_rows, R))
+                chunk_logps = forward_per_token_logps(
+                    _mmod, inputs[sl], batch_chunk=1,
+                    use_checkpoint=True)[:, plen - 1:]
+                chunk_loss, chunk_stats = compute_loss(
+                    cfg["algo"], chunk_logps, gen_logps[sl], advantages[sl],
+                    mask[sl], cfg, ref_logps=ref_logps[sl])
+                engine.backward(chunk_loss * (sl.stop - sl.start) / R)
+                loss_total += float(chunk_loss.item()) * (sl.stop - sl.start) / R
+                stats_list.append(chunk_stats)
+            loss = loss_total   # 显示口径 = 整批等价 loss
+            stats = {k: sum(s[k] for s in stats_list) / len(stats_list)
+                     for k in stats_list[0]}
+        else:
+            per_token_logps = forward_per_token_logps(
+                _mmod, inputs, batch_chunk=1, use_checkpoint=True)[:, plen - 1:]
+            loss, stats = compute_loss(
+                cfg["algo"], per_token_logps, gen_logps, advantages, mask, cfg,
+                ref_logps=ref_logps,
+                num_items_in_batch=batch.get("num_items_in_batch"))
+            engine.backward(loss)
+            loss = float(loss.item())
         # 梯度健康探针：策略梯度全零 = 零梯度 bug 的直接签名（cispo 教训：
         # 300 步 loss 数值"正常"但梯度处处为零，训完评测才发现）。连续 3 次
         # 全零直接 fail-fast，不在废训上继续烧 GPU。
@@ -187,7 +216,7 @@ def run_training(cfg, args):
         engine.step()
 
         if dist.get_rank() == 0:
-            progress.set_description(f"Loss: {loss.item():.6f}")
+            progress.set_description(f"Loss: {loss:.6f}")
             n = inputs.shape[0]
             totals["num"] += n
             if "acc_scores" in batch:
@@ -265,6 +294,9 @@ def main():
     ap.add_argument("--zero_stage", type=int, default=None,
                     help="DeepSpeed zero stage（默认 0；4B 用 2 = 优化器态 offload "
                          "CPU，GPU1 静态 64G->24G）")
+    ap.add_argument("--micro_rows", type=int, default=None,
+                    help="训练步按行拆 micro-backward（0=整批；4B 用 1：前向 1 行->"
+                         "backward->释放图，动态峰值降到单行；仅支持 sample_mean）")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -288,6 +320,7 @@ def main():
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
+    if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))

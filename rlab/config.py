@@ -89,6 +89,12 @@ BASE = dict(
     # 108M 都放不下。4B 传 --zero_stage 2：优化器态 offload 到 CPU RAM（~48G），
     # GPU1 静态降到 ~24G；单卡训 step 稍慢（CPU 优化器），吞吐占比小可接受。
     zero_stage=0,
+    # 【2026-09-11 4B OOM】训练步按行拆 micro-backward（0=整批一次 backward，3B 不变）。
+    # 背景见 train.py 训练步注释：DS bf16 优化器全态把 GPU1 逼到 ~80G 静态，本机
+    # RAM 60G（offload 放不下 + DS pin_memory 撞容器锁页上限）——只能砍"8 行图
+    # 共存"。sample_mean 归一下 Σ chunk_loss×(k/R) 梯度与整批严格等价；
+    # 其他 loss_norm 会在 train.py fail-fast（批内归一跨 chunk 不等价）。
+    micro_rows=0,
 
     # ---- 数据采集 ----
     Q_batch_size=1,          # 每次 rollout 的题目数（grpo_dapo 断言=1）
