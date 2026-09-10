@@ -103,6 +103,15 @@ def run_training(cfg, args):
     model.config.use_cache = False   # 训练不用 KV cache，关掉防 HF 告警/缓存分支
     engine, optimizer, _, _ = deepspeed.initialize(
         config=ds_config(cfg), model=model, model_parameters=model.parameters())
+    # 【2026-09-11 4B OOM 根因】from_pretrained 默认 eval 模式，而 transformers
+    # 激活检查点在 DecoderLayer.__call__ 里要求 self.training 为真——不进 train
+    # 模式则 gradient_checkpointing_enable() 静默失效，backbone 全量激活保留
+    # （实测 94.65G OOM；3B 时代激活小从未暴露此坑）。Qwen 系 dropout=0，
+    # train 模式无数值影响。
+    _m = engine.module if hasattr(engine, "module") else engine
+    _m.train()
+    print(f"[train] train 模式已启用: training={_m.training} "
+          f"激活检查点={getattr(_m.base_model, 'gradient_checkpointing', '?')}")
     pad_id = tokenizer.pad_token_id
 
     wandb_run = None
