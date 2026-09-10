@@ -133,6 +133,9 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset；参考实现 6 轮）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    ap.add_argument("--dump_samples", type=int, default=0,
+                    help="额外把前 N 条截断轨迹 + 前 3 条正常轨迹的原文落盘到 "
+                         "<out>.samples.jsonl（截断率高时定位 token 去向用）")
     args = ap.parse_args()
 
     from rlab.config import get_config
@@ -181,6 +184,12 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fout = open(args.out, "a", encoding="utf-8")
+    fout_samp = None
+    if args.dump_samples > 0:
+        samp_path = args.out + ".samples.jsonl"
+        fout_samp = open(samp_path, "w", encoding="utf-8")
+        print(f"[probe] 样本落盘 -> {samp_path}")
+    n_dump_trunc, n_dump_ok = 0, 0   # 截断轨迹是定位对象；正常轨迹留几条做对照
     k, wq = args.k, args.questions_per_wave
     all_rows, t0 = [], time.time()
     n_traj = 0   # 全局轨迹计数（seed 盐：防不同波次复采同轨迹）
@@ -196,7 +205,7 @@ def main():
                               top_k=cfg["top_k"], seed=args.seed * 1000003 + n_traj + j)
                for j in range(len(group_prompts))]
         n_traj += len(group_prompts)
-        segs, _texts, code_stats = multi_turn_rollout_group(
+        segs, texts, code_stats = multi_turn_rollout_group(
             vllm_gen, sps, tokenizer, group_prompts, cfg)
         for qi, x in enumerate(wave):
             for j in range(k):
@@ -208,9 +217,26 @@ def main():
                     completion_len=clen, max_gen_tokens=cfg["max_gen_tokens"],
                     overlong_buffer=cfg["overlong_buffer"],
                     overlong_shaping=cfg.get("overlong_shaping", False))
+                trunc = code_stats[idx]["trunc_final"]
                 rows.append({"Q": x["Q"], "A": x["A"], "acc": sc["acc"],
-                             "fmt": sc["format"], "trunc": code_stats[idx]["trunc_final"],
+                             "fmt": sc["format"], "trunc": trunc,
                              "clen": clen, "code_ok": code_stats[idx]["code_ok"]})
+                if fout_samp is not None:
+                    dump = (trunc == 1 and n_dump_trunc < args.dump_samples) or \
+                           (trunc == 0 and n_dump_ok < 3)
+                    if dump:
+                        n_dump_trunc += (trunc == 1)
+                        n_dump_ok += (trunc == 0)
+                        fout_samp.write(json.dumps(
+                            {"Q": x["Q"], "A": x["A"], "acc": sc["acc"], "trunc": trunc,
+                             "clen": clen, "code_ok": code_stats[idx]["code_ok"],
+                             "n_segs": len(segs[idx]),
+                             "segs_kind": [s["kind"] for s in segs[idx]],
+                             "text": texts[idx]}, ensure_ascii=False) + "\n")
+                        fout_samp.flush()
+        if fout_samp is not None and n_dump_trunc >= args.dump_samples and n_dump_ok >= 3:
+            fout_samp.close()
+            fout_samp = None   # 额度收满即停写，防止全量落盘
         per_q = aggregate_rows(rows)
         for r in per_q:
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
