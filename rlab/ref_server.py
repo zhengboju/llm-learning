@@ -112,12 +112,18 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # FA2 仅支持 bf16/fp16：flash_attention_2 档位下 ref 自动降 bf16（ref 冻结
+    # 只做前向打分，bf16 与 fp32 的 logps 差在教学规模可忽略；口径变化见
+    # config.attn_implementation 注释，报告需声明）。其余档位维持 fp32 历史口径。
+    ref_dtype = torch.bfloat16 if attn_implementation == "flash_attention_2" \
+        else torch.float32
     ref_model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float32,
+        model_path, torch_dtype=ref_dtype,
         _attn_implementation=attn_implementation).to(device)
     ref_model.eval()
     ref_model.requires_grad_(False)
-    print(f"[ref_server] mode={mode} device={device} port={port}", flush=True)
+    print(f"[ref_server] mode={mode} device={device} port={port} "
+          f"attn={attn_implementation} dtype={ref_dtype}", flush=True)
 
     macro_step = grad_accum          # 单 GPU 部署：macro batch = grad_accum 个 micro upload
     # 队列语义与各自原版逐字一致：
@@ -190,6 +196,10 @@ if __name__ == "__main__":
     ap.add_argument("--beta", type=float, default=0.04)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--device", default="cuda", help="cuda（训练机默认）或 cpu（集成测试）")
+    ap.add_argument("--attn_implementation", default="sdpa",
+                    choices=("sdpa", "flash_attention_2"),
+                    help="注意力实现（默认 sdpa=fp32 ref 历史口径；FA2 档位 ref "
+                         "自动降 bf16，与训练端 --attn_implementation 保持一致）")
     args = ap.parse_args()
     run_server(args.model_path, args.port, args.mode, args.beta, args.grad_accum,
-               args.device)
+               args.device, attn_implementation=args.attn_implementation)

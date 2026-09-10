@@ -964,6 +964,33 @@ def test_alloc_conf_ipc():
           "关键只在发送端张量在普通段分配）", True)
 
 
+def test_attn_impl():
+    """【T】attn_implementation 提速开关：三处 torch 加载点统一接线（FA2 提速）。"""
+    print("[T] attn_implementation：三处 torch 加载点统一接线（FA2 消 T² math 回退）")
+    cfg = get_config("retool_math")
+    check("BASE 默认 sdpa（3B 历史口径零变化）", cfg["attn_implementation"] == "sdpa")
+    with open("rlab/train.py", encoding="utf-8") as f:
+        train_src = f.read()
+    with open("rlab/rollout.py", encoding="utf-8") as f:
+        rollout_src = f.read()
+    with open("rlab/ref_server.py", encoding="utf-8") as f:
+        ref_src = f.read()
+    with open("rlab/run_gsm8k.sh", encoding="utf-8") as f:
+        sh_src = f.read()
+    check("train.py 加载点走 cfg（无硬编码 sdpa）",
+          '_attn_implementation=cfg.get("attn_implementation", "sdpa")' in train_src)
+    check("rollout.py gen 副本加载点走 cfg",
+          '_attn_implementation=cfg.get("attn_implementation", "sdpa")' in rollout_src)
+    check("ref_server.py FA2 档位自动降 bf16（FA2 不支持 fp32）",
+          'torch.bfloat16 if attn_implementation == "flash_attention_2"' in ref_src)
+    check("run_gsm8k.sh 把 ATTN_IMPL 注入 ref_server 与 train 两处（手动传参可覆盖："
+          "注入 flag 在 \"$@\" 之前，argparse 后者胜）",
+          sh_src.count('--attn_implementation "$ATTN_IMPL"') == 2
+          and '--attn_implementation "$ATTN_IMPL" "$@"' in sh_src)
+    check("train.py CLI choices 含 flash_attention_2",
+          '"flash_attention_2"' in train_src and "--attn_implementation" in train_src)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1015,6 +1042,7 @@ if __name__ == "__main__":
     test_split_load_remap()
     test_chunked_logps()
     test_alloc_conf_ipc()
+    test_attn_impl()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

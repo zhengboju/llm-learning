@@ -455,7 +455,7 @@ def gen_worker(Q, cfg: dict):
     # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）
     gen_torch = AutoModelForCausalLM.from_pretrained(
         cfg["model_path"], torch_dtype=torch.bfloat16,
-        _attn_implementation="sdpa").cuda().eval()
+        _attn_implementation=cfg.get("attn_implementation", "sdpa")).cuda().eval()
     print("[rollout] torch gen_logps 副本已加载")
 
     sampling_params = SamplingParams(n=cfg["num_pre_Q"], temperature=cfg["temperature"],

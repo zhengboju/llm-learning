@@ -103,7 +103,8 @@ def run_training(cfg, args):
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
     model = AutoModelForCausalLM.from_pretrained(
-        cfg["model_path"], torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
+        cfg["model_path"], torch_dtype=torch.bfloat16,
+        _attn_implementation=cfg.get("attn_implementation", "sdpa"))
     # 【2026-09-11 4B】8-bit 优化器在 DS initialize 前构建并传入（ds_config 相应
     # 省略 optimizer 段）：bnb AdamW8bit 把 m/v 量化到 8bit（32G->8G），step 全程
     # GPU、无 offload、无 RAM 压力。数值口径声明见 config.optim_8bit 注释。
@@ -323,6 +324,11 @@ def main():
                     help="bitsandbytes AdamW8bit 优化器（4B 显存：8bit 态留 GPU，"
                          "规避 fused fp32 的 96G 无解与 CPU offload 的 RAM 爆；"
                          "需 pip install bitsandbytes）")
+    ap.add_argument("--attn_implementation", default=None,
+                    choices=("sdpa", "flash_attention_2"),
+                    help="torch 侧注意力实现（默认 sdpa；flash_attention_2 提速："
+                         "head_dim 256 消除 T² math 回退，配合放开 --micro_rows；"
+                         "需 pip install flash-attn，ref_server 同步降 bf16）")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -348,6 +354,7 @@ def main():
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows
     if args.optim_8bit: overrides["optim_8bit"] = True
+    if args.attn_implementation: overrides["attn_implementation"] = args.attn_implementation
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))

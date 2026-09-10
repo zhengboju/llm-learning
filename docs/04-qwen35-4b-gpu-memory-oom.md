@@ -126,9 +126,13 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 
 ## 6. 未做的后续优化（按需启用）
 
-- **flash-attn**：head_dim 256 走 flash 核后 T² 物化消失，可撤 batch_chunk=1
-  行拆（训练前向恢复 8 行批，吞吐回升）——`pip install flash-attn` +
-  `_attn_implementation="flash_attention_2"`。
+- **flash-attn（已落地开关，2026-09-11）**：`ATTN_IMPL=flash_attention_2 bash
+  rlab/run_gsm8k.sh ...`（或 `--attn_implementation flash_attention_2`）——三处
+  torch 加载点（train/gen 副本/ref_server）统一接线，head_dim 256 走 flash 核后
+  T² 物化消失，随后可逐步撤 batch_chunk=1 / 放开 `--micro_rows`（先 2 后 4）。
+  注意：FA2 不支持 fp32，ref_server 在该档位**自动降 bf16**（ref 打分口径变化
+  需在报告声明）；pod 需先 `pip install flash-attn --no-build-isolation`。
+  vLLM 有独立 backend，不受此开关影响。
 - **vLLM `enforce_eager`**：GPU0 若再紧，砍 CUDA graph 内存（吞吐降 20-30%）。
 - **纯生成协议消融**：v4 探针样本 code_ok≈0（4B 纯 prose 直接解）——若正式
   跑确认 code 恒 0，可砍沙箱/多轮/mask 整套，单轮协议下 T 直接 = max_gen_tokens，

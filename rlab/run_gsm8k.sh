@@ -31,6 +31,12 @@ export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 # 训练机无交互终端 + 常无 WANDB_API_KEY：默认离线记录防 wandb login prompt 卡死；
 # 有 key 且想实时上传时 WANDB_MODE=online bash rlab/run_gsm8k.sh ... 覆盖。
 export WANDB_MODE=${WANDB_MODE:-offline}
+# 【提速开关】torch 侧注意力实现（train/gen副本/ref_server 三处统一注入）。
+# 默认 sdpa=历史口径；flash_attention_2 需先 pip install flash-attn --no-build-isolation，
+# 收益：head_dim 256 的 T² math 回退消失 -> 可放开 --micro_rows（docs/04 §6）。
+# ref_server 在 FA2 档位自动降 bf16。手动传参可覆盖（注入的 flag 在 "$@" 之前）。
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+echo "[run] attn_implementation=$ATTN_IMPL"
 
 PORT=59875
 MODE=passthrough
@@ -82,7 +88,7 @@ REF_BETA_ARGS=""
 if [ "$ALGO" = "rfpp" ]; then REF_BETA_ARGS="--beta 0.0"; fi
 
 CUDA_VISIBLE_DEVICES=$REF_GPU python -m rlab.ref_server --model_path "$MODEL" \
-    --port $PORT --mode $MODE $REF_BETA_ARGS &
+    --port $PORT --mode $MODE $REF_BETA_ARGS --attn_implementation "$ATTN_IMPL" &
 REF_PID=$!
 
 # Pre-flight 2：等 /health 且模式匹配（替代盲等 15s；ref 模型加载可能 >15s）
@@ -104,4 +110,4 @@ fi
 # CUDA_VISIBLE_DEVICES 限定训练卡；生成 worker 由 train.py spawn 后自行把
 # CUDA_VISIBLE_DEVICES 改回 REF_GPU 的物理卡号（rollout.gen_worker 内置）
 CUDA_VISIBLE_DEVICES=$TRAIN_GPU python -m rlab.train --algo "$ALGO" \
-    --model_path "$MODEL" --port $PORT "$@"
+    --model_path "$MODEL" --port $PORT --attn_implementation "$ATTN_IMPL" "$@"

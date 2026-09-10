@@ -151,6 +151,14 @@ BASE = dict(
     difficulty_band=(0.0, 1.0),  # 保留 n_correct/k 严格落在开区间 (lo, hi) 的题
 
     # ---- 训练 ----
+    # 【2026-09-11 提速】torch 侧三处加载（train/gen 副本/ref_server）共用的注意力
+    # 实现，默认 sdpa 与 3B 历史完全可比。Qwen3.5 的 head_dim=256 门控注意力在
+    # SDPA 走 math 回退物化 T²（docs/04 B4），整条链被迫 batch_chunk=1；
+    # flash_attention_2 支持大 head_dim，T² 消失后训练端可放开 --micro_rows。
+    # 注意：FA2 仅支持 bf16/fp16 —— ref_server 的 fp32 ref 在该档位自动降 bf16
+    # （口径：ref logps 精度略降，教学规模可忽略，报告声明）。vLLM 有独立的
+    # attention backend 选择，不受本参数影响。需 pod 上 pip install flash-attn。
+    attn_implementation="sdpa",
     all_steps=300,
     save_steps=100,
     gen_update_steps=16,     # 每 N 个 optimizer step 推送权重给生成端
