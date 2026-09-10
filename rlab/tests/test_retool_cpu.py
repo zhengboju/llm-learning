@@ -899,6 +899,13 @@ def test_split_load_remap():
     cfg = get_config("retool_math", use_wandb=False)
     check("BASE 默认 vllm_model_path=None（单 checkpoint 路径零变化）",
           cfg["vllm_model_path"] is None)
+    check("BASE 默认 zero_stage=0（3B 路径零变化；4B 用 --zero_stage 2 offload）",
+          cfg["zero_stage"] == 0)
+    from rlab.config import ds_config as _ds
+    check("stage 2 配置带 offload_optimizer(cpu)，stage 0 不带",
+          "offload_optimizer" in _ds({**cfg, "zero_stage": 2})["zero_optimization"]
+          and "offload_optimizer"
+          not in _ds({**cfg, "zero_stage": 0})["zero_optimization"])
 
 
 def test_chunked_logps():

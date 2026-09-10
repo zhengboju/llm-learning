@@ -83,6 +83,12 @@ BASE = dict(
     # extract_text_model.py 抽出的纯文本版 → model_path=纯文本（torch 三处加载）、
     # vllm_model_path=原多模态，权重同步经 sync.remap_text_to_multimodal 映射键名。
     vllm_model_path=None,
+    # 【2026-09-11 4B OOM】DeepSpeed zero stage（0=默认，3B 全态 ~60G 历史可比）。
+    # 4B bf16 优化器全态 = fp32 master+m+v ~48G + bf16 权重/梯度 16G ≈ 64G 静态，
+    # 动态（检查点包+重算瞬态+math 注意力 T²）顶满 95G——第一步 backward 差
+    # 108M 都放不下。4B 传 --zero_stage 2：优化器态 offload 到 CPU RAM（~48G），
+    # GPU1 静态降到 ~24G；单卡训 step 稍慢（CPU 优化器），吞吐占比小可接受。
+    zero_stage=0,
 
     # ---- 数据采集 ----
     Q_batch_size=1,          # 每次 rollout 的题目数（grpo_dapo 断言=1）
@@ -278,5 +284,10 @@ def ds_config(cfg: dict) -> dict:
         "steps_per_print": 5,
         "optimizer": {"type": "AdamW", "params": {"lr": cfg["lr"]}},
         "bf16": {"enabled": True},
-        "zero_optimization": {"stage": 0},
+        # stage 2 + offload：fp32 优化器态驻 CPU（4B 专用；stage 0 路径零变化）
+        "zero_optimization": {
+            "stage": cfg.get("zero_stage", 0),
+            **({"offload_optimizer": {"device": "cpu"}}
+               if cfg.get("zero_stage", 0) >= 2 else {}),
+        },
     }

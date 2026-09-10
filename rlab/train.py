@@ -262,6 +262,9 @@ def main():
     ap.add_argument("--gen_gpu_mem", type=float, default=None,
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
+    ap.add_argument("--zero_stage", type=int, default=None,
+                    help="DeepSpeed zero stage（默认 0；4B 用 2 = 优化器态 offload "
+                         "CPU，GPU1 静态 64G->24G）")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
     args = ap.parse_args()
 
@@ -284,6 +287,7 @@ def main():
     if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
+    if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
