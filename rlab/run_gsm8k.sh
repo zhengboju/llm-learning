@@ -37,6 +37,16 @@ export WANDB_MODE=${WANDB_MODE:-offline}
 # ref_server 在 FA2 档位自动降 bf16。手动传参可覆盖（注入的 flag 在 "$@" 之前）。
 ATTN_IMPL=${ATTN_IMPL:-sdpa}
 echo "[run] attn_implementation=$ATTN_IMPL"
+# 【容器 libstdc++ 兜底】基础镜像 /lib/x86_64-linux-gnu/libstdc++.so.6 偏老
+# （实测缺 GLIBCXX_3.4.31，pip 新装 C 扩展如 optree 需要）；conda 自带的那份更新。
+# 动态链接器"谁先被加载谁定终身"，不显式指定时能否启动随 import 顺序漂移——
+# 统一 preload conda 版（仅当文件存在、确含所需符号、且用户没自己设 LD_PRELOAD）。
+CONDA_STDCXX=/opt/conda/lib/libstdc++.so.6
+if [ -f "$CONDA_STDCXX" ] && strings "$CONDA_STDCXX" 2>/dev/null | grep -q GLIBCXX_3.4.31 \
+   && [ -z "$LD_PRELOAD" ]; then
+  export LD_PRELOAD="$CONDA_STDCXX"
+  echo "[run] LD_PRELOAD=$LD_PRELOAD（容器 libstdc++ 兜底）"
+fi
 
 PORT=59875
 MODE=passthrough
