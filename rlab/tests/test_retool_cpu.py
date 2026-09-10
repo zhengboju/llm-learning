@@ -901,6 +901,32 @@ def test_split_load_remap():
           cfg["vllm_model_path"] is None)
 
 
+def test_chunked_logps():
+    print("[R] 分块 logps：forward_per_token_logps == 全量前向（4B logits 峰 OOM 修复）")
+    from rlab.losses import forward_per_token_logps
+    from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
+    cfg = GPT2Config(vocab_size=50257, n_positions=128, n_embd=64, n_layer=2,
+                     n_head=2, resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0)
+    model = GPT2LMHeadModel(cfg).eval()
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    ids = tok("The capital of France is Paris and Rome is old",
+              return_tensors="pt").input_ids
+    with torch.inference_mode():
+        ref = get_per_token_logps(model(ids).logits[:, :-1, :], ids[:, 1:])
+        chunked = forward_per_token_logps(model, ids, seq_chunk=3)
+    check("分块 == 全量（seq_chunk=3 覆盖非对齐边界）",
+          torch.allclose(ref, chunked, atol=1e-5))
+    model.config.use_cache = False
+    model.train()   # dropout 已置 0，train 模式确定性与 eval 一致
+    out = forward_per_token_logps(model, ids, seq_chunk=3, use_checkpoint=True)
+    check("checkpoint 分块 == 全量（grad 路径数值等价）",
+          torch.allclose(ref, out.detach(), atol=1e-5))
+    out.sum().backward()
+    check("checkpoint 反向梯度可达（lm_head/embed 均有 grad）",
+          model.lm_head.weight.grad is not None
+          and model.transformer.wte.weight.grad is not None)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -916,6 +942,7 @@ def test_pyflakes_undefined():
              "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
              "rlab/sandbox.py", "rlab/analysis.py", "rlab/probe_retool_gen.py",
              "rlab/probe_difficulty.py", "rlab/extract_text_model.py",
+             "rlab/ref_server.py",
              "rlab/data.py", "rlab/prepare_dapo_math.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
@@ -949,6 +976,7 @@ if __name__ == "__main__":
     test_sandbox_hardening()
     test_chat_template_kwargs()
     test_split_load_remap()
+    test_chunked_logps()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

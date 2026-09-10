@@ -43,7 +43,7 @@ from rlab.config import get_config
 from rlab.data import filter_qas_by_difficulty, load_difficulty_table, load_qas
 from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
-from rlab.losses import compute_advantages, get_per_token_logps
+from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, sanitize_tool_text,
                            segment_mask_from_spans, tensor_to_bytes)
@@ -536,10 +536,11 @@ def gen_worker(Q, cfg: dict):
         # 已知妥协（阶段0 遗留，如实记录）：前向不传 attention_mask，左 pad 区
         # token 参与 attention——但训练端 policy 前向与 ref_server 前向同样不传，
         # 三方一致的偏差在 ratio（policy/gen）中抵消；教学规模实测可用。
+        # 【2026-09-11】改走分块 logps：全长 logits (8, ~5.4k, 248320) ~22G 实测 OOM。
         with torch.inference_mode():
-            mids = merged_ids.to(gen_torch.device)
-            logits = gen_torch(mids).logits
-            return get_per_token_logps(logits[:, :-1, :], mids[:, 1:])[:, plen - 1:].cpu()
+            logps = forward_per_token_logps(
+                gen_torch, merged_ids.to(gen_torch.device), seq_chunk=512)
+            return logps[:, plen - 1:].cpu()
 
     def score_group(inputs, answers, completion_lens):
         """打分。返回 (scores, acc_s, fmt_s)。

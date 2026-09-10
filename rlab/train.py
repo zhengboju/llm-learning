@@ -27,7 +27,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from rlab.config import ds_config, get_config
-from rlab.losses import ALGOS, compute_loss, get_per_token_logps
+from rlab.losses import ALGOS, compute_loss, forward_per_token_logps
 from rlab.protocol import decode_batch
 
 
@@ -95,6 +95,12 @@ def run_training(cfg, args):
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
     model = AutoModelForCausalLM.from_pretrained(
         cfg["model_path"], torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
+    # 【2026-09-11 4B 显存】backbone 激活检查点：B=8×T~5.4k 的层内激活 ~80G 量级
+    # （3B 实测 ~20G × T 3.2× H 1.25×），不开必 OOM；只存层输入、backward 重算。
+    # use_reentrant=False 与分块 logps 的 checkpoint 重算兼容。
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False   # 训练不用 KV cache，关掉防 HF 告警/缓存分支
     engine, optimizer, _, _ = deepspeed.initialize(
         config=ds_config(cfg), model=model, model_parameters=model.parameters())
     pad_id = tokenizer.pad_token_id
@@ -135,8 +141,12 @@ def run_training(cfg, args):
         gen_logps = batch["gen_logps"].to(engine.device)
         ref_logps = batch["refs"].to(engine.device)
 
-        logits = engine(inputs).logits[:, :-1, :]
-        per_token_logps = get_per_token_logps(logits, inputs[:, 1:])[:, plen - 1:]
+        # 【2026-09-11 4B 显存】分块 logps + backbone 激活检查点（模型初始化处开启）：
+        # 全量 logits (8, ~5.4k, 248320) ~22G + 未开检查点的 backbone 激活 ~80G
+        # 量级，96G 卡放不下。分块走 checkpoint 重算，激活峰值 O(B×chunk×V)。
+        per_token_logps = forward_per_token_logps(
+            engine.module if hasattr(engine, "module") else engine, inputs,
+            use_checkpoint=True)[:, plen - 1:]
         if "mask" in batch:
             # 阶段2 retool：mask 由生成端按段边界给出（assistant=1 / 工具返回段=0 / pad=0），
             # 训练端直接采用——工具返回 token 不进 loss 是 TIR 的核心契约，不可用 pad 重算。

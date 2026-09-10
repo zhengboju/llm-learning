@@ -30,18 +30,15 @@ import threading
 
 import torch
 
+from rlab.losses import forward_per_token_logps
 from rlab.protocol import bytes_list_to_list, bytes_to_tensor, make_bytes_list, tensor_to_bytes
 
 
 def get_per_token_logps(model, input_ids):
-    logits = model(input_ids).logits
-    logits = logits[:, :-1, :]
-    ids = input_ids[:, 1:]
-    out = []
-    for row_logits, row_ids in zip(logits, ids):
-        log_probs = row_logits.log_softmax(dim=-1)
-        out.append(torch.gather(log_probs, dim=1, index=row_ids.unsqueeze(1)).squeeze(1))
-    return torch.stack(out)
+    """ref per-token logps（打分路径）。【2026-09- logits 峰】改走分块实现：
+    全量 logits (8, ~5.4k, 248320) ~22G 会把 ref 进程（GPU0 三方共居）炸掉，
+    且 ref 是 eval 前向无梯度——朴素分块即可，无需 checkpoint。"""
+    return forward_per_token_logps(model, input_ids, seq_chunk=512)
 
 
 def get_eos_mask(completion_mask):
