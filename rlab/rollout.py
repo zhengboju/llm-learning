@@ -220,11 +220,23 @@ class LogpsVerifier:
             return
         self.n += 1
         m = mask.bool()
-        d = (gv[m].float() - gt.to(gv.dtype)[m].float()).abs().max().item()
-        self.max_diff = max(self.max_diff, d)
-        print(f"[rollout][verify] 第 {self.n}/{self.budget} 组：vLLM vs torch "
-              f"gen_logps 最大差 {d:.3e}（累积最大 {self.max_diff:.3e}，"
-              f"有效位 {int(m.sum())} 个）", flush=True)
+        # 只报 max 会掩盖病因（2026-09-11 首轮对拍 max=11.3 但不知道是"整体平移"
+        # 还是"个别离群"）——补分布统计与最大差位置，一次对拍就能定性
+        d = (gv[m].float() - gt.to(gv.dtype)[m].float()).abs()
+        if d.numel() == 0:
+            print(f"[rollout][verify] 第 {self.n}/{self.budget} 组：无有效位，跳过", flush=True)
+            return
+        mx = d.max().item()
+        mean = d.mean().item()
+        p50 = d.median().item()
+        p99 = d.kthvalue(max(1, int(d.numel() * 0.99))).values.item()
+        pos = m.nonzero()[d.argmax()].tolist() if d.numel() else [-1, -1]
+        self.max_diff = max(self.max_diff, mx)
+        print(f"[rollout][verify] 第 {self.n}/{self.budget} 组：vLLM vs torch gen_logps "
+              f"| diff mean={mean:.3e} p50={p50:.3e} p99={p99:.3e} max={mx:.3e}"
+              f"（有效位 {int(m.sum())}，最大差在 [行{pos[0]}, 列{pos[1]}]，"
+              f"vLLM={float(gv[m][d.argmax()]):.3f} torch={float(gt.to(gv.dtype)[m][d.argmax()]):.3f}）",
+              flush=True)
         if not self.wants() and self.on_finish is not None:
             self.on_finish()
 
