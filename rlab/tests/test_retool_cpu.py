@@ -1037,6 +1037,19 @@ def test_materialize_mm():
         check("纯视觉骨架 fail-fast（语言键无处落位=配置错误）", True)
 
 
+def test_eval_spawn_guard():
+    print("[V] eval spawn 递归引爆防护：vLLM V1 spawn 子进程重执行 eval_vllm_one.py "
+          "顶层 LLM() -> _check_not_importing_main（2026-09-11 4B eval 实测）")
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "eval_vllm_one.py"), encoding="utf-8").read()
+    guard = 'os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")'
+    check("eval_vllm_one.py 顶部设 VLLM_ENABLE_V1_MULTIPROCESSING=0"
+          "（与 run_gsm8k.sh 训练端同款，进程内引擎不走 spawn）",
+          guard in src)
+    check("守卫在 vLLM import 之前（spawn 发生在 LLM() 初始化，env 须先于其生效）",
+          src.index(guard) < src.index("from vllm import"))
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1090,6 +1103,7 @@ if __name__ == "__main__":
     test_alloc_conf_ipc()
     test_attn_impl()
     test_materialize_mm()
+    test_eval_spawn_guard()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

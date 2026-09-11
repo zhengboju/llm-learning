@@ -10,6 +10,13 @@ import os
 import re
 from transformers import AutoTokenizer
 
+# 【spawn 递归引爆防护】vLLM V1 默认用 multiprocessing spawn 启动 EngineCore 子进程，
+# 子进程会按 spawn 语义重新执行本模块顶层代码——本脚本沿用"顶层直线流程"风格没有
+# __main__ 保护，子进程会再次跑到 LLM() 触发 _check_not_importing_main RuntimeError
+# （2026-09-11 eval 4B checkpoint 实测）。进程内引擎（=0）与训练端 run_gsm8k.sh 的
+# 既有配置完全一致，评测为一次性批量生成无性能损失。必须在 vLLM 首次初始化前生效。
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", required=True, help="模型/checkpoint 路径")
 parser.add_argument("--name", default=None, help="表内显示名，默认取路径末2段")
