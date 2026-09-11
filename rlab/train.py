@@ -247,6 +247,15 @@ def run_training(cfg, args):
 
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss:.6f}")
+            # 【2026-09-11】ratio 口径健康：这两个数原本只进 wandb（默认离线），终端
+            # 看不见——而它们是"gen_logps 与 policy 差多少"的**唯一直接量**。判读：
+            # 第 1 步 / 每次权重同步后的第一步，batch 与策略同权重 → ratio 理论上恒 1，
+            # 实测 clip_frac 与 approx_kl 就是两路实现的口径差（torch 副本档应严格 0；
+            # vLLM logprobs 档（减法①）≲0.5% / ~1e-4 属实现层噪声，见 docs/02）。
+            if step == 1 or step % 10 == 0:
+                print(f"[train][口径] step {step}: clip_frac={stats['clip_frac']:.4f} "
+                      f"approx_kl={stats['approx_kl']:.2e} "
+                      f"mean_ratio={stats['mean_ratio']:.4f}", flush=True)
             n = inputs.shape[0]
             totals["num"] += n
             if "acc_scores" in batch:
