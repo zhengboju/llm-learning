@@ -62,7 +62,14 @@ ALGO_DEFAULTS = {
                         gen_questions_per_attempt=4, sandbox_workers=8,
                         max_context_tokens=8192, round_gen_tokens=1024,
                         max_gen_tokens=8192, max_prompt_length=1024,
-                        code_w=0.0, reward_switch_step=1000000000),
+                        code_w=0.0, reward_switch_step=1000000000,
+                        # 【2026-09-11 eval 全灭事故】思考开关收进 preset 单点同源：
+                        # Qwen3.5 默认 enable_thinking=True，eval 端 prompt 构造从
+                        # config 取此值——此前只在训练 CLI 传，eval 拿到 None，
+                        # 生成以 <think> 开头烧穿预算，fmt/acc 双灭（base 同灭，
+                        # 证明是协议问题非权重）。训练 CLI --chat_template_kwargs
+                        # 仍可覆盖；GSM8K 家族（Qwen2.5）模板忽略该上下文键。
+                        chat_template_kwargs={"enable_thinking": False}),
 }
 
 BASE = dict(

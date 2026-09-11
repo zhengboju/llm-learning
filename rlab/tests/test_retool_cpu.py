@@ -864,8 +864,11 @@ def test_chat_template_kwargs():
     build_prompt("Q1", "SYS", tok, {"enable_thinking": False})
     check("kwargs 透传模板上下文", seen["kw"] == {"enable_thinking": False})
     cfg = get_config("retool_math", use_wandb=False)
-    check("BASE 默认 chat_template_kwargs=None（阶段0-2 行为不变）",
-          cfg["chat_template_kwargs"] is None)
+    check("retool_math preset 带思考开关（2026-09-11 eval 全灭事故后收进 preset "
+          "单点同源，训练/eval 共用；旧契约'preset 必须 None'已随事故作废）",
+          cfg["chat_template_kwargs"] == {"enable_thinking": False})
+    check("GSM8K 家族（grpo）仍无该键（Qwen2.5 行为零变化）",
+          get_config("grpo", use_wandb=False)["chat_template_kwargs"] is None)
     # CLI 以 JSON 字符串进 overrides（train.py / probe_difficulty.py 同一解析形态）
     check("CLI JSON 反序列化形态",
           json.loads('{"enable_thinking": false}') == {"enable_thinking": False})
@@ -1050,6 +1053,23 @@ def test_eval_spawn_guard():
           src.index(guard) < src.index("from vllm import"))
 
 
+def test_eval_thinking_switch():
+    print("[W] Qwen3.5 思考开关单点同源：eval 全灭事故（base/step200 同为 2%）——"
+          "eval 未传 enable_thinking=False，<think> 烧穿预算，炸协议不炸权重")
+    cfg_m = get_config("retool_math", use_wandb=False)
+    check("retool_math preset 带 chat_template_kwargs={'enable_thinking': False}"
+          "（训练/eval 单点同源，CLI 仍可覆盖）",
+          cfg_m.get("chat_template_kwargs") == {"enable_thinking": False})
+    check("BASE 保持 None（Qwen2.5 家族零变化）",
+          get_config("grpo", use_wandb=False).get("chat_template_kwargs") is None)
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "eval_vllm_one.py"), encoding="utf-8").read()
+    check("eval_vllm_one.py 从 rlab config 取 chat_template_kwargs 传给"
+          " apply_chat_template（不再裸调）",
+          'chat_template_kwargs=_ctkw' in src
+          and '_rcfg.get("chat_template_kwargs")' in src)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1065,6 +1085,7 @@ def test_pyflakes_undefined():
              "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
              "rlab/sandbox.py", "rlab/analysis.py", "rlab/probe_retool_gen.py",
              "rlab/probe_difficulty.py", "rlab/extract_text_model.py",
+             "rlab/materialize_mm_ckpt.py",
              "rlab/ref_server.py",
              "rlab/data.py", "rlab/prepare_dapo_math.py",
              "eval_vllm_one.py", "eval_vllm.py"]
@@ -1104,6 +1125,7 @@ if __name__ == "__main__":
     test_attn_impl()
     test_materialize_mm()
     test_eval_spawn_guard()
+    test_eval_thinking_switch()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

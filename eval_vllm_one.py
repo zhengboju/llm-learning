@@ -175,13 +175,22 @@ if _n_take < args.n:
     print(f"  [警告] 请求 n={args.n} 但池仅 {len(test_data)} 题 → 实际评测 {_n_take} 题"
           f"（最坏二项噪声 ±{_noise:.1f}pp，结论慎读）")
 sample = random.sample(test_data, _n_take)
-print(f"  固定 seed={args.seed}，抽 {len(sample)} 题  algo={args.algo} eval_task={args.eval_task} max_len={args.max_len} round_tokens={args.round_tokens}")
+print(f"  固定 seed={args.seed}，抽 {len(sample)} 题  algo={args.algo} eval_task={args.eval_task} "
+      f"max_len={args.max_len} round_tokens={args.round_tokens}")
 
 # ---------- 建 prompt ----------
+# 【2026-09-11 eval 4B 全灭事故】chat_template_kwargs 必须与训练端单点同源：
+# Qwen3.5 默认 enable_thinking=True，eval 未传开关时生成以 <think> 开头，贪心解码
+# 烧穿轮预算也出不了 </think>/boxed -> fmt/acc 双灭（base 与 step200 同为 2%——
+# 炸的是协议不是权重）。从 rlab config 取训练同款（retool_math preset 已带
+# {"enable_thinking": false}），Qwen2.5 家族模板忽略多余上下文键，无副作用。
 tokenizer = AutoTokenizer.from_pretrained(args.model)
+_ctkw = _rcfg.get("chat_template_kwargs")
+print(f"  chat_template_kwargs={_ctkw}（与训练端 config 单点同源）")
 prompts = [tokenizer.apply_chat_template(
     [{"role": "system", "content": system_prompt},
-     {"role": "user", "content": item["Q"]}], tokenize=False, add_generation_prompt=True)
+     {"role": "user", "content": item["Q"]}], tokenize=False, add_generation_prompt=True,
+    chat_template_kwargs=_ctkw)
     for item in sample]
 
 # 【2026-09-09 审查修复·prompt 长度防线】训练端 plen>max_prompt_length 跳组，eval

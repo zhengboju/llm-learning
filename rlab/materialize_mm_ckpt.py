@@ -27,7 +27,6 @@ config 类型检查直接 TypeError）。训练端运行时同步用 remap_text_
 """
 
 import argparse
-import json
 import os
 import shutil
 
