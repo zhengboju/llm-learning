@@ -1064,10 +1064,17 @@ def test_eval_thinking_switch():
           get_config("grpo", use_wandb=False).get("chat_template_kwargs") is None)
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))), "eval_vllm_one.py"), encoding="utf-8").read()
-    check("eval_vllm_one.py 从 rlab config 取 chat_template_kwargs 传给"
-          " apply_chat_template（不再裸调）",
-          'chat_template_kwargs=_ctkw' in src
-          and '_rcfg.get("chat_template_kwargs")' in src)
+    # 【二次修复】包裹形态 chat_template_kwargs={...} 会被 pod 上 transformers 版本
+    # 静默忽略（实测：直接 kwarg -> <think>\n\n</think>，包裹 -> <think>\n），
+    # eval 必须复用训练端 build_prompt 函数本身，而非自己拼 apply_chat_template
+    check("eval_vllm_one.py 复用训练端 build_prompt（调用形态单点同源，"
+          "包裹形态 chat_template_kwargs= 会被 transformers 静默忽略——二次全灭教训）",
+          "from rlab.rollout import build_prompt" in src
+          and "_build_prompt(item[\"Q\"], system_prompt, tokenizer, _ctkw)" in src)
+    check("eval_vllm_one.py 不再自带 apply_chat_template 调用（杜绝形态分叉复发）",
+          "apply_chat_template" not in src)
+    check("eval_vllm_one.py 有 enable_thinking 未生效的 fail-fast 告警",
+          "模板未响应 enable_thinking=False" in src)
 
 
 def test_pyflakes_undefined():

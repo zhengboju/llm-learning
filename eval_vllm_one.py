@@ -179,19 +179,23 @@ print(f"  固定 seed={args.seed}，抽 {len(sample)} 题  algo={args.algo} eval
       f"max_len={args.max_len} round_tokens={args.round_tokens}")
 
 # ---------- 建 prompt ----------
-# 【2026-09-11 eval 4B 全灭事故】chat_template_kwargs 必须与训练端单点同源：
-# Qwen3.5 默认 enable_thinking=True，eval 未传开关时生成以 <think> 开头，贪心解码
-# 烧穿轮预算也出不了 </think>/boxed -> fmt/acc 双灭（base 与 step200 同为 2%——
-# 炸的是协议不是权重）。从 rlab config 取训练同款（retool_math preset 已带
-# {"enable_thinking": false}），Qwen2.5 家族模板忽略多余上下文键，无副作用。
+# 【2026-09-11 eval 4B 全灭事故·二次修复】prompt 构造直接复用训练端 build_prompt
+# （单点同源，调用形态物理上不可能分叉）。根因：Qwen3.5 模板支持 enable_thinking
+# 开关，但只认"直接 kwarg 透传"形态——训练端 build_prompt 一直用 **kwargs 直接
+# 透传所以训练正常；eval 曾两次全灭：①没传开关；②用 chat_template_kwargs={...}
+# 包裹形态传，被当前 transformers 版本静默忽略（pod 实测两形态 prompt 分叉：
+# 直接 kwarg -> <think>\n\n</think>，包裹 -> <think>\n）。生成以未闭合 <think>
+# 开头烧穿轮预算，fmt/acc 双灭（base 同灭 = 炸协议非权重）。
+from rlab.rollout import build_prompt as _build_prompt
 tokenizer = AutoTokenizer.from_pretrained(args.model)
 _ctkw = _rcfg.get("chat_template_kwargs")
-print(f"  chat_template_kwargs={_ctkw}（与训练端 config 单点同源）")
-prompts = [tokenizer.apply_chat_template(
-    [{"role": "system", "content": system_prompt},
-     {"role": "user", "content": item["Q"]}], tokenize=False, add_generation_prompt=True,
-    chat_template_kwargs=_ctkw)
-    for item in sample]
+print(f"  chat_template_kwargs={_ctkw}（经训练端 build_prompt 单点同源）")
+prompts = [_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw) for item in sample]
+# fail-fast：请求关思考但模板没响应（如 transformers 版本行为变化），立刻告警
+if _ctkw and _ctkw.get("enable_thinking") is False \
+        and prompts[0].rstrip().endswith("<think>"):
+    print("  [警告] 模板未响应 enable_thinking=False，生成仍将以 <think> 开头！"
+          "结果会接近全灭，请检查 transformers 版本行为")
 
 # 【2026-09-09 审查修复·prompt 长度防线】训练端 plen>max_prompt_length 跳组，eval
 # 旧版没有任何防线：长题多轮 ctx 增长后撞 vLLM max_model_len → 整个 eval 进程崩溃。
