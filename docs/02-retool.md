@@ -82,6 +82,24 @@ padding_side="left")` 会把短题补到**批内最长 prompt**，而 vLLM 生�
 **判据**（tests `[AB]` 组锁死）：批内短题行的逐 token logps == 该行单独无 pad 前向
 （实测最大差 9.5e-07）；反证：同一行带 pad 前缀时同位置差 0.27（tiny GPT2）。
 
+**实机验证（2026-09-11，4B 长跑 + 减法①）**：修复前后各 5 组对拍里，**无 pad 的那一组
+逐位完全相同**（mean 5.953e-03 / p99 0.1094 / max 0.375 / 有效位 23919 全等）——天然
+对照组；带 pad 的三组 mean 6.6~7.4e-2 → 5.8~7.5e-3、max 3.4~5.7 → 0.34~0.50，**塌到与
+该对照组统计不可区分**。残差（vLLM 与 HF torch 的 kernel/bf16 实现差）在训练端的直接
+代价，由 `[train][口径]` 在权重同步后的第一步量出（此时 ratio 理论恒 1）：
+
+```
+[train][口径] step 1: clip_frac=0.0007 approx_kl=5.11e-04 mean_ratio=1.0000
+```
+
+判读：**mean_ratio=1.0000 说明残差是零均值噪声而非偏置**（有偏会直接腐化 ratio 与
+advantage 的关系）；clip_frac 0.07% = 被误裁的 token 占比（裁剪带 (0.8,1.28)）；
+approx_kl 5.11e-04 = 残差均方 → RMS 残差 0.023（对比 mean|diff| 6e-3 可知是重尾，与
+对拍的 p50/p99 形态一致）。对照 torch 副本档应为 clip_frac=0 / approx_kl=0（严格同源）
+——即减法① 的代价被量化在"0.07% 误裁 + 5e-4 的 KL 底噪"，比真实 clip_frac 小两个数量级。
+注：此 approx_kl 是监控量（mean((log ratio)²)，= (policy−gen) 的均方），**不是 loss 里
+的 ref-KL**——后者用 ref_logps，不受本残差影响。
+
 ---
 
 ## 3. 实现清单（commit 见 git log）
