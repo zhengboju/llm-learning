@@ -134,6 +134,24 @@ def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64)
     return min((completion_len - trigger) / buffer, 1.0)
 
 
+def overlong_ref_tokens(cfg: dict) -> int:
+    """overlong shaping 的长度参考系（单点真相，retool/单轮两路共用）。
+
+    单轮路径参考 = max_gen_tokens；retool 多轮路径的**总**生成预算 =
+    max_rounds × round_gen_tokens（每轮 assistant 段上限 round_gen_tokens）。
+
+    【2026-09-11 修复】旧版两路都拿 cfg["max_gen_tokens"] 当参考——retool_math
+    preset 的 8192 是单轮时代遗留值，而 3×3072(CLI 探针口径)=9216 > 8192：
+    合法用满预算的轨迹越过 trigger 即被整额扣 1.0，而本算法 reward 域是 ±1，
+    等于把做对的 +1 抹成 0、把做错的 -1 加倍成 -2——是误伤不是 shaping。
+    """
+    rounds = cfg.get("max_rounds", 1)
+    per_round = cfg.get("round_gen_tokens")
+    if cfg.get("algo", "").startswith("retool") and per_round:
+        return rounds * per_round
+    return cfg["max_gen_tokens"]
+
+
 # ------------------------------------------------- 阶段2 ReTool 奖励 ----
 # 代码可用率小权重：执行成功的代码块数 * code_w（失败/超时不加分）。
 # Auto_Program 原口径 call_python = (python_cnt - error_cnt) * 0.1，

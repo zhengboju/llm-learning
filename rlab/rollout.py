@@ -47,8 +47,9 @@ from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, sanitize_tool_text,
                            segment_mask_from_spans, tensor_to_bytes)
-from rlab.reward import (reward_phase, total_reward, total_reward_math,
-                           total_reward_retool, total_reward_retool_math)
+from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
+                         total_reward_math, total_reward_retool,
+                         total_reward_retool_math)
 from rlab.sandbox import run_code
 from rlab.sync import remap_text_to_multimodal, sync_weights_into_vllm
 
@@ -342,6 +343,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     assert len(asst_texts) == len(inputs) * n, \
         f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
     is_math = cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo")
+    # overlong 参考系 = 多轮总预算（max_rounds × round_gen_tokens），非单轮
+    # max_gen_tokens——否则用满预算的轨迹被整额扣分（见 reward.overlong_ref_tokens）
+    _ol_ref = overlong_ref_tokens(cfg)
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
@@ -349,13 +353,17 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                 sc = total_reward_retool_math(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
                     completion_len=(completion_lens[idx] if completion_lens is not None else 0),
-                    max_gen_tokens=cfg["max_gen_tokens"],
+                    max_gen_tokens=_ol_ref,
                     overlong_buffer=cfg["overlong_buffer"],
                     overlong_shaping=cfg.get("overlong_shaping", False))
             else:
                 sc = total_reward_retool(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
                     phase=phase, code_w=cfg["code_w"],
+                    completion_len=(completion_lens[idx] if completion_lens is not None else 0),
+                    max_gen_tokens=_ol_ref,
+                    overlong_buffer=cfg["overlong_buffer"],
+                    overlong_shaping=cfg.get("overlong_shaping", False),
                     cold_w=cfg["reward_cold_w"], hot_w=cfg["reward_hot_w"])
             rewards.append(sc["reward"]); acc_s.append(sc["acc"])
             fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])

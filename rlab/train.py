@@ -324,6 +324,15 @@ def main():
                     help="bitsandbytes AdamW8bit 优化器（4B 显存：8bit 态留 GPU，"
                          "规避 fused fp32 的 96G 无解与 CPU offload 的 RAM 爆；"
                          "需 pip install bitsandbytes）")
+    # 优化超参三件套（2026-09-11 补 CLI 入口）：4B 200 步跑出 +9.7pp 信号后，
+    # 放大更新预算不需要改 config 源码——preset 默认值仍是 3B 时代标定。
+    ap.add_argument("--lr", type=float, default=None,
+                    help="覆盖学习率（preset 默认 1e-6；4B 加杠杆建议 5e-6）")
+    ap.add_argument("--beta", type=float, default=None,
+                    help="覆盖 KL 锚系数（preset 默认 0.04；放松建议 0.01）")
+    ap.add_argument("--overlong_shaping", action="store_true",
+                    help="开 DAPO 截断软悬崖惩罚（被轮长截断的样本给负奖励，"
+                         "抑制烧预算不收尾；默认关）")
     ap.add_argument("--attn_implementation", default=None,
                     choices=("sdpa", "flash_attention_2"),
                     help="torch 侧注意力实现（默认 sdpa；flash_attention_2 提速："
@@ -355,6 +364,9 @@ def main():
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows
     if args.optim_8bit: overrides["optim_8bit"] = True
     if args.attn_implementation: overrides["attn_implementation"] = args.attn_implementation
+    if args.lr is not None: overrides["lr"] = args.lr
+    if args.beta is not None: overrides["beta"] = args.beta
+    if args.overlong_shaping: overrides["overlong_shaping"] = True
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))

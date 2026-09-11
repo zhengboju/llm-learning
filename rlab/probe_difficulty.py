@@ -155,7 +155,7 @@ def main():
         cfg["max_context_tokens"] = args.max_context_tokens
 
     from rlab.data import load_qas, load_difficulty_table
-    from rlab.reward import total_reward_retool_math
+    from rlab.reward import overlong_ref_tokens, total_reward_retool_math
     from rlab.rollout import build_prompt, multi_turn_rollout_group
 
     QAs = load_qas(cfg["data_task"])
@@ -214,7 +214,7 @@ def main():
                 clen = sum(len(s["ids"]) for s in segs[idx])   # 全长口径（与训练一致）
                 sc = total_reward_retool_math(
                     x["A"], asst_text, code_ok=code_stats[idx]["code_ok"],
-                    completion_len=clen, max_gen_tokens=cfg["max_gen_tokens"],
+                    completion_len=clen, max_gen_tokens=overlong_ref_tokens(cfg),
                     overlong_buffer=cfg["overlong_buffer"],
                     overlong_shaping=cfg.get("overlong_shaping", False))
                 trunc = code_stats[idx]["trunc_final"]

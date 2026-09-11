@@ -1077,6 +1077,61 @@ def test_eval_thinking_switch():
           "模板未响应 enable_thinking=False" in src)
 
 
+def test_overlong_ref_and_opt_cli():
+    print("[X] overlong 参考系修复 + 优化超参 CLI：retool 多轮总预算 ≠ 单轮 max_gen_tokens")
+    from rlab.reward import overlong_ref_tokens, overlong_penalty, total_reward_math
+    # 参考系：retool 家族 = max_rounds × round_gen_tokens（CLI 覆盖后同步生效）
+    cfg_rm = get_config("retool_math", use_wandb=False, round_gen_tokens=3072)
+    check("retool_math 参考系 = max_rounds × round_gen_tokens = 9216（非单轮 8192）",
+          overlong_ref_tokens(cfg_rm) == 3 * 3072)
+    check("preset 默认（round_gen_tokens=1024）参考系 = 3072",
+          overlong_ref_tokens(get_config("retool_math", use_wandb=False)) == 3 * 1024)
+    check("单轮路径（grpo）参考系仍 = max_gen_tokens",
+          overlong_ref_tokens(get_config("grpo", use_wandb=False))
+          == get_config("grpo", use_wandb=False)["max_gen_tokens"])
+    # 行为：合法用满预算（2 轮满 3072 + 末轮 3008 = 9152，落在 trigger 9152 内）
+    # 做对的轨迹不该被误伤；旧口径（8192）下同一轨迹被扣满 → +1 抹成 0 / -1 压成 -2
+    _full_legit = 2 * 3072 + 3008
+    r_now = total_reward_math("72", "answer is \\boxed{72}",
+                              completion_len=_full_legit,
+                              max_gen_tokens=overlong_ref_tokens(cfg_rm),
+                              overlong_shaping=True)["reward"]
+    r_old = total_reward_math("72", "answer is \\boxed{72}",
+                              completion_len=_full_legit, max_gen_tokens=8192,
+                              overlong_shaping=True)["reward"]
+    check("合法满预算(9152)+答对：新参考系不罚（+1），旧参考系被抹平（0）",
+          abs(r_now - 1.0) < 1e-6 and abs(r_old - 0.0) < 1e-6)
+    r_wrong_old = total_reward_math("72", "answer is \\boxed{99}",
+                                    completion_len=_full_legit, max_gen_tokens=8192,
+                                    overlong_shaping=True)["reward"]
+    check("旧参考系还会加倍惩罚答错（-1 → -2），新参考系下为 -1",
+          abs(r_wrong_old - (-2.0)) < 1e-6
+          and abs(total_reward_math("72", "answer is \\boxed{99}",
+                                    completion_len=_full_legit,
+                                    max_gen_tokens=overlong_ref_tokens(cfg_rm),
+                                    overlong_shaping=True)["reward"] - (-1.0)) < 1e-6)
+    check("真超预算才线性扣分（trigger 9152 + 32 → 0.5）",
+          abs(overlong_penalty(9152 + 32, 9216, 64) - 0.5) < 1e-6)
+    # CLI 入口：新三件套被 train.py 接收并落到 overrides
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    for flag, key in (('"--lr"', 'overrides["lr"] = args.lr'),
+                      ('"--beta"', 'overrides["beta"] = args.beta'),
+                      ('"--overlong_shaping"', 'overrides["overlong_shaping"] = True')):
+        check(f"train.py CLI {flag} 存在且映射到 {key}",
+              flag in src and key in src)
+    # 接线：rollout retool 打分路径与探针都用同一参考系函数
+    ro = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "rollout.py"), encoding="utf-8").read()
+    pb = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "probe_difficulty.py"), encoding="utf-8").read()
+    check("rollout retool 打分用 overlong_ref_tokens（不再传单轮 max_gen_tokens）",
+          "_ol_ref = overlong_ref_tokens(cfg)" in ro
+          and 'max_gen_tokens=cfg["max_gen_tokens"]' not in ro.split("def retool_score_flat")[1].split("def ")[0])
+    check("probe_difficulty 与训练同口径（overlong_ref_tokens）",
+          "max_gen_tokens=overlong_ref_tokens(cfg)" in pb)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1133,6 +1188,7 @@ if __name__ == "__main__":
     test_materialize_mm()
     test_eval_spawn_guard()
     test_eval_thinking_switch()
+    test_overlong_ref_and_opt_cli()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
