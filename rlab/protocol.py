@@ -3,7 +3,10 @@
 
 字节流格式（沿用本项目 ref_server 协议，bytes_list）：
   [0] json meta   : {"plen": int, "num_items_in_batch": int(可选), ...}
-  [1] merged_ids  : (B, plen+T) 左 pad prompt + 右 pad completion
+  [1] merged_ids  : (B, plen+T) prompt + 右 pad completion
+                    （阶段0/1 单轮批的 prompt 段含左 pad；阶段2 retool 逐题用
+                    rollout.strip_left_pad 剥掉左 pad 后建批，plen=本题真实 prompt
+                    长——左 pad 会同时污染注意力键与位置编码，见 docs/02）
   [2] advantages  : (B,) 已在生成端按 adv_mode 归一化（或 (B,T) per-token，RF++）
   [3] refs        : (B, T) ref 模型 per-token logps（ref_server 补充）
   [4] gen_logps   : (B, T) 生成时 policy 的 per-token logps（torch 副本算）

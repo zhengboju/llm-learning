@@ -1368,6 +1368,124 @@ def test_vllm_gen_logps():
           "gen_torch" not in ro and "if _torch_holder[0] is not None:" in ro)
 
 
+def test_strip_left_pad():
+    """【AB】逐题剥左 pad：打分序列 == vLLM 生成序列。
+
+    这是"生成序列 == 训练序列"契约在**多题并采 + 批内 pad** 场景下的完整版。
+    判据是数值等价，不是"跑通了"：带 pad 的批（批内最长 prompt 补齐）里，短题行
+    的真实 token 既要被 pad 键污染（attention_mask 可解），位置编码又整体后移
+    （attention_mask 解不了——主流 HF 实现 position_ids 取下标，不按 mask 做
+    cumsum 修正）——两处叠加实测差 1.0 量级，且这正是对拍里 1e1 分叉的来源。
+    剥掉 pad 后两处同时消失：逐 token 逐位置与 vLLM 一致，且不依赖模型对 2D 掩码
+    的支持（Qwen3.5 线性注意力层是否吃 mask 无从离线验证，故不走掩码这条路）。"""
+    print("[AB] 逐题剥左 pad：批内 pad 短题的打分序列 == 无 pad 生成序列")
+    import torch as _t
+    from rlab.losses import forward_per_token_logps
+    from rlab.rollout import collect_retool_group, strip_left_pad
+    from transformers import AutoTokenizer, GPT2LMHeadModel
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _save_tiny_gpt2(tmp)
+        tok = AutoTokenizer.from_pretrained(path)
+        model = GPT2LMHeadModel.from_pretrained(path).eval()
+        tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+        pad = tok.pad_token_id
+
+        # ---- 纯函数单测 ----
+        row = _t.tensor([[pad, pad, 5, 6, 7]])
+        check("strip_left_pad：剥掉左 pad 前缀（保留真实 token 顺序）",
+              strip_left_pad(row, pad).tolist() == [[5, 6, 7]])
+        check("strip_left_pad：无 pad 时是恒等（单题路径零变化）",
+              strip_left_pad(_t.tensor([[5, 6, 7]]), pad).tolist() == [[5, 6, 7]])
+        try:
+            strip_left_pad(_t.tensor([[pad, pad]]), pad)
+            check("整行皆 pad → ValueError", False)
+        except ValueError:
+            check("整行皆 pad → ValueError（否则 plen=0 会让 logps 切片变 -1 整条错位）", True)
+
+        # ---- 端到端：两题 prompt 长度不同 → 批内左 pad ----
+        q0, q1 = "a short question", "a much longer question text for padding"
+        p0 = tok(q0, add_special_tokens=False)["input_ids"]
+        p1 = tok(q1, add_special_tokens=False)["input_ids"]
+        prompts_text = [q0, q1]
+        prompt_ids = tok(prompts_text, return_tensors="pt", padding=True,
+                         add_special_tokens=False)["input_ids"]
+        plen = prompt_ids.shape[1]
+        assert len(p0) < plen, "测试前提：q0 的 prompt 被左 pad 补齐（否则本组无效）"
+        check("前提：批内最长 prompt 补齐，q0 前面挂着 pad",
+              int((prompt_ids[0] != pad).sum()) == len(p0) < plen)
+
+        def tids(s):
+            return tok(s, add_special_tokens=False)["input_ids"]
+
+        class _C:
+            def __init__(self, text): self.text, self.token_ids = text, tids(text)
+        class _O:
+            def __init__(self, text): self.outputs = [_C(text)]
+        class FakeGen:
+            def generate(self, prompts, sps, use_tqdm=False):
+                return [_O(t) for t in self.rounds[0]]
+
+        good72, good99 = fmt_answer("72"), fmt_answer("99")
+        # 用 retool preset（fmt_answer 派生的合法格式串即得分口径）；retool_math 的
+        # 奖励走数学答案抽取，格式串不是它的拿分形态
+        cfg = get_config("retool", use_wandb=False)
+        n_traj = 2 * int(cfg["num_pre_Q"])            # 2 题 × num_pre_Q
+        FakeGen.rounds = [[good72, good99] * (n_traj // 2)]   # 一半对一半错
+        sps = [object() for _ in range(n_traj)]
+        gl_calls = []
+
+        def gl(merged, plen_):
+            """真 torch 前向当 compute_gen_logps（不是 zeros 桩——要对拍数值）。"""
+            gl_calls.append(tuple(merged.shape))
+            with _t.inference_mode():
+                return forward_per_token_logps(model, merged)[:, plen_ - 1:]
+
+        results = collect_retool_group(FakeGen(), tok, cfg, gl, [{"Q": q0, "A": "72"},
+                                        {"Q": q1, "A": "72"}], prompts_text,
+                                        prompt_ids, plen, sps, steps_elapsed=0)
+        check("两题都产出 ok 组（q0 是带 pad 的短题）",
+              [r["status"] for r in results] == ["ok", "ok"])
+        r0 = results[0]
+        check("q0 的 plen = 本题真实 prompt 长（不再是批内最长的含 pad 宽）",
+              r0["plen"] == len(p0) and results[1]["plen"] == len(p1))
+        check("q0 的 merged 前缀就是无 pad 的真实 prompt（逐 token 一致）",
+              r0["merged"][0, :len(p0)].tolist() == p0)
+        check("q0 各行的 prompt 区都无 pad token（整批剥干净）",
+              int((r0["merged"][:, :len(p0)] == pad).sum()) == 0)
+
+        # 决定性判据：批内短题行的逐 token logps == 该行单独(无 pad)前向的 logps
+        row = r0["merged"][0]
+        c0 = r0["clen"][0]
+        seq = row[:len(p0) + c0].tolist()          # 该行真实序列（无 pad 前缀）
+        with _t.inference_mode():
+            alone = forward_per_token_logps(model, _t.tensor([seq]))[:, len(p0) - 1:]
+        d_new = float((r0["gen_logps"][0, :c0] - alone[0, :c0]).abs().max())
+        check(f"批内短题行 logps == 该行单独无 pad 前向（最大差 {d_new:.3g}）",
+              d_new < 1e-4)
+
+        # 反证：旧行为 = 同一行前面挂上 pad 前缀（批内最长补齐）后前向
+        old_row = [pad] * (plen - len(p0)) + seq
+        with _t.inference_mode():
+            old_lp = forward_per_token_logps(model, _t.tensor([old_row]))[:, plen - 1:]
+        d_old = float((old_lp[0, :c0] - alone[0, :c0]).abs().max())
+        check(f"反证：带 pad 前缀（旧行为，plen={plen}）同位置分叉 {d_old:.3g} > 1e-4",
+              d_old > 1e-4)
+
+    # ---- 接线 ----
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    check("collect_retool_group 逐题剥 pad，全部 plen 用本题真实长度",
+          "prompt_i = strip_left_pad(prompt_ids[i:i + 1]" in ro
+          and "plen_i = prompt_i.shape[1]" in ro
+          and "retool_build_batch(\n            prompt_i, segs_i, plen_i" in ro
+          and ro.count("compute_gen_logps(merged_i, plen_i)") == 2
+          and '"plen": plen_i})' in ro)
+    check("超长判定用真实 plen（旧版把 pad 宽度算进每个样本的 token 预算）",
+          'per_ids_i, plen_i, cfg["max_context_tokens"]' in ro)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1428,6 +1546,7 @@ if __name__ == "__main__":
     test_grad_clip_and_run_info()
     test_fwd_batch_chunk()
     test_vllm_gen_logps()
+    test_strip_left_pad()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

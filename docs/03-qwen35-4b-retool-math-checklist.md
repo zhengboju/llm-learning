@@ -48,6 +48,13 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty \
   `_audit_tokenize_probe` 类探针确认（BPE 词表不同，边界合并行为不可外推）。
 - [ ] **tokenizer 契约**：Qwen3.5 的 pad/eos id 与 2.5 不同，run_gsm8k.sh 前先
   打印 `tokenizer.pad_token_id / eos_token_id` 核对 protocol 语义。
+- [x] **批内左 pad（2026-09-11 实锤，已修）**：`padding=True + padding_side="left"`
+  补出的 pad 不只是"多几个 token"——它同时污染注意力键**和位置编码**（HF
+  `position_ids` 取下标、不按 mask 做 cumsum 修正），带 pad 前向与 vLLM 生成序列
+  在约 1% 位置差到 1e1（减法① 对拍实测：中位差 1e-6、尾部爆炸）。已改为逐题
+  `rollout.strip_left_pad` 剥 pad 后建批（plen=本题真实长），tests `[AB]` 数值锁定。
+  **换模型/换 tokenizer 时这条要重新验**：判据是"批内短题行 logps == 该行单独
+  无 pad 前向"，而不是"跑起来没报错"。
 
 ## 2. 预算重审（3B 时代的行为假设全部失效）
 

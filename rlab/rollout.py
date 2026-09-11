@@ -405,6 +405,32 @@ def retool_build_batch(prompt_ids, segs, plen, pad_token_id):
     return merged_ids, mask, per_sample_ids
 
 
+def strip_left_pad(prompt_ids: torch.Tensor, pad_token_id: int) -> torch.Tensor:
+    """剥掉 prompt 的左 pad 前缀，返回 (B, 真实长)（纯函数，CPU 可测）。
+
+    【2026-09-11 生成/打分口径分叉根治】多题并采时 tokenizer 按批内最长 prompt
+    左 pad，而 vLLM 生成侧是逐条**无 pad** 的序列。带 pad 前向有**两处**与生成侧
+    不等价：
+      ① pad token 作为 attention 的 key，被后面所有真实位置读到；
+      ② 位置编码整体后移——主流 HF 实现（Qwen/GPT 系）的 position_ids 取的是下标
+         （cache_position = arange），**不按 attention_mask 做 cumsum 修正**，短题
+         的真实 token 拿到的是"下标位置"而非"真实位置"，embedding 处就错了。
+    实测（tiny 模型逐位对拍）：只补 ①（传 attention_mask 把 pad 键权重压到 0，
+    已验证生效）真实位仍与无 pad 前向差 1.0 量级——②没修掉，缺口就还在。
+    剥掉 pad 则 ①②同时消失，且**不依赖模型是否支持 2D 掩码或位置修正**——merged
+    序列逐 token、逐位置与生成时完全一致。配合 retool_build_batch 的分段 ids
+    拼接，"生成序列 == 训练序列"从此在数据构造层一次性成立。
+
+    pad 只在左侧（tokenizer padding_side="left"）：取最后一个非 pad 位置之前的
+    全部。整行都是 pad（空 prompt）fail-fast——静默返回空序列会让 plen=0，
+    下游 `logps[:, plen-1:]` 变成 -1 切片，切出整条错位序列。"""
+    row = prompt_ids[0]
+    keep = int((row != pad_token_id).sum())
+    if keep == 0:
+        raise ValueError("[rollout] prompt 整行都是 pad（空 prompt），无法剥出真实长度")
+    return prompt_ids[:, prompt_ids.shape[1] - keep:]
+
+
 def retool_context_overlong(per_sample_ids, plen, max_context_tokens):
     """逐样本全长 token 预算检查（模块级纯函数，CPU 可测）。任一样本超限即超。
 
@@ -493,10 +519,13 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
 
     返回 per-question list，每项 {"status": "ok"|"uniform"|"overlong"}；
     ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen
-    （plen = prompt_ids 的左 pad 宽度，跨题统一——上传 meta 与 gen_logps/
-    训练前向共用同一基准，与旧 Q=1 路径的逐批 plen 语义一致）。"""
+    （plen = **本题** prompt 的真实长度——每道题先剥掉左 pad 再建批，见
+    strip_left_pad：带 pad 会让打分序列与 vLLM 生成序列在位置编码与注意力键上
+    双重分叉。上传 meta 与 gen_logps/训练前向共用同一基准）。"""
     n = int(cfg["num_pre_Q"])
     nq = len(inputs)
+    assert prompt_ids.shape[1] == plen, \
+        f"prompt_ids 宽 {prompt_ids.shape[1]} != plen {plen}（调用约定：未剥 pad 的整批）"
     group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
     # gen_logps 来源：vLLM 逐轮 logprobs（需采样时就带上 logprobs=0）或 torch 副本重算
     use_vllm_logps = bool(cfg.get("vllm_gen_logps"))
@@ -508,12 +537,19 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     results = []
     for i in range(nq):
         segs_i = segs[i * n:(i + 1) * n]
+        # 【2026-09-11】逐题剥掉左 pad（批内最长 prompt 补出来的）——本题 plen_i 即
+        # 真实 prompt 长；merged 因此逐 token/逐位置等于 vLLM 生成时看到的序列
+        # （详见 strip_left_pad：pad 会同时污染注意力键与位置编码两处）。
+        prompt_i = strip_left_pad(prompt_ids[i:i + 1], tokenizer.pad_token_id)
+        plen_i = prompt_i.shape[1]
         merged_i, mask_i, per_ids_i = retool_build_batch(
-            prompt_ids[i:i + 1], segs_i, plen, tokenizer.pad_token_id)
+            prompt_i, segs_i, plen_i, tokenizer.pad_token_id)
         clen_i = [len(t) for t in per_ids_i]
-        # 逐样本全长预算检查（按题：单题超长不再连坐其他题，2026-09-10）
+        # 逐样本全长预算检查（按题：单题超长不再连坐其他题，2026-09-10）。
+        # plen_i 为真实 prompt 长——旧版用批内最长（含 pad）会把 pad 宽度算进
+        # 每个样本的 token 预算，单题超长判定偏严。
         if mask_i.shape[1] == 0 or retool_context_overlong(
-                per_ids_i, plen, cfg["max_context_tokens"]):
+                per_ids_i, plen_i, cfg["max_context_tokens"]):
             results.append({"status": "overlong"})
             continue
         adv_i, acc_i, fmt_i, cu_i, ck_i, phase = retool_score_flat(
@@ -532,16 +568,16 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             # 在 torch 重算之前：预算用尽后不再触发，副本才能安全释放。
             if verify_logps is not None and (getattr(verify_logps, "wants", None) is None
                                              or verify_logps.wants()):
-                verify_logps(gen_logps_i, compute_gen_logps(merged_i, plen), mask_i)
+                verify_logps(gen_logps_i, compute_gen_logps(merged_i, plen_i), mask_i)
         else:
-            gen_logps_i = compute_gen_logps(merged_i, plen)
+            gen_logps_i = compute_gen_logps(merged_i, plen_i)
         results.append({"status": "ok", "merged": merged_i, "mask": mask_i,
                         "gen_logps": gen_logps_i, "adv": adv_i, "acc": acc_i,
                         "fmt": fmt_i, "cu": cu_i, "ck": ck_i, "phase": phase,
                         "clen": clen_i,
                         "trunc": [int(s["trunc_final"])
                                   for s in code_stats[i * n:(i + 1) * n]],
-                        "plen": plen})
+                        "plen": plen_i})
     return results
 
 
@@ -774,6 +810,7 @@ def gen_worker(Q, cfg: dict):
     is_retool = cfg["algo"] in ("retool", "retool_math")
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
     samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0}
+    _pad_logged = [False]   # 剥左 pad 的可见性只打一次（见 retool 分支）
     # 题目级调度两条路径（2026-09-10 重构）：
     # - 队列路径（gen_questions_per_attempt>1，当前仅 retool_math）：QuestionScheduler
     #   顺序走池 + 同题重试 + 拉黑——旧 random.sample 全池抽题下同题重抽概率
@@ -828,6 +865,16 @@ def gen_worker(Q, cfg: dict):
                     inputs, prompts_text, prompt_ids, plen, sps,
                     steps_elapsed=pushes[0] * cfg["gen_update_steps"],
                     verify_logps=_verifier)
+                # 剥 pad 可见性（一次性）：本批最长 prompt token 数 vs 各题真实长度。
+                # 静默改变 token 预算是这类"口径修正"最难排查的形态，打一行自证。
+                if not _pad_logged[0]:
+                    _trues = [r["plen"] for r in results if r["status"] == "ok"]
+                    if _trues and min(_trues) < plen:
+                        _pad_logged[0] = True   # 只在真发生剥除时消费这一次机会
+                        print(f"[rollout] 已剥左 pad：批内最长 prompt {plen} token，"
+                              f"各题真实 {min(_trues)}~{max(_trues)}"
+                              "（打分序列与 vLLM 生成序列逐 token/逐位置同源）",
+                              flush=True)
                 rollout_seq[0] += 1   # 盐递增：uniform/超长题重试时不会复采同轨迹
                 for q, res in zip(inputs, results):
                     if res["status"] == "uniform":
