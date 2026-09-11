@@ -555,7 +555,8 @@ def gen_worker(Q, cfg: dict):
         with torch.inference_mode():
             logps = forward_per_token_logps(
                 gen_torch, merged_ids.to(gen_torch.device),
-                seq_chunk=512, batch_chunk=1)
+                seq_chunk=512,
+                batch_chunk=max(1, int(cfg.get("fwd_batch_chunk", 1) or 1)))
             return logps[:, plen - 1:].cpu()
 
     def score_group(inputs, answers, completion_lens):

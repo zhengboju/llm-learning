@@ -34,11 +34,14 @@ from rlab.losses import forward_per_token_logps
 from rlab.protocol import bytes_list_to_list, bytes_to_tensor, make_bytes_list, tensor_to_bytes
 
 
-def get_per_token_logps(model, input_ids):
+def get_per_token_logps(model, input_ids, batch_chunk: int = 1):
     """ref per-token logps（打分路径）。【2026-09- logits 峰】改走分块实现：
     全量 logits (8, ~5.4k, 248320) ~22G 会把 ref 进程（GPU0 三方共居）炸掉，
-    且 ref 是 eval 前向无梯度——朴素分块即可，无需 checkpoint。"""
-    return forward_per_token_logps(model, input_ids, seq_chunk=256, batch_chunk=1)
+    且 ref 是 eval 前向无梯度——朴素分块即可，无需 checkpoint。
+    batch_chunk>1 时一次前向多行（数学等价，减少 kernel/调度开销），显存峰值
+    随 B 线性增长；本进程与训练端共用 FWD_BATCH_CHUNK 保持全链路口径一致。"""
+    return forward_per_token_logps(model, input_ids, seq_chunk=256,
+                                   batch_chunk=max(1, int(batch_chunk or 1)))
 
 
 def get_eos_mask(completion_mask):
@@ -106,7 +109,7 @@ def rfpp_process_macro(items, beta, pad_id):
 
 
 def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
-               device="cuda", attn_implementation="sdpa"):
+               device="cuda", attn_implementation="sdpa", batch_chunk=1):
     from bottle import Bottle, request
     from bottle import run as bottle_run
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -168,7 +171,8 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
             d = raw_queue.get()
             plen = d["base"]["plen"]
             with torch.inference_mode():
-                refs = get_per_token_logps(ref_model, d["inputs"].to(device))
+                refs = get_per_token_logps(ref_model, d["inputs"].to(device),
+                                           batch_chunk=batch_chunk)
             result_queue.put(make_bytes_list(passthrough_repack(d, refs[:, plen - 1:].cpu())))
     elif mode == "rfpp":
         while True:
@@ -177,7 +181,8 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
                 d = raw_queue.get()
                 plen = d["base"]["plen"]
                 with torch.inference_mode():
-                    refs = get_per_token_logps(ref_model, d["inputs"].to(device))
+                    refs = get_per_token_logps(ref_model, d["inputs"].to(device),
+                                           batch_chunk=batch_chunk)
                 items.append({"base": d["base"], "inputs": d["inputs"],
                               "rewards": d["rewards"], "refs": refs[:, plen - 1:].cpu(),
                               "gen_logps": d["extras"][0],
@@ -200,6 +205,10 @@ if __name__ == "__main__":
                     choices=("sdpa", "flash_attention_2"),
                     help="注意力实现（默认 sdpa=fp32 ref 历史口径；FA2 档位 ref "
                          "自动降 bf16，与训练端 --attn_implementation 保持一致）")
+    ap.add_argument("--batch_chunk", type=int, default=1,
+                    help="分块前向每次过 backbone 的行数（默认 1=逐行=历史口径）。"
+                         "run_gsm8k.sh 用 FWD_BATCH_CHUNK 环境变量与 train/gen 同步")
     args = ap.parse_args()
     run_server(args.model_path, args.port, args.mode, args.beta, args.grad_accum,
-               args.device, attn_implementation=args.attn_implementation)
+               args.device, attn_implementation=args.attn_implementation,
+               batch_chunk=args.batch_chunk)

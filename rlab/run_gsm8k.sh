@@ -37,6 +37,11 @@ export WANDB_MODE=${WANDB_MODE:-offline}
 # ref_server 在 FA2 档位自动降 bf16。手动传参可覆盖（注入的 flag 在 "$@" 之前）。
 ATTN_IMPL=${ATTN_IMPL:-sdpa}
 echo "[run] attn_implementation=$ATTN_IMPL"
+# 【提速开关】分块前向粒度（每次几行过 backbone）：1=逐行（历史口径）。
+# 三处必须同步（train / gen_logps 副本 / ref_server），train+gen 由 get_config
+# 读本环境变量，ref_server 是独立进程由下面命令行显式传——单一环境变量驱动全链路。
+export FWD_BATCH_CHUNK=${FWD_BATCH_CHUNK:-1}
+echo "[run] fwd_batch_chunk=$FWD_BATCH_CHUNK（train/gen/ref_server 三处同口径）"
 # 【容器 libstdc++ 兜底】基础镜像 /lib/x86_64-linux-gnu/libstdc++.so.6 偏老
 # （实测缺 GLIBCXX_3.4.31，pip 新装 C 扩展如 optree 需要）；conda 自带的那份更新。
 # 动态链接器"谁先被加载谁定终身"，不显式指定时能否启动随 import 顺序漂移——
@@ -98,7 +103,8 @@ REF_BETA_ARGS=""
 if [ "$ALGO" = "rfpp" ]; then REF_BETA_ARGS="--beta 0.0"; fi
 
 CUDA_VISIBLE_DEVICES=$REF_GPU python -m rlab.ref_server --model_path "$MODEL" \
-    --port $PORT --mode $MODE $REF_BETA_ARGS --attn_implementation "$ATTN_IMPL" &
+    --port $PORT --mode $MODE $REF_BETA_ARGS --attn_implementation "$ATTN_IMPL" \
+    --batch_chunk "$FWD_BATCH_CHUNK" &
 REF_PID=$!
 
 # Pre-flight 2：等 /health 且模式匹配（替代盲等 15s；ref 模型加载可能 >15s）

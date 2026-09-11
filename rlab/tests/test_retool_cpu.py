@@ -932,6 +932,14 @@ def test_chunked_logps():
     check("checkpoint 分块 == 全量（grad 路径数值等价）",
           torch.allclose(ref, out.detach(), atol=1e-5))
     out.sum().backward()
+    # 【2026-09-11 放开 batch_chunk】批量前向与逐行严格等价（多行输入的跨行独立性）
+    ids2 = torch.cat([ids, ids], dim=0)          # 2 行
+    with torch.inference_mode():
+        ref2 = get_per_token_logps(model(ids2).logits[:, :-1, :], ids2[:, 1:])
+        bc2 = forward_per_token_logps(model, ids2, seq_chunk=3, batch_chunk=2)
+        bc_mixed = forward_per_token_logps(model, ids2, seq_chunk=3, batch_chunk=1)
+    check("batch_chunk=2（整块）== batch_chunk=1（逐行）== 全量前向（三路同值）",
+          torch.allclose(ref2, bc2, atol=1e-5) and torch.allclose(ref2, bc_mixed, atol=1e-5))
     check("checkpoint 反向梯度可达（lm_head/embed 均有 grad）",
           model.lm_head.weight.grad is not None
           and model.transformer.wte.weight.grad is not None)
@@ -1163,6 +1171,50 @@ def test_grad_clip_and_run_info():
     check("gradient_clipping 已在 BASE 注册（未知键 fail-fast 契约未被绕过）", ok)
 
 
+def test_fwd_batch_chunk():
+    print("[Z] 分块前向粒度放开：三处同口径（train/gen/ref_server），默认 1 不变历史口径")
+    import inspect
+    import os as _os
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # 默认值：不动 3B 与 200 步 run 的口径
+    _os.environ.pop("FWD_BATCH_CHUNK", None)
+    check("preset 默认 fwd_batch_chunk=1（历史口径零变化）",
+          get_config("retool_math", use_wandb=False)["fwd_batch_chunk"] == 1)
+    # 环境变量驱动（ref_server 读不到 cfg，靠它保持全链路一致）
+    _os.environ["FWD_BATCH_CHUNK"] = "2"
+    try:
+        check("FWD_BATCH_CHUNK 环境变量可驱动（供 ref_server 同口径）",
+              get_config("retool_math", use_wandb=False)["fwd_batch_chunk"] == 2)
+        check("显式 override 优先于环境变量",
+              get_config("retool_math", use_wandb=False,
+                         fwd_batch_chunk=4)["fwd_batch_chunk"] == 4)
+    finally:
+        _os.environ.pop("FWD_BATCH_CHUNK", None)
+    # 四处接线
+    tr = open(os.path.join(root, "rlab", "train.py"), encoding="utf-8").read()
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    rs = open(os.path.join(root, "rlab", "ref_server.py"), encoding="utf-8").read()
+    sh = open(os.path.join(root, "rlab", "run_gsm8k.sh"), encoding="utf-8").read()
+    check("train.py 两条训练路径都用 _fbc（无残留 batch_chunk=1 硬编码）",
+          "batch_chunk=_fbc" in tr and "batch_chunk=1" not in tr
+          and '"--fwd_batch_chunk"' in tr
+          and 'overrides["fwd_batch_chunk"] = args.fwd_batch_chunk' in tr)
+    check("rollout gen_logps 副本读 cfg.fwd_batch_chunk",
+          'batch_chunk=max(1, int(cfg.get("fwd_batch_chunk", 1) or 1))' in ro)
+    check("ref_server 有 --batch_chunk 并接到两处调用点",
+          '"--batch_chunk"' in rs and rs.count("batch_chunk=batch_chunk") == 2)
+    check("run_gsm8k.sh 用 FWD_BATCH_CHUNK 驱动三处（export + 传 ref_server）",
+          "export FWD_BATCH_CHUNK=${FWD_BATCH_CHUNK:-1}" in sh
+          and '--batch_chunk "$FWD_BATCH_CHUNK"' in sh)
+    # e2e 测试按位置传 run_server(path, port, mode, beta, grad_accum, device, attn)——
+    # 新参数必须追加在末尾，插在中间会静默错位（device 收到 "cpu" 之类的字符串）
+    from rlab.ref_server import run_server
+    params = list(inspect.signature(run_server).parameters)
+    check("run_server 前 6 个位置参数保持不变（e2e 位置传参契约）",
+          params[:6] == ["model_path", "port", "mode", "beta", "grad_accum", "device"]
+          and params[-1] == "batch_chunk")
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1221,6 +1273,7 @@ if __name__ == "__main__":
     test_eval_thinking_switch()
     test_overlong_ref_and_opt_cli()
     test_grad_clip_and_run_info()
+    test_fwd_batch_chunk()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

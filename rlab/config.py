@@ -166,6 +166,14 @@ BASE = dict(
     # （口径：ref logps 精度略降，教学规模可忽略，报告声明）。vLLM 有独立的
     # attention backend 选择，不受本参数影响。需 pod 上 pip install flash-attn。
     attn_implementation="sdpa",
+    # 【2026-09-11 放开】分块前向的"每次几行过 backbone"粒度，四处共用
+    # （train 两条路径 / gen_logps 副本 / ref_server）。1 = 逐行（3B 时代为躲
+    # T² 与 logits 峰而固定，历史口径）；>1 一次前向多行，减少 kernel 次数与
+    # 调度开销——数学严格等价（因果注意力按行独立，CPU 对拍锁定）。
+    # 显存代价：logits 峰与激活随 B 线性增长。FA2 档位 T² 已消失，4B 可试 2~4。
+    # ref_server 是独立进程读不到 cfg：run_gsm8k.sh 用同一个 FWD_BATCH_CHUNK
+    # 环境变量把它传给三处（CLI --fwd_batch_chunk > 环境变量 > 本默认值）。
+    fwd_batch_chunk=1,
     all_steps=300,
     save_steps=100,
     gen_update_steps=16,     # 每 N 个 optimizer step 推送权重给生成端
@@ -309,6 +317,11 @@ def get_config(algo: str, **overrides) -> dict:
     if "record_path" not in overrides:
         cfg["record_path"] = os.path.join(cfg["out_dir"], "record.jsonl")
     cfg["ref_server"] = f"http://{cfg['ref_server_host']}:{cfg['ref_server_port']}"
+    # FWD_BATCH_CHUNK 环境变量统一驱动三处（train/gen/ref_server）——ref_server 是
+    # 独立进程读不到本 cfg，只能靠共享环境变量保持全链路口径一致；显式 override 优先。
+    _env_bc = os.environ.get("FWD_BATCH_CHUNK")
+    if _env_bc and "fwd_batch_chunk" not in overrides:
+        cfg["fwd_batch_chunk"] = int(_env_bc)
     return cfg
 
 

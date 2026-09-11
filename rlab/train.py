@@ -188,6 +188,9 @@ def run_training(cfg, args):
             mask = (inputs[:, plen:] != pad_id).float()
 
         micro_rows = int(cfg.get("micro_rows", 0) or 0)
+        # 分块前向粒度（0/缺省→1=逐行，历史口径；>1 减少 kernel 次数与调度开销，
+        # 数学等价，代价是 logits/激活峰值随 B 线性增长——见 config.fwd_batch_chunk）
+        _fbc = max(1, int(cfg.get("fwd_batch_chunk", 1) or 1))
         R = inputs.shape[0]
         if micro_rows and micro_rows < R:
             if cfg.get("loss_norm") != "sample_mean":
@@ -199,7 +202,7 @@ def run_training(cfg, args):
             for c0 in range(0, R, micro_rows):
                 sl = slice(c0, min(c0 + micro_rows, R))
                 chunk_logps = forward_per_token_logps(
-                    _mmod, inputs[sl], batch_chunk=1,
+                    _mmod, inputs[sl], batch_chunk=_fbc,
                     use_checkpoint=True)[:, plen - 1:]
                 chunk_loss, chunk_stats = compute_loss(
                     cfg["algo"], chunk_logps, gen_logps[sl], advantages[sl],
@@ -212,7 +215,7 @@ def run_training(cfg, args):
                      for k in stats_list[0]}
         else:
             per_token_logps = forward_per_token_logps(
-                _mmod, inputs, batch_chunk=1, use_checkpoint=True)[:, plen - 1:]
+                _mmod, inputs, batch_chunk=_fbc, use_checkpoint=True)[:, plen - 1:]
             loss, stats = compute_loss(
                 cfg["algo"], per_token_logps, gen_logps, advantages, mask, cfg,
                 ref_logps=ref_logps,
@@ -340,6 +343,10 @@ def main():
                          "惩罚起坡点 9152 够不着（见 config.overlong_shaping 注释）")
     ap.add_argument("--grad_clip", type=float, default=None,
                     help="DeepSpeed 梯度裁剪（默认 0=不裁剪=历史口径；4B 大 lr 长跑建议 1.0）")
+    ap.add_argument("--fwd_batch_chunk", type=int, default=None,
+                    help="分块前向每次过 backbone 的行数（默认 1=逐行=历史口径；"
+                         ">1 减少 kernel/调度开销，显存峰值线性增长；四处共用同一"
+                         "口径，ref_server 由 FWD_BATCH_CHUNK 环境变量同步）")
     ap.add_argument("--attn_implementation", default=None,
                     choices=("sdpa", "flash_attention_2"),
                     help="torch 侧注意力实现（默认 sdpa；flash_attention_2 提速："
@@ -375,6 +382,7 @@ def main():
     if args.beta is not None: overrides["beta"] = args.beta
     if args.overlong_shaping: overrides["overlong_shaping"] = True
     if args.grad_clip is not None: overrides["gradient_clipping"] = args.grad_clip
+    if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
