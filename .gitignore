@@ -49,3 +49,7 @@ logs/
 # Temporary files
 tmp/
 temp/
+
+# 运行产物（pod 侧训练/eval 输出，本地同步保留但勿入库）
+rlab_out/
+_head_config.py
