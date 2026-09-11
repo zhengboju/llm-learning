@@ -193,8 +193,16 @@ BASE = dict(
     loss_norm="sample_mean", # sample_mean | token_mean | token_const | seq_mean | token_items
     dr_grpo_const=None,      # token_const 的固定常数，默认=max_gen_tokens
     dynamic_sampling=False,
+    # 【2026-09-11 实测：当前配置下不可达，等价惰性开关】overlong_penalty 以
+    # completion 总长对 max_rounds×round_gen_tokens 起坡，但 retool_context_overlong
+    # 会先丢弃 len(ids)+plen > max_context_tokens(8192) 的样本 → clen 物理封顶
+    # ~7800（200 步 run 实测 max=7809），任何以总长为参考系的惩罚都够不着 trigger。
+    # 真实截断是 trunc_final（末段被轮上限切断，实测 28.7%），目前无奖励项覆盖；
+    # 要动它需按 trunc_final 靶向 shaping，别指望本开关。健康检查的 trunc 签名
+    # （0.95×max_rounds×round_gen_tokens）同理不可达。
     overlong_shaping=False,
     overlong_buffer=64,      # DAPO 软悬崖缓冲区宽度
+    gradient_clipping=0.0,   # DeepSpeed 梯度裁剪（0=不裁剪=历史口径；4B 大 lr 建议 1.0）
 
     # ---- 系统提示（与 simple_grpo_v1 完全一致，保证可比）----
     system_prompt=(
@@ -313,6 +321,8 @@ def ds_config(cfg: dict) -> dict:
         # optim_8bit 时省略 optimizer 段——DS 由调用方传入 bitsandbytes 优化器对象
         **({} if cfg.get("optim_8bit") else
            {"optimizer": {"type": "AdamW", "params": {"lr": cfg["lr"]}}}),
+        # 0.0 = 不裁剪（3B 时代历史口径，零变化）；大 lr 长跑建议 1.0
+        "gradient_clipping": float(cfg.get("gradient_clipping", 0.0)),
         "bf16": {"enabled": True},
         # stage 2 + offload：fp32 优化器态驻 CPU（4B 专用；stage 0 路径零变化）。
         # 【为什么必须 offload】GPU 上无论怎么省都不够：静态 64G（fp32 master 16

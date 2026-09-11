@@ -1130,6 +1130,37 @@ def test_overlong_ref_and_opt_cli():
           and 'max_gen_tokens=cfg["max_gen_tokens"]' not in ro.split("def retool_score_flat")[1].split("def ")[0])
     check("probe_difficulty 与训练同口径（overlong_ref_tokens）",
           "max_gen_tokens=overlong_ref_tokens(cfg)" in pb)
+    # 【2026-09-11 审查】overlong 在 retool 当前预算几何下不可达（clen 被
+    # max_context_tokens 封顶 ~7800 < trigger 9152），注释必须写明防误导
+    cfg_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "config.py"), encoding="utf-8").read()
+    check("config 注释声明 overlong 当前不可达（防后人误以为它在抑制截断）",
+          "当前配置下不可达" in cfg_src)
+
+
+def test_grad_clip_and_run_info():
+    print("[Y] 梯度裁剪入口 + checkpoint 自证配方（10 小时长跑的provenance）")
+    from rlab.config import ds_config
+    cfg_g = get_config("retool_math", use_wandb=False)
+    check("ds_config 默认 gradient_clipping=0.0（历史口径零变化）",
+          ds_config(cfg_g)["gradient_clipping"] == 0.0)
+    check("设 gradient_clipping=1.0 能进 DS 配置",
+          ds_config(get_config("retool_math", use_wandb=False,
+                               gradient_clipping=1.0))["gradient_clipping"] == 1.0)
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    check("train.py CLI --grad_clip 映射到 overrides（float 透传）",
+          '"--grad_clip"' in src and 'overrides["gradient_clipping"] = args.grad_clip' in src)
+    check("run_info 落盘完整 cfg（lr/beta/grad_clip/GAS 可回溯）",
+          '"config": {k: v for k, v in cfg.items()}' in src
+          and "default=str" in src)
+    # get_config 拒绝未知键的契约仍成立（新键必须先在 BASE 注册）
+    try:
+        get_config("retool_math", use_wandb=False, gradient_clipping=1.0)
+        ok = True
+    except KeyError:
+        ok = False
+    check("gradient_clipping 已在 BASE 注册（未知键 fail-fast 契约未被绕过）", ok)
 
 
 def test_pyflakes_undefined():
@@ -1189,6 +1220,7 @@ if __name__ == "__main__":
     test_eval_spawn_guard()
     test_eval_thinking_switch()
     test_overlong_ref_and_opt_cli()
+    test_grad_clip_and_run_info()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

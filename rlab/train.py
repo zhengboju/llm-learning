@@ -70,9 +70,13 @@ def write_run_info(path: str, cfg: dict) -> None:
             "all_steps": cfg["all_steps"], "seed": cfg.get("seed"),
             "reward_switch_step": cfg.get("reward_switch_step"),
             "round_gen_tokens": cfg.get("round_gen_tokens"),
-            "temperature": cfg.get("temperature")}
+            "temperature": cfg.get("temperature"),
+            # 【2026-09-11】完整配方落盘（lr/beta/grad_clip/overlong/GAS…）：旧版只记
+            # 7 个字段，10 小时长跑后无法自证用的是哪套超参——评测到一个 checkpoint
+            # 时无从核对它对应哪次 run 的哪个配方（9/8 覆盖事故的同类盲区）。
+            "config": {k: v for k, v in cfg.items()}}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(info, f, ensure_ascii=False, indent=2)
+        json.dump(info, f, ensure_ascii=False, indent=2, default=str)
 
 
 def run_training(cfg, args):
@@ -331,8 +335,11 @@ def main():
     ap.add_argument("--beta", type=float, default=None,
                     help="覆盖 KL 锚系数（preset 默认 0.04；放松建议 0.01）")
     ap.add_argument("--overlong_shaping", action="store_true",
-                    help="开 DAPO 截断软悬崖惩罚（被轮长截断的样本给负奖励，"
-                         "抑制烧预算不收尾；默认关）")
+                    help="开 DAPO 截断软悬崖惩罚（默认关）。【注意】retool 家族下"
+                         "当前配置不可达：clen 被 max_context_tokens 封顶 ~7800，"
+                         "惩罚起坡点 9152 够不着（见 config.overlong_shaping 注释）")
+    ap.add_argument("--grad_clip", type=float, default=None,
+                    help="DeepSpeed 梯度裁剪（默认 0=不裁剪=历史口径；4B 大 lr 长跑建议 1.0）")
     ap.add_argument("--attn_implementation", default=None,
                     choices=("sdpa", "flash_attention_2"),
                     help="torch 侧注意力实现（默认 sdpa；flash_attention_2 提速："
@@ -367,6 +374,7 @@ def main():
     if args.lr is not None: overrides["lr"] = args.lr
     if args.beta is not None: overrides["beta"] = args.beta
     if args.overlong_shaping: overrides["overlong_shaping"] = True
+    if args.grad_clip is not None: overrides["gradient_clipping"] = args.grad_clip
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
