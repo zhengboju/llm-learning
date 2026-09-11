@@ -166,8 +166,94 @@ class QuestionScheduler:
         return sum(1 for v in self.q_stat.values() if v >= self.streak_max)
 
 
+def sampled_logps_from_output(out, ids) -> list:
+    """从 vLLM 单条 completion 提取"被采样 token"的逐 token logprob。
+
+    【减法① 2026-09-11】SamplingParams(logprobs=0) 时 vLLM 为每个生成位置返回
+    {token_id: Logprob}；取其中实际采样到的那个 token 的 logprob，数学上就是
+    log π(tok | 完整前文)——多轮场景下每轮请求的上下文已包含之前所有轮的工具结果，
+    所以逐轮收集再拼接 == compute_gen_logps 在拼接序列上重算，严格同义，且完全
+    绕开 prompt_logprobs 路径（那条路在本环境会 hang，是 torch 副本存在的起因）。
+    任何一步对不齐都 raise：静默错位会让 gen_logps 全错而训练照跑。"""
+    lps = getattr(out, "logprobs", None)
+    if lps is None:
+        raise RuntimeError(
+            "[rollout] vLLM 未返回 logprobs（SamplingParams 缺 logprobs=0）——"
+            "vllm_gen_logps 路径要求采样时就带上该参数")
+    if len(lps) != len(ids):
+        raise ValueError(
+            f"[rollout] logprobs 条数 {len(lps)} != 采样 token 数 {len(ids)}"
+            "（位置对不齐，gen_logps 会全错）")
+    vals = []
+    for pos, tid in enumerate(ids):
+        entry = lps[pos]
+        if not entry:
+            raise ValueError(f"[rollout] 第 {pos} 个位置没有 logprobs（entry={entry!r}）")
+        lp = entry.get(tid)
+        if lp is None:
+            raise ValueError(
+                f"[rollout] 第 {pos} 个位置缺被采样 token {tid} 的 logprob"
+                f"（可用键：{list(entry)[:4]}）")
+        vals.append(float(getattr(lp, "logprob", lp)))
+    return vals
+
+
+class LogpsVerifier:
+    """vLLM 路 vs torch 路 gen_logps 对拍器（减法① 的口径验证闸门）。
+
+    wants() 是**调用前**的闸门：预算用尽后返回 False，调用方据此不再触发 torch
+    重算——否则 verify 结束释放 torch 副本后，钩子仍会被调用而 raise。on_finish
+    在最后一组比对完成后执行（gen_worker 用它把副本还给 GPU0）。
+    """
+
+    def __init__(self, budget: int, on_finish=None):
+        self.budget = int(budget)
+        self.on_finish = on_finish
+        self.n = 0
+        self.max_diff = 0.0
+
+    def wants(self) -> bool:
+        return self.n < self.budget
+
+    def __call__(self, gv, gt, mask):
+        if not self.wants():
+            return
+        self.n += 1
+        m = mask.bool()
+        d = (gv[m].float() - gt.to(gv.dtype)[m].float()).abs().max().item()
+        self.max_diff = max(self.max_diff, d)
+        print(f"[rollout][verify] 第 {self.n}/{self.budget} 组：vLLM vs torch "
+              f"gen_logps 最大差 {d:.3e}（累积最大 {self.max_diff:.3e}，"
+              f"有效位 {int(m.sum())} 个）", flush=True)
+        if not self.wants() and self.on_finish is not None:
+            self.on_finish()
+
+
+def gen_logps_from_segs(segs, pad_value: float = 0.0):
+    """由每段记录的被采样 logprob 拼出 (B, T) 的 gen_logps（与 mask 同布局）。
+
+    工具段 token 是环境插入的、vLLM 从未采样过（无从给出 logprob），置 0——它们在
+    mask 里恒为 0 不进 loss，ratio 的有效位统计也被 mask 过滤，唯一要求是取值有限
+    （policy_logps ≤ 0 → exp(·) ≤ 1，不溢出）。"""
+    rows = []
+    for segs_i in segs:
+        vals = []
+        for seg in segs_i:
+            if seg["kind"] == "assistant":
+                lp = seg.get("logps")
+                if lp is None or len(lp) != len(seg["ids"]):
+                    raise ValueError(
+                        "[rollout] assistant 段缺 logps 或与 ids 长度不齐——"
+                        "采样时未开 collect_logps/logprobs？")
+                vals.extend(lp)
+            else:
+                vals.extend([pad_value] * len(seg["ids"]))
+        rows.append(torch.tensor(vals, dtype=torch.bfloat16))
+    return pad_sequence(rows, batch_first=True, padding_value=pad_value)
+
+
 def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text, cfg,
-                             code_runner=run_code):
+                             code_runner=run_code, collect_logps: bool = False):
     """阶段2 ReTool：代码交织多轮生成（一组样本并行走）——token id 续写版。
 
     【2026-09-09 修复·生成/训练同序列契约】续写一律走 token id（vLLM
@@ -223,8 +309,12 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
             # 替身无此属性时按 None≈stop 处理——末段截断是 retool 答案被切的直接签名，
             # 训练期不记录就永远看不见（2026-09-09 审查发现6）
             fin = getattr(o.outputs[0], "finish_reason", None)
-            segs[i].append({"kind": "assistant", "text": new_text, "ids": new_ids,
-                            "finish_reason": fin})
+            seg = {"kind": "assistant", "text": new_text, "ids": new_ids,
+                   "finish_reason": fin}
+            if collect_logps:
+                # 本轮被采样 token 的 logprob（= log π(tok|完整前文)），逐轮收集
+                seg["logps"] = sampled_logps_from_output(o.outputs[0], new_ids)
+            segs[i].append(seg)
             new_ids_map[i] = new_ids
             blocks = extract_python_blocks(new_text)
             if not blocks:
@@ -375,7 +465,7 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
 
 def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                          inputs, prompts_text, prompt_ids, plen,
-                         sampling_params, steps_elapsed=0):
+                         sampling_params, steps_elapsed=0, verify_logps=None):
     """多轮 rollout → 打分 → 按题拆分的上传就绪结果（模块级，FakeGen CPU 可测）。
 
     【2026-09-10 结构修改·采样并发与按题拆分】一次调用处理 len(inputs) 道题
@@ -396,8 +486,11 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     n = int(cfg["num_pre_Q"])
     nq = len(inputs)
     group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
+    # gen_logps 来源：vLLM 逐轮 logprobs（需采样时就带上 logprobs=0）或 torch 副本重算
+    use_vllm_logps = bool(cfg.get("vllm_gen_logps"))
     segs, _full_texts, code_stats = multi_turn_rollout_group(
-        vllm_gen, sampling_params, tokenizer, group_prompts, cfg)
+        vllm_gen, sampling_params, tokenizer, group_prompts, cfg,
+        collect_logps=use_vllm_logps)
     asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                   for segs_i in segs]
     results = []
@@ -420,7 +513,16 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
         if not group_ok(adv_i):
             results.append({"status": "uniform"})
             continue
-        gen_logps_i = compute_gen_logps(merged_i, plen)
+        if use_vllm_logps:
+            gen_logps_i = gen_logps_from_segs(segs_i)
+            # 对拍（口径变更的验证钩子）只在 mask 有效位上比——工具段两路语义不同
+            # （vLLM 路置 0，torch 路是真实重算值），比了没有意义。wants() 闸门
+            # 在 torch 重算之前：预算用尽后不再触发，副本才能安全释放。
+            if verify_logps is not None and (getattr(verify_logps, "wants", None) is None
+                                             or verify_logps.wants()):
+                verify_logps(gen_logps_i, compute_gen_logps(merged_i, plen), mask_i)
+        else:
+            gen_logps_i = compute_gen_logps(merged_i, plen)
         results.append({"status": "ok", "merged": merged_i, "mask": mask_i,
                         "gen_logps": gen_logps_i, "adv": adv_i, "acc": acc_i,
                         "fmt": fmt_i, "cu": cu_i, "ck": ck_i, "phase": phase,
@@ -458,13 +560,38 @@ def gen_worker(Q, cfg: dict):
     # + gen_logps logits 瞬时峰(~6-12G)，0.45×96=43G 总计 ~70G < 96G，安全。
     # 3B+GQA 的 KV 极小（每条 5k token 才 ~370MB），旧 0.35 的 KV 池大量闲置——
     # 多给 vLLM 显存主要扩大 continuous batching 的调度余量。
+    # 【2026-09-11】vllm_gen_logps 档位不再加载 torch 副本（见下），腾出的 ~8G
+    # 应回灌给 vLLM（gen_gpu_mem 0.30 → 0.38 量级）——生成是每步耗时的大头。
     vllm_gen = LLM(model=cfg.get("vllm_model_path") or cfg["model_path"],
                    gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)))
-    # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）
-    gen_torch = AutoModelForCausalLM.from_pretrained(
-        cfg["model_path"], torch_dtype=torch.bfloat16,
-        _attn_implementation=cfg.get("attn_implementation", "sdpa")).cuda().eval()
-    print("[rollout] torch gen_logps 副本已加载")
+    # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）。
+    # 【减法① 2026-09-11】vllm_gen_logps 档位改用逐轮采样 logprobs，不再需要副本
+    # ——GPU0 省 ~8G（可抬高 gen_gpu_mem 扩大 KV 池提速生成）；仅当要对拍
+    # （verify_gen_logps>0）时才临时加载，验完立即释放。
+    _use_vllm_logps = bool(cfg.get("vllm_gen_logps")) and cfg["algo"] in ("retool", "retool_math")
+    _verify_budget = int(cfg.get("verify_gen_logps", 0) or 0)
+    # SamplingParams 的可用字段（msgspec/dataclass 两代实现）——logprobs_mode 是
+    # 较新版本才有的字段，老版本硬传会 TypeError，用字段表探测而不是 try/except
+    _sp_fields = set(getattr(SamplingParams, "__struct_fields__", ()) or ()) | \
+        set(getattr(SamplingParams, "__dataclass_fields__", {}) or {})
+    _torch_holder = [None]
+    if (not _use_vllm_logps) or _verify_budget > 0:
+        _torch_holder[0] = AutoModelForCausalLM.from_pretrained(
+            cfg["model_path"], torch_dtype=torch.bfloat16,
+            _attn_implementation=cfg.get("attn_implementation", "sdpa")).cuda().eval()
+        print(f"[rollout] torch gen_logps 副本已加载"
+              f"{'（仅用于前 %d 组对拍，验完释放）' % _verify_budget if _use_vllm_logps else ''}")
+    else:
+        print("[rollout] vllm_gen_logps 档位：不加载 torch 副本（GPU0 省 ~8G）")
+    if _use_vllm_logps:
+        _t = float(cfg.get("temperature", 1.0))
+        _tk = cfg.get("top_k", -1)
+        _tp = float(cfg.get("top_p", 1.0))
+        if _t != 1.0 or _tk not in (-1, None) or _tp != 1.0:
+            print(f"[rollout][警告] vllm_gen_logps 下采样有后处理（temperature={_t} "
+                  f"top_k={_tk} top_p={_tp}）——若 vLLM 版本不支持 logprobs_mode="
+                  "raw_logprobs，返回的是后处理 logprob，与 torch 重算口径不一致；"
+                  "务必用 --verify_gen_logps 对拍后再长跑", flush=True)
 
     sampling_params = SamplingParams(n=cfg["num_pre_Q"], temperature=cfg["temperature"],
                                      max_tokens=cfg["max_gen_tokens"], top_p=cfg["top_p"],
@@ -528,8 +655,13 @@ def gen_worker(Q, cfg: dict):
             path = sync_weights_into_vllm(
                 vllm_gen, state_dict,
                 name_remap=remap_text_to_multimodal if _split_load else None)
-            gen_torch.load_state_dict(
-                {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
+            if _torch_holder[0] is not None:
+                # 副本必须与 vLLM 同步（顺序强制：先 vLLM 后副本），否则 gen_logps
+                # 会用旧策略算——vllm_gen_logps 档位下无副本，跳过即可（不改语义）
+                _torch_holder[0].load_state_dict(
+                    {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
+            else:
+                print("[rollout] vllm_gen_logps 档位：无 torch 副本，跳过其权重同步")
             print(f"[rollout] model updated via {path}, {len(state_dict)} tensors")
             pushes[0] += 1            # 权重推送计数（用于冷启动/后期奖励切换）
             # 权重指纹（float64，位级敏感）：两次推送指纹完全相同 = 训练端权重
@@ -552,12 +684,27 @@ def gen_worker(Q, cfg: dict):
         # token 参与 attention——但训练端 policy 前向与 ref_server 前向同样不传，
         # 三方一致的偏差在 ratio（policy/gen）中抵消；教学规模实测可用。
         # 【2026-09-11】改走分块 logps：全长 logits (8, ~5.4k, 248320) ~22G 实测 OOM。
+        if _torch_holder[0] is None:
+            raise RuntimeError(
+                "[rollout] vllm_gen_logps 档位不该调用 torch 重算路径（副本未加载）"
+                "——检查 verify_gen_logps 与调用点是否一致")
         with torch.inference_mode():
             logps = forward_per_token_logps(
-                gen_torch, merged_ids.to(gen_torch.device),
+                _torch_holder[0], merged_ids.to(_torch_holder[0].device),
                 seq_chunk=512,
                 batch_chunk=max(1, int(cfg.get("fwd_batch_chunk", 1) or 1)))
             return logps[:, plen - 1:].cpu()
+
+    def _free_torch_copy():
+        _torch_holder[0] = None
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("[rollout][verify] 对拍结束，torch gen_logps 副本已释放（GPU0 归还 ~8G）",
+              flush=True)
+
+    _verifier = (LogpsVerifier(_verify_budget, on_finish=_free_torch_copy)
+                 if (_use_vllm_logps and _verify_budget > 0) else None)
 
     def score_group(inputs, answers, completion_lens):
         """打分。返回 (scores, acc_s, fmt_s)。
@@ -592,9 +739,18 @@ def gen_worker(Q, cfg: dict):
         ——共用 seed 会让同题各条生成完全相同的轨迹，组内零方差 → group_ok
         永假无限重采）。seed_salt：随重采/轮次递增的盐，防同 seed 复采同轨迹。"""
         seed0 = cfg.get("seed")
-        return [SamplingParams(n=1, temperature=cfg["temperature"],
-                               max_tokens=cfg.get("round_gen_tokens", 400),
-                               top_p=cfg["top_p"], top_k=cfg.get("top_k", 50),
+        kw = dict(n=1, temperature=cfg["temperature"],
+                  max_tokens=cfg.get("round_gen_tokens", 400),
+                  top_p=cfg["top_p"], top_k=cfg.get("top_k", 50))
+        if _use_vllm_logps:
+            # 被采样 token 的 logprob（= log π(tok|完整前文)），逐轮收集即 gen_logps。
+            # logprobs_mode=raw_logprobs：显式要"后处理前"的 logprob，防某些 vLLM
+            # 版本默认返回经 temperature/top-k 处理后的值（本配置 temperature=1、
+            # 无截断时两者相同，但显式声明不留歧义）。
+            kw["logprobs"] = 0
+            if "logprobs_mode" in _sp_fields:
+                kw["logprobs_mode"] = "raw_logprobs"
+        return [SamplingParams(**kw,
                                seed=(seed0 + seed_salt + k
                                      if seed0 is not None else None))
                 for k in range(n_req)]
@@ -658,7 +814,8 @@ def gen_worker(Q, cfg: dict):
                 results = collect_retool_group(
                     vllm_gen, tokenizer, cfg, compute_gen_logps,
                     inputs, prompts_text, prompt_ids, plen, sps,
-                    steps_elapsed=pushes[0] * cfg["gen_update_steps"])
+                    steps_elapsed=pushes[0] * cfg["gen_update_steps"],
+                    verify_logps=_verifier)
                 rollout_seq[0] += 1   # 盐递增：uniform/超长题重试时不会复采同轨迹
                 for q, res in zip(inputs, results):
                     if res["status"] == "uniform":

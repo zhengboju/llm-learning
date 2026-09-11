@@ -211,6 +211,16 @@ BASE = dict(
     overlong_shaping=False,
     overlong_buffer=64,      # DAPO 软悬崖缓冲区宽度
     gradient_clipping=0.0,   # DeepSpeed 梯度裁剪（0=不裁剪=历史口径；4B 大 lr 建议 1.0）
+    # 【减法① 2026-09-11】gen_logps 来源（仅 retool 家族有效）：
+    #   False = torch 副本在拼接序列上重算（历史口径；GPU0 多占 ~8G + 每步一次全序列前向）
+    #   True  = 逐轮 vLLM 采样 logprobs（SamplingParams(logprobs=0) 返回被采样 token 的
+    #           logprob）。多轮下每轮请求的上下文已含之前所有工具结果，故逐轮收集拼接
+    #           == 在拼接序列上重算，数学严格同义，且完全绕开 prompt_logprobs（那条
+    #           路径在本环境会 hang，正是 torch 副本存在的起因）。
+    # 口径变化：logps 分母由 torch kernel 换 vLLM kernel（同为 bf16）——首次启用必须
+    # 用 verify_gen_logps 对拍并把最大差写进报告。
+    vllm_gen_logps=False,
+    verify_gen_logps=0,      # >0：前 N 组同时算两路并打印最大差（临时加载 torch 副本，验完释放）
 
     # ---- 系统提示（与 simple_grpo_v1 完全一致，保证可比）----
     system_prompt=(

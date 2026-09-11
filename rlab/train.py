@@ -343,6 +343,12 @@ def main():
                          "惩罚起坡点 9152 够不着（见 config.overlong_shaping 注释）")
     ap.add_argument("--grad_clip", type=float, default=None,
                     help="DeepSpeed 梯度裁剪（默认 0=不裁剪=历史口径；4B 大 lr 长跑建议 1.0）")
+    ap.add_argument("--vllm_gen_logps", action="store_true",
+                    help="gen_logps 改用逐轮 vLLM 采样 logprobs（省 GPU0 ~8G 的 torch "
+                         "副本与每步一次全序列前向；数学同义但 kernel 口径变化，"
+                         "首次启用请配 --verify_gen_logps 对拍）")
+    ap.add_argument("--verify_gen_logps", type=int, default=None,
+                    help="前 N 组同时算两路 gen_logps 并打印最大差，验完释放 torch 副本")
     ap.add_argument("--fwd_batch_chunk", type=int, default=None,
                     help="分块前向每次过 backbone 的行数（默认 1=逐行=历史口径；"
                          ">1 减少 kernel/调度开销，显存峰值线性增长；四处共用同一"
@@ -383,6 +389,8 @@ def main():
     if args.overlong_shaping: overrides["overlong_shaping"] = True
     if args.grad_clip is not None: overrides["gradient_clipping"] = args.grad_clip
     if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk
+    if args.vllm_gen_logps: overrides["vllm_gen_logps"] = True
+    if args.verify_gen_logps is not None: overrides["verify_gen_logps"] = args.verify_gen_logps
 
     cfg = get_config(args.algo, **overrides)
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))

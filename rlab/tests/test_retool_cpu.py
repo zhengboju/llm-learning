@@ -1215,6 +1215,159 @@ def test_fwd_batch_chunk():
           and params[-1] == "batch_chunk")
 
 
+def test_vllm_gen_logps():
+    print("[AA] 减法①：gen_logps 改走 vLLM 逐轮采样 logprobs（提取/拼接/对拍闸门）")
+    from rlab.rollout import (LogpsVerifier, collect_retool_group, gen_logps_from_segs,
+                              multi_turn_rollout_group, sampled_logps_from_output)
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+
+    def tids(s):
+        return tok(s, add_special_tokens=False)["input_ids"]
+
+    class _LP:
+        def __init__(self, v): self.logprob = v
+
+    class _C:
+        def __init__(self, text, with_lp=True):
+            self.text = text
+            self.token_ids = tids(text)
+            self.logprobs = ([{i: _LP(-0.1 * (k + 1))}
+                              for k, i in enumerate(self.token_ids)] if with_lp else None)
+
+    class _O:
+        def __init__(self, c): self.outputs = [c]
+
+    # ---- 提取：happy path + 三种错位 fail-fast ----
+    ids = tids("hello")
+    out = _C("hello")
+    got = sampled_logps_from_output(out, ids)
+    check("提取被采样 token 的 logprob（逐位置对齐）",
+          len(got) == len(ids) and abs(got[0] - (-0.1)) < 1e-9
+          and abs(got[-1] - (-0.1 * len(ids))) < 1e-9)
+
+    def _expect_raise(fn, exc, why):
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception as e:
+            print(f"  !! 期望 {exc.__name__}，实得 {type(e).__name__}: {e}")
+            return False
+        print(f"  !! 期望 {exc.__name__}，实得无异常")
+        return False
+
+    check("无 logprobs（未开 logprobs=0）→ RuntimeError",
+          _expect_raise(lambda: sampled_logps_from_output(_C("hi", with_lp=False),
+                                                          tids("hi")), RuntimeError, "no-lp"))
+    check("logprobs 条数 ≠ token 数 → ValueError",
+          _expect_raise(lambda: sampled_logps_from_output(out, ids + [1]),
+                        ValueError, "len-mismatch"))
+    bad = _C("hi")
+    bad.token_ids = bad.token_ids + [999]
+    check("被采样 token 不在该位置 logprobs 里 → ValueError",
+          _expect_raise(lambda: sampled_logps_from_output(bad, bad.token_ids),
+                        ValueError, "missing-key"))
+
+    # ---- 拼接：assistant 段取真实 logps，工具段置 0，右补 0 ----
+    segs2 = [[{"kind": "assistant", "ids": [1, 2], "logps": [-0.5, -1.5]},
+              {"kind": "tool", "ids": [3, 4, 5]}],
+             [{"kind": "assistant", "ids": [6], "logps": [-2.0]}]]
+    t = gen_logps_from_segs(segs2)
+    check("拼接：(B,T) 形状 + 工具段填 0 + pad 填 0 + bf16（与 torch 路同 dtype）",
+          tuple(t.shape) == (2, 5) and t.dtype == torch.bfloat16
+          and [round(float(x), 3) for x in t[0]] == [-0.5, -1.5, 0.0, 0.0, 0.0]
+          and [round(float(x), 3) for x in t[1]] == [-2.0, 0.0, 0.0, 0.0, 0.0])
+    check("assistant 段缺 logps → ValueError（采样时没开 collect_logps 的签名）",
+          _expect_raise(lambda: gen_logps_from_segs([[{"kind": "assistant", "ids": [1]}]]),
+                        ValueError, "no-logps"))
+
+    # ---- 对拍闸门：预算内才要求 torch 重算，验完关闸（副本才可安全释放）----
+    fin = []
+    v = LogpsVerifier(2, on_finish=lambda: fin.append(1))
+    gv = torch.zeros(1, 3, dtype=torch.bfloat16)
+    gt = torch.zeros(1, 3, dtype=torch.bfloat16)
+    m = torch.ones(1, 3)
+    gt[0, 1] = 0.25
+    v(gv, gt, m)
+    check("对拍器：第 1 组后 wants 仍为真、记录最大差",
+          v.wants() and abs(v.max_diff - 0.25) < 1e-6 and fin == [])
+    v(gv, gt, m)
+    check("对拍器：预算用尽后 wants 转假 + on_finish 恰好触发一次（释放副本）",
+          (not v.wants()) and fin == [1])
+
+    # ---- collect_retool_group 接线：vLLM 路不再调用 torch 重算 ----
+    cfg = get_config("retool", use_wandb=False)
+    cfg["vllm_gen_logps"] = True
+    class FakeGen:
+        def __init__(self, rounds):
+            self.rounds = rounds; self.r = 0
+        def generate(self, prompts, sps, use_tqdm=False):
+            texts = self.rounds[self.r]; self.r += 1
+            return [_O(_C(t)) for t in texts]
+
+    good72, good99 = fmt_answer("72"), fmt_answer("99")
+    r1 = [good72, good99, good72, good99]
+    qs = [{"Q": "q0", "A": "72"}]
+    prompts_text = ["prompt0"]
+    prompt_ids = tok(prompts_text, return_tensors="pt", padding=True,
+                     add_special_tokens=False)["input_ids"]
+    plen = prompt_ids.shape[0 + 1]
+    sps = [object() for _ in range(4)]
+    gl_calls = []
+
+    def fake_gl(merged, plen_):
+        gl_calls.append(merged.shape[0])
+        return torch.zeros(merged.shape[0], merged.shape[1] - plen_)
+
+    ok = collect_retool_group(FakeGen([r1]), tok, cfg, fake_gl, qs, prompts_text,
+                              prompt_ids, plen, sps)[0]
+    check("vLLM 路：torch 重算零调用（副本真的省掉了）", gl_calls == [])
+    clen0 = ok["clen"][0]
+    exp = [-0.1 * (k + 1) for k in range(clen0)]
+    check("vLLM 路：gen_logps == 采样 logprob（逐位置），形状与 mask 一致",
+          tuple(ok["gen_logps"].shape) == tuple(ok["mask"].shape)
+          and all(abs(float(ok["gen_logps"][0][k]) - exp[k]) < 1e-2 for k in range(clen0)))
+
+    # 带对拍器：只在前 1 组触发 torch 重算，之后自动关闸
+    cfg_v = dict(cfg)
+    v2 = LogpsVerifier(1, on_finish=lambda: None)
+    collect_retool_group(FakeGen([r1]), tok, cfg_v, fake_gl, qs, prompts_text,
+                         prompt_ids, plen, sps, verify_logps=v2)
+    check("带对拍器：恰好 1 次 torch 重算（预算内）", gl_calls == [4])
+    collect_retool_group(FakeGen([r1]), tok, cfg_v, fake_gl, qs, prompts_text,
+                         prompt_ids, plen, sps, verify_logps=v2)
+    check("对拍预算用尽后：不再触发 torch 重算（副本释放后不会炸）", gl_calls == [4])
+
+    # ---- 采样侧缺 logprobs 时 fail-fast（而不是静默产出错位 gen_logps）----
+    class FakeGenNoLP:
+        def generate(self, prompts, sps, use_tqdm=False):
+            return [_O(_C(t, with_lp=False)) for t in r1]
+    check("collect_logps=True 但 vLLM 没回 logprobs → RuntimeError",
+          _expect_raise(lambda: multi_turn_rollout_group(
+              FakeGenNoLP(), sps, tok, prompts_text * 4,
+              {"max_rounds": 3, "sandbox_timeout": 5.0, "sandbox_mem_mb": 256,
+               "tool_result_max_chars": 500}, collect_logps=True), RuntimeError, "nologp"))
+
+    # ---- 配置/CLI 接线 ----
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tr = open(os.path.join(root, "rlab", "train.py"), encoding="utf-8").read()
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    check("preset 默认 False（历史口径零变化）+ CLI 双开关存在",
+          get_config("retool_math", use_wandb=False)["vllm_gen_logps"] is False
+          and '"--vllm_gen_logps"' in tr and '"--verify_gen_logps"' in tr
+          and 'overrides["vllm_gen_logps"] = True' in tr)
+    check("gen_worker 仅在需要时加载 torch 副本（含对拍窗口）",
+          "if (not _use_vllm_logps) or _verify_budget > 0:" in ro)
+    check("SamplingParams 在 vLLM 路带 logprobs=0（+ logprobs_mode 字段探测）",
+          'kw["logprobs"] = 0' in ro and '"logprobs_mode" in _sp_fields' in ro)
+    # 回归锁：权重同步处曾残留 gen_torch 悬空引用（pyflakes 抓到），无副本时必须跳过
+    check("无 torch 副本时权重同步跳过它（不留悬空引用）",
+          "gen_torch" not in ro and "if _torch_holder[0] is not None:" in ro)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1274,6 +1427,7 @@ if __name__ == "__main__":
     test_overlong_ref_and_opt_cli()
     test_grad_clip_and_run_info()
     test_fwd_batch_chunk()
+    test_vllm_gen_logps()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
