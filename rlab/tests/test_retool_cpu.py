@@ -991,6 +991,52 @@ def test_attn_impl():
           '"flash_attention_2"' in train_src and "--attn_implementation" in train_src)
 
 
+def test_materialize_mm():
+    print("[U] 多模态壳物化：纯文本 checkpoint -> vLLM 可评的多模态格式"
+          "（A2 在 eval 路复现：vLLM 拒 Qwen3_5TextConfig）")
+    from rlab.materialize_mm_ckpt import merge_text_into_mm
+
+    t_emb = torch.randn(4, 3)
+    t_norm = torch.randn(4)
+    t_vis = torch.randn(2, 2)
+    text_sd = {"model.embed_tokens.weight": t_emb, "model.norm.weight": t_norm,
+               "lm_head.weight": torch.randn(4, 3)}   # tied 重复键
+    mm_sd = {"model.language_model.embed_tokens.weight": torch.randn(4, 3),
+             "model.language_model.norm.weight": torch.randn(4, dtype=torch.bfloat16),
+             "model.visual.patch_embed.weight": t_vis}
+    merged, stats = merge_text_into_mm(text_sd, mm_sd)
+    check("语言键被文本张量替换（与训练端同步同一映射表，杜绝两套映射漂移）",
+          merged["model.language_model.embed_tokens.weight"] is t_emb)
+    check("dtype cast 键数值守恒（bf16 舍入容差内；t.to() 产生新对象按值验）",
+          torch.allclose(merged["model.language_model.norm.weight"].float(),
+                         t_norm, rtol=0.05, atol=0.05))
+    check("tied lm_head 丢弃（与 remap_text_to_multimodal 行为一致）",
+          "lm_head.weight" not in merged and "model.lm_head.weight" not in merged)
+    check("视觉键原样保留（骨架非语言键不动）",
+          merged["model.visual.patch_embed.weight"] is t_vis)
+    check("dtype 对齐骨架（文本 fp32 master -> 骨架 bf16）",
+          merged["model.language_model.norm.weight"].dtype == torch.bfloat16)
+    check("stats 计数正确（替换 2 / 保留 1）",
+          stats["text_substituted"] == 2 and stats["base_kept"] == 1)
+    # 布局漂移双向 fail-fast：骨架键缺文本对应 / 文本键未命中骨架
+    try:
+        merge_text_into_mm({"model.embed_tokens.weight": t_emb}, mm_sd)
+        check("骨架键缺文本对应 fail-fast", False)
+    except KeyError:
+        check("骨架键缺文本对应 fail-fast（禁止 base 旧权重静默补位）", True)
+    try:
+        merge_text_into_mm({**text_sd, "model.dummy.weight": t_norm}, mm_sd)
+        check("文本键未命中骨架 fail-fast", False)
+    except KeyError:
+        check("文本键未命中骨架 fail-fast（新键 = 布局漂移）", True)
+    # 纯视觉骨架 + 文本 ckpt = 语言键无处落位，同样 fail-fast（不许静默丢层）
+    try:
+        merge_text_into_mm({"model.norm.weight": t_norm}, {"model.visual.x": t_vis})
+        check("纯视觉骨架 fail-fast", False)
+    except KeyError:
+        check("纯视觉骨架 fail-fast（语言键无处落位=配置错误）", True)
+
+
 def test_pyflakes_undefined():
     print("[J] pyflakes 静态检查：gen_worker 内部只有运行时才执行，import 冒烟测不出"
           "未定义名（_health 别名事故教训）")
@@ -1043,6 +1089,7 @@ if __name__ == "__main__":
     test_chunked_logps()
     test_alloc_conf_ipc()
     test_attn_impl()
+    test_materialize_mm()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
