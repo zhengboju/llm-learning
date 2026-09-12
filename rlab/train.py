@@ -61,15 +61,46 @@ def _git_head() -> str:
         return "unknown"
 
 
+def run_signature(cfg: dict) -> str:
+    """一行「偏离签名」：把最容易被静默改掉、事后只能靠考古发现的维度压成可读串。
+
+    【2026-09-12 为什么要它】run2 的四个关键偏离散落在四处——trunc_shaping 在
+    preset、max_rounds 在 preset 注释里、步数在 CLI、评测口径在 eval 的默认值——
+    跑完 6 小时才发现"和参考项目(agentic-rl-lab/05-retool)差了哪几维"要靠翻日志。
+    签名同时进 ①wandb run name ②run_info.json ③启动 print，三次冗余。
+    字段顺序固定、缺项写 "-"（`g` 格式避免 5e-06 这类尾巴），保证两次 run 可逐段比对。
+    """
+    if cfg.get("difficulty_path"):
+        lo, hi = (cfg.get("difficulty_band") or (0.0, 1.0))
+        dtag = f"d{lo:g}-{hi:g}"
+    else:
+        dtag = "nodiff"
+    lr = cfg.get("lr")
+    lr_tag = f"{lr:g}" if isinstance(lr, (int, float)) else str(lr)
+    ts = float(cfg.get("trunc_shaping") or 0.0)
+    return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
+            f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
+            f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
+            f"-lr{lr_tag}-{dtag}")
+
+
 def write_run_info(path: str, cfg: dict) -> None:
-    """把 run 身份（git head/开始时刻/完整配置）落成 json——checkpoint 与 record
-    从此自证出处。（2026-09-08 教训：out_dir 按 algo 共享，多次 run 会静默覆盖
+    """把 run 身份（git head/开始时刻/完整配置/偏离签名）落成 json——checkpoint 与
+    record 从此自证出处。（2026-09-08 教训：out_dir 按 algo 共享，多次 run 会静默覆盖
     step_* 同名 checkpoint，评测可能在测旧 run 的模型而毫不知情。）"""
-    info = {"git_head": _git_head(), "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+    info = {"signature": cfg.get("run_signature") or run_signature(cfg),
+            "git_head": _git_head(), "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "algo": cfg["algo"], "model_path": cfg["model_path"],
-            "all_steps": cfg["all_steps"], "seed": cfg.get("seed"),
+            "all_steps": cfg["all_steps"], "save_steps": cfg.get("save_steps"),
+            "seed": cfg.get("seed"),
             "reward_switch_step": cfg.get("reward_switch_step"),
             "round_gen_tokens": cfg.get("round_gen_tokens"),
+            "max_rounds": cfg.get("max_rounds"),
+            "trunc_shaping": cfg.get("trunc_shaping"),
+            "overlong_shaping": cfg.get("overlong_shaping"),
+            "difficulty_path": cfg.get("difficulty_path"),
+            "difficulty_band": cfg.get("difficulty_band"),
+            "lr": cfg.get("lr"),
             "temperature": cfg.get("temperature"),
             # 【2026-09-11】完整配方落盘（lr/beta/grad_clip/overlong/GAS…）：旧版只记
             # 7 个字段，10 小时长跑后无法自证用的是哪套超参——评测到一个 checkpoint
@@ -144,9 +175,12 @@ def run_training(cfg, args):
             # 无 key 默认离线记录（WANDB_MODE 可覆盖为 online），事后 wandb sync 补传。
             if os.environ.get("WANDB_API_KEY"):
                 wandb.login(key=os.environ["WANDB_API_KEY"], relogin=False)
-            wandb_run = wandb.init(project=cfg["wandb_project"], name=cfg["wandb_name"],
-                                   config={k: v for k, v in cfg.items()},
-                                   mode=os.environ.get("WANDB_MODE", "offline"))
+            # run name 带偏离签名：wandb 列表页上直接可比"这轮和参考/上轮差在哪几维"
+            wandb_run = wandb.init(
+                project=cfg["wandb_project"],
+                name=f"{cfg['wandb_name']}-{cfg.get('run_signature') or run_signature(cfg)}",
+                config={k: v for k, v in cfg.items()},
+                mode=os.environ.get("WANDB_MODE", "offline"))
         except Exception as e:
             print(f"[train] wandb 不可用（{e}），继续训练不记录")
     totals = {"num": 0, "acc": 0.0, "fmt": 0.0}
@@ -446,6 +480,11 @@ def main():
     if args.verify_gen_logps is not None: overrides["verify_gen_logps"] = args.verify_gen_logps
 
     cfg = get_config(args.algo, **overrides)
+    # 【2026-09-12】偏离签名先算好再打印/落盘：wandb run name 与 run_info.json 同源，
+    # 终端这一行是"和参考项目差了哪几维"的第一现场（grep signature= 即可）。
+    cfg["run_signature"] = run_signature(cfg)
+    print(f"[train] 偏离签名 signature={cfg['run_signature']}"
+          f"（对比参考 agentic-rl-lab/05-retool 与上轮 run 时先看这一行）")
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
     run_training(cfg, args)
 

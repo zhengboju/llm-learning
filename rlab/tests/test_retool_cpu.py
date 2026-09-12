@@ -1198,6 +1198,13 @@ def test_grad_clip_and_run_info():
     check("run_info 落盘完整 cfg（lr/beta/grad_clip/GAS 可回溯）",
           '"config": {k: v for k, v in cfg.items()}' in src
           and "default=str" in src)
+    # 【2026-09-12】偏离签名三处冗余（wandb name / run_info / 启动 print）：run2 的四个
+    # 关键偏离散落在 preset + CLI + eval 默认值里，跑完才发现"差了哪几维"全靠翻日志。
+    check("run signature 进 run_info 顶层（checkpoint 自证消融维度）",
+          "run_signature(cfg)," in src)
+    check("run signature 进 wandb run name（列表页可直接比对偏离）",
+          "run_signature(cfg)}" in src)
+    check("启动即打印 signature=（grep 第一现场）", "偏离签名 signature=" in src)
     # get_config 拒绝未知键的契约仍成立（新键必须先在 BASE 注册）
     try:
         get_config("retool_math", use_wandb=False, gradient_clipping=1.0)

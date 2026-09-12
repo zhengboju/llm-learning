@@ -4,6 +4,7 @@
 # 一个进程只评一个模型（vLLM显存随进程退出干净释放）；多模型=多进程并行，同卡几个进程就各给 --gpu_mem≈1/N
 # 用法: CUDA_VISIBLE_DEVICES=0 python eval_vllm_one.py --name dapo200 --model /path/step_200 --n 300 --gpu_mem 0.26 --out eval_v_dapo200.json
 import argparse
+import hashlib
 import json
 import random
 import os
@@ -33,6 +34,10 @@ parser.add_argument("--show", type=int, default=0, help="打印前N个原始回�
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/dapo/retool/retool_math 等；指定后自动决定 prompt/预算/奖励口径。未指定时由 --retool 推断")
 parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"], help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
+# 【2026-09-12】per-item 落盘默认开：run2 评完只留聚合计数，导致 m200−BASE 的 +5.0pp
+# 无法做同题配对的 McNemar（未配对检验 p≈0.11、白丢功效），事后无法补救。
+parser.add_argument("--dump_items", action=argparse.BooleanOptionalAction, default=True,
+                    help="落盘 per-item 明细（默认开，供 analysis.py 做配对检验/分层）；--no-dump_items 关闭")
 parser.add_argument("--max_rounds", type=int, default=None, help="--retool 时最多代码-执行轮数；None=取训练配置")
 parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置")
 args = parser.parse_args()
@@ -253,27 +258,46 @@ else:
 # 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
 # 把"只写代码没写答案/输出为空"的样本剔出分母，模型退化时反而美化 acc。
 acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
+items = []      # per-item 明细（--dump_items，默认开）：供 analysis.py 配对检验/分层
 for i, (item, ans) in enumerate(zip(sample, answers)):
     n_valid += 1
-    if len(ans.strip()) == 0:
-        continue    # 空答案：计入分母，acc/fmt 记 0
-    # ground_truth 归一：gsm8k 带 ####，dapo 直接答案
-    if args.eval_task == "gsm8k":
-        gt = item["A"].split("####")[-1].strip()
-        a = reward_correct_gsm8k(ans, gt)
-        f = reward_format_gsm8k(ans)
-    else:
-        gt = str(item["A"]).strip()
-        a = reward_correct_boxed_eval(ans, gt)
-        f = reward_format_boxed(ans)
+    a = f = 0.0     # 空答案计入分母记 0 分（见上方审查修复注释）
+    if len(ans.strip()) > 0:
+        # ground_truth 归一：gsm8k 带 ####，dapo 直接答案
+        if args.eval_task == "gsm8k":
+            gt = item["A"].split("####")[-1].strip()
+            a = reward_correct_gsm8k(ans, gt)
+            f = reward_format_gsm8k(ans)
+        else:
+            gt = str(item["A"]).strip()
+            a = reward_correct_boxed_eval(ans, gt)
+            f = reward_format_boxed(ans)
     acc += a; fmt += f; both += (a == 1.0 and f == 1.0)
+    if args.dump_items:
+        items.append({
+            # 题面指纹：跨模型对齐用（同 seed/split 下同题同 key）——McNemar 的配对键。
+            # run2 缺的正是这个键，导致 +5.0pp 只能做未配对检验（p≈0.11）。
+            "qk": hashlib.sha1(str(item["Q"]).encode("utf-8")).hexdigest()[:12],
+            "acc": a, "fmt": f,
+            "code_used": int(code_used[i]) if code_used and i < len(code_used) else 0,
+            "code_ok": int(code_ok[i]) if code_ok and i < len(code_ok) else 0,
+            "ans_len": len(ans), "empty": 0 if ans.strip() else 1,
+        })
     if i < args.show:
         print(f"  [a={a:.0f} f={f:.0f}] {ans[:500]}")
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid,
           "n_requested": args.n, "n_dropped_long": _dropped_long,
-          "algo": args.algo, "eval_task": args.eval_task, "split": args.split}
+          "algo": args.algo, "eval_task": args.eval_task, "split": args.split,
+          # 【2026-09-12 审计缺口补齐】旧版不记 model_path：多模型同表时事后无法核对
+          # "这一行评的到底是哪个 checkpoint"（本文件 docstring 自己就在警告同名覆盖）。
+          "model_path": args.model,
+          "eval_protocol": {"temperature": 0, "greedy": True, "seed": args.seed,
+                            "max_rounds": args.max_rounds, "round_tokens": args.round_tokens,
+                            "max_tokens": args.max_tokens, "max_len": args.max_len}}
+if args.dump_items:
+    result["items"] = items
 if is_retool_family and n_valid:
     result["code_rate"] = sum(1 for u in code_used if u > 0) / n_valid
     result["code_ok_rate"] = sum(1 for k in code_ok if k > 0) / n_valid

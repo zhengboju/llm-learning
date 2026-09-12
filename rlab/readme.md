@@ -18,9 +18,9 @@
 | `health.py` | 训练期健康检查：窗口签名告警（信号恒死/平坦/退化/截断），历史 bug 的直接探测 |
 | `ref_server.py` | 打分中转服务器，双模式：passthrough（GRPO 家族）/ rfpp（macro-batch per-token advantage） |
 | `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端；协议 mask 感知） |
-| `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42；--retool 多轮代码评测） |
-| `analysis.py` | eval 汇总表（±2pp 噪声地板判定）+ record.jsonl 曲线 |
-| `tests/test_smoke_cpu.py` | 45 项 CPU 冒烟测试（losses 解析值/协议/reward/数据） |
+| `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42；--retool 多轮代码评测；per-item 明细默认落盘） |
+| `analysis.py` | eval 汇总表（**N-aware 95%CI + 同题配对 McNemar** 判定，替代旧 ±2pp 固定地板）+ record.jsonl 曲线 |
+| `tests/test_smoke_cpu.py` | 64 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名） |
 | `tests/test_retool_cpu.py` | 60 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查是核心学习点） |
 
 ## 算法切换对照
@@ -63,7 +63,7 @@ python -m rlab.analysis --record rlab_out/record.jsonl
 CPU 冒烟（本机即可跑，共 81 项）：
 
 ```bash
-python -m rlab.tests.test_smoke_cpu        # 45 项：losses 解析值/协议/reward/数据 ✅
+python -m rlab.tests.test_smoke_cpu        # 64 项：losses 解析值/协议/reward/数据/eval 统计/run 签名 ✅
 python -m rlab.tests.test_train_step_cpu   #  9 项：tiny 模型端到端 plen 切片/mask/backward ✅
 python -m rlab.tests.test_ref_server_cpu   # 17 项：eos mask/passthrough 布局/rfpp 信用回传数学 ✅
 python -m rlab.tests.test_e2e_http         # 15 项：真实 HTTP 双模式服务器 + 算法消费闭环 ✅
@@ -88,6 +88,8 @@ NativeCommandError 假象；以退出码为准（stdout/stderr 重定向到文�
   + 协议 mask 槽位（工具返回 token 不进 loss，`has_mask` 元数据）+ retool 奖励
   （acc+fmt+code 小权重，cold/hot 权重切换）。loss 复用 grpo。运行与验收见
   `docs/02-retool.md`；CPU 验收 `python -m rlab.tests.test_retool_cpu`（34 项）。
+  **retool_math 换 4B 基座后的 run2 诊断与优化方案见 `docs/05-retool-math-diagnosis-plan.md`**
+  （与参考 `05-retool` 逐维对照、退化根因排序、P0–P4 方案与进度看板；P1/P2/P3/P4 尚未执行）。
 - 检索 RL（Search-R1）：可复用阶段2 的多段轨迹协议与 mask 契约，新增
   `search_backend.py`（BM25 起步），reward 换 EM；数据在 `data.py` 注册。
 

@@ -170,6 +170,14 @@ for name, r in results.items():
     print(f"{name:<16}{r['acc']*100:>9.1f}%{r['fmt']*100:>9.1f}%{r['both']*100:>9.1f}%{r['n']:>10}")
 if failures:
     print(f"\n[警告] {len(failures)} 个模型失败: {[(n, f'GPU{g}', rc) for n, g, rc in failures]}")
+# 【2026-09-12 审计缺口】落盘调度级上下文：旧版只有每个模型的指标、不记 BASE 是哪条
+# 路径，事后无法核对 Δacc 的基线有没有用对基座（run2 里 --base_path 默认还是 Qwen2.5-3B
+# 的遗留值）。analysis.py 汇总时跳过 "_" 前缀键。
+results["_meta"] = {"base_path": base_path, "tuned": args.tuned, "n": args.n,
+                    "seed": args.seed, "split": args.split, "algo": args.algo,
+                    "eval_task": args.eval_task, "gpus": gpus, "per_gpu": args.per_gpu,
+                    "failures": [list(x) for x in failures],
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S")}
 with open(args.out, "w", encoding="utf-8") as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
 print(f"\n结果已存 {args.out}（单模型明细在各 eval_v_*.json）")

@@ -12,28 +12,117 @@
 import argparse
 import glob
 import json
+import math
 import os
 import time
 
-NOISE_FLOOR_PP = 2.0   # 公共协议：±2pp 内视为噪声，>3pp 才算真差异
+NOISE_FLOOR_PP = 2.0   # 【已降级】仅留作历史报告对照；判定改用 ci95()/McNemar，见下
 SESS_GAP_S = 120.0     # record 时间戳间隔 >120s = 新训练会话（进程重启/新 run 追加同文件）
+
+
+# ---------------------------------------------- 统计口径（2026-09-12 新增）----
+# 【为什么必须改】旧版 summarize_eval 用固定 ±2pp 地板判"真差异"——那是 GSM8K/N=300
+# 时代的常数。实测量级：dapo_math N=500 下单臂 95%CI 就有 ±4.4pp、两臂差 ±6.2pp，
+# 于是 m200−BASE 的 +5.0pp（未配对两比例 p≈0.11）会被旧逻辑直接打成"真差异"。
+# 现在：①单臂/两臂 CI 一律按 n 现算；②若两模型都落了 per-item 结果（eval 端
+# --dump_items，默认开），改用**同题配对的 McNemar 精确检验**——只看分歧对，功效
+# 远高于独立两臂。这正是 run2 里 +5.0pp 本可能显著、却因只存聚合值而算不出来的检验。
+
+def ci95(p: float, n: int) -> float:
+    """单臂比例 p 的 95% 置信半宽（返回 pp）。n<=0 返回 nan。"""
+    if not n or n <= 0:
+        return float("nan")
+    return 1.96 * math.sqrt(max(p * (1.0 - p), 0.0) / n) * 100.0
+
+
+def diff_ci95(p1: float, n1: int, p2: float, n2: int):
+    """两臂差（pp）与 95% 半宽（未配对两比例）。返回 (diff_pp, half_pp)。"""
+    if not n1 or not n2:
+        return (p1 - p2) * 100.0, float("nan")
+    se = math.sqrt(max(p1 * (1 - p1), 0.0) / n1 + max(p2 * (1 - p2), 0.0) / n2)
+    return (p1 - p2) * 100.0, 1.96 * se * 100.0
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """配对 McNemar 精确二项检验（双侧 p）。b/c = 两个方向的分歧计数。"""
+    n = int(b) + int(c)
+    if n <= 0:
+        return 1.0
+    k = min(int(b), int(c))
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2.0 ** n)
+    return min(1.0, 2.0 * tail)
+
+
+def paired_counts(items_model, items_base, key: str = "qk"):
+    """按题面 key 对齐两份 per-item 结果 → (b, c, matched)。
+
+    约定 model 为被测臂、base 为基线臂：
+      b = model 对 & base 错（提升方向的 discordant pair）
+      c = model 错 & base 对（回退方向）
+    任一臂缺 items / 无 key / 无可对齐题时返回 None（调用方回落两比例检验）。"""
+    if not items_model or not items_base:
+        return None
+    bm = {it.get(key): it for it in items_model if it.get(key)}
+    bb = {it.get(key): it for it in items_base if it.get(key)}
+    if not bm or not bb:
+        return None
+    matched = b = c = 0
+    for k in bm.keys() & bb.keys():
+        am, ab = bm[k].get("acc", 0) == 1.0, bb[k].get("acc", 0) == 1.0
+        matched += 1
+        if am and not ab:
+            b += 1
+        elif ab and not am:
+            c += 1
+    return (b, c, matched) if matched else None
+
+
+def _verdict(diff_pp: float, half_pp: float, p=None) -> str:
+    """判定：有 McNemar p 用 p<0.05；否则看 CI 是否跨 0（不再用固定 ±2pp 地板）。"""
+    if p is not None:
+        return "显著" if p < 0.05 else "噪声内"
+    if half_pp != half_pp:      # nan
+        return "—"
+    return "显著" if (diff_pp - half_pp > 0 or diff_pp + half_pp < 0) else "噪声内"
 
 
 def summarize_eval(path: str, base_name: str = "BASE") -> str:
     with open(path, encoding="utf-8") as f:
         results = json.load(f)
-    base = results.get(base_name, {})
-    lines = [f"| 模型 | acc | fmt | both | Δacc vs {base_name} | 判定 |",
-             "|---|---|---|---|---|---|"]
-    for name, r in results.items():
-        acc, both = r["acc"] * 100, r["both"] * 100
-        if name == base_name or not base:
-            delta, verdict = "—", "—"
+    models = {k: v for k, v in results.items() if not k.startswith("_")}
+    base = models.get(base_name, {})
+    n_base = base.get("n") or 0
+    lines = []
+    if n_base:
+        hw = ci95(0.5, n_base)
+        lines.append(f"> N={n_base} · 单臂 95%CI 最坏 ≈±{hw:.1f}pp · 两臂差 ≈±{hw * math.sqrt(2):.1f}pp "
+                     f"· 判定 = CI 不跨 0（有 per-item 时改用 McNemar p<0.05）")
+        lines.append("")
+    lines += [f"| 模型 | acc%(±95%CI) | fmt% | code% | Δacc vs {base_name} | 检验 | 判定 |",
+              "|---|---|---|---|---|---|---|"]
+    for name, r in models.items():
+        n = r.get("n") or 0
+        acc = r.get("acc", 0.0) * 100
+        hw = ci95(r.get("acc", 0.0), n)
+        acc_col = f"{acc:.1f}±{hw:.1f}" if hw == hw else f"{acc:.1f}"
+        fmt_col = f"{r.get('fmt', 0.0) * 100:.1f}"
+        code_col = f"{r['code_rate'] * 100:.1f}" if "code_rate" in r else "—"
+        if name == base_name or not base or not n or not n_base:
+            delta, test, verdict = "—", "—", "—"
         else:
-            d = acc - base["acc"] * 100
-            delta = f"{d:+.1f}pp"
-            verdict = ("真差异" if d > 3 else "噪声级" if d > NOISE_FLOOR_PP else "噪声内")
-        lines.append(f"| {name} | {acc:.1f} | {r['fmt']*100:.1f} | {both:.1f} | {delta} | {verdict} |")
+            d, h = diff_ci95(r.get("acc", 0.0), n, base.get("acc", 0.0), n_base)
+            pc = paired_counts(r.get("items"), base.get("items"))
+            if pc is not None:
+                b, c, matched = pc
+                p = mcnemar_exact(b, c)
+                delta = f"{d:+.1f}pp"
+                test = f"McNemar p={p:.3f} (b={b}/c={c}, n={matched})"
+                verdict = _verdict(d, h, p)
+            else:
+                delta = f"{d:+.1f}±{h:.1f}pp"
+                test = "两比例（无 per-item）"
+                verdict = _verdict(d, h)
+        lines.append(f"| {name} | {acc_col} | {fmt_col} | {code_col} | {delta} | {test} | {verdict} |")
     return "\n".join(lines)
 
 

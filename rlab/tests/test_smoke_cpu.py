@@ -218,10 +218,79 @@ def test_reward_and_data():
           cfg["clip_high"] == 0.28 and cfg["clip_low"] == 0.2 and cfg["lr"] == 1e-6)
 
 
+# ------------------------------- G. eval 统计口径 + run 偏离签名 ----
+def test_eval_stats_and_signature():
+    """【2026-09-12】把 run2 暴露的两个测量缺口钉成回归测试：
+    ①analysis 旧版用固定 ±2pp 地板判"真差异"，dapo_math N=500 下会把 m200−BASE 的
+      +5.0pp（未配对 p≈0.11）误判成真差异；
+    ②eval 只存聚合值 → 同题配对的 McNemar 永远算不出来（功效白丢，事后无法补救）。
+    以及 run 偏离签名：让"这轮和参考差了哪几维"成为可 grep 的事实而非考古结论。"""
+    import json as _json
+    import os
+    import tempfile
+
+    from rlab.analysis import (ci95, diff_ci95, mcnemar_exact, paired_counts,
+                               summarize_eval, _verdict)
+    from rlab.train import run_signature, write_run_info
+
+    print("[G] eval 统计口径（N-aware CI + McNemar）")
+    check("ci95(0.5,500)≈±4.4pp（N=500 单臂）", abs(ci95(0.5, 500) - 4.38) < 0.05)
+    check("ci95 n=0 → nan（不假装有精度）", ci95(0.5, 0) != ci95(0.5, 0))
+    d, h = diff_ci95(0.516, 500, 0.466, 500)
+    check("两臂差 = +5.0pp / ±6.2pp", abs(d - 5.0) < 0.05 and abs(h - 6.2) < 0.1)
+    check("+5.0±6.2pp → 噪声内（旧 ±2pp 地板会误判真差异）", _verdict(d, h) == "噪声内")
+    d2, h2 = diff_ci95(0.678, 500, 0.530, 500)
+    check("fmt +14.8±6.0pp → 显著", _verdict(d2, h2) == "显著")
+    check("有 McNemar p 时以 p 为准（配对功效更高）", _verdict(d, h, p=0.01) == "显著")
+    check("mcnemar b=c=0 → p=1.0", mcnemar_exact(0, 0) == 1.0)
+    check("mcnemar(20,5)≈0.004 <0.05 且两个方向对称",
+          mcnemar_exact(20, 5) < 0.05 and mcnemar_exact(20, 5) == mcnemar_exact(5, 20))
+    _m = [{"qk": "a", "acc": 1.0}, {"qk": "b", "acc": 0.0},
+          {"qk": "c", "acc": 1.0}, {"qk": "d", "acc": 0.0}]
+    _b = [{"qk": "a", "acc": 0.0}, {"qk": "b", "acc": 1.0},
+          {"qk": "c", "acc": 1.0}, {"qk": "d", "acc": 0.0}]
+    check("paired_counts: b=model对&base错 / c=model错&base对 / 只数分歧对",
+          paired_counts(_m, _b) == (1, 1, 4))
+    check("paired_counts 缺 items → None（回落两比例，不静默当成 0）",
+          paired_counts(None, _b) is None and paired_counts(_m, []) is None)
+
+    print("[G] run 偏离签名（配置自证）")
+    cfg = get_config("retool_math", use_wandb=False, trunc_shaping=0.0,
+                     all_steps=300, save_steps=50, lr=5e-6)
+    sig = run_signature(cfg)
+    check("签名含 algo/trunc/轮次/步数存盘/lr",
+          sig.startswith("retool_math-ts0-ol1-r2x3072-s300x50-lr5e-06"))
+    check("trunc_shaping 变化会改变签名（P1 消融可直接比对）",
+          run_signature({**cfg, "trunc_shaping": 0.5}) != sig)
+    check("lr=0.0 不被 falsy 吞掉（显式 0 仍进签名）", "-lr0-" in run_signature({**cfg, "lr": 0.0}))
+    _dir = tempfile.mkdtemp()
+    _p = os.path.join(_dir, "run_info.json")
+    write_run_info(_p, {**cfg, "run_signature": sig})
+    info = _json.load(open(_p, encoding="utf-8"))
+    check("run_info 顶层带 signature + 消融维度（trunc/rounds/save_steps）",
+          info["signature"] == sig and info["trunc_shaping"] == 0.0
+          and info["max_rounds"] == 2 and info["save_steps"] == 50)
+    check("run_info 仍保留完整 cfg（2026-09-11 provenance 契约不破）", len(info["config"]) > 50)
+
+    print("[G] summarize_eval 表格口径")
+    _j = os.path.join(_dir, "eval.json")
+    _json.dump({"BASE": {"acc": 0.466, "fmt": 0.53, "both": 0.466, "n": 500},
+                "m200": {"acc": 0.516, "fmt": 0.602, "both": 0.516, "n": 500},
+                "_meta": {"base_path": "/root/Qwen3.5-4B"}},
+               open(_j, "w", encoding="utf-8"), ensure_ascii=False)
+    tbl = summarize_eval(_j)
+    check("汇总表不再出现旧『真差异』固定地板判定", "真差异" not in tbl)
+    check("汇总表给出 N-aware CI 与样本量", "±4.4pp" in tbl and "N=500" in tbl)
+    check("_meta 不被当成模型行（审计字段与模型行分流）", "base_path" not in tbl)
+    check("无 per-item 时明确标注是两比例检验（不冒充满配检验）",
+          "两比例（无 per-item）" in tbl)
+
+
 if __name__ == "__main__":
     test_advantages()
     test_losses()
     test_protocol()
     test_reward_and_data()
+    test_eval_stats_and_signature()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
