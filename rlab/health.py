@@ -76,6 +76,22 @@ def window_check(hist, *, retool=False, max_clen=None):
                        "最近 32 组 >20% 样本的末段被轮长上限切断 → final 答案被截、"
                        "acc 结构性受损，建议调大 round_gen_tokens 或 max_rounds"))
 
+    # --- 签名④c：长度膨胀（2026-09-12 新增，本轮静默跑废的直接签名）
+    # 事故形态：outcome-only ±1 奖励下"更长的轨迹答对率 75.4%"（corr(clen,acc)=
+    # +0.25~+0.43）→ 组内优势把长度当正确性代理来强化 → clen 中位数从 3072 顶满、
+    # 均值 2950→3832 单调爬升 → 尾部撞 max_context_tokens 被 overlong 全丢。
+    # 全程没有任何告警：既有四种签名（恒定/平坦/退化/截断）都看不见"均值在爬"。
+    # 这条把它们补上，并且只在窗口均值显著高于开局时触发（不误报自然波动）。
+    _clen_w = _wmean([h["clen"] for h in hist[-k:]])
+    _clen_0 = _wmean([h["clen"] for h in hist[:k]])
+    if n >= 96 and _clen_0 > 0 and _clen_w > 1.35 * _clen_0:
+        alerts.append(("length_runaway",
+                       f"completion 长度窗口均值较开局涨 {( _clen_w / _clen_0 - 1) * 100:.0f}%"
+                       f"（{_clen_0:.0f}→{_clen_w:.0f}）→ 长度膨胀签名。outcome-only 奖励下"
+                       "长度常与正确性相关，梯度会把它当代理强化。查：①是否有长度反向项"
+                       "（trunc_shaping/overlong_shaping 是否真可达）；②预算是否已自洽"
+                       "（否则尾部会被整组丢弃，丢弃率随之攀升）"))
+
     # --- 签名⑤：retool 代码信号未出现（提示性，非致命）
     if retool and n >= 128 and _wmean([h["code_rate"] for h in hist[-k:]]) == 0.0:
         alerts.append(("no_code",

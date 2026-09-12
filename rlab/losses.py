@@ -120,15 +120,36 @@ def _adv_broadcast(advantages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor
 
 
 def _finalize(loss: torch.Tensor, per_token_loss: torch.Tensor, ratio: torch.Tensor,
-              mask: torch.Tensor) -> tuple:
-    """附统计量：clip 比例 / 近似 KL / 平均 ratio（全部只统计有效 token）。"""
+              mask: torch.Tensor, lo: float = 0.2, hi: float = 0.2) -> tuple:
+    """附统计量：clip 比例 / 近似 KL / 离群比例（全部只统计有效 token）。
+
+    【2026-09-12 修复三处口径】
+    ① clip_frac 原来硬编码 `ratio>1.2 | ratio<0.8`，而 loss 实际 clip 在
+       `[1-lo, 1+hi]`，本 preset 是 `[0.8, 1.28]`——ratio∈(1.2,1.28) 的 token
+       被真 clip 了却不计数，系统性低估。改为由 lo/hi 驱动。
+    ② mean_ratio **恒等于 1 是重要度采样的数学恒等式**，不是健康指标：
+       只要 token 是从 π_old 采样的，`E_{t~π_old}[π_new/π_old] = Σ_t π_new(t) = 1`
+       对**任意远**的 π_new 都成立 → 它永远不可能报出 drift。留着只会误导
+       （200 步 run 里它 14 个采样点全部 1.0000，而同期 clip_frac 从 0.07% 涨到
+       15.6%）。保留该键仅为向后兼容，另给三个真有信息量的量：
+    ③ 新增两个真有信息量的量：`kl` = mean(-log ratio)（KL(π_old‖π_new) 的采样
+       估计，PPO 常用定义）与 `frac_d_gt_0.1` = |log ratio|>0.1 的 token 占比
+       （真的漂了多少位置）。approx_kl 保持 `mean(log ratio²)` 不改名，保证与
+       历史 run 可比。
+    """
     with torch.no_grad():
         m = mask.bool()
-        clip_frac = (((ratio > 1.2) | (ratio < 0.8)) & m).sum() / m.sum().clamp(min=1)
+        n = m.sum().clamp(min=1)
+        clip_frac = (((ratio > 1.0 + hi) | (ratio < 1.0 - lo)) & m).sum() / n
         approx_kl = ((ratio.log() ** 2)[m]).mean()
         mean_ratio = (ratio[m]).mean()
+        d = ratio.log()[m].float()
+        kl = (-d).mean() if d.numel() else torch.zeros((), dtype=torch.float32)
+        frac_d = (d.abs() > 0.1).float().mean() if d.numel() \
+            else torch.zeros((), dtype=torch.float32)
     stats = {"loss": float(loss.item()), "clip_frac": float(clip_frac.item()),
-             "approx_kl": float(approx_kl.item()), "mean_ratio": float(mean_ratio.item())}
+             "approx_kl": float(approx_kl.item()), "mean_ratio": float(mean_ratio.item()),
+             "kl": float(kl.item()), "frac_d_gt_0.1": float(frac_d.item())}
     return loss, stats
 
 # ------------------------------------------------------------- loss 主体 ----
@@ -213,7 +234,7 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
     else:
         raise KeyError(f"未知算法 {algo!r}")
 
-    return _finalize(loss, None, ratio, mask)
+    return _finalize(loss, None, ratio, mask, lo=lo, hi=hi)
 
 
 ALGOS = ("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool", "retool_math")

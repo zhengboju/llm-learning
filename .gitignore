@@ -53,3 +53,7 @@ temp/
 # 运行产物（pod 侧训练/eval 输出，本地同步保留但勿入库）
 rlab_out/
 _head_config.py
+
+# 本地测试依赖（transformers 等，仅供 CPU 测试套件；不入库）
+._testdeps/
+._hf/

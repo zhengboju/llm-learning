@@ -137,19 +137,51 @@ def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64)
 def overlong_ref_tokens(cfg: dict) -> int:
     """overlong shaping 的长度参考系（单点真相，retool/单轮两路共用）。
 
-    单轮路径参考 = max_gen_tokens；retool 多轮路径的**总**生成预算 =
-    max_rounds × round_gen_tokens（每轮 assistant 段上限 round_gen_tokens）。
+    单轮路径参考 = max_gen_tokens；retool 多轮路径参考 = **可写满的总预算**，
+    即 min(max_rounds × round_gen_tokens, max_context_tokens − max_prompt_length)。
+    取 min 是双保险：预算自洽时前者更小（也是真正的"用完轮数预算"信号），
+    万一配置被绕过，也绝不会把 trigger 放到 overlong 丢弃线之外（那样又会变成
+    永远够不着的死开关）。
 
     【2026-09-11 修复】旧版两路都拿 cfg["max_gen_tokens"] 当参考——retool_math
     preset 的 8192 是单轮时代遗留值，而 3×3072(CLI 探针口径)=9216 > 8192：
     合法用满预算的轨迹越过 trigger 即被整额扣 1.0，而本算法 reward 域是 ±1，
     等于把做对的 +1 抹成 0、把做错的 -1 加倍成 -2——是误伤不是 shaping。
+
+    【2026-09-12 二次修复】上一版直接返回 rounds × per_round，但在
+    `3×3072=9216 > max_context_tokens=8192` 的配置下它 **大于丢弃线** →
+    retool_context_overlong 先把样本丢了，trigger 永远够不着 = 死开关。
+    根因（预算不自洽）已由 config.validate_retool_budget() fail-fast 拦死，
+    这里再加 min() 兜底，让"shaping 永远可达"成为结构性保证。
     """
     rounds = cfg.get("max_rounds", 1)
     per_round = cfg.get("round_gen_tokens")
     if cfg.get("algo", "").startswith("retool") and per_round:
-        return rounds * per_round
+        cap = rounds * per_round
+        ctx = cfg.get("max_context_tokens")
+        if ctx:
+            usable = ctx - int(cfg.get("max_prompt_length", 0) or 0)
+            if usable > 0:
+                return min(cap, usable)
+        return cap
     return cfg["max_gen_tokens"]
+
+
+def trunc_penalty(trunc_final: int, weight: float = 0.0) -> float:
+    """末段被轮长上限切断的靶向惩罚（纯函数）。
+
+    【2026-09-12 为什么需要它】completion 总长惩罚（overlong_penalty）够不到
+    "单轮就结束"的 prose 轨迹：clen ≤ round_gen_tokens < overlong trigger，
+    而这类样本正是长度膨胀的受害主体。实测（200 步 run，1040 条样本）：
+      trunc_final=1 的 458 条 acc+ = 5.0%；trunc_final=0 的 582 条 acc+ = 64.3%；
+      组内更长的轨迹答对率 75.4%（corr(clen,acc)=+0.25~+0.43）。
+    纯 ±1 outcome 奖励会把"长度"当作正确性的代理来强化（长→更可能答对→
+    正 advantage→再变长），必须有反向项把"撞上限"这件事本身标成负信号。
+    权重为 0 时本项完全不存在（其他算法协议零变化）。
+    """
+    if weight <= 0.0:
+        return 0.0
+    return weight if int(trunc_final) else 0.0
 
 
 # ------------------------------------------------- 阶段2 ReTool 奖励 ----
@@ -232,7 +264,8 @@ def total_reward_math(ground_truth: str, answer: str, *,
 
 def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0,
                              completion_len: int = 0, max_gen_tokens: int = 8192,
-                             overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
+                             overlong_buffer: int = 64, overlong_shaping: bool = False,
+                             trunc_final: int = 0, trunc_shaping: float = 0.0) -> dict:
     """retool-math outcome-only：与 total_reward_math 同 reward（±1），
     工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。
 
@@ -240,11 +273,19 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
     旧版直接在 assistant 拼接上取 boxed——模型在最终 boxed 之后补一段验证代码
     （或码内含 boxed）时，训练端 rfind 会取到码内 boxed、eval 端（先剥离）取不到，
     同一轨迹两边对错判定漂移。剥离后代码是脚手架（与 retool 口径一致）：
-    码内 boxed 不当答案，末 300 字符窗口也作用于剥离后的真实回答文本。"""
+    码内 boxed 不当答案，末 300 字符窗口也作用于剥离后的真实回答文本。
+
+    【2026-09-12 长度控制】trunc_final（末段被轮长上限切断）叠加 trunc_shaping
+    扣分——总长惩罚够不到单轮 prose 轨迹，这是唯一能作用于它的反向信号，
+    见 trunc_penalty 的实测依据。trunc_shaping=0 时行为与旧版逐位相同。"""
     base = total_reward_math(ground_truth, strip_code_blocks(answer),
                              completion_len=completion_len,
                              max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
                              overlong_shaping=overlong_shaping)
+    tp = trunc_penalty(trunc_final, trunc_shaping)
+    if tp:
+        base["reward"] = base["reward"] - tp
+    base["trunc_penalty"] = tp
     # 保留 code 字段供 record 监控，但 reward 不含它
     base["code"] = reward_code(code_ok, 0.0)
     base["code_ok"] = code_ok

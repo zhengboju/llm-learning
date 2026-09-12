@@ -644,10 +644,22 @@ def test_question_scheduler():
     q1 = {"Q": "q1", "A": "1"}
     sched.report(q1, "ok")
     check("ok 清零 streak", sched.q_stat["q1"] == 0)
+    # 【2026-09-12 反压修复】旧语义"overlong 不动 streak"导致模型整体变长时
+    # 题池原地打转（真机：丢弃率 90%、采样主循环空转、训练端 5 小时零产出）。
+    # 现在超长计入 streak（但不插队首——不是"立刻重试"，是"当前预算装不下"）。
     sched.report(q1, "uniform")
     sched.report(q1, "overlong")
-    check("overlong 不计 streak（uniform 后超长不会误拉黑）", sched.q_stat["q1"] == 1)
-    check("blacklisted_count 只算达标（拉黑）题", sched.blacklisted_count() == 1)
+    check("overlong 计入 streak（默认开启反压，防采样空转）", sched.q_stat["q1"] == 2)
+    check("overlong 达标即拉黑、不插回队首",
+          "q1" not in [q["Q"] for q in sched.draw(8)])
+    # 旧语义可显式退回（对照实验用）
+    sched._refill()
+    q2 = {"Q": "q2", "A": "1"}
+    sched.report(q2, "uniform")
+    sched.report(q2, "overlong", count_overlong=False)
+    check("count_overlong=False → 退回旧语义（不动 streak）", sched.q_stat["q2"] == 1)
+    check("blacklisted_count 只算达标（拉黑）题：q0/q1 达标、q2 未达标 → 2",
+          sched.blacklisted_count() == 2)
     # 拉黑到候选 < floor → draw 自动全量重置（难题重新入场）
     for i in range(2, 8):
         for _ in range(2):
@@ -1088,44 +1100,64 @@ def test_eval_thinking_switch():
 def test_overlong_ref_and_opt_cli():
     print("[X] overlong 参考系修复 + 优化超参 CLI：retool 多轮总预算 ≠ 单轮 max_gen_tokens")
     from rlab.reward import overlong_ref_tokens, overlong_penalty, total_reward_math
-    # 参考系：retool 家族 = max_rounds × round_gen_tokens（CLI 覆盖后同步生效）
-    cfg_rm = get_config("retool_math", use_wandb=False, round_gen_tokens=3072)
-    check("retool_math 参考系 = max_rounds × round_gen_tokens = 9216（非单轮 8192）",
-          overlong_ref_tokens(cfg_rm) == 3 * 3072)
-    check("preset 默认（round_gen_tokens=1024）参考系 = 3072",
-          overlong_ref_tokens(get_config("retool_math", use_wandb=False)) == 3 * 1024)
+    # 【2026-09-12 语义变更】参考系不再是裸的 rounds×per_round，而是"可写满的总预算"
+    # = min(rounds×per_round, max_context_tokens − max_prompt_length)，防止在
+    # 预算不自洽的配置下 trigger 落到 overlong 丢弃线之外（那样它永远够不着 → 死开关）。
+    cfg_rm = get_config("retool_math", use_wandb=False)
+    _rounds, _per = cfg_rm["max_rounds"], cfg_rm["round_gen_tokens"]
+    _usable = cfg_rm["max_context_tokens"] - cfg_rm["max_prompt_length"]
+    check(f"retool_math 参考系 = min(rounds×per_round, ctx−plen) "
+          f"= min({_rounds * _per}, {_usable}) = {_rounds * _per}",
+          overlong_ref_tokens(cfg_rm) == min(_rounds * _per, _usable))
+    # 单轮路径（grpo）参考系仍 = max_gen_tokens，历史口径零变化
     check("单轮路径（grpo）参考系仍 = max_gen_tokens",
           overlong_ref_tokens(get_config("grpo", use_wandb=False))
           == get_config("grpo", use_wandb=False)["max_gen_tokens"])
-    # 行为：合法用满预算（2 轮满 3072 + 末轮 3008 = 9152，落在 trigger 9152 内）
-    # 做对的轨迹不该被误伤；旧口径（8192）下同一轨迹被扣满 → +1 抹成 0 / -1 压成 -2
-    _full_legit = 2 * 3072 + 3008
-    r_now = total_reward_math("72", "answer is \\boxed{72}",
-                              completion_len=_full_legit,
-                              max_gen_tokens=overlong_ref_tokens(cfg_rm),
-                              overlong_shaping=True)["reward"]
-    r_old = total_reward_math("72", "answer is \\boxed{72}",
-                              completion_len=_full_legit, max_gen_tokens=8192,
-                              overlong_shaping=True)["reward"]
-    check("合法满预算(9152)+答对：新参考系不罚（+1），旧参考系被抹平（0）",
-          abs(r_now - 1.0) < 1e-6 and abs(r_old - 0.0) < 1e-6)
-    r_wrong_old = total_reward_math("72", "answer is \\boxed{99}",
-                                    completion_len=_full_legit, max_gen_tokens=8192,
-                                    overlong_shaping=True)["reward"]
-    check("旧参考系还会加倍惩罚答错（-1 → -2），新参考系下为 -1",
-          abs(r_wrong_old - (-2.0)) < 1e-6
-          and abs(total_reward_math("72", "answer is \\boxed{99}",
-                                    completion_len=_full_legit,
-                                    max_gen_tokens=overlong_ref_tokens(cfg_rm),
-                                    overlong_shaping=True)["reward"] - (-1.0)) < 1e-6)
-    check("真超预算才线性扣分（trigger 9152 + 32 → 0.5）",
-          abs(overlong_penalty(9152 + 32, 9216, 64) - 0.5) < 1e-6)
+    # 【2026-09-12 关键不变量】参考系必须落在 overlong 丢弃线之内，否则 shaping 不可达
+    # （2026-09-11 那版就是踩了这个：3×3072=9216 > 8192，trigger 永不可达）
+    check("不变量：overlong 参考系 ≤ max_context_tokens − max_prompt_length（shaping 必然可达）",
+          overlong_ref_tokens(cfg_rm) <= _usable)
+    # DAPO 软悬崖语义（参考系 = 悬崖顶）：trigger=ref-buffer 以下不罚，
+    # ref 处扣满，中点 0.5。关键是**参考系可达**——旧配置下 trigger(9152)
+    # 在丢弃线(8192)之外，样本先被 retool_context_overlong 丢掉，永远走不到这里。
+    _ref = overlong_ref_tokens(cfg_rm)
+    check("软悬崖：trigger(=ref−buffer) 以下不罚",
+          overlong_penalty(_ref - 256, _ref, 256) == 0.0)
+    check("软悬崖：ref−buffer/2 → 0.5（参考系可达，惩罚真能生效）",
+          abs(overlong_penalty(_ref - 128, _ref, 256) - 0.5) < 1e-6)
+    check("软悬崖：ref 处扣满 1.0（+1 抹成 0、−1 压成 −2 的最坏情形）",
+          abs(overlong_penalty(_ref, _ref, 256) - 1.0) < 1e-6)
+    # 可达性对照：旧配置（3×3072=9216，丢弃线 8192）下，能触发 shaping 的长度
+    # （>9152）必然已经被 retool_context_overlong 整组丢弃（见 [H] 的超长检查）
+    _old_ref = 3 * 3072
+    check("旧配置自证死开关：能触发 penalty 的长度(>9152) 全在丢弃线(8192)之外，"
+          "样本先被丢 → penalty 永不生效",
+          _old_ref > 8192 and overlong_penalty(9200, _old_ref, 64) > 0.0
+          and 9200 > 8192)
+    # 【2026-09-12】trunc 靶向 shaping：总长惩罚够不到的单轮 prose 轨迹靠它反向
+    from rlab.reward import trunc_penalty, total_reward_retool_math
+    check("trunc_penalty：weight=0 → 恒 0（其他算法协议零变化）",
+          trunc_penalty(1, 0.0) == 0.0 and trunc_penalty(0, 0.5) == 0.0)
+    check("trunc_penalty：trunc_final=1 → weight", trunc_penalty(1, 0.5) == 0.5)
+    _ans = "answer is \\boxed{72}"
+    _n = total_reward_retool_math("72", _ans, trunc_final=1, trunc_shaping=0.5)["reward"]
+    _y = total_reward_retool_math("72", _ans, trunc_final=0, trunc_shaping=0.5)["reward"]
+    check("trunc shaping 打在 reward 上：未截断 +1，被截断 +0.5（不改正负号）",
+          abs(_y - 1.0) < 1e-6 and abs(_n - 0.5) < 1e-6)
+    _neg = total_reward_retool_math("72", "answer is \\boxed{99}",
+                                    trunc_final=1, trunc_shaping=0.5)["reward"]
+    check("trunc shaping 对答错：-1 → -1.5（仍为负，group_mean 语义不变）",
+          abs(_neg - (-1.5)) < 1e-6)
+    check("trunc_shaping 默认关闭（total_reward_retool_math 不传 = 旧行为）",
+          abs(total_reward_retool_math("72", _ans)["reward"] - 1.0) < 1e-6)
     # CLI 入口：新三件套被 train.py 接收并落到 overrides
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
     for flag, key in (('"--lr"', 'overrides["lr"] = args.lr'),
                       ('"--beta"', 'overrides["beta"] = args.beta'),
-                      ('"--overlong_shaping"', 'overrides["overlong_shaping"] = True')):
+                      ('"--overlong_shaping"', 'overrides["overlong_shaping"] = True'),
+                      ('"--trunc_shaping"', 'overrides["trunc_shaping"] = args.trunc_shaping'),
+                      ('"--discard_abort"', 'overrides["discard_abort"] = args.discard_abort')):
         check(f"train.py CLI {flag} 存在且映射到 {key}",
               flag in src and key in src)
     # 接线：rollout retool 打分路径与探针都用同一参考系函数
@@ -1138,12 +1170,16 @@ def test_overlong_ref_and_opt_cli():
           and 'max_gen_tokens=cfg["max_gen_tokens"]' not in ro.split("def retool_score_flat")[1].split("def ")[0])
     check("probe_difficulty 与训练同口径（overlong_ref_tokens）",
           "max_gen_tokens=overlong_ref_tokens(cfg)" in pb)
-    # 【2026-09-11 审查】overlong 在 retool 当前预算几何下不可达（clen 被
-    # max_context_tokens 封顶 ~7800 < trigger 9152），注释必须写明防误导
+    # 【2026-09-12 修复】旧注释断言"overlong 当前配置下不可达"——那是 bug 的自白，
+    # 不是设计。现在改为断言：预算自洽校验存在，且预设配置能通过它。
     cfg_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))), "rlab", "config.py"), encoding="utf-8").read()
-    check("config 注释声明 overlong 当前不可达（防后人误以为它在抑制截断）",
-          "当前配置下不可达" in cfg_src)
+    check("config 有 validate_retool_budget（预算自洽 fail-fast，防事故重演）",
+          "def validate_retool_budget" in cfg_src
+          and "validate_retool_budget(cfg)" in cfg_src)
+    check("preset 预算自洽：rounds×per_round + max_prompt_length + 工具段预留 ≤ ctx",
+          _rounds * _per + cfg_rm["max_prompt_length"] + cfg_rm["_tool_reserve"]
+          <= cfg_rm["max_context_tokens"])
 
 
 def test_grad_clip_and_run_info():
@@ -1276,10 +1312,19 @@ def test_vllm_gen_logps():
               {"kind": "tool", "ids": [3, 4, 5]}],
              [{"kind": "assistant", "ids": [6], "logps": [-2.0]}]]
     t = gen_logps_from_segs(segs2)
-    check("拼接：(B,T) 形状 + 工具段填 0 + pad 填 0 + bf16（与 torch 路同 dtype）",
-          tuple(t.shape) == (2, 5) and t.dtype == torch.bfloat16
+    check("拼接：(B,T) 形状 + 工具段填 0 + pad 填 0 + float32",
+          tuple(t.shape) == (2, 5) and t.dtype == torch.float32
           and [round(float(x), 3) for x in t[0]] == [-0.5, -1.5, 0.0, 0.0, 0.0]
           and [round(float(x), 3) for x in t[1]] == [-2.0, 0.0, 0.0, 0.0, 0.0])
+    # 【2026-09-12 dtype 回归锁】vLLM 返回 float32 精度的 logprob，降到 bf16 会引入
+    # |δ|≈|logp|·2⁻⁹ 的量化误差（|logp|=5 → ~0.01），既给 ratio 加噪声，又给
+    # approx_kl 造出 ~1.5e-4 的假地板，让人分不清后面的读数是 drift 还是量化。
+    _fine = [[{"kind": "assistant", "ids": [1], "logps": [-3.14159265]}]]
+    _tf = gen_logps_from_segs(_fine)
+    check("float32 保精度：-3.14159265 不丢有效数字（bf16 会截成 -3.140625）",
+          abs(float(_tf[0, 0]) - (-3.14159265)) < 1e-6)
+    check("dtype 回归锁：gen_logps_from_segs 不再降到 bf16",
+          t.dtype == torch.float32 and float(_tf[0, 0]) != -3.140625)
     check("assistant 段缺 logps → ValueError（采样时没开 collect_logps 的签名）",
           _expect_raise(lambda: gen_logps_from_segs([[{"kind": "assistant", "ids": [1]}]]),
                         ValueError, "no-logps"))
@@ -1516,6 +1561,108 @@ def test_pyflakes_undefined():
             print(f"  !! {l}")
 
 
+def test_budget_guard_and_drift_stats():
+    """[Z] 2026-09-12 事故固化：预算自洽 fail-fast + 口径诊断修复。
+
+    两件都是"静默跑废"型 bug——不报错、不崩，只在 10 小时后表现为精度没了：
+      ① 3×3072 > 8192 使 overlong 丢弃吃掉 86% 尝试（丢弃率 20%→90%），
+         采样主循环空转、训练端 5 小时零产出；
+      ② clip_frac 用硬编码 1.2/0.8（与 loss 的 1+hi/1-lo 不一致）系统性低估；
+         mean_ratio 恒为 1 是重要度采样恒等式，永远报不出 drift。
+    """
+    print("[Z] 预算自洽 fail-fast + ratio 口径诊断修复")
+    import torch as _t
+    from rlab.config import validate_retool_budget
+    from rlab.losses import compute_loss, _finalize
+
+    # ---- ① 旧的事故配置必须被硬拦 ----
+    _raised = False
+    try:
+        get_config("retool_math", use_wandb=False, max_rounds=3, round_gen_tokens=3072)
+    except ValueError as e:
+        _raised = "预算不自洽" in str(e)
+    check("旧事故配置 3×3072+1024 > 8192 → get_config 直接 ValueError（防静默上线）", _raised)
+    check("错误信息含可执行改法（给出 round_gen_tokens 上限）",
+          "round_gen_tokens ≤" in str(_exc_msg(lambda: get_config(
+              "retool_math", use_wandb=False, max_rounds=3, round_gen_tokens=3072))))
+    check("预算自洽的 preset 不报错（retool 与 retool_math 都要过）",
+          validate_retool_budget(get_config("retool_math", use_wandb=False)) >= 0
+          and validate_retool_budget(get_config("retool", use_wandb=False)) > 0)
+    check("非 retool 算法不参与预算校验（返回值 0）",
+          validate_retool_budget(get_config("grpo", use_wandb=False)) == 0)
+
+    # ---- ② clip_frac 阈值必须与 loss 的 clip 域一致 ----
+    B, T = 1, 4
+    mask = _t.ones(B, T)
+    adv = _t.ones(B)
+    cfg = get_config("retool_math", use_wandb=False)
+    # ratio = exp(policy - gen)。构造 ratio = 1.25：在 (1+lo, 1+hi] = (1.2, 1.28]
+    # 内 → 旧口径（硬编码 1.2）漏计，新口径（1+hi=1.28）也不该计；再构造 1.30 二者都计
+    gen = _t.zeros(B, T)
+    pol_125 = _t.full((B, T), float(__import__("math").log(1.25)))
+    _, st125 = compute_loss("retool_math", pol_125, gen, adv, mask, cfg,
+                            ref_logps=_t.zeros(B, T))
+    check("clip_frac 由 clip_high 驱动：ratio=1.25 在 [0.8,1.28] 内不计 clip",
+          st125["clip_frac"] == 0.0)
+    pol_130 = _t.full((B, T), float(__import__("math").log(1.30)))
+    _, st130 = compute_loss("retool_math", pol_130, gen, adv, mask, cfg,
+                            ref_logps=_t.zeros(B, T))
+    check("ratio=1.30 超出 1+clip_high=1.28 → clip_frac=1（旧硬编码 1.2 阈值口径不一致）",
+          st130["clip_frac"] == 1.0)
+    check("ratio=0.75 低于 1-clip_low=0.8 → clip_frac=1",
+          compute_loss("retool_math", _t.full((B, T), float(__import__("math").log(0.75))),
+                       gen, adv, mask, cfg, ref_logps=_t.zeros(B, T))[1]["clip_frac"] == 1.0)
+
+    # ---- ③ 新统计量真的有信息量（mean_ratio 没有）----
+    check("stats 新键存在：kl / frac_d_gt_0.1",
+          "kl" in st130 and "frac_d_gt_0.1" in st130)
+    check("kl = mean(-log ratio) 是 KL(π_old‖π_new) 的采样估计（ratio=1.30 → -0.262）",
+          abs(st130["kl"] - (-float(__import__("math").log(1.30)))) < 1e-5)
+    check("frac_d_gt_0.1：ratio=1.30（|log ratio|=0.262>0.1）→ 1.0",
+          st130["frac_d_gt_0.1"] == 1.0)
+    # 关键对照：ratio 一半 1.30 一半 0.70 —— mean_ratio≈1 但 drift 明显
+    _mix = _t.tensor([[float(__import__("math").log(1.4))] * 2
+                      + [float(__import__("math").log(0.6))] * 2])
+    _, stm = compute_loss("retool_math", _mix, _t.zeros(1, 4), _t.ones(1),
+                          _t.ones(1, 4), cfg, ref_logps=_t.zeros(1, 4))
+    check("对照实锤：对称 drift 下 mean_ratio≈1.0（恒等式，无诊断价值），"
+          "而 frac|d|>0.1=1.0 与 kl>0 能报出来",
+          abs(stm["mean_ratio"] - 1.0) < 1e-6 and stm["frac_d_gt_0.1"] == 1.0
+          and stm["kl"] > 0.05)
+
+    # ---- ④ mean_ratio 恒等式（记录在案，防后人再把它当健康指标）----
+    _src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "losses.py"), encoding="utf-8").read()
+    check("losses.py 注释写明 mean_ratio 是重要度采样恒等式（对任意远 π_new 都=1）",
+          "重要度采样的数学恒等式" in _src or "数学恒等式" in _src)
+
+
+def _exc_msg(fn):
+    try:
+        fn()
+    except Exception as e:
+        return str(e)
+    return ""
+
+
+def test_length_runaway_signature():
+    """[Z2] 2026-09-12 新增健康签名：长度膨胀（本轮静默跑废的直接签名）。"""
+    print("[Z2] health 新增 length_runaway 签名")
+    from rlab.health import window_check
+    # 开局 32 组 clen≈1500 → 后面 32 组 clen≈4000（涨 167%）→ 必须报
+    hist = ([{"acc": 0.3, "fmt": 0.3, "clen": 1500.0, "code_rate": 0.3,
+              "trunc_rate": 0.05} for _ in range(64)]
+            + [{"acc": 0.15, "fmt": 0.15, "clen": 4000.0, "code_rate": 0.1,
+                "trunc_rate": 0.8} for _ in range(32)])
+    codes = [c for c, _ in window_check(hist, retool=True, max_clen=6144)]
+    check("clen 窗口均值较开局涨 167% → length_runaway", "length_runaway" in codes)
+    # 稳定长度不误报
+    hist2 = [{"acc": 0.3, "fmt": 0.3, "clen": 1500.0, "code_rate": 0.3,
+              "trunc_rate": 0.05} for _ in range(96)]
+    codes2 = [c for c, _ in window_check(hist2, retool=True, max_clen=6144)]
+    check("长度稳定 → 不误报 length_runaway", "length_runaway" not in codes2)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -1547,6 +1694,8 @@ if __name__ == "__main__":
     test_fwd_batch_chunk()
     test_vllm_gen_logps()
     test_strip_left_pad()
+    test_budget_guard_and_drift_stats()
+    test_length_runaway_signature()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

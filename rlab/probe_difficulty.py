@@ -138,7 +138,7 @@ def main():
                          "<out>.samples.jsonl（截断率高时定位 token 去向用）")
     args = ap.parse_args()
 
-    from rlab.config import get_config
+    from rlab.config import get_config, validate_retool_budget
     cfg = get_config("retool_math", model_path=args.model_path, use_wandb=False,
                      seed=args.seed)
     if args.data_task:
@@ -153,6 +153,10 @@ def main():
         cfg["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None:
         cfg["max_context_tokens"] = args.max_context_tokens
+    # 【2026-09-12】CLI 覆盖后必须重跑预算校验：探针的价值就在于"描述训练时的
+    # 采样分布"，若探针预算几何与训练不一致（或不自洽），整张难度表都是另一个
+    # 分布下的产物。get_config 里的校验发生在 override 之前，拦不住这里。
+    cfg["_tool_reserve"] = validate_retool_budget(cfg)
 
     from rlab.data import load_qas, load_difficulty_table
     from rlab.reward import overlong_ref_tokens, total_reward_retool_math

@@ -150,17 +150,27 @@ class QuestionScheduler:
             self._refill()
         return out
 
-    def report(self, q, status):
-        """attempt 结果回填：status ∈ {"uniform", "ok", "overlong"}。"""
+    def report(self, q, status, count_overlong: bool = True):
+        """attempt 结果回填：status ∈ {"uniform", "ok", "overlong"}。
+
+        【2026-09-12 反压修复】旧版对 "overlong" 什么都不做：题目从队列 pop 出来后
+        既不拉黑也不插回，`_refill()` 又把整池放回 → 当模型整体变长、几乎每题都
+        判超长时，采样主循环就对着同一批题无限空转（真机事故：丢弃率 90%、日志里
+        18274 行 "waiting for batch..."、末尾 5 小时零产出，且没有任何告警）。
+        现在超长也计 streak（**不插队首**——超长不是"值得立刻重试"，而是"这题当前
+        预算装不下"，攒够 streak_max 就暂时移出池子），让题池停止原地打转。
+        count_overlong=False 可退回旧语义（对照实验用）。"""
         key = q["Q"]
         if status == "uniform":
             self.q_stat[key] = self.q_stat.get(key, 0) + 1
             if self.q_stat[key] < self.streak_max:
                 self.queue.appendleft(q)   # 未达标：插队首，下一 attempt 尽快重试
             # 达标：不入队 = 拉黑（blacklisted_count / 下次补给排除）
+        elif status == "overlong":
+            if count_overlong:
+                self.q_stat[key] = self.q_stat.get(key, 0) + 1
         elif status == "ok":
             self.q_stat[key] = 0
-        # "overlong"：不动 streak
 
     def blacklisted_count(self):
         return sum(1 for v in self.q_stat.values() if v >= self.streak_max)
@@ -246,7 +256,19 @@ def gen_logps_from_segs(segs, pad_value: float = 0.0):
 
     工具段 token 是环境插入的、vLLM 从未采样过（无从给出 logprob），置 0——它们在
     mask 里恒为 0 不进 loss，ratio 的有效位统计也被 mask 过滤，唯一要求是取值有限
-    （policy_logps ≤ 0 → exp(·) ≤ 1，不溢出）。"""
+    （policy_logps ≤ 0 → exp(·) ≤ 1，不溢出）。
+
+    【2026-09-12 dtype 修复：bf16 → float32】vLLM 返回的 logprob 是 float32 精度，
+    旧版在这里降到 bf16，引入 `|δ| ≈ |logp|·2⁻⁹` 的逐 token 量化误差（|logp|=5 时
+    ~0.01、|logp|=30 时 ~0.06）。后果有两层：
+      ① ratio 上凭空多了 ~1% 的噪声，低频 token 尤甚（正是对拍里 p99=0.109 /
+         max=0.77 那批），给策略梯度注入与策略无关的扰动；
+      ② **approx_kl 出现一个 ~1.5e-4 的硬地板**（step 1 实测 5.11e-4 里绝大部分
+         来自它），让人无法判断后面 0.01~0.10 的读数里有多少是真实 off-policy。
+    存储代价可忽略（B=8、T=8000 的 (B,T) float32 仅 256KB），而精度收益直接决定
+    诊断能否用。对拍器注意：LogpsVerifier 里 `gt.to(gv.dtype)` 会把 torch 路也降到
+    bf16——改 dtype 后两边都是 float32，报出的 diff 才是真实实现口径差（旧版的
+    对拍结果被 bf16 量化同时污染了两侧）。"""
     rows = []
     for segs_i in segs:
         vals = []
@@ -260,7 +282,7 @@ def gen_logps_from_segs(segs, pad_value: float = 0.0):
                 vals.extend(lp)
             else:
                 vals.extend([pad_value] * len(seg["ids"]))
-        rows.append(torch.tensor(vals, dtype=torch.bfloat16))
+        rows.append(torch.tensor(vals, dtype=torch.float32))
     return pad_sequence(rows, batch_first=True, padding_value=pad_value)
 
 
@@ -471,9 +493,12 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     assert len(asst_texts) == len(inputs) * n, \
         f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
     is_math = cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo")
-    # overlong 参考系 = 多轮总预算（max_rounds × round_gen_tokens），非单轮
-    # max_gen_tokens——否则用满预算的轨迹被整额扣分（见 reward.overlong_ref_tokens）
+    # overlong 参考系 = 可写满的多轮总预算（min(max_rounds×round_gen_tokens,
+    # max_context_tokens−max_prompt_length)），非单轮 max_gen_tokens——否则要么
+    # 用满预算的轨迹被整额扣分，要么 trigger 落在丢弃线之外变成死开关
+    # （两代 bug 都记录在 reward.overlong_ref_tokens 的 docstring 里）
     _ol_ref = overlong_ref_tokens(cfg)
+    _trunc_w = float(cfg.get("trunc_shaping", 0.0) or 0.0)
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
@@ -483,7 +508,10 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     completion_len=(completion_lens[idx] if completion_lens is not None else 0),
                     max_gen_tokens=_ol_ref,
                     overlong_buffer=cfg["overlong_buffer"],
-                    overlong_shaping=cfg.get("overlong_shaping", False))
+                    overlong_shaping=cfg.get("overlong_shaping", False),
+                    # 末段被轮长上限切断 → 额外扣分（prose 路径唯一够得到的长度反向信号）
+                    trunc_final=code_stats[idx].get("trunc_final", 0),
+                    trunc_shaping=_trunc_w)
             else:
                 sc = total_reward_retool(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
@@ -681,6 +709,7 @@ def gen_worker(Q, cfg: dict):
     ref_server = cfg["ref_server"]
     pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
     last_fp = [None]   # 上次推送的权重指纹（两次相同 = 训练端权重没在变）
+    policy_version = [None]   # 当前 vLLM/副本 权重对应的 train micro-step（staleness 标签）
     health = _HealthMonitor()
     # 分裂加载判定：vLLM 用另一份 checkpoint（多模态）时，同步需做键名映射
     _split_load = bool(cfg.get("vllm_model_path"))
@@ -693,10 +722,20 @@ def gen_worker(Q, cfg: dict):
         if Q is None:
             return
         try:
-            state_dict = Q.get_nowait()
+            item = Q.get_nowait()
         except _queue.Empty:
             return
-        print("[rollout] recving new model ...")
+        # 【2026-09-12 staleness 可观测】训练端推的是 (version, state_dict)，
+        # version = 推送时的 train micro-step。旧协议只有 state_dict（version=None）。
+        # 没有这个标签，训练端只能**假设**"这批数据是 16×k 步前的权重生成的"——
+        # 而真机 run 的 approx_kl 忽 5e-4 忽 9.9e-2（200× 地板）、完全对不上 16 步
+        # 推送周期，说明真实新鲜度根本不可控也不可测。标签让 PPO ratio 修正的
+        # baseline 从"猜"变成"测"。
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], int):
+            gen_version, state_dict = item
+        else:
+            gen_version, state_dict = None, item
+        print(f"[rollout] recving new model ... (version={gen_version})")
         try:
             # 顺序强制：先 vLLM 后 torch 副本，两者必须保持同一份权重
             # 分裂加载（多模态 vLLM + 纯文本 torch）时同步走键名映射
@@ -710,7 +749,9 @@ def gen_worker(Q, cfg: dict):
                     {k: v.to(torch.bfloat16) for k, v in state_dict.items()})
             else:
                 print("[rollout] vllm_gen_logps 档位：无 torch 副本，跳过其权重同步")
-            print(f"[rollout] model updated via {path}, {len(state_dict)} tensors")
+            print(f"[rollout] model updated via {path}, {len(state_dict)} tensors"
+                  f" (version={gen_version})")
+            policy_version[0] = gen_version
             pushes[0] += 1            # 权重推送计数（用于冷启动/后期奖励切换）
             # 权重指纹（float64，位级敏感）：两次推送指纹完全相同 = 训练端权重
             # 位级未变（优化器未步进/更新全被 bf16 舍入吞掉）。float32 求和会在
@@ -822,6 +863,14 @@ def gen_worker(Q, cfg: dict):
     sched = (QuestionScheduler(QAs, cfg["q_skip_streak"], cfg["q_pool_reset_floor"])
              if use_qqueue else None)
     q_stat = {}   # 旧路径专用：Q 文本 -> 连续零方差组次数
+    # 【2026-09-12 反压状态机】外层轮次零产出计数 + 窗口丢弃率游标
+    _zy_limit = int(cfg.get("sampler_max_zero_yield", 0) or 0)
+    _disc_alert = float(cfg.get("discard_alert", 0.0) or 0.0)
+    _disc_abort = float(cfg.get("discard_abort", 0.0) or 0.0)
+    _count_ov = bool(cfg.get("overlong_counts_toward_skip", True))
+    zero_yield = 0
+    _mark = {"a": 0, "d": 0}     # 上次打点时的 attempts / 丢弃总数（算窗口率，不是累计率）
+    _disc_fired = set()
     while True:
         try_update_model()
         # dynamic sampling（DAPO 机制2）：全同组不占配额，继续采直到攒够 Q_batch_size 组
@@ -885,7 +934,12 @@ def gen_worker(Q, cfg: dict):
                         elif qkey is not None:
                             q_stat[qkey] = q_stat.get(qkey, 0) + 1
                     elif res["status"] == "overlong":
-                        samp_stats["overlong"] += 1   # 超长与难度无关：不计 streak
+                        samp_stats["overlong"] += 1
+                        # 【2026-09-12】超长也回填调度器（不再"与难度无关所以不管"）：
+                        # 旧语义下超长既不拉黑也不插回，池子 refill 后又回到同一批题
+                        # → 模型整体变长时采样主循环无限空转。见 QuestionScheduler.report。
+                        if sched is not None:
+                            sched.report(q, "overlong", count_overlong=_count_ov)
                     else:
                         if sched is not None:
                             sched.report(q, "ok")
@@ -914,7 +968,10 @@ def gen_worker(Q, cfg: dict):
             if is_retool:
                 r = g
                 plen = r["plen"]
-                meta = {"plen": plen, "algo": cfg["algo"], "has_mask": 1}
+                meta = {"plen": plen, "algo": cfg["algo"], "has_mask": 1,
+                        # 【2026-09-12】本组轨迹是哪一版权重生成的（train micro-step）。
+                        # 训练端据此算出**真实** staleness，不再靠"16 步推送周期"猜。
+                        "gen_version": policy_version[0]}
                 xdata = encode_batch(meta, r["merged"], r["adv"], r["gen_logps"],
                                      r["mask"], r["acc"], r["fmt"])
                 requests.post(f"{ref_server}/upload", data=xdata)
@@ -924,6 +981,7 @@ def gen_worker(Q, cfg: dict):
                     "acc": r["acc"].tolist(), "fmt": r["fmt"].tolist(),
                     "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
                     "trunc_final": r["trunc"],
+                    "gen_version": policy_version[0],
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
                 health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"],
                                r["trunc"])
@@ -947,6 +1005,28 @@ def gen_worker(Q, cfg: dict):
                 "clen": [len(t) for t in ans_token_ids]}, ensure_ascii=False) + "\n")
             health.observe(acc_s.tolist(), fmt_s.tolist(),
                            [len(t) for t in ans_token_ids])
+        # 【2026-09-12 反压①：外层轮次零产出熔断】内层循环到 max_attempts 仍没攒到
+        # 一个可用组 = 这一整轮白跑。旧版外层是 `while True` 无任何计数，模型一旦
+        # 整体变长就无限重来（真机：日志里 18274 行 "waiting for batch..."，训练端
+        # 最后 5 小时零产出且零告警）。连续 N 轮零产出直接 fail-fast，把"无限空转"
+        # 变成"当场崩掉并留下可排查的错"。
+        if not groups:
+            zero_yield += 1
+            print(f"[rollout] 本轮零产出（{zero_yield}/{_zy_limit or '∞'}）"
+                  f"：attempts={attempts} 全部被丢弃"
+                  f"（uniform={samp_stats['uniform']} overlong={samp_stats['overlong']}）",
+                  flush=True)
+            if _zy_limit and zero_yield >= _zy_limit:
+                raise RuntimeError(
+                    f"[rollout] 连续 {zero_yield} 轮零产出 → 采样已死锁，fail-fast。\n"
+                    f"  累计 attempts={samp_stats['attempts']} "
+                    f"uniform={samp_stats['uniform']} overlong={samp_stats['overlong']}"
+                    f" uploaded={uploaded_total}\n"
+                    f"  最常见根因：预算不自洽/模型长度膨胀 → overlong 全丢"
+                    f"（查 config.validate_retool_budget、record 的 clen/trunc_final 分布）；"
+                    f"或题目池被拉黑到空（查 q_skip_streak / q_pool_reset_floor）。")
+        else:
+            zero_yield = 0
         if uploaded_total % 10 == 0:
             fout.flush()
         if uploaded_total and uploaded_total % 16 == 0:
@@ -960,7 +1040,27 @@ def gen_worker(Q, cfg: dict):
                   f"（丢弃率 {(_u + _o) / max(1, _a) * 100:.0f}% = 零方差 {_u} + 超长 {_o}；"
                   f"题目过滤中 {_skipped}/{len(QAs)} 题被跳过）",
                   flush=True)
-        # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/代码信号缺失）
+            # 【2026-09-12 反压②：窗口丢弃率告警/熔断】累计率会被开局的正常波动
+            # 永久污染，所以按"上次打点以来的增量"算窗口率。旧版健康检查只有
+            # acc 平坦/退化/截断/代码缺失四种签名，**唯独没有丢弃率**——真机 run
+            # 丢弃率 20%→90% 全程零告警，是最该报的信号。
+            _da = _a - _mark["a"]; _dd = (_u + _o) - _mark["d"]
+            _mark["a"], _mark["d"] = _a, (_u + _o)
+            if _da > 0:
+                _rate = _dd / _da
+                if _disc_alert and _rate >= _disc_alert and "discard" not in _disc_fired:
+                    _disc_fired.add("discard")
+                    print(f"\n[健康检查] 窗口丢弃率 {_rate * 100:.0f}% ≥ "
+                          f"{_disc_alert * 100:.0f}%（{_dd}/{_da}）→ 采集端在大量白跑。"
+                          f"判别：超长占多 = 预算/长度失控（查 clen/trunc_final）；"
+                          f"零方差占多 = 难度带过窄或温度过低。\n", flush=True)
+                if _disc_abort and _rate >= _disc_abort:
+                    raise RuntimeError(
+                        f"[rollout] 窗口丢弃率 {_rate * 100:.0f}% ≥ 熔断线 "
+                        f"{_disc_abort * 100:.0f}%（{_dd}/{_da}）→ 采集端已无有效产能，"
+                        f"fail-fast 而非继续烧 GPU。累计：uniform={_u} overlong={_o} "
+                        f"uploaded={uploaded_total}。")
+        # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/长度膨胀/代码缺失）
         # retool 家族的 clen 上限按"轮数×每轮预算"计——旧版用
         # max_context_tokens-max_prompt_length（8192-1024=7168），而轨迹实际上限
         # ≈3×1024+工具段，永远摸不到 0.95×上限，trunc 签名形同虚设

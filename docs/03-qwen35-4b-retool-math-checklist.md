@@ -63,13 +63,27 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty \
   1024 被 prose 烧断→无完整代码围栏→命中"本轮无代码即终局"→**max_rounds 是
   虚假预算，有效单轨迹预算=round_gen_tokens**（v3 实测 max_rounds 翻倍截断不动）。
   3072 下：正确轨迹 10.4%→36.7%、全对题 7→80、可学带 99→194(k=4 低估，n=8
-  修正后 ≈60%)、完成题正确率 ≈82%。**训练必须与探针同口径**（--round_gen_tokens 3072）。
+  修正后 ≈60%)、完成题正确率 ≈82%。**训练必须与探针同口径**（preset 已内置 3072）。
   备注：4B 样本 code_ok≈0，纯 prose 直接解——TIR 协议对 4B 可能不必要，留观。
-- [ ] `max_rounds=3` 保持即可（对 4B 无效预算，见上；若后续 prompt 约束让模型
-  写代码，再按参考 6 轮重审）。
+- [x] **`max_rounds` 3 → 2（2026-09-12，被 200 步 run 逼出来的必改项）**。上一版
+  把 `--round_gen_tokens 3072` 和 `max_rounds=3` 一起用 → `3×3072 = 9216 >
+  max_context_tokens = 8192`，单轮预算比整条轨迹的丢弃线还大：**用满预算的合法
+  轨迹物理上不可能存在**，`retool_context_overlong` 把 86% 尝试整组丢弃（丢弃率
+  20%→90%），采样主循环对同一批题无限空转，训练端 5 小时零产出。
+  **定版原则：先保证预算自洽，再谈长度控制**——
+  `max_rounds×round_gen_tokens + max_prompt_length + 工具段预留 ≤ max_context_tokens`，
+  现由 `config.validate_retool_budget()` fail-fast 强制（2×3072+1024+266=7434 ✅）。
+  为什么砍轮数而不是砍单轮预算：精度杀手是 `trunc_final`（末段被**单轮**上限切断），
+  它只跟 `round_gen_tokens` 有关；而 `max_rounds` 对 4B 是虚假预算（见上一条）。
+  要恢复 2 次代码执行请改 `max_rounds=3 + round_gen_tokens=2048`，并接受截断上升。
+- [x] **长度反向项（2026-09-12）**：`trunc_shaping=0.5`（末段被轮长上限切断扣 0.5）
+  + `overlong_shaping=True`（预算自洽后已可达）。依据：1040 条样本里 trunc=1 的
+  458 条 acc 仅 5.0%、trunc=0 的 582 条 64.3%，而组内"更长的那条答对率 75.4%"
+  （corr(clen,acc)=+0.25~+0.43）——纯 ±1 outcome 奖励会把长度当正确性代理强化。
 - [ ] `max_prompt_length=1024`：4B 下 prompt 变长（模板+工具定义），确认不误杀。
 - [ ] 采样配置 temp=1.0/top_p=1.0/top_k=-1 保持（与参考对齐）；eval 端参考用
-  top_p=0.7，AIME 评测时对齐。
+  top_p=0.7，AIME 评测时对齐。若长度膨胀复燃，首要调温旋钮是 temperature→0.9
+  （压长度尾部方差），但要接受组内零方差丢弃上升。
 
 ## 3. 显存与训练结构（2×H20 需重新排卡）
 

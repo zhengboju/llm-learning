@@ -15,12 +15,25 @@
 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
     --vllm_model_path /root/Qwen3.5-4B \
     --chat_template_kwargs '{"enable_thinking": false}' \
-    --round_gen_tokens 3072 \
     --gen_gpu_mem 0.30 \
     --micro_rows 1 \
     --optim_8bit \
+    --vllm_gen_logps --verify_gen_logps 5 \
     --difficulty_path rlab_out/difficulty_probe_4b_v4.jsonl
 ```
+
+> **2026-09-12 变更（相对上一版命令）**
+> - `--round_gen_tokens 3072` **移除**：preset 已内置 3072，且 `max_rounds` 从 3 降到 2。
+>   旧组合 `3×3072 = 9216 > max_context_tokens = 8192` 是**预算不自洽**：用满预算的
+>   合法轨迹会被 `retool_context_overlong` 整组丢弃，实测丢弃率 20%→90%、采样主循环
+>   空转、训练端最后 5 小时零产出。现在 `config.validate_retool_budget()` 会 fail-fast
+>   拦住这类配置（`2×3072 + 1024 + 266 = 7434 ≤ 8192` ✅）。
+> - 新增 `trunc_shaping=0.5`（preset 内置，无需 CLI）：末段被轮长上限切断额外扣分——
+>   实测 trunc=1 的样本 acc 仅 5.0%（trunc=0 是 64.3%），而总长惩罚够不到单轮轨迹。
+> - `--vllm_gen_logps --verify_gen_logps 5`：gen_logps 走 vLLM 采样 logprob（省 GPU0
+>   ~8G torch 副本），并保留对拍窗口测实现口径地板。
+> - 采集端新增反压与熔断（超长计入题目 streak、连续 6 轮零产出 fail-fast、窗口丢弃率
+>   ≥50% 告警 / ≥90% 熔断），健康检查新增"长度膨胀"签名。
 
 实测稳定态：GPU0 ~57G（vLLM + torch 副本 + ref）｜ GPU1 ~55-60G（8bit 优化器
 方案）｜ CPU RAM ~50G 内。训练步 ~84-120s/it。
@@ -98,7 +111,7 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 | `model_path=-text 目录` | A1 | torch 三处全崩 |
 | `--vllm_model_path 原多模态` | A2 | vLLM 拒纯文本 checkpoint |
 | `--chat_template_kwargs '{"enable_thinking": false}'` | 协议层（非显存） | thinking 烧穿单轮预算，截断 98.9%，难度分布失真 |
-| `--round_gen_tokens 3072` | 协议层 + 显存（T 进入所有公式） | 1024 下截断 85%（"无代码即终局"使 max_rounds 成虚假预算） |
+| `round_gen_tokens=3072`（preset 内置）+ `max_rounds=2` | 协议层 + 显存（T 进入所有公式） | 1024 下截断 85%（"无代码即终局"使 max_rounds 成虚假预算）。**但单轮预算必须与 max_context_tokens 自洽**：3×3072=9216>8192 会让合法轨迹被整组丢弃（2026-09-12 事故），故 max_rounds 由 3 降为 2 |
 | `--gen_gpu_mem 0.30` | B2 | vLLM 实测超支 ~15G 挤爆 GPU0 共居 |
 | `--micro_rows 1` | B9 | 动态 ~30G 叠加在静态上顶满 GPU1 |
 | `--optim_8bit` | B7/B8 | fused fp32 96G>95G 数学无解；offload RAM 爆 |

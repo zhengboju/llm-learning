@@ -48,20 +48,38 @@ ALGO_DEFAULTS = {
     # 仍与参考不同的三处（报告须注明）：loss_norm 保持 sample_mean、保留 KL β=0.04、
     # Q_batch_size=1（参考每 step 8 题×8 条=64 条；我们每 upload 1 题×8 条，
     # 有效 batch=8×grad_accum4=32 样本/optimizer step，旧协议是 16）。
-    # 预算：每轮上限 round_gen_tokens=1024 × max_rounds=3 ≈ 3072 token，
-    # 远小于名义 max_gen_tokens/max_context_tokens=8192——后者留作保险丝；
-    # 真正要紧的轮长截断见 health 的 retool_trunc。
-    # 【2026-09-10 训练变慢修复】gen_questions_per_attempt=4：一次 attempt 并采
-    # 4 题×8 条（vLLM 并发 32）+ 题目过滤走 QuestionScheduler（旧 random.sample
-    # 全池抽题使 q_skip_streak 永不达标，过滤器死代码，丢弃率卡在 ~64%）。
-    # 沙箱并发同步 8：单轮最多 32 条待执行代码，4 并发时 spawn 串行段 ~2s/轮。
+    # 【2026-09-12 预算重定·必读】旧 preset（round_gen_tokens=1024）+ 探针口径的
+    # CLI 覆盖（--round_gen_tokens 3072）合起来是 `3×3072 = 9216 > max_context_tokens
+    # = 8192`——单轮预算比全轨迹保险丝还大，于是"用满预算"物理上不可达，
+    # retool_context_overlong 把 86% 的尝试整组丢掉（丢弃率 20%→90%），
+    # 采样主循环空转、训练端 5 小时零产出；同时 37% 样本 clen 顶满 3072、
+    # 44% 样本末段被轮长切断（trunc=1 的 acc 只有 5.0%）。
+    # 定版原则：**先保证预算自洽，再谈长度控制**。约束由
+    # config.validate_retool_budget() 强制（不满足直接 raise，防再次静默上线）：
+    #     max_rounds × round_gen_tokens + max_prompt_length + 工具段预留
+    #         ≤ max_context_tokens
+    # 本 preset 代入：2×3072 + 1024 + 1×266 = 7434 ≤ 8192 ✅（余量 758）
+    # 为什么是 max_rounds 2 而不是 round_gen_tokens 2048：
+    #   ① 精度杀手是 trunc_final（末段被**单轮**上限切断），它只跟 round_gen_tokens
+    #      有关；降到 2048 会让 trunc 更糟（探针已实测 1024 下截断 85%）。
+    #   ② max_rounds 对本模型是"虚假预算"（docs/03 v4 探针：无代码即终局，
+    #      有效单轨迹预算 = round_gen_tokens）——砍掉一轮不损失 prose 路径，
+    #      换来的 3072 token 余量让"合法轨迹永不被 overlong 丢"。
+    #   ③ 保留 TIR 最小闭环：round1 写代码 → 沙箱执行 → round2 出 final 答案。
+    #   想恢复 2 次代码执行（3 轮）请改 max_rounds=3 + round_gen_tokens=2048，
+    #   并接受 trunc_final 上升（本轮已有健康签名会报警）。
     "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
                         loss_norm="sample_mean", data_task="dapo_math",
                         num_pre_Q=8, train_micro_batch_size_per_gpu=8,
                         temperature=1.0, top_k=-1,
                         gen_questions_per_attempt=4, sandbox_workers=8,
-                        max_context_tokens=8192, round_gen_tokens=1024,
+                        max_context_tokens=8192, round_gen_tokens=3072,
+                        max_rounds=2,
                         max_gen_tokens=8192, max_prompt_length=1024,
+                        # 长度控制：overlong 现在可达（预算自洽）→ 打开；再叠一个
+                        # 靶向 trunc_final 的项（prose 路径唯一够得到的反向信号）。
+                        overlong_shaping=True, overlong_buffer=256,
+                        trunc_shaping=0.5,
                         code_w=0.0, reward_switch_step=1000000000,
                         # 【2026-09-11 eval 全灭事故】思考开关收进 preset 单点同源：
                         # Qwen3.5 默认 enable_thinking=True，eval 端 prompt 构造从
@@ -201,15 +219,34 @@ BASE = dict(
     loss_norm="sample_mean", # sample_mean | token_mean | token_const | seq_mean | token_items
     dr_grpo_const=None,      # token_const 的固定常数，默认=max_gen_tokens
     dynamic_sampling=False,
-    # 【2026-09-11 实测：当前配置下不可达，等价惰性开关】overlong_penalty 以
-    # completion 总长对 max_rounds×round_gen_tokens 起坡，但 retool_context_overlong
-    # 会先丢弃 len(ids)+plen > max_context_tokens(8192) 的样本 → clen 物理封顶
-    # ~7800（200 步 run 实测 max=7809），任何以总长为参考系的惩罚都够不着 trigger。
-    # 真实截断是 trunc_final（末段被轮上限切断，实测 28.7%），目前无奖励项覆盖；
-    # 要动它需按 trunc_final 靶向 shaping，别指望本开关。健康检查的 trunc 签名
-    # （0.95×max_rounds×round_gen_tokens）同理不可达。
+    # 【2026-09-12 预算自洽后重新可达】overlong_penalty 以 completion 总长对
+    # `overlong_ref_tokens()` 起坡。旧配置（3×3072=9216 > max_context_tokens=8192）
+    # 下它是死开关：retool_context_overlong 会先丢弃 len(ids)+plen > 8192 的样本，
+    # clen 物理封顶 ~7800 < trigger 9152 → 永远够不着。现在由
+    # `validate_retool_budget()` 在 get_config 阶段强制
+    # `max_rounds×round_gen_tokens + max_prompt_length + 工具段预留 ≤ max_context_tokens`，
+    # 合法轨迹再也不会被丢，shaping 成为**唯一**的长度控制 → 打开它。
     overlong_shaping=False,
     overlong_buffer=64,      # DAPO 软悬崖缓冲区宽度
+    # 【2026-09-12 靶向 shaping·长度膨胀的真正出口】末段被轮长上限切断
+    # （trunc_final=1）的额外扣分。为什么不能只靠 overlong_shaping：completion
+    # 总长惩罚够不到"单轮就结束"的 prose 轨迹（clen ≤ round_gen_tokens < trigger）。
+    # 而 200 步 run 实测：trunc=1 的 458 条 acc 仅 5.0%，trunc=0 的 582 条 64.3%，
+    # 44% 样本撞在轮上限上——长度膨胀杀伤精度的直接出口就在 trunc_final。另外
+    # 组内"更长的那条答对率 75.4%"（corr(clen,acc)=+0.25~0.43）意味着纯 ±1 奖励
+    # 会把长度当正确性的代理来强化，必须有反向项。
+    # 量纲：reward 域 ±1，扣 0.5 → +1 变 +0.5、-1 变 -1.5，不改正负号、不破坏
+    # group_mean 的减均值语义；评测端不用 reward，eval 口径零影响。
+    # 0.0 = 关闭（其余算法协议零变化）；retool_math preset 开 0.5。
+    trunc_shaping=0.0,
+    # ---- 采集端反压（2026-09-12 事故）----
+    # 事故形态：模型变长 → 86% 尝试被判 overlong 丢弃 → 而 overlong 既不推进
+    # 题目 streak 也不触发任何熔断 → 采样主循环 `while True` 对着同一批题无限
+    # 空转（log 里 18274 行 "waiting for batch..."，末尾 5 小时零产出）。
+    overlong_counts_toward_skip=True,  # 超长是否计入题目级 streak（防整池原地打转）
+    sampler_max_zero_yield=6,   # 连续 N 个外层轮次零产出 → fail-fast（0=关闭）
+    discard_alert=0.50,         # 窗口丢弃率告警阈值（0=关闭）
+    discard_abort=0.90,         # 窗口丢弃率熔断阈值（0=关闭）
     gradient_clipping=0.0,   # DeepSpeed 梯度裁剪（0=不裁剪=历史口径；4B 大 lr 建议 1.0）
     # 【减法① 2026-09-11】gen_logps 来源（仅 retool 家族有效）：
     #   False = torch 副本在拼接序列上重算（历史口径；GPU0 多占 ~8G + 每步一次全序列前向）
@@ -303,6 +340,45 @@ _RETOOL_MATH_SYSTEM = (
 system_prompt_retool_math = _RETOOL_MATH_SYSTEM
 
 
+def validate_retool_budget(cfg: dict) -> int:
+    """多轮预算自洽校验（纯函数，CPU 可测）。返回工具段预留 token 数。
+
+    【2026-09-12 事故固化】旧配置 `max_rounds=3 × round_gen_tokens=3072 = 9216`
+    超过了全轨迹保险丝 `max_context_tokens=8192`：单轮预算比整条轨迹的丢弃线
+    还大 → "合法地用满预算"物理上不可能 → `retool_context_overlong` 把 86% 的
+    尝试整组丢弃 → 丢弃率 20%→90% → 采样主循环空转、训练端 5 小时零产出。
+    这类错误在真实 run 里只表现为"丢弃率慢慢爬"，不报错、不崩，必须在这里
+    硬拦：**任何一轮用满预算的轨迹 + 最长 prompt + 全部工具段，都必须落在
+    max_context_tokens 之内。**
+
+    工具段预留：每轮工具输出 ≤ tool_result_max_chars 字符，按最坏 2 字符/token
+    （ASCII 密集 token 的保守下界）折算，加 TOOL_START/END 标记开销。
+    """
+    if not cfg.get("algo", "").startswith("retool"):
+        return 0
+    rounds = int(cfg.get("max_rounds", 1) or 1)
+    per_round = int(cfg.get("round_gen_tokens", 0) or 0)
+    if per_round <= 0:
+        return 0
+    ctx = int(cfg.get("max_context_tokens", 0) or 0)
+    if ctx <= 0:
+        return 0
+    reserve = (rounds - 1) * (int(cfg.get("tool_result_max_chars", 0) or 0) // 2 + 16)
+    need = rounds * per_round + int(cfg.get("max_prompt_length", 0) or 0) + reserve
+    if need > ctx:
+        per_round_max = (ctx - int(cfg.get("max_prompt_length", 0) or 0) - reserve) // rounds
+        raise ValueError(
+            f"[config] retool 预算不自洽：max_rounds({rounds}) × round_gen_tokens({per_round})"
+            f" + max_prompt_length({cfg.get('max_prompt_length')}) + 工具段预留({reserve})"
+            f" = {need} > max_context_tokens({ctx})。\n"
+            f"  后果：用满预算的合法轨迹会被 retool_context_overlong 整组丢弃"
+            f"（2026-09-12 事故：丢弃率 90%、采样空转、训练端零产出）。\n"
+            f"  改法（三选一）：round_gen_tokens ≤ {per_round_max}"
+            f"（会加剧末段截断，trunc_final 上升）；或降 max_rounds；"
+            f"或抬高 max_context_tokens ≥ {need}（T 进入所有显存公式，需重算峰值）。")
+    return reserve
+
+
 def get_config(algo: str, **overrides) -> dict:
     """合并 BASE + 算法 preset + 显式覆盖，返回冻结配置 dict。"""
     if algo not in ALGO_DEFAULTS:
@@ -332,6 +408,8 @@ def get_config(algo: str, **overrides) -> dict:
     _env_bc = os.environ.get("FWD_BATCH_CHUNK")
     if _env_bc and "fwd_batch_chunk" not in overrides:
         cfg["fwd_batch_chunk"] = int(_env_bc)
+    # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
+    cfg["_tool_reserve"] = validate_retool_budget(cfg)
     return cfg
 
 

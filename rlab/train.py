@@ -247,15 +247,29 @@ def run_training(cfg, args):
 
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss:.6f}")
-            # 【2026-09-11】ratio 口径健康：这两个数原本只进 wandb（默认离线），终端
+            # 【2026-09-11】ratio 口径健康：这些数原本只进 wandb（默认离线），终端
             # 看不见——而它们是"gen_logps 与 policy 差多少"的**唯一直接量**。判读：
             # 第 1 步 / 每次权重同步后的第一步，batch 与策略同权重 → ratio 理论上恒 1，
-            # 实测 clip_frac 与 approx_kl 就是两路实现的口径差（torch 副本档应严格 0；
-            # vLLM logprobs 档（减法①）≲0.5% / ~1e-4 属实现层噪声，见 docs/02）。
+            # 实测 clip_frac/kl 就是两路实现的口径差（torch 副本档应严格 0；
+            # vLLM logprobs 档（减法①）属实现层噪声，见 docs/02）。
+            # 【2026-09-12 判读口径修正（必读）】
+            #  · mean_ratio **恒为 1 是重要度采样恒等式**（E_{t~π_old}[π_new/π_old]=1
+            #    对任意远的 π_new 都成立），没有诊断价值——留着只为与历史 run 对齐；
+            #  · 真正该看的是 kl（KL(π_old‖π_new) 的采样估计）与 frac_d_gt_0.1
+            #    （真的漂了多少比例的 token）；clip_frac 已按 1±clip_lo/hi 计；
+            #  · staleness = 本步距该批数据生成时权重的 micro-step 差（gen_version
+            #    由生成端随批上传）。旧版只能"假设 16 步周期"，实测 approx_kl 忽
+            #    5e-4 忽 9.9e-2、完全对不上周期 → 新鲜度必须测而不是猜。
             if step == 1 or step % 10 == 0:
+                _gv = batch.get("gen_version")
+                _lag = (step - _gv) if isinstance(_gv, int) else -1
+                _lag_opt = _lag / max(1, int(cfg.get("gradient_accumulation_steps", 1)))
                 print(f"[train][口径] step {step}: clip_frac={stats['clip_frac']:.4f} "
-                      f"approx_kl={stats['approx_kl']:.2e} "
-                      f"mean_ratio={stats['mean_ratio']:.4f}", flush=True)
+                      f"kl={stats['kl']:.2e} approx_kl={stats['approx_kl']:.2e} "
+                      f"frac|d|>0.1={stats['frac_d_gt_0.1']:.3f} "
+                      f"mean_ratio={stats['mean_ratio']:.4f} "
+                      f"| gen_version={_gv} staleness={_lag} micro-step"
+                      f"({_lag_opt:.1f} opt-step)", flush=True)
             n = inputs.shape[0]
             totals["num"] += n
             if "acc_scores" in batch:
@@ -264,16 +278,22 @@ def run_training(cfg, args):
             if wandb_run is not None:
                 log = {"loss": stats["loss"], "clip_frac": stats["clip_frac"],
                        "approx_kl": stats["approx_kl"], "mean_ratio": stats["mean_ratio"],
+                       "kl": stats["kl"], "frac_d_gt_0.1": stats["frac_d_gt_0.1"],
                        "acc_correct_ratio": totals["acc"] / totals["num"],
                        "format_correct_ratio": totals["fmt"] / totals["num"]}
+                if isinstance(batch.get("gen_version"), int):
+                    log["staleness_micro_steps"] = step - batch["gen_version"]
                 wandb_run.log(log, step=step)
 
         if step % cfg["gen_update_steps"] == 0:
             dist.barrier()
             if dist.get_rank() == 0:
                 print("[train] sending latest state_dict ...")
-                Q.put(engine.module.state_dict())
-                print("[train] send state_dict ok!")
+                # 【2026-09-12】(version, state_dict)：version = 本次推送对应的
+                # train micro-step，生成端把它写进每组数据的 meta，训练端据此算
+                # 真实 staleness（旧协议裸传 state_dict，新鲜度不可测）。
+                Q.put((step, engine.module.state_dict()))
+                print(f"[train] send state_dict ok! (version={step})")
             dist.barrier()
 
         if step % cfg["save_steps"] == 0:
@@ -347,9 +367,17 @@ def main():
     ap.add_argument("--beta", type=float, default=None,
                     help="覆盖 KL 锚系数（preset 默认 0.04；放松建议 0.01）")
     ap.add_argument("--overlong_shaping", action="store_true",
-                    help="开 DAPO 截断软悬崖惩罚（默认关）。【注意】retool 家族下"
-                         "当前配置不可达：clen 被 max_context_tokens 封顶 ~7800，"
-                         "惩罚起坡点 9152 够不着（见 config.overlong_shaping 注释）")
+                    help="开 DAPO 截断软悬崖惩罚（总长对 overlong_ref_tokens 起坡）。"
+                         "【2026-09-12 已修正】参考系 = min(max_rounds×round_gen_tokens, "
+                         "max_context_tokens−max_prompt_length)；预算自洽时它必然可达"
+                         "（config.validate_retool_budget 会 fail-fast 拦截不自洽配置）")
+    ap.add_argument("--trunc_shaping", type=float, default=None,
+                    help="末段被轮长上限切断（trunc_final=1）的额外扣分权重（默认取 preset；"
+                         "retool_math=0.5，其余算法=0）。这是 prose 轨迹唯一够得到的"
+                         "长度反向信号——总长惩罚够不到 clen ≤ round_gen_tokens 的单轮轨迹")
+    ap.add_argument("--discard_abort", type=float, default=None,
+                    help="窗口丢弃率熔断线（默认 0.90，0=关闭）：超过即 fail-fast，"
+                         "防丢弃率爬升到采样空转、训练端无限 waiting for batch 的事故")
     ap.add_argument("--grad_clip", type=float, default=None,
                     help="DeepSpeed 梯度裁剪（默认 0=不裁剪=历史口径；4B 大 lr 长跑建议 1.0）")
     ap.add_argument("--vllm_gen_logps", action="store_true",
@@ -396,6 +424,8 @@ def main():
     if args.lr is not None: overrides["lr"] = args.lr
     if args.beta is not None: overrides["beta"] = args.beta
     if args.overlong_shaping: overrides["overlong_shaping"] = True
+    if args.trunc_shaping is not None: overrides["trunc_shaping"] = args.trunc_shaping
+    if args.discard_abort is not None: overrides["discard_abort"] = args.discard_abort
     if args.grad_clip is not None: overrides["gradient_clipping"] = args.grad_clip
     if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk
     if args.vllm_gen_logps: overrides["vllm_gen_logps"] = True
