@@ -5,7 +5,9 @@
 > **现象 → 根因 → 修复**，沉淀显存账本公式与通用方法论，避免换下一个
 > 模型时把同样的账重新算一遍。
 >
-> 配套：迁移决策与协议层 checklist 见 `03-qwen35-4b-retool-math-checklist.md`。
+> 配套：迁移决策与协议层 checklist 见 `03-qwen35-4b-retool-math-checklist.md`；
+> run2 的诊断与优化方案见 `05-retool-math-diagnosis-plan.md`（P2 若要把
+> `max_context_tokens` 提到 16384，先按本文的显存账本重算）。
 
 ## 0. TL;DR：最终定版
 
