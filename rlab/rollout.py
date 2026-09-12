@@ -709,7 +709,13 @@ def gen_worker(Q, cfg: dict):
     ref_server = cfg["ref_server"]
     pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
     last_fp = [None]   # 上次推送的权重指纹（两次相同 = 训练端权重没在变）
-    policy_version = [None]   # 当前 vLLM/副本 权重对应的 train micro-step（staleness 标签）
+    # 当前 vLLM/副本 权重对应的 train micro-step（staleness 标签）。
+    # 【初值必须是 0 而不是 None】第 1~15 步还没发生第一次 state_dict 推送，但
+    # rollout 的权重就是训练端的初始 checkpoint（= version 0），真实 staleness
+    # 是 `step − 0`。初值 None 会让这段最"新鲜"的数据报成 `staleness=-1`
+    # （2026-09-12 实测日志：`gen_version=None staleness=-1 micro-step(-0.2)`），
+    # 把整段标签作废。None 只应出现在"训练端用旧协议裸传 state_dict"的兼容路径。
+    policy_version = [0]
     health = _HealthMonitor()
     # 分裂加载判定：vLLM 用另一份 checkpoint（多模态）时，同步需做键名映射
     _split_load = bool(cfg.get("vllm_model_path"))

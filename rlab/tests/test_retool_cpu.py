@@ -1636,6 +1636,19 @@ def test_budget_guard_and_drift_stats():
     check("losses.py 注释写明 mean_ratio 是重要度采样恒等式（对任意远 π_new 都=1）",
           "重要度采样的数学恒等式" in _src or "数学恒等式" in _src)
 
+    # ---- ⑤ staleness 标签：初值必须是 0（= 初始 checkpoint），不能是 None ----
+    # 真机实测：初值 None 时第 1~15 步（第一次推送之前）打出
+    # `gen_version=None staleness=-1 micro-step(-0.2)` —— 这段恰恰是权重最新鲜的
+    # 区间，标签却被作废。初始权重等价于 version 0。
+    _ro_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "rollout.py"), encoding="utf-8").read()
+    check("rollout policy_version 初值 = 0（初始 checkpoint；None 会让前 15 步 staleness 报 -1）",
+          "policy_version = [0]" in _ro_src)
+    _tr_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    check("train.py 对缺失 gen_version 单独走 n/a 分支（不打印 staleness=-1）",
+          "staleness=n/a" in _tr_src and "staleness=-1" not in _tr_src)
+
 
 def _exc_msg(fn):
     try:

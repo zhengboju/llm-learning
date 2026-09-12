@@ -262,14 +262,17 @@ def run_training(cfg, args):
             #    5e-4 忽 9.9e-2、完全对不上周期 → 新鲜度必须测而不是猜。
             if step == 1 or step % 10 == 0:
                 _gv = batch.get("gen_version")
-                _lag = (step - _gv) if isinstance(_gv, int) else -1
-                _lag_opt = _lag / max(1, int(cfg.get("gradient_accumulation_steps", 1)))
+                if isinstance(_gv, int):
+                    _gas = max(1, int(cfg.get("gradient_accumulation_steps", 1)))
+                    _sx = f"staleness={step - _gv} micro-step({(step - _gv) / _gas:.1f} opt-step)"
+                else:
+                    # 只有"训练端裸传 state_dict / 静态 rollout（Q=None）"才会走到这
+                    _sx = "staleness=n/a（该批无 gen_version 标签）"
                 print(f"[train][口径] step {step}: clip_frac={stats['clip_frac']:.4f} "
                       f"kl={stats['kl']:.2e} approx_kl={stats['approx_kl']:.2e} "
                       f"frac|d|>0.1={stats['frac_d_gt_0.1']:.3f} "
                       f"mean_ratio={stats['mean_ratio']:.4f} "
-                      f"| gen_version={_gv} staleness={_lag} micro-step"
-                      f"({_lag_opt:.1f} opt-step)", flush=True)
+                      f"| gen_version={_gv} {_sx}", flush=True)
             n = inputs.shape[0]
             totals["num"] += n
             if "acc_scores" in batch:
