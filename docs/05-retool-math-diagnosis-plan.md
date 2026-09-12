@@ -299,6 +299,11 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 
 ## 7. 进度看板
 
+> **`[x]` 的语义 = 代码已提交到 `origin/main`；在 pod 上生效必须先 `git pull`。**
+> 【2026-09-12 教训】P0-1..3 在本地实现完但**没提交推送**，结果紧接着的一次重评
+> 仍跑在旧代码上：`analysis.py` 打的是旧 6 列表格、json 里没有 `items`/`_meta` ——
+> 又一次没留下 per-item，McNemar 还是算不了。"本地改完" ≠ "评测生效"。
+
 | # | 项 | 状态 | 备注 |
 |---|---|---|---|
 | P0-1 | eval per-item 明细默认落盘（`--dump_items`） | `[x]` | `eval_vllm_one.py`，默认开；`--no-dump_items` 关闭 |
@@ -368,6 +373,9 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 
 ### 9.5 使用注意
 
+- **pod 上先 `git pull` 再评**，并自检新代码在位：
+  `grep -c dump_items eval_vllm_one.py`（>0）。判据还可以看 json：三个模型都应有
+  `items`/`model_path`/`eval_protocol`，顶层应有 `_meta` —— 缺任何一项就说明仍在跑旧代码。
 - 命令**不变**：`--dump_items` 默认开，wrapper 不转发也能生效。flag 拼写是**下划线**
   （`--no-dump_items`；argparse 不接受 `--no-dump-items`）。它**只能直接给 `eval_vllm_one.py`**，
   `eval.py`/`eval_vllm.py` 暂无透传出口。
