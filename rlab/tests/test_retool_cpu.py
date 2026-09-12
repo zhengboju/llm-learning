@@ -1648,6 +1648,10 @@ def test_budget_guard_and_drift_stats():
         os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
     check("train.py 对缺失 gen_version 单独走 n/a 分支（不打印 staleness=-1）",
           "staleness=n/a" in _tr_src and "staleness=-1" not in _tr_src)
+    # staleness 精确口径：step 1-based 而 version 是"step 末"语义，直接相减恒多算 1
+    check("train.py staleness 用精确优化器步 floor((step-1)/GAS) − floor(gv/GAS)（不是 step−gv）",
+          "(step - 1) // _gas - _gv // _gas" in _tr_src
+          and "staleness={step - _gv}" not in _tr_src)
 
 
 def _exc_msg(fn):

@@ -263,8 +263,16 @@ def run_training(cfg, args):
             if step == 1 or step % 10 == 0:
                 _gv = batch.get("gen_version")
                 if isinstance(_gv, int):
+                    # 【2026-09-12 精确口径】step 是 1-based，而 gen_version 的语义是
+                    # "第 v 步 engine.step() 之后的权重"（推送发生在 step 末）：
+                    #   训练端在本次 forward 前已应用的更新数 = floor((step−1)/GAS)
+                    #   生成端权重对应的更新数           = floor(gen_version/GAS)
+                    # 直接写 step−gen_version 会恒多算 1 个 micro-step（step 1 应报 0
+                    # 却报 1——真机日志已见），opt-step 那项还会带上 .25 的小数尾巴。
                     _gas = max(1, int(cfg.get("gradient_accumulation_steps", 1)))
-                    _sx = f"staleness={step - _gv} micro-step({(step - _gv) / _gas:.1f} opt-step)"
+                    _upd = (step - 1) // _gas - _gv // _gas
+                    _micro = step - 1 - _gv
+                    _sx = f"staleness={_micro} micro-step({_upd} opt-step)"
                 else:
                     # 只有"训练端裸传 state_dict / 静态 rollout（Q=None）"才会走到这
                     _sx = "staleness=n/a（该批无 gen_version 标签）"
@@ -285,7 +293,10 @@ def run_training(cfg, args):
                        "acc_correct_ratio": totals["acc"] / totals["num"],
                        "format_correct_ratio": totals["fmt"] / totals["num"]}
                 if isinstance(batch.get("gen_version"), int):
-                    log["staleness_micro_steps"] = step - batch["gen_version"]
+                    _g = max(1, int(cfg.get("gradient_accumulation_steps", 1)))
+                    log["staleness_micro_steps"] = step - 1 - batch["gen_version"]
+                    log["staleness_opt_steps"] = ((step - 1) // _g
+                                                  - batch["gen_version"] // _g)
                 wandb_run.log(log, step=step)
 
         if step % cfg["gen_update_steps"] == 0:
