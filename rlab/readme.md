@@ -17,11 +17,11 @@
 | `sandbox.py` | 阶段2：subprocess 隔离代码沙箱（超时/内存上限/输出截断） |
 | `health.py` | 训练期健康检查：窗口签名告警（信号恒死/平坦/退化/截断），历史 bug 的直接探测 |
 | `ref_server.py` | 打分中转服务器，双模式：passthrough（GRPO 家族）/ rfpp（macro-batch per-token advantage） |
-| `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端；协议 mask 感知） |
+| `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端；协议 mask 感知；run 偏离签名 + ckpt 撞名 fail-fast 护栏） |
 | `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42；--retool 多轮代码评测；per-item 明细默认落盘） |
 | `analysis.py` | eval 汇总表（**N-aware 95%CI + 同题配对 McNemar** 判定，替代旧 ±2pp 固定地板）+ record.jsonl 曲线 |
 | `tests/test_smoke_cpu.py` | 64 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名） |
-| `tests/test_retool_cpu.py` | 60 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查是核心学习点） |
+| `tests/test_retool_cpu.py` | 66 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏是核心学习点） |
 
 ## 算法切换对照
 
@@ -60,14 +60,14 @@ python -m rlab.analysis --eval-json eval_vllm_all.json
 python -m rlab.analysis --record rlab_out/record.jsonl
 ```
 
-CPU 冒烟（本机即可跑，共 81 项）：
+CPU 冒烟（本机即可跑，共 87 项）：
 
 ```bash
 python -m rlab.tests.test_smoke_cpu        # 64 项：losses 解析值/协议/reward/数据/eval 统计/run 签名 ✅
 python -m rlab.tests.test_train_step_cpu   #  9 项：tiny 模型端到端 plen 切片/mask/backward ✅
 python -m rlab.tests.test_ref_server_cpu   # 17 项：eos mask/passthrough 布局/rfpp 信用回传数学 ✅
 python -m rlab.tests.test_e2e_http         # 15 项：真实 HTTP 双模式服务器 + 算法消费闭环 ✅
-python -m rlab.tests.test_retool_cpu       # 60 项：阶段2 mask 错/对 A/B/沙箱/奖励/协议/logps 对齐/多轮循环/健康检查 ✅
+python -m rlab.tests.test_retool_cpu       # 66 项：阶段2 mask 错/对 A/B/沙箱/奖励/协议/logps 对齐/多轮循环/健康检查/ckpt 护栏 ✅
 ```
 
 注意：e2e 测试中 bottle 的启动 banner 走 stderr，在 PowerShell 管道里可能显示

@@ -553,6 +553,29 @@ def test_health_monitor():
     check("Monitor 触发告警一次",
           "[健康检查]" in buf1.getvalue() and buf2.getvalue() == "")
 
+    # 【2026-09-13 P1 教训】maybe_check 每个外层轮末才被调用一次、外层轮产组数
+    # 不定，旧版 %16 门让多数检查点永远落空（P1 实测组 112→240 约 1 小时零检查，
+    # 期间 fmt_low/length_runaway 条件真的成立过却从未报告）。滚动门：非 16 倍数
+    # 也查，且不重复查没攒够新组的老窗口。
+    m2 = HealthMonitor()
+    for _ in range(40):
+        m2.observe([-1.0, 1.0], [-1.0, -1.0], [100, 100])
+    buf3 = io.StringIO()
+    with contextlib.redirect_stdout(buf3):
+        m2.maybe_check(max_clen=200)
+    check("稀疏调用：n=40（非16倍数）也检查（P1 盲窗修复）",
+          "[健康检查]" in buf3.getvalue())
+    m3 = HealthMonitor()
+    for _ in range(18):   # 不足 32 组 → 不查
+        m3.observe([-1.0, 1.0], [-1.0, -1.0], [100, 100])
+    buf4 = io.StringIO()
+    with contextlib.redirect_stdout(buf4):
+        m3.maybe_check(max_clen=200)
+    m3._last_check = 17   # 模拟"上次检查后只攒了 1 组"的稀疏调用
+    with contextlib.redirect_stdout(io.StringIO()):
+        m3.maybe_check(max_clen=200)
+    check("不足32组/未攒够 check_every → 不查", buf4.getvalue() == "")
+
     # 权重指纹：float64 位级敏感——单权重翻转一个 bf16 ULP 必须被识别
     from rlab.health import weight_fingerprint
     sd1 = {"a": torch.randn(2048).bfloat16(),
@@ -1212,6 +1235,42 @@ def test_grad_clip_and_run_info():
     except KeyError:
         ok = False
     check("gradient_clipping 已在 BASE 注册（未知键 fail-fast 契约未被绕过）", ok)
+
+    # 【2026-09-13 P1 事故】ckpt 撞名护栏：P1（ts0）的 step_200 静默覆掉了
+    # run2（ts0.5）的 step_200 原始 ckpt（后者只剩 _mm 合并副本）。护栏契约：
+    # 外来签名/无签名（出处不明）→ 启动即拒；同签名重跑 → 放行。
+    from rlab.train import guard_ckpt_collision
+    from rlab.train import run_signature as _run_sig
+    import shutil
+    _tmp = tempfile.mkdtemp()
+    try:
+        cfg_t = get_config("retool_math", use_wandb=False)
+        cfg_t["run_signature"] = _run_sig(cfg_t)
+        ck = os.path.join(_tmp, "step_200")
+        os.makedirs(ck)
+        with open(os.path.join(ck, "run_info.json"), "w", encoding="utf-8") as f:
+            json.dump({"signature": "retool_math-ts0.5-ol1-r2x3072-s1000x200-lr5e-06-d0-1"}, f)
+        try:
+            guard_ckpt_collision(_tmp, cfg_t)
+            ok = False
+        except RuntimeError:
+            ok = True
+        check("外来签名 ckpt → 启动即拒绝（P1 覆盖事故的护栏）", ok)
+        with open(os.path.join(ck, "run_info.json"), "w", encoding="utf-8") as f:
+            json.dump({"signature": cfg_t["run_signature"]}, f)
+        guard_ckpt_collision(_tmp, cfg_t)
+        check("同签名重跑 → 放行", True)
+        os.remove(os.path.join(ck, "run_info.json"))
+        try:
+            guard_ckpt_collision(_tmp, cfg_t)
+            ok = False
+        except RuntimeError:
+            ok = True
+        check("无签名旧 ckpt（run2 时代，出处不明）→ 拒绝", ok)
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
+    check("护栏接入 run_training 启动路径",
+          'guard_ckpt_collision(cfg["out_dir"], cfg)' in src)
 
 
 def test_fwd_batch_chunk():

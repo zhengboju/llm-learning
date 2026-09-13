@@ -110,6 +110,40 @@ def write_run_info(path: str, cfg: dict) -> None:
         json.dump(info, f, ensure_ascii=False, indent=2, default=str)
 
 
+def _ckpt_signature(ckpt_dir: str):
+    """读 step_*/run_info.json 里的偏离签名；目录缺失/无 run_info/损坏 → None。
+    None 视为"出处不明"（run2 时代的 ckpt 还没有签名字段），按外来 ckpt 处理。"""
+    try:
+        with open(os.path.join(ckpt_dir, "run_info.json"), encoding="utf-8") as f:
+            return json.load(f).get("signature")
+    except (OSError, ValueError):
+        return None
+
+
+def guard_ckpt_collision(out_dir: str, cfg: dict) -> None:
+    """【2026-09-13 P1 事故】out_dir 按 algo 共享 + save_steps 撞名 → 新 run 静默
+    覆盖旧 run 的 step_* 原始 ckpt：P1（ts0）的 step_200 覆掉了 run2（ts0.5）的
+    step_200，后者只因评测前做过 step_200_mm 合并副本才幸存。启动时扫描
+    out_dir 下已有 step_*/：任一签名与本次不同/缺失 → fail-fast，把"3 小时后
+    静默覆盖"变成"第 0 秒崩掉并留下可排查的错"。同签名重跑（有意覆盖）放行。"""
+    import glob
+    sig = cfg.get("run_signature") or run_signature(cfg)
+    for ckpt in sorted(glob.glob(os.path.join(out_dir, "step_*"))):
+        if not os.path.isdir(ckpt):
+            continue
+        old = _ckpt_signature(ckpt)
+        if old == sig:
+            continue
+        raise RuntimeError(
+            f"[train] out_dir={out_dir} 已有别的 run 的 checkpoint，拒绝启动：\n"
+            f"  {ckpt}  signature={old!r}\n"
+            f"  本次 run signature={sig}\n"
+            f"继续跑会在 save_steps 撞名时静默覆盖旧 ckpt（2026-09-13 P1 的 step_200\n"
+            f"就这样覆掉了 run2 的 step_200）。\n"
+            f"→ 换 --out_dir（如 rlab_out/{cfg['algo']}_p2），或先把旧 ckpt 移走；\n"
+            f"  确认是同签名重跑则不会触发本护栏（本护栏只在签名不同/缺失时拦）。")
+
+
 def run_training(cfg, args):
     import deepspeed
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -121,6 +155,7 @@ def run_training(cfg, args):
     Q = None
     if dist.get_rank() == 0:
         os.makedirs(cfg["out_dir"], exist_ok=True)
+        guard_ckpt_collision(cfg["out_dir"], cfg)
         write_run_info(os.path.join(cfg["out_dir"], "run_info.json"), cfg)
         print("\n[train] START vLLM generation worker...\n")
         mp.set_start_method("spawn", force=True)
@@ -348,6 +383,12 @@ def run_training(cfg, args):
             dist.barrier()
             if dist.get_rank() == 0:
                 save_name = os.path.join(cfg["out_dir"], f"step_{step}")
+                # 存盘第二道护栏：启动扫描之后才出现的同名外来 ckpt（手工放置/
+                # 挂掉的旧 run 残留）也拒绝覆盖——静默覆盖是不可逆的。
+                if _ckpt_signature(save_name) not in (None, cfg["run_signature"]):
+                    raise RuntimeError(
+                        f"[train] {save_name} 已有别的签名的 ckpt，拒绝覆盖"
+                        f"（{_ckpt_signature(save_name)!r} != {cfg['run_signature']!r}）")
                 os.makedirs(save_name, exist_ok=True)
                 sd = engine.module.state_dict()
                 sd = type(sd)({k: v.cpu() for k, v in sd.items()})

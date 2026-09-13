@@ -10,7 +10,7 @@
 的签名——两者都该当场停下排查，而不是跑完全程再评测。
 
 用法：生成端每上传一组就 HealthMonitor.observe(...) 聚合一条组级摘要，
-每 check_every 组调 maybe_check() 打印一次新告警（同一告警只报一次）。
+距上次检查新攒 check_every 组时 maybe_check() 打印一次新告警（同一告警只报一次）。
 规则全部在纯函数 window_check 里，CPU 可测。
 """
 
@@ -129,6 +129,7 @@ class HealthMonitor:
         self.hist = []
         self.check_every = check_every
         self.fired = set()
+        self._last_check = 0
 
     def observe(self, acc_list, fmt_list, clen_list, code_used_list=None,
                 trunc_list=None):
@@ -142,9 +143,17 @@ class HealthMonitor:
         self.hist.append(e)
 
     def maybe_check(self, retool: bool = False, max_clen=None):
-        """每 check_every 组检查一次；新告警打印（带 [健康检查] 前缀，只报一次）。"""
-        if len(self.hist) < 32 or len(self.hist) % self.check_every != 0:
+        """距上次检查新攒了 check_every 组（且 ≥32 组）就检查一次；新告警打印
+        （带 [健康检查] 前缀，同一告警只报一次）。
+        【2026-09-13 P1 教训】旧版门是 `len(hist) % check_every == 0`，而本方法
+        每个外层轮末才被调用一次、外层轮产组数不定 → 多数 16 倍数永远落不上
+        检查点（P1 实测：组 112→240 约 1 小时零检查，期间 fmt_low/length_runaway
+        的触发条件真的成立过，却从未被报告）。改滚动门后，稀疏调用也保证
+        每 check_every 组至少检查一次。"""
+        n = len(self.hist)
+        if n < 32 or n - self._last_check < self.check_every:
             return
+        self._last_check = n
         for code, msg in window_check(self.hist, retool=retool, max_clen=max_clen):
             if code not in self.fired:
                 self.fired.add(code)

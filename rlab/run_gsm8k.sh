@@ -62,18 +62,24 @@ echo "[run] algo=$ALGO model=$MODEL ref_server_mode=$MODE ref_gpu=$REF_GPU train
 # 【record 防混跑】record.jsonl 是追加写，多次 run 混进同一文件会让曲线跨 run
 # 误读（2026-09-08 五会话混排把"会话边界"读成"训练中崩溃"的教训）。
 # 启动前归档旧 record（纯文本很小，直接 mv）。
-OUT_DIR="rlab_out/$ALGO"
+OUT_DIR="${OUT_DIR:-rlab_out/$ALGO}"
 if [ -f "$OUT_DIR/record.jsonl" ]; then
   TS=$(date +%m%d-%H%M%S)
   mv "$OUT_DIR/record.jsonl" "$OUT_DIR/record.jsonl.bak-$TS"
   echo "[run] 已归档旧 record -> $OUT_DIR/record.jsonl.bak-$TS"
 fi
-# 【旧 checkpoint 提示】out_dir 按 algo 共享，新 run 到 save_steps 会覆盖同名
-# step_* 目录（9/8 step_200 被静默覆盖、评测到旧 run 模型的教训）。不自动移动
-# （每个 ~6.7G）；新 run 写的 checkpoint 内含 run_info.json（git_head+时刻）可自证出处。
+# 【旧 checkpoint 硬护栏】out_dir 按 algo 共享，新 run 到 save_steps 会覆盖同名
+# step_* 目录。9/8 与 9/13（P1 的 step_200 覆掉 run2 的 step_200）两次同类事故：
+# 纯提示挡不住深夜启动的新 run，升级为默认拒绝；train.py 里还有签名级第二道
+# 护栏（guard_ckpt_collision，同签名重跑放行）。确要复用目录设 OUT_DIR_REUSE=1。
 if ls "$OUT_DIR"/step_* >/dev/null 2>&1; then
   echo "[run] 注意: $OUT_DIR 下已有旧 checkpoint: $(ls -d "$OUT_DIR"/step_* | tr '\n' ' ')"
-  echo "[run]       新 run 会覆盖同名目录；评测前核对 checkpoint 内 run_info.json"
+  if [ -z "$OUT_DIR_REUSE" ]; then
+    echo "[run] 致命错误: 拒绝在有旧 checkpoint 的共享目录启动（save_steps 撞名会静默覆盖）。"
+    echo "[run]   → 新 run 传 --out_dir rlab_out/${ALGO}_<标签>（或 export OUT_DIR=...）"
+    echo "[run]   → 同签名重跑/确认覆盖：OUT_DIR_REUSE=1 bash $0 ..."
+    exit 1
+  fi
 fi
 
 # 退出清理：无论正常结束、训练崩溃还是 Ctrl+C，都杀掉 ref_server，
@@ -125,5 +131,7 @@ fi
 
 # CUDA_VISIBLE_DEVICES 限定训练卡；生成 worker 由 train.py spawn 后自行把
 # CUDA_VISIBLE_DEVICES 改回 REF_GPU 的物理卡号（rollout.gen_worker 内置）
+# --out_dir 放在 "$@" 之前：用户显式传的 --out_dir 优先（argparse 取后者）
 CUDA_VISIBLE_DEVICES=$TRAIN_GPU python -m rlab.train --algo "$ALGO" \
-    --model_path "$MODEL" --port $PORT --attn_implementation "$ATTN_IMPL" "$@"
+    --model_path "$MODEL" --port $PORT --attn_implementation "$ATTN_IMPL" \
+    --out_dir "$OUT_DIR" "$@"
