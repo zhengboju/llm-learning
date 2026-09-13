@@ -1308,6 +1308,11 @@ def test_fwd_batch_chunk():
     check("run_gsm8k.sh 用 FWD_BATCH_CHUNK 驱动三处（export + 传 ref_server）",
           "export FWD_BATCH_CHUNK=${FWD_BATCH_CHUNK:-1}" in sh
           and '--batch_chunk "$FWD_BATCH_CHUNK"' in sh)
+    # 【2026-09-13 护栏口径修正】首版撞名护栏只看脚本自己的 OUT_DIR 变量，
+    # 没解析 "$@" 里的 --out_dir → 把带 --out_dir 的合法启动误拦在共享目录上。
+    check("run_gsm8k.sh 护栏/归档跟随用户 --out_dir（空格与等号两种写法）",
+          '[ "$_prev" = "--out_dir" ]; then OUT_DIR="$_a"' in sh
+          and 'case "$_a" in --out_dir=*) OUT_DIR="${_a#--out_dir=}"' in sh)
     # e2e 测试按位置传 run_server(path, port, mode, beta, grad_accum, device, attn)——
     # 新参数必须追加在末尾，插在中间会静默错位（device 收到 "cpu" 之类的字符串）
     from rlab.ref_server import run_server

@@ -413,6 +413,10 @@ Run 身份：签名 `retool_math-ts0-ol1-r2x3072-s300x50-lr5e-06-d0-1`（日志�
    （`OUT_DIR_REUSE=1` 逃生口；`OUT_DIR` 环境变量可整体换目录，现在会透传给 train）；
    `train.py guard_ckpt_collision` 启动时签名级扫描（同签名重跑放行、**无签名按出处
    不明拒绝** —— run2 时代的 ckpt 没有签名字段）；存盘时二次核对。
+   【2026-09-13 顺带修正】脚本级护栏首版只看脚本自己的 `OUT_DIR` 变量、不解析
+   `"$@"` 里的 `--out_dir`，把 P1b 首跑（带了 `--out_dir rlab_out/retool_math_run2b`）
+   误拦在共享目录上 —— 已修：护栏/record 归档均跟随用户 `--out_dir`（空格/等号
+   两种写法都认，测试 +1）。
    **【后续，2026-09-13】`step_200_mm` 也被删除 → run2 的 m200 模型彻底灭失**
    （raw 已被 P1 覆盖、副本又删，RL 不可复现）。唯一遗物 = per-item 评测 json。
    已补 `analysis.py pair_eval`：跨两个 json 按题 qk 同题配对 McNemar ——

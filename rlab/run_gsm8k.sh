@@ -63,6 +63,16 @@ echo "[run] algo=$ALGO model=$MODEL ref_server_mode=$MODE ref_gpu=$REF_GPU train
 # 误读（2026-09-08 五会话混排把"会话边界"读成"训练中崩溃"的教训）。
 # 启动前归档旧 record（纯文本很小，直接 mv）。
 OUT_DIR="${OUT_DIR:-rlab_out/$ALGO}"
+# 【护栏口径修正 2026-09-13】用户在 "$@" 里显式传 --out_dir 时，record 归档与
+# 撞名护栏都必须按**用户的**目录算 —— 脚本变量跟不上 argparse：首版护栏只看
+# 默认目录，把一次带 --out_dir 的合法启动（P1b 首跑）误拦在共享目录上。
+_prev=""
+for _a in "$@"; do
+  if [ -n "$_prev" ] && [ "$_prev" = "--out_dir" ]; then OUT_DIR="$_a"; break; fi
+  case "$_a" in --out_dir=*) OUT_DIR="${_a#--out_dir=}"; break ;; esac
+  _prev="$_a"
+done
+unset _prev _a
 if [ -f "$OUT_DIR/record.jsonl" ]; then
   TS=$(date +%m%d-%H%M%S)
   mv "$OUT_DIR/record.jsonl" "$OUT_DIR/record.jsonl.bak-$TS"
