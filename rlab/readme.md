@@ -19,8 +19,8 @@
 | `ref_server.py` | 打分中转服务器，双模式：passthrough（GRPO 家族）/ rfpp（macro-batch per-token advantage） |
 | `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端；协议 mask 感知；run 偏离签名 + ckpt 撞名 fail-fast 护栏） |
 | `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42；--retool 多轮代码评测；per-item 明细默认落盘） |
-| `analysis.py` | eval 汇总表（**N-aware 95%CI + 同题配对 McNemar** 判定，替代旧 ±2pp 固定地板）+ record.jsonl 曲线 |
-| `tests/test_smoke_cpu.py` | 64 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名） |
+| `analysis.py` | eval 汇总表（**N-aware 95%CI + 同题配对 McNemar** 判定，替代旧 ±2pp 固定地板）+ `pair_eval` 跨 json 两两配对（可对照已灭失的 ckpt）+ record.jsonl 曲线 |
+| `tests/test_smoke_cpu.py` | 67 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名/跨 json 配对） |
 | `tests/test_retool_cpu.py` | 66 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏是核心学习点） |
 
 ## 算法切换对照
@@ -60,10 +60,10 @@ python -m rlab.analysis --eval-json eval_vllm_all.json
 python -m rlab.analysis --record rlab_out/record.jsonl
 ```
 
-CPU 冒烟（本机即可跑，共 87 项）：
+CPU 冒烟（本机即可跑，共 90 项）：
 
 ```bash
-python -m rlab.tests.test_smoke_cpu        # 64 项：losses 解析值/协议/reward/数据/eval 统计/run 签名 ✅
+python -m rlab.tests.test_smoke_cpu        # 67 项：losses 解析值/协议/reward/数据/eval 统计/run 签名/跨 json 配对 ✅
 python -m rlab.tests.test_train_step_cpu   #  9 项：tiny 模型端到端 plen 切片/mask/backward ✅
 python -m rlab.tests.test_ref_server_cpu   # 17 项：eos mask/passthrough 布局/rfpp 信用回传数学 ✅
 python -m rlab.tests.test_e2e_http         # 15 项：真实 HTTP 双模式服务器 + 算法消费闭环 ✅

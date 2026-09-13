@@ -126,6 +126,65 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
     return "\n".join(lines)
 
 
+def pair_eval(path_a: str, path_b: str, name_a: str, name_b: str) -> str:
+    """跨 json 两两同题配对（McNemar）。
+
+    【2026-09-13 由来】run2 的 m200（唯一显著正增益 +5.8pp p=0.006）原始 ckpt
+    被 P1 覆盖、step_200_mm 合并副本又被手工删除 —— **模型已灭失**。但它的
+    per-item 评测 json 还在；eval 抽题是 seed/split/n 确定的，两次评测抽到
+    同一批题，qk 同题配对依旧成立。于是"活模型 p1s200 vs 死模型 m200"的
+    单变量对照（同 step、唯一差异 trunc_shaping）可以靠两份 json 打完。
+
+    用法：python -m rlab.analysis --eval-json 新.json --pair-json 旧.json
+              --pair-a p1s200 --pair-b m200
+    模型名先在 --eval-json 里找、找不到再找 --pair-json；两边都没有 → 列出
+    可用名字（防拼错静默空表）。"""
+    def load(p):
+        with open(p, encoding="utf-8") as f:
+            res = json.load(f)
+        return {k: v for k, v in res.items() if not k.startswith("_")}
+
+    ja, jb = load(path_a), load(path_b)
+
+    def find(name):
+        for res, path in ((ja, path_a), (jb, path_b)):
+            if name in res:
+                return res[name], path
+        return None, None
+
+    ma, sa = find(name_a)
+    mb, sb = find(name_b)
+    if not ma or not mb:
+        missing = name_a if not ma else name_b
+        avail = sorted(set(ja) | set(jb))
+        return (f"[pair] 两个 json 里都找不到 {missing!r}。可用模型名："
+                f"{', '.join(avail) if avail else '（无）'}")
+    lines = [f"> [跨json配对] {name_a} ← {os.path.basename(sa)}"
+             f"  vs  {name_b} ← {os.path.basename(sb)}（同题 qk 配对，模型本体无需在世）",
+             "| 模型 | acc%(±95%CI) | n | Δacc(A−B) | 检验 | 判定 |",
+             "|---|---|---:|---|---|---|"]
+    for name, r in ((name_a, ma), (name_b, mb)):
+        n = r.get("n") or 0
+        acc = r.get("acc", 0.0) * 100
+        hw = ci95(r.get("acc", 0.0), n)
+        acc_col = f"{acc:.1f}±{hw:.1f}" if hw == hw else f"{acc:.1f}"
+        lines.append(f"| {name} | {acc_col} | {n} | — | — | — |")
+    na, nb = ma.get("n") or 0, mb.get("n") or 0
+    if na and nb:
+        d, h = diff_ci95(ma.get("acc", 0.0), na, mb.get("acc", 0.0), nb)
+        pc = paired_counts(ma.get("items"), mb.get("items"))
+        if pc is not None:
+            b, c, matched = pc
+            p = mcnemar_exact(b, c)
+            test = f"McNemar p={p:.3f} (b={b}/c={c}, n={matched})"
+            verdict = _verdict(d, h, p)
+        else:
+            test = "两比例（无 per-item 可配对）"
+            verdict = _verdict(d, h)
+        lines.append(f"| **A−B** | {d:+.1f}±{h:.1f}pp | {min(na, nb)} | {d:+.1f}pp | {test} | {verdict} |")
+    return "\n".join(lines)
+
+
 def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
     """按 upload 批次滑动平均 acc/fmt/code 率与完成长度（retool 诊断用）。
 
@@ -212,12 +271,25 @@ if __name__ == "__main__":
     ap.add_argument("--eval-json", default=None)
     ap.add_argument("--record", default=None)
     ap.add_argument("--base", default="BASE")
+    # 跨 json 两两配对（模型本体可以已灭失，只要有 per-item json）
+    ap.add_argument("--pair-json", default=None,
+                    help="另一份 eval json（--pair-a/--pair-b 的模型可来自任一份）")
+    ap.add_argument("--pair-a", default=None, help="配对臂 A 的模型名")
+    ap.add_argument("--pair-b", default=None, help="配对臂 B 的模型名")
     args = ap.parse_args()
+    _primary = args.eval_json
+    if args.pair_json and args.pair_a and args.pair_b:
+        if not _primary:
+            cands = sorted(glob.glob("eval_vllm_all*.json"))
+            if not cands:
+                raise SystemExit("[pair] 需要 --eval-json（主 json）")
+            _primary = cands[-1]
+        print(pair_eval(_primary, args.pair_json, args.pair_a, args.pair_b))
     if args.eval_json:
         print(summarize_eval(args.eval_json, args.base))
     if args.record:
         print(summarize_record(args.record))
-    if not args.eval_json and not args.record:
+    if not args.eval_json and not args.record and not args.pair_json:
         cands = sorted(glob.glob("eval_vllm_all*.json"))
         if cands:
             print(summarize_eval(cands[-1], args.base))

@@ -323,6 +323,7 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 | P0-4 | OOD 评测集（AIME25） | `[ ]` | 路线待定，见 §6.5 |
 | P0-5 | ckpt 撞名护栏（脚本硬拦 + train 签名扫描双层） | `[x]` | 2026-09-13 P1 的 step_200 覆掉 run2 的 step_200 后补，见 §7.2.1 |
 | P0-6 | 健康检查滚动门（修检查点盲窗） | `[x]` | P1 实测组 112→240 约 1h 零检查，`fmt_low`/`length_runaway` 漏报 |
+| P0-7 | `pair_eval` 跨 json 两两配对（对照已灭失模型） | `[x]` | m200 json 遗物 vs p1s200，见 §7.3 |
 | 习惯 | run 偏离签名三处冗余 | `[x]` | `train.py`：wandb name / `run_info.json` / 启动日志 |
 | P1 | `trunc_shaping 0.5 → 0.0`，300 步，存盘 50 | `[~]` | **训练完成**（3h17m，553 组），训练侧结论见 §7.2；**eval 待做** |
 | P2 | 原生 `<tool_call>` + rounds 6 / per_round 1024 | `[ ]` | 与 P1 分开跑 |
@@ -400,12 +401,35 @@ Run 身份：签名 `retool_math-ts0-ol1-r2x3072-s300x50-lr5e-06-d0-1`（日志�
    （`OUT_DIR_REUSE=1` 逃生口；`OUT_DIR` 环境变量可整体换目录，现在会透传给 train）；
    `train.py guard_ckpt_collision` 启动时签名级扫描（同签名重跑放行、**无签名按出处
    不明拒绝** —— run2 时代的 ckpt 没有签名字段）；存盘时二次核对。
-   **pod 待办：`cp -r rlab_out/retool_math/step_200_mm rlab_out/retool_math/step_200_mm.run2.bak` 留底。**
+   **【后续，2026-09-13】`step_200_mm` 也被删除 → run2 的 m200 模型彻底灭失**
+   （raw 已被 P1 覆盖、副本又删，RL 不可复现）。唯一遗物 = per-item 评测 json。
+   已补 `analysis.py pair_eval`：跨两个 json 按题 qk 同题配对 McNemar ——
+   **"活模型 p1s200 vs 已灭失的 m200"的单变量对照（同 step、唯一差异 shaping）
+   仍可打完**，见 §7.3。教训升级：评测 json 与 ckpt 同级是承重产物，删之前先备份。
 2. **健康检查盲窗**：`maybe_check` 旧门 `%16` + 每外层轮末才调一次 → 检查点稀疏，
    P1 实测组 112→240 约 1 小时零检查；期间 `fmt_low`（窗口 fmt 22%<25%）与
    `length_runaway`（clen 较开局 +43%）的触发条件**真的成立过但从未报告**（把
    重放对齐到真实检查点后与日志 3 条告警逐一对上，确认不是代码没到位）。
    修复：滚动门（距上次检查 ≥`check_every` 组即查）。测试 +6（60→66 项）。
+
+### 7.3 m200 灭失后的评测计划调整（2026-09-13）
+
+原计划的 `--models m200=...step_200_mm` 已不可执行。替代方案分两层：
+
+1. **p1s200 vs 已灭失的 m200**（同 step、唯一差异 trunc_shaping —— 最干净的单变量对）：
+   走 per-item json 遗物。前提：**先备份 m200 的评测 json**（它是唯一遗物）：
+   `cp eval_vllm_all.json eval_vllm_all.run3-0913.json.bak`（含全部 items）。
+   评测 p1s200 后：
+   ```bash
+   python -m rlab.analysis --eval-json eval_vllm_all.json \
+     --pair-json eval_vllm_all.run3-0913.json.bak --pair-a p1s200 --pair-b m200
+   ```
+   同 seed/split/n 抽同一批题，qk 配对成立；两边都是 09-13 新代码产物，items 齐全。
+2. **P1 曲线**：p1s150/p1s200/p1s250/p1s300 vs BASE/baseB，看 50 步粒度上增益何时出现、
+   末段是否延续训练曲线的上爬。
+
+解读时记住 §7.2 的限制：即使 p1s200 ≈ m200（差在噪声内），也只能说明"shaping 在
+step200 处不是增益来源"，不能说明"shaping 不是晚期崩塌的原因"（P1 没跑到那段）。
 
 ---
 
@@ -418,8 +442,9 @@ Run 身份：签名 `retool_math-ts0-ol1-r2x3072-s300x50-lr5e-06-d0-1`（日志�
 - ❌ **不要**在补上 OOD 集之前宣称复现了 ReTool —— 参考的 +23.89pp 是 OOD。
 - ❌ **不要**一次改多个变量 —— 尤其别把 P1（奖励）和 P2（协议）合到一次跑里。
 - ❌ **不要**用 run2 的 `eval_vllm_all.json` 做配对检验 —— 旧产物永远只有聚合值，补不回来。
-- ❌ **不要**以为 run2 的 `step_200` 原始 ckpt 还在 —— **已被 P1 覆盖**（§7.2.1），
-   m200 只剩 `step_200_mm` 一份，动它之前先备份。
+- ❌ **不要**以为 run2 的 `step_200` 原始 ckpt 还在 —— **已被 P1 覆盖**（§7.2.1）；
+   其后 `step_200_mm` 也被删除，**m200 模型已灭失**，与它的一切新对照只能走
+   per-item json 的 `pair_eval`（§7.3），别再拿模型路径说事。
 
 ---
 
@@ -521,16 +546,16 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 |---|---|
 | `eval_vllm_one.py` | 已改（per-item + 审计字段，09-12） |
 | `eval_vllm.py` | 已改（`_meta`，09-12） |
-| `rlab/analysis.py` | 已改（统计口径，09-12） |
+| `rlab/analysis.py` | 已改（统计口径 09-12；**`pair_eval` 跨 json 配对** 09-13，对照已灭失模型） |
 | `rlab/train.py` | 已改（偏离签名 09-12；**ckpt 撞名护栏** 09-13：`guard_ckpt_collision` 启动扫描 + 存盘二次核对） |
 | `rlab/health.py` | 已改（09-13：`maybe_check` 滚动门，修 P1 检查点盲窗） |
 | `rlab/run_gsm8k.sh` | 已改（09-13：旧 `step_*` 默认拒绝启动 + `OUT_DIR` 透传给 train） |
-| `rlab/tests/test_smoke_cpu.py` | 已改（+19 项，**64 项全过**） |
+| `rlab/tests/test_smoke_cpu.py` | 已改（+19 项 09-12、pair_eval +3 项 09-13，**67 项全过**） |
 | `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，**共 66 项**，隔离运行全过） |
 | `rlab/readme.md` | 已改（测试计数与 eval/analysis/train/health 说明） |
 
 验证：
-- `python -m rlab.tests.test_smoke_cpu` → **64 项全过**
+- `python -m rlab.tests.test_smoke_cpu` → **67 项全过**（含 pair_eval +3）
 - `test_health_monitor()` / `test_grad_clip_and_run_info()` 隔离运行 → 全过（含新 +6 项）
 - `bash -n run_gsm8k.sh` 通过；全部改动文件 `py_compile` 通过
 - ⚠️ `test_retool_cpu` / `test_train_step_cpu` 在**开发机**跑到需要 `transformers` 的段

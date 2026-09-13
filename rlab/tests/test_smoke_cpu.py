@@ -230,7 +230,7 @@ def test_eval_stats_and_signature():
     import tempfile
 
     from rlab.analysis import (ci95, diff_ci95, mcnemar_exact, paired_counts,
-                               summarize_eval, _verdict)
+                               summarize_eval, pair_eval, _verdict)
     from rlab.train import run_signature, write_run_info
 
     print("[G] eval 统计口径（N-aware CI + McNemar）")
@@ -284,6 +284,25 @@ def test_eval_stats_and_signature():
     check("_meta 不被当成模型行（审计字段与模型行分流）", "base_path" not in tbl)
     check("无 per-item 时明确标注是两比例检验（不冒充满配检验）",
           "两比例（无 per-item）" in tbl)
+
+    print("[G] pair_eval 跨 json 配对（模型已灭失也可对照）")
+    # 【2026-09-13】run2 的 m200 权重灭失（raw 被 P1 覆盖 + _mm 副本被删），
+    # per-item json 是唯一遗物 —— 跨 json 同题配对让它仍能进对照表。
+    _ja = os.path.join(_dir, "eval_new.json")
+    _jb = os.path.join(_dir, "eval_old.json")
+    _mk_items = lambda accs: [{"qk": f"q{i}", "acc": a} for i, a in enumerate(accs)]
+    _json.dump({"p1s200": {"acc": 0.55, "n": 4, "items": _mk_items([1, 1, 0, 0])}},
+               open(_ja, "w", encoding="utf-8"))
+    _json.dump({"m200": {"acc": 0.50, "n": 4, "items": _mk_items([1, 0, 0, 1])}},
+               open(_jb, "w", encoding="utf-8"))
+    ptbl = pair_eval(_ja, _jb, "p1s200", "m200")
+    check("跨 json 配对出 McNemar（b/c 来自两份 json 的 qk 交集）",
+          "McNemar" in ptbl and "n=4" in ptbl)
+    check("A/B 名字可以互换来源（主 json 找不到就去副 json 找）",
+          "m200 ← eval_old.json" in ptbl and "p1s200 ← eval_new.json" in ptbl)
+    missing = pair_eval(_ja, _jb, "p1s200", "nope")
+    check("拼错模型名 → 列出可用名字（不静默空表）",
+          "找不到" in missing and "m200" in missing)
 
 
 if __name__ == "__main__":
