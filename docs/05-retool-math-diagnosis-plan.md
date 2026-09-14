@@ -1,6 +1,7 @@
 # retool_math（Qwen3.5-4B）run2 诊断与优化方案
 
-> 状态：**诊断已定案；P0 测量已生效并回收首次配对结果（§7.1），下一步 P1**（2026-09-13 更新）
+> 状态：**诊断已定案；P1 消融已反向证伪（§7.3.1），下一步 = P1b（run2 原配方重跑，§6 P1b）**
+> （2026-09-14 更新）
 > 依据：run2 训练日志 `rlab/rlab_out/train_log2.txt`、得分记录 `rlab/rlab_out/record2.jsonl`、
 > run2 评测 `eval_vllm_all.json`，以及参考项目
 > [agentic-rl-lab/05-retool](https://github.com/KMnO4-zx/agentic-rl-lab/tree/main/05-retool)。
@@ -243,9 +244,16 @@ health 口径（32 组窗）：开局 **55.5%** → 峰值 **64.1%**（group 386
 
 ```bash
 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
-  --seed 42 --steps 300 --save_steps 50 --trunc_shaping 0.0
+  --seed 42 --steps 300 --save_steps 50 --lr 5e-6 --trunc_shaping 0.0
 # 签名 = retool_math-ts0-ol1-r2x3072-s300x50-lr5e-06-d0-1
 ```
+
+> **`--lr 5e-6` 必须显式传**（2026-09-14 补）：`retool_math` preset **不含 `lr` 键**，
+> 落到 BASE 默认 **1e-6**（实测 `get_config('retool_math')['lr'] == 1e-06`）——
+> 漏传不报错、只会静默用 1e-6 跑完全程，签名写 `lr1e-06` 才看得出来。
+> 而 run2 与 P1 的实测签名都是 `lr5e-06`（`rlab/train.py:455`：
+> "preset 默认 1e-6；4B 加杠杆建议 5e-6"）。本文与 `04-...oom.md` 的命令块此前都漏了
+> 这个 flag，照抄即静默偏离原配方。
 
 **除 `trunc_shaping` 外一切与 run2 一致**（含 `max_rounds=2`），确保单变量。
 步数 300 是因为参考 200 步收工、存盘 50 是为了不再出现 0–200 盲区。
@@ -266,6 +274,49 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 > p1s200 = BASE、m200 − p1s200 = +6.4pp（p=0.002）。**本节假设反向证伪**，转向 P1b/P2。
 
 成本：300 步 ≈ 2.6h（按 run2 实测 ~31 s/step）+ 评测。
+
+### P1b · run2 原配方重跑（**当前唯一阻塞点，优先于 P2**）
+
+目的（§7.3.1 定案 4）：① 定标 m200 的 +5.8pp 是**配方属性还是 run 随机性**
+（跨 run 的 McNemar 只算了题级采样噪声，没算 RL 轨迹分岔）；② 拿回一个**活着的**
+最佳 ckpt——m200 已灭失，OOD（AIME25）与 P2 对照都需要它。
+
+```bash
+bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
+    --vllm_model_path /root/Qwen3.5-4B \
+    --chat_template_kwargs '{"enable_thinking": false}' \
+    --gen_gpu_mem 0.30 --micro_rows 1 --optim_8bit \
+    --vllm_gen_logps --verify_gen_logps 5 \
+    --difficulty_path rlab_out/difficulty_probe_4b_v4.jsonl \
+    --out_dir rlab_out/retool_math_run2b \
+    --seed 42 --steps 300 --save_steps 50 --lr 5e-6
+# 签名 = retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-d0-1
+```
+
+**启动 30 秒内自检**：日志的 `signature=` 行必须含 **`lr5e-06`** 与 **`d0-1`**。
+若见 `lr1e-06` → 漏传 `--lr`（静默 5 倍偏离）；若见 `nodiff` → 漏传 `--difficulty_path`。
+两者都不报错，只有签名能暴露。（签名实测：传 `--lr 5e-6` = `...-lr5e-06-d0-1`，
+不传 = `...-lr1e-06-d0-1`。）
+
+与 run2 的唯一差异是**步数/存盘**（1000×200 → 300×50），奖励配方一字不改：
+`trunc_shaping` **故意不传**（preset 内置 0.5 = 原配方），`--lr 5e-6` 必须显式传（见 P1 注解）。
+
+启动注意三条：① `--out_dir` 必须给**新目录**——签名与 run2 不同（`s1000x200` → `s300x50`），
+`guard_ckpt_collision` 不会放行同目录；② pod 上先 `git pull`；③ 若 `retool_math_run2b`
+已有半截 `step_*`（09-13 首跑被旧版护栏误拦前可能已建目录），先确认是续跑还是换目录。
+
+评测（对齐 §7.1 路线：`materialize_mm_ckpt` 物化 → `eval_vllm.py` 调度 → `eval_vllm_all.json`，
+N=500 / greedy / seed=42），然后走 `pair_eval` 三方配对：
+
+```bash
+cp eval_vllm_all.json eval_vllm_all.p1b.json     # 新一轮产物，别覆盖（旧 json 是唯一遗物）
+python -m rlab.analysis --eval-json eval_vllm_all.p1b.json \
+    --pair-json eval_vllm_all.run3-0913.json.bak --pair-a p1bs200 --pair-b m200
+```
+
+**事前写死判据**：`p1bs200 − BASE` 显著为正 **且** 与 m200 的差落在噪声内（|Δ| ≲1pp，
+§9.6 地板）→ +5.8pp 是**配方属性**，§7.3.1 结论坐实、可推 P2；若 `p1bs200 ≈ BASE`
+（差在噪声内）→ run 级随机性比 McNemar 算出来的大，§7.3.1 的跨 run 对比需整体降级。
 
 ### P2 · 协议与轮次（结构性，**必须与 P1 分开跑**）
 
@@ -337,7 +388,8 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 | P0-7 | `pair_eval` 跨 json 两两配对（对照已灭失模型） | `[x]` | m200 json 遗物 vs p1s200，见 §7.3 |
 | 习惯 | run 偏离签名三处冗余 | `[x]` | `train.py`：wandb name / `run_info.json` / 启动日志 |
 | P1 | `trunc_shaping 0.5 → 0.0`，300 步，存盘 50 | `[x]` | **已定案（§7.3.1）**：证伪且方向相反 —— 去掉惩罚丢掉 step200 全部增益（−6.4pp, p=0.002）、中段崩盘（p1s150 −7.4pp, p=0.001）。不延长 |
-| P1b | **run2 原配方（ts0.5）重跑** 300 步 / 存盘 50 / 新 out_dir | `[ ]` | 定标 m200 增益是配方还是 run 随机性 + 拿回活的最佳 ckpt（m200 已灭失，OOD 需要）。**优先于 P2** |
+| P1b | **run2 原配方（ts0.5）重跑** 300 步 / 存盘 50 / 新 out_dir | `[ ]` | 定标 m200 增益是配方还是 run 随机性 + 拿回活的最佳 ckpt（m200 已灭失，OOD 需要）。**优先于 P2**。**命令 + 判据见 §6 P1b**（注意 `--lr 5e-6` 必须显式传） |
+| — | 抽取自检判据改口径（`max\|Δlogits\|>0.1` → 逐位相等主闸） | `[x]` | 2026-09-14，非 P 序列任务：0.1017 是**异路径对拍**在 bf16 下的正常累积，不是抽取有误。`rlab/extract_text_model.py` `_selfcheck` 重写为三层判据 + 反证控制；若重跑过抽取，本条是 P1b 的隐性前置 |
 | P2 | 原生 `<tool_call>` + rounds 6 / per_round 1024 | `[ ]` | 与 P1 分开跑 |
 | P3 | 步数 200–300 + 存盘 50 成为默认 | `[ ]` | |
 | P4 | 无难度过滤对照 + `train.jsonl` 行数核对 | `[ ]` | 见 §10 |
@@ -599,13 +651,23 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 | `rlab/train.py` | 已改（偏离签名 09-12；**ckpt 撞名护栏** 09-13：`guard_ckpt_collision` 启动扫描 + 存盘二次核对） |
 | `rlab/health.py` | 已改（09-13：`maybe_check` 滚动门，修 P1 检查点盲窗） |
 | `rlab/run_gsm8k.sh` | 已改（09-13：旧 `step_*` 默认拒绝启动 + `OUT_DIR` 透传给 train） |
-| `rlab/tests/test_smoke_cpu.py` | 已改（+19 项 09-12、pair_eval +3 项 09-13，**67 项全过**） |
-| `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，**共 66 项**，隔离运行全过） |
+| `rlab/tests/test_smoke_cpu.py` | 已改（+19 项 09-12、pair_eval +3 项 09-13；`[H]` 抽取自检 +4 项 09-14，**71 项全过**） |
+| `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，09-13；**09-14 修脆性断言**：`[T]` 段 `--attn_implementation "$ATTN_IMPL" "$@"` 的字面紧邻判据被 8496f47 插入的 `--out_dir "$OUT_DIR"` 打断，改断言**位置关系**，**280 项全过**） |
+| `rlab/extract_text_model.py` | 已改（09-14：`_selfcheck` 三层判据 + 反证控制，见看板 09-14 行） |
 | `rlab/readme.md` | 已改（测试计数与 eval/analysis/train/health 说明） |
 
-验证：
-- `python -m rlab.tests.test_smoke_cpu` → **67 项全过**（含 pair_eval +3）
-- `test_health_monitor()` / `test_grad_clip_and_run_info()` 隔离运行 → 全过（含新 +6 项）
+验证（2026-09-14 本机实测）：
+- `python -m rlab.tests.test_smoke_cpu` → **71 项全过**
+- `python -m rlab.tests.test_retool_cpu` → **280 项全过**（`[T]` 断言修复前 exit=1：
+  该段是文件靠后的段落，中断导致其后 4 个段从未执行 —— 见下方教训）
+- `test_health_monitor()` / `test_grad_clip_and_run_info()` 隔离运行 → 全过
 - `bash -n run_gsm8k.sh` 通过；全部改动文件 `py_compile` 通过
-- ⚠️ `test_retool_cpu` / `test_train_step_cpu` 在**开发机**跑到需要 `transformers` 的段
-  `ModuleNotFoundError` 退出；`git stash` 后复现同样失败 ⇒ **环境缺失，与本次改动无关**（pod 上有）。
+
+> **教训（2026-09-14）：「隔离跑几个子测试」≠「跑整个文件」。**
+> 本表此前记的"test_retool_cpu 共 66 项、隔离运行全过"——隔离只覆盖了 health / grad_clip
+> 两段，而失败发生在**文件最后**的 `[T]` 段，且因断言在 [T] 处抛异常，其后的 4 个段
+> **根本没执行**（这也解释了计数长期对不上：实际 280 项，文档记 66/67）。
+> 该断言自 8496f47（09-13）起就是红的，但**不影响 pod 行为**（脚本语义完好，坏的是
+> "字面紧邻"这个过强的实现细节），所以只有本地跑完整文件才会暴露。
+> 另：早前记的"开发机 `test_retool_cpu` 跑到 transformers 段 `ModuleNotFoundError` 退出"
+> 现已不成立（本机环境已补齐），红灯是这次才浮出来的。

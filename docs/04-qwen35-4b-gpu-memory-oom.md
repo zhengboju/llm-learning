@@ -21,8 +21,14 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
     --micro_rows 1 \
     --optim_8bit \
     --vllm_gen_logps --verify_gen_logps 5 \
-    --difficulty_path rlab_out/difficulty_probe_4b_v4.jsonl
+    --difficulty_path rlab_out/difficulty_probe_4b_v4.jsonl \
+    --lr 5e-6
 ```
+
+> **2026-09-14 补 `--lr 5e-6`**：本命令块此前漏了这个 flag，而 `retool_math` preset
+> **不含 `lr` 键**（落到 BASE 默认 1e-6）——照抄会静默跑成 5 倍小的学习率。
+> run2/P1 的实测签名都是 `lr5e-06`，`train.py --lr` 帮助串也写明"preset 默认 1e-6；
+> 4B 加杠杆建议 5e-6"。漏传不报错，只有签名里 `lr1e-06` 能暴露。
 
 > **2026-09-12 变更（相对上一版命令）**
 > - `--round_gen_tokens 3072` **移除**：preset 已内置 3072，且 `max_rounds` 从 3 降到 2。
