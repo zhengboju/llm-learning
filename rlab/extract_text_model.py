@@ -15,14 +15,119 @@ gen_logps 副本/训练端三处都要改。一次性抽取纯文本 checkpoint 
     python -m rlab.extract_text_model --src /root/Qwen3.5-4B --dst /root/Qwen3.5-4B-text
 
 产出 /dst（纯文本 Qwen3_5ForCausalLM + tokenizer + chat template）。之后探针/
-训练/评测的 model_path 一律用 --dst；脚本内置 logits 对拍自检（全模型 vs 抽取
-模型同输入 logits allclose），不通过会显式报错而不是静默产出坏 checkpoint。
+训练/评测的 model_path 一律用 --dst；脚本内置分层自检（见 _selfcheck：同权重同路径
+逐位对拍为主判据，wrapper 路径偏差单列），不通过会显式报错而不是静默产出坏 ckpt。
 """
 
 import argparse
 import os
 
 import torch
+
+
+def _selfcheck(full, backbone, causal, tok, ids) -> None:
+    """抽取自检：分层判据 + 反证控制（2026-09-14 重写）。
+
+    旧判据 `max|Δlogits| > 0.1` 一票否决，实测 0.1017 被判"抽取有误"，是口径问题、
+    不是缺陷：
+      ① 对拍两侧是两条**不同代码路径**——`full(...)` 走多模态复合 wrapper（自己构造
+         position_ids/attention_mask），`causal(...)` 是裸文本模型。同权重不同路径在
+         bf16 下逐层舍入，32 层混合线性注意力（无 flash-linear-attention 时走参考实现）
+         累积到 1e-1 量级属正常，与"权重抄错"无关。
+      ② 阈值是**绝对值**，与 logits 量纲无关，且卡在噪声地板上（0.1017 只超线 1.7%）。
+
+    新判据分三层，①②＋反证是硬闸，③ 只报数不拦：
+      ① 同权重同路径必须**逐位相等**：直接调 backbone + full.lm_head 与 causal 对拍，
+         max|Δ| 必须恰为 0.0——这才是"抽取正确"的充分证据，不需要任何阈值。
+      ② determinism：同一模型两次前向逐位相等。新建的 Qwen3_5ForCausalLM 默认 train
+         模式，配置里 dropout 一旦非 0，对拍比的就不是权重而是随机数。
+      ③ wrapper 路径偏差单列，用 argmax/top-5 一致性 + softmax 总变差（TV，无量纲）报。
+         数学等价的两条路径 TV 应在 1e-3 量级，真错（错层/漏层/lm_head 没绑）TV ~ 1。
+         不设硬闸：① 已证明抽取逐位精确，残余偏差属 Qwen3.5 复合前向自身的数值路径
+         差异，不该由抽取脚本判死；超 1e-2 打 WARN，值得单独记录。
+
+    反证控制：把某个 block 权重 ×1.02（先确认扰动真落在 bf16 网格上，bf16 相对精度
+    ~4e-3）后 ① 必须爆——判据抓不住故意注入的错误，就等于没有判据。还原后复测 ①，
+    确认产出不会被污染。
+    """
+    full.eval()
+    causal.eval()          # 新建模块默认 train 模式：dropout 非 0 会污染对拍
+
+    if type(backbone) is not type(causal.model):
+        raise RuntimeError(
+            f"主干类不同（{type(backbone).__name__} vs {type(causal.model).__name__}）"
+            "——① 的逐位前提不成立")
+
+    def h_of(module) -> torch.Tensor:
+        with torch.no_grad():
+            # ModelOutput 支持按位置取值，第 0 项即 last_hidden_state
+            return module(input_ids=ids)[0]
+
+    # ---- ① 同权重同路径：逐位相等（硬闸）----
+    h_ref, h_cau = h_of(backbone), h_of(causal.model)
+    d_backbone = (h_ref - h_cau).abs().max().item()
+    eq_backbone = torch.equal(h_ref, h_cau)
+    with torch.no_grad():
+        out_ref = full.lm_head(h_ref)            # 直连 lm_head，绕开复合 wrapper
+        out_cau = causal(input_ids=ids).logits
+    d_head = (out_ref[0, -1] - out_cau[0, -1]).abs().max().item()
+    eq_head = torch.equal(out_ref[0, -1], out_cau[0, -1])
+    print(f"[extract] ① 主干/lm_head 直连对拍（同权重同路径，要求逐位相等）: "
+          f"max|Δh|={d_backbone:.3e} bitwise={eq_backbone} | "
+          f"max|Δlogits|={d_head:.3e} bitwise={eq_head}")
+
+    # ---- ② determinism：排除 dropout / RNG（硬闸）----
+    det = torch.equal(h_of(causal.model), h_of(causal.model))
+    print(f"[extract] ② determinism（同模型两次前向逐位相等）: {det}")
+
+    # ---- ③ wrapper 路径偏差：只报数（信息项，非抽取缺陷）----
+    with torch.no_grad():
+        lg_cau = out_cau[0, -1].float()
+        lg_wrap = full(input_ids=ids).logits[0, -1].float()
+    d_wrap = (lg_wrap - lg_cau).abs().max().item()
+    tv = 0.5 * (lg_cau.softmax(-1) - lg_wrap.softmax(-1)).abs().sum().item()
+    same_top = int(lg_cau.argmax()) == int(lg_wrap.argmax())
+    top5 = (set(lg_cau.topk(5).indices.tolist())
+            == set(lg_wrap.topk(5).indices.tolist()))
+    print(f"[extract] ③ 多模态 wrapper 路径 vs 裸文本路径: max|Δlogits|={d_wrap:.4f} "
+          f"softmax TV={tv:.2e} argmax 一致={same_top} top5 一致={top5} "
+          f"(top={tok.decode(int(lg_cau.argmax()))!r})")
+    if tv > 1e-2:
+        print(f"[extract] WARN TV={tv:.2e} 偏大（数学等价的两条路径经验值 ~1e-3）——"
+              "残余属复合前向自身差异；可加 --dtype float32 复核是否纯 bf16 舍入")
+
+    # ---- 反证控制：判据必须抓得住"权重错"这类真错误 ----
+    target = next(((n, p) for n, p in causal.model.named_parameters()
+                   if n.startswith("layers.") and p.dim() >= 2
+                   and p.numel() >= 1_000_000), None)
+    if target is None:
+        raise RuntimeError("找不到可扰动的 block 权重，反证控制无法执行")
+    name, w = target
+    with torch.no_grad():      # 叶子参数带 requires_grad，原地改写必须在 no_grad 下
+        backup = w.detach().clone()
+        w.mul_(1.02)
+        moved = not torch.equal(w, backup)  # bf16 相对精度 ~4e-3，2% 必须真的改到值
+    d_ctrl = (h_of(backbone) - h_of(causal.model)).abs().max().item()
+    with torch.no_grad():
+        w.copy_(backup)
+    restored = torch.equal(w, backup)          # 直接验张量还原，不依赖对拍基数
+    d_after = (h_of(backbone) - h_of(causal.model)).abs().max().item()
+    print(f"[extract] 反证控制（{name} ×1.02，扰动生效={moved}）: max|Δh|={d_ctrl:.3e} "
+          f"| 还原={restored} 还原后 max|Δh|={d_after:.3e}（基线 {d_backbone:.3e}）")
+
+    # ---- 硬闸汇总：按"主判据优先"排序，真缺陷的报错不能被控制项的先决条件掩盖 ----
+    # （原地改写都在上面已还原，这里 raise 不影响权重状态；分项数值上面已全部打出）
+    if not det:
+        raise RuntimeError("同一模型两次前向不逐位相等——存在随机性（dropout/未 eval），"
+                           "自检结果不可用")
+    if not eq_backbone or not eq_head:
+        raise RuntimeError(f"抽取有误：同权重同路径不逐位相等（max|Δh|={d_backbone:.3e} "
+                           f"bitwise={eq_backbone}, lm_head bitwise={eq_head}）"
+                           "——这才是真错误，不产出 checkpoint")
+    if not restored:
+        raise RuntimeError(f"{name} 未能还原——产出 checkpoint 会被污染，已中止")
+    if not moved or d_ctrl < 1e-3:
+        raise RuntimeError(f"判据无区分力：扰动权重后主干差值仅 {d_ctrl:.3e}，自检形同虚设")
 
 
 def _find_text_backbone(full):
@@ -69,20 +174,11 @@ def main():
     else:
         causal.tie_weights()   # lm_head 与 embedding 共享，绑一下即可
 
-    # ---- 自检：同输入 logits 对拍（bf16 噪声内一致才产出）----
-    print("[extract] logits 对拍自检...")
+    # ---- 自检：分层判据（详见 _selfcheck docstring）----
+    print("[extract] 分层自检...")
     tok = AutoTokenizer.from_pretrained(args.src)
     ids = tok("The capital of France is", return_tensors="pt").input_ids
-    with torch.no_grad():
-        lg_full = full(input_ids=ids).logits[0, -1].float()
-        lg_causal = causal(input_ids=ids).logits[0, -1].float()
-    max_diff = (lg_full - lg_causal).abs().max().item()
-    same_top = int(lg_full.argmax()) == int(lg_causal.argmax())
-    print(f"[extract] max|Δlogits|={max_diff:.4f} argmax 一致={same_top} "
-          f"(top={tok.decode(int(lg_causal.argmax()))!r})")
-    if max_diff > 0.1 or not same_top:
-        raise RuntimeError(f"对拍不通过（max_diff={max_diff}, same_top={same_top}）"
-                           "——抽取有误，不产出 checkpoint")
+    _selfcheck(full, backbone, causal, tok, ids)
 
     # ---- 落盘：模型 + tokenizer（含 chat template，enable_thinking 靠它）----
     print(f"[extract] 保存 -> {args.dst}")

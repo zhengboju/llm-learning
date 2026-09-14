@@ -7,6 +7,7 @@
   C. protocol 双布局编解码 roundtrip
   D. reward 正则/超长惩罚/退化比对路径
   E. data fixture 加载
+  H. 抽取纯文本 checkpoint 的自检判据（替身模型，不依赖真权重）
 
 运行：python -m rlab.tests.test_smoke_cpu
 """
@@ -218,6 +219,103 @@ def test_reward_and_data():
           cfg["clip_high"] == 0.28 and cfg["clip_low"] == 0.2 and cfg["lr"] == 1e-6)
 
 
+# --------------------- H. 抽取纯文本 ckpt 的自检判据（替身模型） ----
+def test_extract_selfcheck_judgement():
+    """【2026-09-14】口径修正固化：旧判据把 0.1017 判成"抽取有误"。
+
+    旧判据 `max|Δlogits| > 0.1` 的两处错：① 对拍两侧是两条**不同代码路径**——
+    `full(...)` 走多模态复合 wrapper（自造 position_ids/attention_mask），
+    `causal(...)` 是裸文本模型，同权重不同路径在 bf16 下逐层舍入，32 层混合线性注意力
+    累积到 1e-1 属正常；② 阈值是绝对值、与 logits 量纲无关，实测只超线 1.7%，是阈值
+    卡在噪声地板上的特征而非缺陷特征。
+
+    新判据的主闸改成可判"对/错"的逐位相等（同类同权重同路径），本测试用替身模型钉死：
+      ① 干净抽取必须放行（含反证控制生效+还原）；
+      ② 错层复制必须被拦；
+      ③ 只污染一个 bias 也必须被拦——**该场景 argmax 仍一致**，这正是不能拿 argmax/
+         top-k 当主判据、必须用逐位相等的原因。
+    """
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from rlab.extract_text_model import _selfcheck
+
+    print("[H] extract_text_model 自检判据（替身模型）")
+
+    h, vocab, n_layer = 1024, 64, 3      # h 保证 block 权重 >1e6 元素，命中反证控制的挑选条件
+
+    class _Text(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(vocab, h)
+            self.layers = nn.ModuleList([nn.Linear(h, h) for _ in range(n_layer)])
+
+        def forward(self, input_ids):
+            x = self.embed(input_ids)
+            for layer in self.layers:
+                x = torch.tanh(layer(x))
+            return (x,)
+
+    class _Full(nn.Module):
+        """多模态复合模型替身：wrapper 路径故意与裸文本路径略有差异。"""
+
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = _Text()
+            self.lm_head = nn.Linear(h, vocab, bias=False)
+
+        def forward(self, input_ids):
+            hidden = self.model.language_model(input_ids)[0]
+            return SimpleNamespace(logits=self.lm_head(hidden) * 1.01)
+
+    class _Causal(nn.Module):
+        """抽取产物替身：同类、同权重、同路径。"""
+
+        def __init__(self, full):
+            super().__init__()
+            self.model = _Text()
+            self.model.load_state_dict(full.model.language_model.state_dict())
+            self.lm_head = nn.Linear(h, vocab, bias=False)
+            self.lm_head.load_state_dict(full.lm_head.state_dict())
+
+        def forward(self, input_ids):
+            return SimpleNamespace(logits=self.lm_head(self.model(input_ids)[0]))
+
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    tok = SimpleNamespace(decode=lambda i: f"<{int(i)}>")
+
+    def run(mutate=None):
+        torch.manual_seed(0)                     # 两模型同源初始化，消除随机差
+        full = _Full().to(torch.bfloat16)
+        causal = _Causal(full).to(torch.bfloat16)
+        if mutate is not None:
+            mutate(causal)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                _selfcheck(full, full.model.language_model, causal, tok, ids)
+                verdict = "pass"
+            except RuntimeError as exc:
+                verdict = "抽取有误" if "抽取有误" in str(exc) else str(exc)[:60]
+        return verdict, buf.getvalue()
+
+    v_clean, out_clean = run()
+    v_wrong, _ = run(lambda c: c.model.layers[0].weight.data.zero_())
+    v_bias, out_bias = run(lambda c: c.model.layers[1].bias.data.add_(0.5))
+
+    check("抽取自检：同权重同路径 → 放行", v_clean == "pass")
+    check("抽取自检：反证控制自身有效（扰动真生效且还原）",
+          "扰动生效=True" in out_clean and "还原=True" in out_clean
+          and "还原后 max|Δh|=0.000e+00" in out_clean)
+    check("抽取自检：错层复制 → 判『抽取有误』", v_wrong == "抽取有误")
+    check("抽取自检：只污染一个 bias（③ 的 argmax 仍一致）→ 主闸仍拦得住",
+          v_bias == "抽取有误" and "argmax 一致=True" in out_bias)
+
+
 # ------------------------------- G. eval 统计口径 + run 偏离签名 ----
 def test_eval_stats_and_signature():
     """【2026-09-12】把 run2 暴露的两个测量缺口钉成回归测试：
@@ -310,6 +408,7 @@ if __name__ == "__main__":
     test_losses()
     test_protocol()
     test_reward_and_data()
+    test_extract_selfcheck_judgement()
     test_eval_stats_and_signature()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
