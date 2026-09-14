@@ -947,26 +947,88 @@ def test_vllm_gen_kwargs():
           and get_config("retool_math", vllm_gen_kwargs={"a": 1})["vllm_gen_kwargs"]
           == {"a": 1})
 
-    # 回读 walk 的容错：真机属性路径随版本漂，读不到必须返回 None 而不是抛
-    # （它是"X 在生效"的唯一现场证据，崩了就白干）
+    # 回读：真机对象布局随版本漂，判据是"能不能在图里找到"，不是写死路径。
+    # 【2026-09-14 实机教训】首版硬编码 LLM.llm_engine[.vllm_config].model_config 四条
+    # 路径，在 vLLM 0.19 上打回 None——那既可能=键被静默忽略、也可能=我找错了地方，
+    # 判据当场失去分辨力（只能靠"日志里没有 ninja"间接推断修复生效）。改为有界 BFS。
     class _MC:
-        gdn_prefill_backend = "triton"
+        def __init__(self):
+            self.gdn_prefill_backend = "triton"
 
     class _VC:
-        model_config = _MC()
+        def __init__(self):
+            self.model_config = _MC()
 
     class _Eng:
-        vllm_config = _VC()
-        model_config = _MC()
+        def __init__(self):
+            self.vllm_config = _VC()
 
     class _LLM:
-        llm_engine = _Eng()
+        def __init__(self):
+            self.engine = _Eng()
 
-    check("回读到生效值（walk LLM.llm_engine.vllm_config.model_config）",
-          _vllm_config_readback(_LLM(), "gdn_prefill_backend") == "triton")
-    check("空替身/键名不存在 -> None 而不抛（路径漂 ≠ 崩）",
-          _vllm_config_readback(object(), "gdn_prefill_backend") is None
-          and _vllm_config_readback(_LLM(), "不存在的键") is None)
+    class _ClsAttr:
+        gdn_prefill_backend = "triton"      # 类属性：纯 __dict__ 遍历读不到，getattr 能
+
+    class _Big:
+        def __init__(self):
+            self.blob = list(range(100000))  # 大容器必须被排除，否则 BFS 爆炸
+            self.gdn_prefill_backend = "triton"
+
+    check("回读到生效值（实例属性深三层，非写死路径）",
+          _vllm_config_readback(_LLM(), "gdn_prefill_backend") == ("triton", []))
+    check("类属性也读得到（首版纯 __dict__ 遍历的盲区）",
+          _vllm_config_readback(_ClsAttr(), "gdn_prefill_backend")[0] == "triton")
+    check("大容器不进图但仍找得到键",
+          _vllm_config_readback(_Big(), "gdn_prefill_backend")[0] == "triton")
+    check("miss -> (None, 线索) 而不抛；线索带宿主类型名（用于分辨「键被忽略」"
+          "vs「布局变了」两种 None）",
+          _vllm_config_readback(object(), "gdn_prefill_backend") == (None, [])
+          and _vllm_config_readback(
+              type("Mn", (), {"gdn_prefill_backends": "x"})(),
+              "gdn_prefill_backend")[1] == ["Mn.gdn_prefill_backends"])
+
+    # 【2026-09-14 实机复现的 A1】护栏判据必须是"本进程**能不能构造**"（meta 真预检），
+    # 不是"config 是不是复合形状"——同一份复合 ckpt 在 train 侧（裸 torch）两次 run 都
+    # 加载成功、在 gen 侧（import 过 vLLM）必抛 A1，差别在**环境**不在形状；按形状判会在
+    # 环境修好之后误杀合法启动（重装环境后就正好落在这一条上）。
+    from rlab.rollout import (_assert_torch_replica_loadable, _is_multimodal_ckpt,
+                              _probe_torch_construct)
+    import rlab.rollout as _ro
+
+    def _mk_cfg(cfg_dict):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg_dict, f)
+        return d
+
+    check("复合形状判定（只用于错误信息，不再作拦截判据）",
+          _is_multimodal_ckpt(_mk_cfg({"text_config": {"vocab_size": 1},
+                                       "vision_config": {}})) is True
+          and _is_multimodal_ckpt(_mk_cfg({"vocab_size": 248320})) is False
+          and _is_multimodal_ckpt("/nope/nope") is False)
+
+    # 判据三分支：替身注入预检结果（真预检见下）
+    _orig_probe = _ro._probe_torch_construct
+    try:
+        _ro._probe_torch_construct = lambda p: (
+            "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'")
+        check("预检报 A1 特征 -> RuntimeError（拦，带两条改法）",
+              _raises(lambda: _assert_torch_replica_loadable("/x"), RuntimeError))
+        _ro._probe_torch_construct = lambda p: "ValueError: meta 预检自身的限制"
+        check("预检报非 A1 -> 只告警放行（反证：否则预检的怪癖会误杀合法启动）",
+              _assert_torch_replica_loadable("/x") is None)
+        _ro._probe_torch_construct = lambda p: None
+        check("预检通过 -> 放行", _assert_torch_replica_loadable("/x") is None)
+    finally:
+        _ro._probe_torch_construct = _orig_probe
+
+    # 真预检（不注入替身）：meta 构造零显存零内存，结论与真实加载同路径
+    check("真预检：可加载的小模型返回 None（gpt2 本地缓存）",
+          _probe_torch_construct("gpt2") is None)
+    check("真预检：坏目录/缺 config 返回错误串而不抛",
+          isinstance(_probe_torch_construct(tempfile.mkdtemp()), str))
+
     check("空 kwargs 直接放行（不触发 vLLM import，CPU 可测）",
           _check_vllm_gen_kwargs({}) is None)
     try:
@@ -1000,6 +1062,9 @@ def test_vllm_gen_kwargs():
           "**_gen_kwargs)" in rollout_src)
     check("键名闸在 LLM 构造**之前**（构造本身就是那次 JIT，事后回读来不及）",
           rollout_src.index("_check_vllm_gen_kwargs(_gen_kwargs)")
+          < rollout_src.index("vllm_gen = LLM("))
+    check("A1 护栏前置到 LLM() 之前（任何 GPU 分配前就拦，不是白烧一分钟才崩）",
+          rollout_src.index('_assert_torch_replica_loadable(cfg["model_path"])')
           < rollout_src.index("vllm_gen = LLM("))
     check("train.py CLI --vllm_gen_kwargs 映射到 overrides",
           '"--vllm_gen_kwargs"' in train_src

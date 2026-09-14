@@ -609,21 +609,117 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     return results
 
 
-def _vllm_config_readback(llm, key: str):
-    """best-effort 回读一个 vLLM 构造参数是否真落到了引擎 config（只作可观测，不作
-    判据：版本间属性路径会漂，读不到返回 None 而不抛）。
+def _vllm_config_readback(llm, key: str, max_depth: int = 4, max_objs: int = 400):
+    """best-effort 在**对象图**里回读 vLLM 构造参数，返回 (值, 相近键名提示)。
 
-    【为什么需要】vLLM 对不认识的 LLM(**kwargs) 参数是**静默忽略**的，而"开了开关"
-    与"开关生效"在这里代价不同（docs/04 §5.3）：前者省掉一次起跑期 nvcc，后者直接
-    再撞一次宿主 RAM OOM-kill。walk 路径：LLM.llm_engine[.vllm_config].model_config。
+    【为什么不是写死路径】首版硬编码 LLM.llm_engine[.vllm_config].model_config 四条
+    路径，2026-09-14 实机打回 None——该版引擎的对象布局与它们不符。于是"回读 None"
+    既可能=键被静默忽略、也可能=我找错了地方，**判据失去分辨力**（那次只能靠"日志里
+    没有 ninja"间接推断修复生效）。改为有界 BFS：**图遍历只走 `__dict__`**（大容器不
+    展开）、**取值用 getattr**（覆盖类属性/property，只对已访问对象、逐键调用）、
+    **提示用 dir**（只取名字，不触发 descriptor）。命中即返回；未命中把图里见过的
+    "相近名字 + 宿主类型名"一并带回，让这个 None 自解释。定位是纯可观测，读不到不抛
+    （版本间布局会继续漂）。
     """
-    eng = getattr(llm, "llm_engine", None)
-    for obj in (eng, getattr(eng, "vllm_config", None),
-                getattr(getattr(eng, "vllm_config", None), "model_config", None),
-                getattr(eng, "model_config", None)):
-        if obj is not None and hasattr(obj, key):
-            return getattr(obj, key)
+    import types
+    seen, visited, hints, seen_hints = set(), 0, [], set()
+    queue = deque([(llm, 0)])
+    stem = key.split("_")[0]        # 如 gdn：捞"名字相近但位置/拼法不同"的键，用于分辨 None
+    while queue and visited < max_objs:
+        obj, depth = queue.popleft()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        visited += 1
+        try:
+            # 取值走 getattr（覆盖类属性/property，不只实例 __dict__）；属性可能惰性
+            # 初始化并抛非 AttributeError → 整段兜住，只跳过这一个对象
+            if hasattr(obj, key):
+                return getattr(obj, key), hints[:12]
+        except Exception:
+            pass
+        for k in dir(obj):          # 只取名字：dir 不触发 descriptor，安全
+            if stem and stem in k and k not in seen_hints:
+                seen_hints.add(k)
+                hints.append(f"{type(obj).__name__}.{k}")   # 带宿主类型名，miss 时能直接定位布局
+        if depth >= max_depth:
+            continue
+        for v in getattr(obj, "__dict__", {}).values():
+            if isinstance(v, (types.ModuleType, torch.Tensor, str, bytes, type)) or v is None:
+                continue
+            if isinstance(v, (int, float, bool)):
+                continue
+            if isinstance(v, (list, tuple, dict, set)) and len(v) > 32:
+                continue    # 大容器多半是权重/数据，不进图（防 BFS 爆开）
+            queue.append((v, depth + 1))
+    return None, hints[:12]
+
+
+def _is_multimodal_ckpt(path: str) -> bool:
+    """config.json 是**复合多模态** config（vocab_size 落在 text_config 里、顶层没有）？
+
+    docs/04 A1 的现场形状：torch 侧 AutoModelForCausalLM 拿复合 config 喂文本类 →
+    `'Qwen3_5Config' object has no attribute 'vocab_size'`。
+    **只用于拼错误信息，不作拦截判据**——形状是数据、能不能构造是数据×环境，环境一升级
+    （transformers 5.17 起会自己解包 text_config，2026-09-14 实机验证）形状判据就会从
+    "保护"翻转成"误杀"；真判据见 `_assert_torch_replica_loadable` 的 meta 预检。
+    读不到/坏 json 一律 False（宁可不拦，不可错拦）。
+    """
+    try:
+        with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return "vocab_size" not in c and "text_config" in c
+
+
+def _probe_torch_construct(model_path: str) -> str | None:
+    """在 **meta 设备**上真构造一次 AutoModelForCausalLM：能构造返回 None，否则返回错误串。
+
+    走的是与真实加载**同一条**类解析 + `__init__` 路径（A1 就发生在这一步），但 meta
+    张量不分配内存/显存、只记形状，所以毫秒~秒级、零资源代价。
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+    try:
+        cfg = AutoConfig.from_pretrained(model_path)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    try:
+        with torch.device("meta"):
+            _m = AutoModelForCausalLM.from_config(cfg)
+        del _m
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
     return None
+
+
+def _assert_torch_replica_loadable(model_path: str) -> None:
+    """fail-fast：torch 侧副本能不能加载？**真预检一次**，而不是猜 config 的形状。
+
+    【为什么不能按形状判】2026-09-14 实测的不对称：同一份复合 ckpt，train 侧（裸 torch
+    进程）两次 run 都加载成功，gen 侧（进程内 import 过 vLLM）必抛 A1——差别在
+    **环境/进程**，不在 ckpt 形状。按形状判会在环境修好（或换 transformers/vLLM 版本）
+    之后**误杀合法启动**，而这正是"宁可不拦，不可错拦"要避免的。
+    【判据】预检失败且错误含 vocab_size（A1 特征）→ fail-fast 并给两条改法；其他失败
+    （meta 预检自身的限制）→ 只告警、交给真实加载定夺。预检通过 → 打一行成功证据。
+    """
+    err = _probe_torch_construct(model_path)
+    if err is None:
+        print(f"[rollout] torch 副本预检通过：本进程可构造 {model_path}"
+              f"（多模态/文本 ckpt 的 torch 侧加载形态已确认可用）", flush=True)
+        return
+    if "vocab_size" in err:
+        raise RuntimeError(
+            f"[rollout] torch 侧副本无法加载（{model_path}）：{err}\n"
+            f"  这是 docs/04 A1（复合多模态 config 喂文本类），gen 侧副本是它的第三个"
+            f"入口（用 --verify_gen_logps 做对拍时踩到）。"
+            f"{'该 ckpt 顶层确实没有 vocab_size（在 text_config 里）——本环境未修复此不兼容。' if _is_multimodal_ckpt(model_path) else ''}\n"
+            f"  改法一（定版分裂加载）：model_path=<纯文本目录，如 /root/Qwen3.5-4B-text> "
+            f"+ --vllm_model_path <多模态目录>；\n"
+            f"  改法二（放弃对拍窗口）：去掉 --verify_gen_logps（副本只在 vllm_gen_logps "
+            f"档位做对拍时才加载）。")
+    print(f"[rollout][警告] torch 副本预检失败但**不像 A1**，继续让真实加载定夺：{err}",
+          flush=True)
 
 
 def _check_vllm_gen_kwargs(kwargs: dict) -> None:
@@ -691,30 +787,39 @@ def gen_worker(Q, cfg: dict):
     # 首例 gdn_prefill_backend=triton：Qwen3.5 的 GDN 层默认走 FlashInfer JIT 现场
     # 编译，nvcc 的宿主 RAM 峰值与三方搬权重的启动期重合 → 生成端被 SIGKILL 带走、
     # 无 traceback（详见 config.vllm_gen_kwargs 的症状→根因记录）。
+    # 【副本档位判定前置】这两行只读 cfg、与引擎无关——提前到 LLM() 之前，好让 A1
+    # 护栏在任何 GPU 分配**之前**拦下（否则要先花 ~1 分钟把 vLLM 起起来才崩，2026-09-14
+    # 实机就是这么白烧了 2.5 分钟才看到一条 transformers 内部 traceback）。
+    _use_vllm_logps = bool(cfg.get("vllm_gen_logps")) and cfg["algo"] in ("retool", "retool_math")
+    _verify_budget = int(cfg.get("verify_gen_logps", 0) or 0)
+    if (not _use_vllm_logps) or _verify_budget > 0:
+        _assert_torch_replica_loadable(cfg["model_path"])   # A1：复合 ckpt 进不了 torch
     _gen_kwargs = cfg.get("vllm_gen_kwargs") or {}
     _check_vllm_gen_kwargs(_gen_kwargs)   # 键名错 = 静默忽略 = 修复白做，必须构造前拦
     vllm_gen = LLM(model=cfg.get("vllm_model_path") or cfg["model_path"],
                    gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
                    **_gen_kwargs)
     if _gen_kwargs:
-        # 「开了 X」与「X 在生效」是两回事（docs/04 §5.3）：这行回读是唯一能当场
-        # 证明 kernel 换成功了的证据（读回 None = 没落到 config，键名多半被忽略）。
+        # 「开了 X」与「X 在生效」是两回事（docs/04 §5.3）：回读是唯一能当场证明 kernel
+        # 换成功了的证据。**None 有歧义**（键被忽略 / 我找错了地方），故把"相近键名"
+        # 一并打出来自解释：有相近名字=布局变了（值大概率生效），一个都没有=真被忽略。
         print(f"[rollout] vLLM 引擎参数透传: {_gen_kwargs}", flush=True)
         for _k in sorted(_gen_kwargs):
-            print(f"[rollout]   回读 {_k} = {_vllm_config_readback(vllm_gen, _k)!r}"
-                  f"（None=没落到引擎 config，vLLM 可能静默忽略了该键）", flush=True)
+            _v, _hints = _vllm_config_readback(vllm_gen, _k)
+            print(f"[rollout]   回读 {_k} = {_v!r}"
+                  f"{'' if _v is not None else f'｜相似键名 {_hints}（空=图里没这个名字，多半被静默忽略；非空=布局变了，值仍可能生效）'}",
+                  flush=True)
     # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）。
     # 【减法① 2026-09-11】vllm_gen_logps 档位改用逐轮采样 logprobs，不再需要副本
     # ——GPU0 省 ~8G（可抬高 gen_gpu_mem 扩大 KV 池提速生成）；仅当要对拍
-    # （verify_gen_logps>0）时才临时加载，验完立即释放。
-    _use_vllm_logps = bool(cfg.get("vllm_gen_logps")) and cfg["algo"] in ("retool", "retool_math")
-    _verify_budget = int(cfg.get("verify_gen_logps", 0) or 0)
+    # （verify_gen_logps>0）时才临时加载，验完立即释放。（档位判定已前置到 LLM() 之前）
     # SamplingParams 的可用字段（msgspec/dataclass 两代实现）——logprobs_mode 是
     # 较新版本才有的字段，老版本硬传会 TypeError，用字段表探测而不是 try/except
     _sp_fields = set(getattr(SamplingParams, "__struct_fields__", ()) or ()) | \
         set(getattr(SamplingParams, "__dataclass_fields__", {}) or {})
     _torch_holder = [None]
     if (not _use_vllm_logps) or _verify_budget > 0:
+        # A1 护栏已在 LLM() 之前拦过（见上），此处只负责加载
         _torch_holder[0] = AutoModelForCausalLM.from_pretrained(
             cfg["model_path"], torch_dtype=torch.bfloat16,
             _attn_implementation=cfg.get("attn_implementation", "sdpa")).cuda().eval()

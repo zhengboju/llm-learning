@@ -676,13 +676,13 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 | `rlab/health.py` | 已改（09-13：`maybe_check` 滚动门，修 P1 检查点盲窗） |
 | `rlab/run_gsm8k.sh` | 已改（09-13：旧 `step_*` 默认拒绝启动 + `OUT_DIR` 透传给 train） |
 | `rlab/tests/test_smoke_cpu.py` | 已改（+19 项 09-12、pair_eval +3 项 09-13；`[H]` 抽取自检 +4 项 09-14，**71 项全过**） |
-| `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，09-13；**09-14 修脆性断言**：`[T]` 段 `--attn_implementation "$ATTN_IMPL" "$@"` 的字面紧邻判据被 8496f47 插入的 `--out_dir "$OUT_DIR"` 打断，改断言**位置关系**；09-14 vLLM 引擎参数透传 +12 项，**292 项全过**） |
+| `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，09-13；**09-14 修脆性断言**：`[T]` 段 `--attn_implementation "$ATTN_IMPL" "$@"` 的字面紧邻判据被 8496f47 插入的 `--out_dir "$OUT_DIR"` 打断，改断言**位置关系**；09-14 vLLM 引擎参数透传 +12 项，**301 项全过**） |
 | `rlab/extract_text_model.py` | 已改（09-14：`_selfcheck` 三层判据 + 反证控制，见看板 09-14 行） |
 | `rlab/readme.md` | 已改（测试计数与 eval/analysis/train/health 说明） |
 
 验证（2026-09-14 本机实测）：
 - `python -m rlab.tests.test_smoke_cpu` → **71 项全过**
-- `python -m rlab.tests.test_retool_cpu` → **292 项全过**（`[T]` 断言修复前 exit=1：
+- `python -m rlab.tests.test_retool_cpu` → **301 项全过**（`[T]` 断言修复前 exit=1：
   该段是文件靠后的段落，中断导致其后 4 个段从未执行 —— 见下方教训）
 - `test_health_monitor()` / `test_grad_clip_and_run_info()` 隔离运行 → 全过
 - `bash -n run_gsm8k.sh` 通过；全部改动文件 `py_compile` 通过
