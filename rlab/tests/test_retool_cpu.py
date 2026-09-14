@@ -909,6 +909,103 @@ def test_chat_template_kwargs():
           json.loads('{"enable_thinking": false}') == {"enable_thinking": False})
 
 
+def test_vllm_gen_kwargs():
+    """【P2】vLLM 引擎参数透传：起跑期 FlashInfer JIT 编译撞宿主 RAM 上限的规避入口。
+
+    2026-09-14 事故：Qwen3.5 的 GDN prefill 默认 FlashInfer JIT（现场 nvcc），编译
+    窗口与三方搬权重的启动期重合 → 生成端被 OOM-killer 以 SIGKILL 带走、**无任何
+    Python traceback**，训练端只看到"生成端进程已退出"。规避=透传
+    gdn_prefill_backend="triton"（免 nvcc）。本测试覆盖：默认零变化 / 类型闸 /
+    回读容错 / 签名可见性 / 接线（真机才有 vLLM，接线用源码断言兜住）。"""
+    print("[P2] vLLM 引擎参数透传：gdn_prefill_backend=triton 免起跑期 JIT 编译")
+    from rlab.rollout import _check_vllm_gen_kwargs, _vllm_config_readback
+    from rlab.train import run_signature
+
+    cfg = get_config("retool_math", use_wandb=False)
+    check("BASE 默认 vllm_gen_kwargs=None（不传任何引擎参数，历史档位零变化）",
+          cfg["vllm_gen_kwargs"] is None)
+    check("CLI JSON 反序列化形态（与 chat_template_kwargs 同一解析套路）",
+          json.loads('{"gdn_prefill_backend": "triton"}')
+          == {"gdn_prefill_backend": "triton"})
+
+    def _raises(fn, exc):
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception as e:
+            print(f"  !! 期望 {exc.__name__}，实得 {type(e).__name__}: {e}")
+            return False
+        print(f"  !! 期望 {exc.__name__}，实得无异常")
+        return False
+
+    # 【类型闸的反证控制】非 dict 若原样进 LLM(**x)，只会在生成端子进程里炸成一句
+    # "进程已退出"；闸放在 config 层，错误才留在能排查的地方。dict 必须放行（反证）。
+    check("非 dict（如 CLI 递了 JSON 数组）-> config 层 ValueError；dict 放行为反证",
+          _raises(lambda: get_config("retool_math", vllm_gen_kwargs=["triton"]),
+                  ValueError)
+          and get_config("retool_math", vllm_gen_kwargs={"a": 1})["vllm_gen_kwargs"]
+          == {"a": 1})
+
+    # 回读 walk 的容错：真机属性路径随版本漂，读不到必须返回 None 而不是抛
+    # （它是"X 在生效"的唯一现场证据，崩了就白干）
+    class _MC:
+        gdn_prefill_backend = "triton"
+
+    class _VC:
+        model_config = _MC()
+
+    class _Eng:
+        vllm_config = _VC()
+        model_config = _MC()
+
+    class _LLM:
+        llm_engine = _Eng()
+
+    check("回读到生效值（walk LLM.llm_engine.vllm_config.model_config）",
+          _vllm_config_readback(_LLM(), "gdn_prefill_backend") == "triton")
+    check("空替身/键名不存在 -> None 而不抛（路径漂 ≠ 崩）",
+          _vllm_config_readback(object(), "gdn_prefill_backend") is None
+          and _vllm_config_readback(_LLM(), "不存在的键") is None)
+    check("空 kwargs 直接放行（不触发 vLLM import，CPU 可测）",
+          _check_vllm_gen_kwargs({}) is None)
+    try:
+        import vllm  # noqa: F401
+        _has_vllm = True
+    except Exception:
+        _has_vllm = False
+    if _has_vllm:
+        check("键名写错 -> RuntimeError（静默忽略=修复白做，必须拦在构造前）",
+              _raises(lambda: _check_vllm_gen_kwargs({"no_such_engine_key": 1}),
+                      RuntimeError))
+    else:
+        print("  -- 本机无 vLLM：键名闸的真机判据回落为下面的接线断言")
+
+    # 签名可见性：kernel 换了（triton vs flashinfer）不能算同配方——但**不设该键时
+    # 历史签名串必须逐字不变**，否则旧 ckpt 全成"外来签名"，同签名重跑被护栏误拦
+    sig0 = run_signature(cfg)
+    check("不设该键：签名无 vk 段（历史串逐字不变 -> 旧 ckpt 仍算同签名）",
+          "-vk" not in sig0)
+    sig_vk = run_signature({**cfg, "vllm_gen_kwargs": {"gdn_prefill_backend": "triton"}})
+    check("设了该键 -> 签名尾部追加 -vk<键=值>（纯追加，前缀不变）",
+          sig_vk.endswith("-vkgdn_prefill_backend=triton") and sig_vk.startswith(sig0))
+    check("多个键按 key 排序（同配方两次 run 签名逐字可比）",
+          run_signature({**cfg, "vllm_gen_kwargs": {"b": 1, "a": 2}})
+          .endswith("-vka=2,b=1"))
+
+    # 接线（无 GPU 的机器上唯一能验的部分：真机构造路径由源码断言兜住）
+    rollout_src = open("rlab/rollout.py", encoding="utf-8").read()
+    train_src = open("rlab/train.py", encoding="utf-8").read()
+    check("gen_worker 把透传 dict 展开进 LLM(**kwargs)",
+          "**_gen_kwargs)" in rollout_src)
+    check("键名闸在 LLM 构造**之前**（构造本身就是那次 JIT，事后回读来不及）",
+          rollout_src.index("_check_vllm_gen_kwargs(_gen_kwargs)")
+          < rollout_src.index("vllm_gen = LLM("))
+    check("train.py CLI --vllm_gen_kwargs 映射到 overrides",
+          '"--vllm_gen_kwargs"' in train_src
+          and 'overrides["vllm_gen_kwargs"] = json.loads(args.vllm_gen_kwargs)' in train_src)
+
+
 def test_split_load_remap():
     print("[Q] 分裂加载键名映射：多模态 vLLM + 纯文本 torch（Qwen3.5 实锤）")
     from rlab.sync import remap_text_to_multimodal, sync_weights_into_vllm
@@ -1029,10 +1126,18 @@ def test_attn_impl():
           '_attn_implementation=cfg.get("attn_implementation", "sdpa")' in rollout_src)
     check("ref_server.py FA2 档位自动降 bf16（FA2 不支持 fp32）",
           'torch.bfloat16 if attn_implementation == "flash_attention_2"' in ref_src)
+    # 【2026-09-14 修脆性断言】原判据是字面串 '--attn_implementation "$ATTN_IMPL" "$@"'，
+    # 8496f47 往 "$@" 之前插入 '--out_dir "$OUT_DIR"'（护栏/record 归档跟随用户目录）后，
+    # 两者不再字面紧邻 → 断言变红；而它要保的契约其实完好：注入 flag 排在 "$@" 之前，
+    # argparse 后者胜、用户可覆盖。原写法把"参数顺序契约"和"字面排版"混为一谈。
+    # 改断言**位置关系**（同文件 train_src.index(...) < train_src.index("import torch")
+    # 是同范式），锚在 train 调用内部——以后再往中间插 flag、或在别处写 "$@" 注释都不会误报。
+    _train_i = sh_src.index("python -m rlab.train")
+    _inj_i = sh_src.index('--attn_implementation "$ATTN_IMPL"', _train_i)  # train 那处注入
+    _argv_i = sh_src.index('"$@"', _train_i)                              # train 的用户参数兜底
     check("run_gsm8k.sh 把 ATTN_IMPL 注入 ref_server 与 train 两处（手动传参可覆盖："
           "注入 flag 在 \"$@\" 之前，argparse 后者胜）",
-          sh_src.count('--attn_implementation "$ATTN_IMPL"') == 2
-          and '--attn_implementation "$ATTN_IMPL" "$@"' in sh_src)
+          sh_src.count('--attn_implementation "$ATTN_IMPL"') == 2 and _inj_i < _argv_i)
     check("train.py CLI choices 含 flash_attention_2",
           '"flash_attention_2"' in train_src and "--attn_implementation" in train_src)
 
@@ -1770,6 +1875,7 @@ if __name__ == "__main__":
     test_probe_aggregate()
     test_sandbox_hardening()
     test_chat_template_kwargs()
+    test_vllm_gen_kwargs()
     test_split_load_remap()
     test_chunked_logps()
     test_alloc_conf_ipc()

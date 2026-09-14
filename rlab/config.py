@@ -205,6 +205,18 @@ BASE = dict(
     gen_gpu_mem=0.45,        # 生成端 vLLM 显存占比（GPU0 = ref~7G + vLLM + 副本~7G
                              # + logits 瞬时峰~12G，0.45×96 总计 ~70G < 96G；2026-09-09
                              # 提速：旧 0.35 的 KV 池对 3B+GQA 大量闲置）
+    # 【2026-09-14 起跑期 OOM-kill】vLLM 引擎参数透传（None=不传，历史行为零变化）。
+    # 直接进 gen_worker 的 LLM(**kwargs)，键名用 vLLM 的**下划线**形态：
+    #   CLI --gdn-prefill-backend triton  →  {"gdn_prefill_backend": "triton"}
+    # 首例用途与动机（症状→根因）：Qwen3.5 的 GDN 线性注意力层，vLLM 默认走
+    # **FlashInfer JIT 现场编译**（不是 AOT 预编译件）。编译窗口恰好落在 ref/gen/
+    # train 三方同时把 4B 权重搬进主机内存的启动期，nvcc 的宿主 RAM 峰值把 60G
+    # 容器顶爆：ninja 被 OOM-killer 以 SIGKILL 带走（日志里只有 "ninja ... died
+    # with <Signals.SIGKILL>"、零编译输出），紧接着生成端进程也被杀——**没有任何
+    # Python traceback**，训练端只看到一句"生成端进程已退出"，排查方向被带偏到
+    # 显存/权重同步。triton 后端不需要 nvcc，从根上消掉这段起跑期编译（代价只在
+    # prefill，而负载是 3072 token 的 decode 为主，占比小）。
+    vllm_gen_kwargs=None,
     ref_server_host="localhost",
     ref_server_port=59875,
     wandb_project="rlab",
@@ -408,6 +420,16 @@ def get_config(algo: str, **overrides) -> dict:
     _env_bc = os.environ.get("FWD_BATCH_CHUNK")
     if _env_bc and "fwd_batch_chunk" not in overrides:
         cfg["fwd_batch_chunk"] = int(_env_bc)
+    # vLLM 引擎参数透传的类型闸：非 dict（如 CLI 递了 JSON 数组/字符串）若原样进
+    # LLM(**x)，会以 TypeError 在**生成端子进程**里炸——而生成端崩溃的表现只是训练端
+    # 一句"生成端进程已退出"（见 config.vllm_gen_kwargs 注释里的同类盲区）。在配置层
+    # fail-fast，错误才留在能排查的地方。
+    _vk = cfg.get("vllm_gen_kwargs")
+    if _vk is not None and not isinstance(_vk, dict):
+        raise ValueError(
+            f"[config] vllm_gen_kwargs 必须是 dict 或 None，收到 "
+            f"{type(_vk).__name__}（{_vk!r}）；CLI 形态："
+            "--vllm_gen_kwargs '{\"gdn_prefill_backend\": \"triton\"}'")
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
     return cfg

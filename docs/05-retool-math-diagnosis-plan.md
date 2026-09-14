@@ -305,6 +305,30 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 `guard_ckpt_collision` 不会放行同目录；② pod 上先 `git pull`；③ 若 `retool_math_run2b`
 已有半截 `step_*`（09-13 首跑被旧版护栏误拦前可能已建目录），先确认是续跑还是换目录。
 
+> **⚠️ 09-14 已知起跑故障：生成端被 OOM-killer 带走（无 traceback）**
+>
+> 09-14 首跑在起跑 ~1 分钟后中止，训练端报「生成端进程已退出」。**生成端没有任何
+> Python traceback**——它是被信号杀死的：Qwen3.5 的 GDN 线性注意力层，vLLM 默认对
+> prefill 走 **FlashInfer JIT 现场编译**（不是 AOT 预编译件，`/root/.cache/flashinfer/`
+> 不跨 pod），而这段 nvcc 编译恰好落在 ref/gen/train 三方同时搬权重的启动期；本机 RAM
+> 稳态已 ~50G/上限 60G，编译峰值直接顶爆。日志特征是 `ninja ... died with
+> <Signals.SIGKILL>` **且零编译输出**（真编译错误会打一屏 nvcc 报错）+ 生成端无 traceback。
+> **别顺着 train.py 那句"常见原因：显存不足/权重同步失败"去查 GPU。**
+>
+> 两个规避（**二选一，且都会改 prefill kernel，故签名已捕获**）：
+> ① 推荐 `--vllm_gen_kwargs '{"gdn_prefill_backend": "triton"}'`（免 nvcc；代价只在
+>    prefill，负载是 3072 token 的 decode 为主）。首跑自检：日志须有
+>    `[rollout] 回读 gdn_prefill_backend = 'triton'`（回读 None = vLLM 静默忽略了该键名，
+>    等于没修），且不再出现 `Using FlashInfer GDN prefill kernel`；签名多出
+>    `-vkgdn_prefill_backend=triton` 后缀。
+> ② 要保持 flashinfer 原配方：起跑前空载窗口预热编译一次
+>    （`MAX_JOBS=1 python -c "import torch; torch.zeros(1,device='cuda');
+>    from flashinfer.gdn_prefill import get_gdn_prefill_module as g; print(g())"`），
+>    缓存落 `/root/.cache/flashinfer/`，之后训练启动只加载不编译。
+>
+> 确诊命令（尚未回填）：`cat /sys/fs/cgroup/memory.events`（看 `oom_kill`）+
+> `cat /sys/fs/cgroup/memory.max`（**别信 `free -g`**，它报的是宿主内存）。
+
 评测（对齐 §7.1 路线：`materialize_mm_ckpt` 物化 → `eval_vllm.py` 调度 → `eval_vllm_all.json`，
 N=500 / greedy / seed=42），然后走 `pair_eval` 三方配对：
 
@@ -652,13 +676,13 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 | `rlab/health.py` | 已改（09-13：`maybe_check` 滚动门，修 P1 检查点盲窗） |
 | `rlab/run_gsm8k.sh` | 已改（09-13：旧 `step_*` 默认拒绝启动 + `OUT_DIR` 透传给 train） |
 | `rlab/tests/test_smoke_cpu.py` | 已改（+19 项 09-12、pair_eval +3 项 09-13；`[H]` 抽取自检 +4 项 09-14，**71 项全过**） |
-| `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，09-13；**09-14 修脆性断言**：`[T]` 段 `--attn_implementation "$ATTN_IMPL" "$@"` 的字面紧邻判据被 8496f47 插入的 `--out_dir "$OUT_DIR"` 打断，改断言**位置关系**，**280 项全过**） |
+| `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，09-13；**09-14 修脆性断言**：`[T]` 段 `--attn_implementation "$ATTN_IMPL" "$@"` 的字面紧邻判据被 8496f47 插入的 `--out_dir "$OUT_DIR"` 打断，改断言**位置关系**；09-14 vLLM 引擎参数透传 +12 项，**292 项全过**） |
 | `rlab/extract_text_model.py` | 已改（09-14：`_selfcheck` 三层判据 + 反证控制，见看板 09-14 行） |
 | `rlab/readme.md` | 已改（测试计数与 eval/analysis/train/health 说明） |
 
 验证（2026-09-14 本机实测）：
 - `python -m rlab.tests.test_smoke_cpu` → **71 项全过**
-- `python -m rlab.tests.test_retool_cpu` → **280 项全过**（`[T]` 断言修复前 exit=1：
+- `python -m rlab.tests.test_retool_cpu` → **292 项全过**（`[T]` 断言修复前 exit=1：
   该段是文件靠后的段落，中断导致其后 4 个段从未执行 —— 见下方教训）
 - `test_health_monitor()` / `test_grad_clip_and_run_info()` 隔离运行 → 全过
 - `bash -n run_gsm8k.sh` 通过；全部改动文件 `py_compile` 通过

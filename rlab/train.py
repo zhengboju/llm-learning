@@ -78,10 +78,18 @@ def run_signature(cfg: dict) -> str:
     lr = cfg.get("lr")
     lr_tag = f"{lr:g}" if isinstance(lr, (int, float)) else str(lr)
     ts = float(cfg.get("trunc_shaping") or 0.0)
+    # 【2026-09-14】vLLM 引擎参数透传（config.vllm_gen_kwargs）一旦设置，prefill 的
+    # kernel 就换了 → 首轮 logits 的数值路径与 flashinfer 档不同。这类偏离不进签名
+    # 就会静默混进"同配方重跑"的对照里，而 P1b 的定标恰恰靠配方干净。
+    # 【刻意的例外：缺项不写占位符】与"缺项写 -"的固定字段不同，不设该键时**一个
+    # 字符都不加**——历史签名串必须逐字不变，否则所有旧 ckpt 都成了"外来签名"，
+    # 同签名重跑会被 guard_ckpt_collision 误拦。语义上也自洽：没设该键 = 同一配方。
+    vk = cfg.get("vllm_gen_kwargs") or {}
+    vk_tag = "" if not vk else "-vk" + ",".join(f"{k}={vk[k]}" for k in sorted(vk))
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -439,6 +447,12 @@ def main():
     ap.add_argument("--gen_gpu_mem", type=float, default=None,
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
+    ap.add_argument("--vllm_gen_kwargs", default=None,
+                    help='JSON dict 透传 vLLM 引擎构造参数（键名用下划线形态）。'
+                         '首例：\'{"gdn_prefill_backend": "triton"}\' —— Qwen3.5 的 '
+                         'GDN prefill 默认走 FlashInfer JIT 现场编译，该编译窗口与'
+                         '三方搬权重的启动期重合会撞宿主 RAM 上限（生成端被 SIGKILL '
+                         '带走、无 traceback）；triton 后端免 nvcc')
     ap.add_argument("--zero_stage", type=int, default=None,
                     help="DeepSpeed zero stage（默认 0；4B 用 2 = 优化器态 offload "
                          "CPU，GPU1 静态 64G->24G）")
@@ -519,6 +533,8 @@ def main():
     if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk
     if args.vllm_gen_logps: overrides["vllm_gen_logps"] = True
     if args.verify_gen_logps is not None: overrides["verify_gen_logps"] = args.verify_gen_logps
+    if args.vllm_gen_kwargs:   # 类型闸在 config.get_config（非 dict 在生成端只会表现为"进程已退出"）
+        overrides["vllm_gen_kwargs"] = json.loads(args.vllm_gen_kwargs)
 
     cfg = get_config(args.algo, **overrides)
     # 【2026-09-12】偏离签名先算好再打印/落盘：wandb run name 与 run_info.json 同源，

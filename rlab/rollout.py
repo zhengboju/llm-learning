@@ -609,6 +609,55 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     return results
 
 
+def _vllm_config_readback(llm, key: str):
+    """best-effort 回读一个 vLLM 构造参数是否真落到了引擎 config（只作可观测，不作
+    判据：版本间属性路径会漂，读不到返回 None 而不抛）。
+
+    【为什么需要】vLLM 对不认识的 LLM(**kwargs) 参数是**静默忽略**的，而"开了开关"
+    与"开关生效"在这里代价不同（docs/04 §5.3）：前者省掉一次起跑期 nvcc，后者直接
+    再撞一次宿主 RAM OOM-kill。walk 路径：LLM.llm_engine[.vllm_config].model_config。
+    """
+    eng = getattr(llm, "llm_engine", None)
+    for obj in (eng, getattr(eng, "vllm_config", None),
+                getattr(getattr(eng, "vllm_config", None), "model_config", None),
+                getattr(eng, "model_config", None)):
+        if obj is not None and hasattr(obj, key):
+            return getattr(obj, key)
+    return None
+
+
+def _check_vllm_gen_kwargs(kwargs: dict) -> None:
+    """fail-fast：在**构造 LLM 之前**把 vLLM 不认识的引擎参数键名拦下。
+
+    【为什么不能只靠回读】LLM(...) 的构造过程本身就是那次 FlashInfer JIT（GDN warmup
+    跑在引擎初始化里）——等构造完再回读，进程可能已经被 OOM-killer 带走了。判据必须
+    在构造之前。键名表取自 vLLM 自己的 CLI 注册表（EngineArgs.add_cli_args），不硬编码
+    键名；探测不到该入口（版本漂）时**跳过检查**并告警，宁可不拦、不可错拦。
+    """
+    if not kwargs:
+        return
+    try:
+        import argparse
+        from vllm.engine.arg_utils import EngineArgs
+        parser = argparse.ArgumentParser(add_help=False)
+        EngineArgs.add_cli_args(parser)
+        known = {a.dest for a in parser._actions}   # dest 即下划线键名（--gdn-prefill-backend -> gdn_prefill_backend）
+    except Exception as e:
+        print(f"[rollout][警告] 无法核对 vLLM 引擎参数键名（{type(e).__name__}: {e}）"
+              f"——键名写错会被 vLLM 静默忽略，请自查", flush=True)
+        return
+    unknown = sorted(set(kwargs) - known)
+    if not unknown:
+        return
+    near = sorted(k for k in known if any(t in k for t in ("gdn", "attn", "eager", "logits")))
+    raise RuntimeError(
+        f"[rollout] vllm_gen_kwargs 里有 vLLM 不认识的键：{unknown}\n"
+        f"  vLLM 对未知构造参数是静默忽略的——键名写错的代价是「修复看起来做了、"
+        f"实际没做」（照旧走 FlashInfer JIT -> 起跑期被 OOM-kill，且无 traceback）。\n"
+        f"  键名用下划线形态：CLI 的 --gdn-prefill-backend 对应 gdn_prefill_backend。\n"
+        f"  相近的已注册键样例：{near[:12]}")
+
+
 def gen_worker(Q, cfg: dict):
     """生成端主入口（由 train.py rank0 spawn，或分进程模式独立运行）。
 
@@ -638,8 +687,22 @@ def gen_worker(Q, cfg: dict):
     # 多给 vLLM 显存主要扩大 continuous batching 的调度余量。
     # 【2026-09-11】vllm_gen_logps 档位不再加载 torch 副本（见下），腾出的 ~8G
     # 应回灌给 vLLM（gen_gpu_mem 0.30 → 0.38 量级）——生成是每步耗时的大头。
+    # 【2026-09-14 起跑期 OOM-kill】引擎参数透传（config.vllm_gen_kwargs，None=零变化）。
+    # 首例 gdn_prefill_backend=triton：Qwen3.5 的 GDN 层默认走 FlashInfer JIT 现场
+    # 编译，nvcc 的宿主 RAM 峰值与三方搬权重的启动期重合 → 生成端被 SIGKILL 带走、
+    # 无 traceback（详见 config.vllm_gen_kwargs 的症状→根因记录）。
+    _gen_kwargs = cfg.get("vllm_gen_kwargs") or {}
+    _check_vllm_gen_kwargs(_gen_kwargs)   # 键名错 = 静默忽略 = 修复白做，必须构造前拦
     vllm_gen = LLM(model=cfg.get("vllm_model_path") or cfg["model_path"],
-                   gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)))
+                   gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
+                   **_gen_kwargs)
+    if _gen_kwargs:
+        # 「开了 X」与「X 在生效」是两回事（docs/04 §5.3）：这行回读是唯一能当场
+        # 证明 kernel 换成功了的证据（读回 None = 没落到 config，键名多半被忽略）。
+        print(f"[rollout] vLLM 引擎参数透传: {_gen_kwargs}", flush=True)
+        for _k in sorted(_gen_kwargs):
+            print(f"[rollout]   回读 {_k} = {_vllm_config_readback(vllm_gen, _k)!r}"
+                  f"（None=没落到引擎 config，vLLM 可能静默忽略了该键）", flush=True)
     # torch 副本：只用它前向算 gen_logps（vLLM prompt_logprobs 路径 hang 的教训）。
     # 【减法① 2026-09-11】vllm_gen_logps 档位改用逐轮采样 logprobs，不再需要副本
     # ——GPU0 省 ~8G（可抬高 gen_gpu_mem 扩大 KV 池提速生成）；仅当要对拍
