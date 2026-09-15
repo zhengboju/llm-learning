@@ -15,6 +15,10 @@ fla 的护栏拒绝了坏 triton 组合。修复走 tilelang 后端（详见
   C. 判定闸门：全过 / 单项超阈值 / 缺失项 / NaN / inf 的判定与报告行。
   D. 【反证】注入已知错误（梯度置零、梯度整体缩放、元素错位）→ **判据必须爆**。
      抓不住注入错误的判据等于没有判据。
+  E. 起跑前置判据（guard_risk）：拦截/放行 + 三条件各拿掉一个的反证。
+  F. tilelang **可用性**判据（tilelang_verdict）—— 09-15 实机第二次假阳性：装了包、
+     find_spec/is_available/is_enabled 三绿，但真 import 缺 libz3.so.4.15 而失败。
+     判据必须按能力（真 import）而不是按形状（包在不在）。
 
 运行：python -m rlab.tests.test_gdn_backend_cpu
 """
@@ -145,6 +149,51 @@ def main():
     msg = guard_risk(is_hopper=True, triton_bad=True, tilelang_ok=False)
     check("拦截消息点名了 chunk_bwd_dqkwg 与 tilelang（可行动）",
           "chunk_bwd_dqkwg" in msg and "tilelang" in msg)
+    # 失败信息要能**分辨两种假设**："没装"与"装了但加载不起来"的修法完全不同
+    check("拦截消息带上具体原因（分辨'没装'与'装了但用不了'）",
+          "未装 tilelang" in guard_risk(is_hopper=True, triton_bad=True,
+                                        tilelang_ok=False, note="未装 tilelang"))
+
+    print("\n[F] tilelang 可用性判据（09-15 第二次假阳性的正解）")
+    from rlab.preflight_gdn import tilelang_verdict
+
+    ok_f, why_f = tilelang_verdict(installed=True, import_error=None,
+                                   backend_available=True, backend_enabled=True)
+    check("装了 + 真 import 通过 + fla 启用 → 可用", ok_f)
+    check("理由说明是'真 import 通过'（不是 find_spec）", "import" in why_f)
+
+    # ★ 正体：09-15 实机就是这一行 —— 三个代理旗标全绿，import 挂
+    Z3_ERR = ("OSError: libz3.so.4.15: cannot open shared object file: "
+              "No such file or directory")
+    ok_i, why_i = tilelang_verdict(installed=True, import_error=Z3_ERR,
+                                   backend_available=True, backend_enabled=True)
+    check("①【代理判据假阳性】三绿但 import 失败 → 判不可用", not ok_i)
+    check("① 理由带真实错误串（libz3 可定位）", "libz3" in why_i and "import" in why_i)
+    # 反证：同一组事实只把 import_error 置 None，判定必须翻转 —— 证明这条差别真的在起作用
+    ok_i2, _ = tilelang_verdict(installed=True, import_error=None,
+                                backend_available=True, backend_enabled=True)
+    check("① 反证：同一事实把 import_error 置 None → 判定翻转", ok_i2)
+
+    ok_n, why_n = tilelang_verdict(installed=False, import_error=None,
+                                   backend_available=False, backend_enabled=False)
+    check("② 未装 → 不可用，理由给出装法", not ok_n and "pip install" in why_n)
+    ok_a, why_a = tilelang_verdict(installed=True, import_error=None,
+                                   backend_available=False, backend_enabled=True)
+    check("③ import 过了但 nvcc 不可用 → 不可用（两个代理条件仍要各自把关）",
+          not ok_a and "nvcc" in why_a)
+    ok_e, why_e = tilelang_verdict(installed=True, import_error=None,
+                                   backend_available=True, backend_enabled=False)
+    check("④ 被 FLA_TILELANG=0 关掉 → 不可用", not ok_e and "FLA_TILELANG" in why_e)
+    ok_b, _ = tilelang_verdict(installed=True, import_error=None, backend_available=True,
+                               backend_enabled=True, backend_error="ImportError: x")
+    check("⑤ fla 后端模块本身 import 失败 → 不可用（不冒充'没装'）", not ok_b)
+
+    # 反证总闸：四个条件各拿掉一个都必须翻转，否则判据可能恒真
+    check("反证总闸：四条件全真才可用（任一为假即不可用）",
+          all(not tilelang_verdict(installed=i, import_error=e,
+                                   backend_available=a, backend_enabled=n)[0]
+              for i, e, a, n in [(False, None, True, True), (True, Z3_ERR, True, True),
+                                 (True, None, False, True), (True, None, True, False)]))
 
     print(f"\n{len(PASS)} 项全部通过")
     return 0

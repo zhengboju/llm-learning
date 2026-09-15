@@ -24,6 +24,25 @@ backward 必撞。
      其余 common 算子仍走 triton —— 前向与生成端的数值路径完全不变。
   ③ 什么都不做 —— 训练跑不起来。
 
+【坑中坑：装了 tilelang ≠ 能用（2026-09-15 实机）】
+
+`pip install tilelang --no-deps` 之后环境行**三绿**（已装=True、backend可用=True、
+backend启用=True），Q1 却直接 OSError：
+
+    File "fla/ops/common/backends/tilelang/chunk_bwd.py", line 8, in <module>
+        import tilelang
+    OSError: libz3.so.4.15: cannot open shared object file: No such file or directory
+
+tilelang 的 libtvm 在 **dlopen 阶段**就要 libz3.so.4.15（TileLang 把 Z3 SMT 求解器
+集成进整数分析 pass，用于 layout inference / bound analysis —— 是**编译期**依赖）。
+而 fla 的 `is_available()` 是 `find_spec("tilelang")` 之类**代理判据**：它证明"包在
+sys.path 上"，证不了"加载得起来"。前向不 import tilelang 所以一路正常，**第一次反向
+dispatch 才炸** —— 代理判据给绿灯，训练照旧死在第一个 backward。
+
+本探针的处置：`tilelang_verdict()`（复用 `rlab/preflight_gdn.py`，CPU 有测试）在代理
+判据之外加一条**真 import**，与训练时那条加载路径同源；不通过就早退，不再把
+"没撞护栏"误读成"tilelang 生效了"。修法见 docs/06 §3.2。
+
 【本探针回答三个问题（每个都带反证对照）】
 
   Q1 tilelang 到底接管了没有、数值对不对？
@@ -86,6 +105,10 @@ OFFICIAL_RATIO = {"o": 0.005, "dq": 0.008, "dk": 0.008,
 # 护栏文案的特征串（判别"是不是这个坑"不依赖行号/版本）
 GUARD_SIGNATURE = "produces incorrect results for"
 GUARD_HINT = "see #640"
+
+# 动态库加载失败的特征串（ld.so 的固定文案）。与护栏是**两种**假设：前者说"不让跑"，
+# 后者说"根本跑不起来"。混成一句"跑不通"就等于没判据。
+DLOPEN_SIGNATURE = "cannot open shared object file"
 
 
 # ---------------------------------------------------------------- 纯函数（CPU 可测）
@@ -185,7 +208,8 @@ def env_facts() -> dict:
     except Exception as exc:                        # pragma: no cover
         facts["fla_utils_error"] = f"{type(exc).__name__}: {exc}"
 
-    # "装了 tilelang" 与 "backend 真能用" 是两回事，分开报
+    # "装了 tilelang" 与 "backend 真能用" 是两回事，分开报。
+    # 【代理层】find_spec + fla 的 is_available/is_enabled —— 只证明"包在"，证不了能 dlopen。
     facts["tilelang_installed"] = importlib.util.find_spec("tilelang") is not None
     try:
         from fla.ops.common.backends.tilelang import TileLangBackend
@@ -194,6 +218,16 @@ def env_facts() -> dict:
     except Exception as exc:                        # pragma: no cover
         facts["tl_available"] = facts["tl_enabled"] = False
         facts["tl_error"] = f"{type(exc).__name__}: {exc}"
+    # 【能力层】真 import 一次 —— 2026-09-15 实机就是在这里翻的车：上面三个旗标全绿，
+    # 但 tilelang 的 libtvm 在 dlopen 阶段要 libz3.so.4.15（TileLang 的编译期 SMT 依赖），
+    # OSError 一路飘到训练第一个 backward 才炸。判据必须与真实加载路径同源。
+    from rlab.preflight_gdn import probe_tilelang_import, tilelang_verdict
+    facts["tl_import_error"] = (probe_tilelang_import()
+                                if facts["tilelang_installed"] else None)
+    facts["tl_ok"], facts["tl_why"] = tilelang_verdict(
+        installed=facts["tilelang_installed"], import_error=facts["tl_import_error"],
+        backend_available=facts["tl_available"], backend_enabled=facts["tl_enabled"],
+        backend_error=facts.get("tl_error"))
     return facts
 
 
@@ -206,11 +240,22 @@ def print_env(f: dict) -> None:
         return
     print(f"[probe] fla 护栏条件: hopper={f['is_hopper']} triton>=3.4.0={f['triton_34']} "
           f"triton>=3.7.1={f['triton_371']} → 会触发护栏={f['guard_would_fire']}")
-    print(f"[probe] tilelang: 已装={f['tilelang_installed']} nvcc可用={f.get('nvcc')} "
-          f"backend可用={f['tl_available']} backend启用={f['tl_enabled']}")
+    imp = f.get("tl_import_error")
+    print(f"[probe] tilelang: 已装={f['tilelang_installed']} "
+          f"真import={'通过' if (not imp and f['tilelang_installed']) else ('未跑' if not f['tilelang_installed'] else '失败')} "
+          f"nvcc可用={f.get('nvcc')} backend可用={f['tl_available']} "
+          f"backend启用={f['tl_enabled']}")
     if not f["guard_would_fire"]:
         print("[probe] → 护栏条件不成立：当前 triton 不在坏区间（或非 Hopper），"
               "本来就不会撞这个坑")
+    elif imp:
+        # 代理判据与真实能力打架：三绿齐亮但加载不起来。这是 2026-09-15 实机的形态，
+        # 单列一段，避免被上面那行"backend可用=True"盖过去。
+        print("[probe] !! 代理判据假阳性：find_spec / backend 旗标都说可用，"
+              "但真 import 失败 ——")
+        print(f"[probe]    {imp}")
+        print("[probe]    装了包 ≠ 能用：包在 sys.path 上，证不了 dlopen 得起来。"
+              "缺 .so 的修法见 docs/06 §3.2")
     elif not f["tilelang_installed"]:
         print("[probe] → 未装 tilelang：护栏会照常触发。先 `pip install tilelang`")
     elif not f.get("nvcc"):
@@ -407,9 +452,17 @@ def main():
         print(f"\n[probe] 环境缺 fla（或 fla 版本不匹配）：{facts['fla_utils_error']}")
         print("[probe] 本坑的前提是「fla 在跑 GDN」——先确认 fla 装好且可 import")
         return 1
-    if not facts.get("tilelang_installed"):
-        print("\n[probe] 未装 tilelang，先装再跑本探针（装完必须重启进程："
-              "backend 可用性在 import 期就定死了）")
+    # 闸门按**能力**不按形状：装了包但 import 不通过时，Q1 根本没有意义（chunk 路径
+    # 必挂在同一个 dlopen 上），而且那会让"护栏没触发"被误读成"tilelang 生效了"。
+    if not facts.get("tl_ok"):
+        print(f"\n[probe] tilelang 后端不可用：{facts.get('tl_why')}")
+        if facts.get("tl_import_error"):
+            print("[probe]   装包这步已经做过了，问题在**依赖**：先 `python -c "
+                  "\"import tilelang\"` 复现，缺 .so（libz3.so.4.15 一类）的修法见 "
+                  "docs/06 §3.2")
+        else:
+            print("[probe]   先装好再跑本探针（装完必须重启进程：backend 可用性在 "
+                  "import 期就定死了）")
         return 1
 
     shape = _resolve_shape(args)
@@ -420,11 +473,18 @@ def main():
     print("\n[probe] ===== Q1：chunk 路径（应为 tilelang）vs naive 参考 =====")
     try:
         ratios = compare(shape, _torch_dtype(args.dtype), args.seed, "cuda")
-    except RuntimeError as exc:
-        if GUARD_HINT in str(exc) or GUARD_SIGNATURE in str(exc):
+    except Exception as exc:
+        msg = str(exc)
+        if GUARD_HINT in msg or GUARD_SIGNATURE in msg:
             print("[probe] chunk 路径撞上护栏 —— tilelang 没接管。")
             print("[probe] 对照上面 3 行 tilelang 状态定位原因；装/改完要"
                   "**重启进程**再跑（backend 可用性在 import 期定死）。")
+            return 1
+        # 加载期炸 vs 数值炸：两种假设必须分开报，否则"跑不通"会被笼统归到护栏上
+        if isinstance(exc, OSError) or DLOPEN_SIGNATURE in msg:
+            print("[probe] chunk 路径挂在**动态库加载**上（不是护栏、也不是数值问题）：")
+            print(f"[probe]   {msg.strip().splitlines()[0]}")
+            print("[probe]   装了 tilelang ≠ 能用；缺 .so 的修法见 docs/06 §3.2。")
             return 1
         raise
     ok, lines = judge(ratios)

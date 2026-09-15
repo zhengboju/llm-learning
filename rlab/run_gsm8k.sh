@@ -126,7 +126,9 @@ if [ -f "$MODEL/config.json" ] && grep -q "linear_num_value_heads" "$MODEL/confi
     _rc=$?
     if [ "$_rc" = "3" ]; then
       echo "[run] 致命错误: GDN 反向护栏会拦住这次训练（详见上方 preflight 消息）"
-      echo "[run]   → pip install tilelang --no-deps  然后重跑；装完必须重启进程"
+      echo "[run]   → 没装 tilelang: pip install tilelang --no-deps（装完必须重启进程）"
+      echo "[run]   → 装了但 import 挂（缺 .so）: python -c \"import tilelang\" 复现，"
+      echo "[run]     修法见 docs/06-gdn-backend-tilelang.md §3.2"
       echo "[run]   → 或 ALLOW_GDN_GUARD_RISK=1 bash $0 ... 显式放行"
       exit 1
     fi
