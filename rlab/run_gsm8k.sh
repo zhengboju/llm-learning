@@ -114,6 +114,26 @@ if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
   exit 1
 fi
 
+# Pre-flight 3：GDN 反向护栏风险（2026-09-15 炸点）
+# Hopper + Triton∈[3.4.0,3.7.1) 时 triton 对 gated chunk_bwd_dqkwg 会算错梯度，
+# fla 主动 raise；缺 tilelang 必在**第一个 backward** 崩——那时起跑已烧掉十几分钟
+# （ref 加载 + vLLM 起引擎 + 首轮生成）。这里提前拦，并直接给出修法。
+# 只对**确实带 GDN 层**的模型生效（config 里有 linear_num_value_heads），
+# 免得拦下 Qwen2.5 这类纯注意力模型的合法起跑。
+# 细节与判据见 docs/06-gdn-backend-tilelang.md；逃生阀 ALLOW_GDN_GUARD_RISK=1。
+if [ -f "$MODEL/config.json" ] && grep -q "linear_num_value_heads" "$MODEL/config.json"; then
+  CUDA_VISIBLE_DEVICES=$TRAIN_GPU python -m rlab.preflight_gdn || {
+    _rc=$?
+    if [ "$_rc" = "3" ]; then
+      echo "[run] 致命错误: GDN 反向护栏会拦住这次训练（详见上方 preflight 消息）"
+      echo "[run]   → pip install tilelang --no-deps  然后重跑；装完必须重启进程"
+      echo "[run]   → 或 ALLOW_GDN_GUARD_RISK=1 bash $0 ... 显式放行"
+      exit 1
+    fi
+    echo "[run] preflight_gdn 自身异常（exit=$_rc），不拦，继续"
+  }
+fi
+
 # rfpp 无 KL：config beta=0.0，但 ref_server 默认 --beta 0.04，不显式传会矛盾
 REF_BETA_ARGS=""
 if [ "$ALGO" = "rfpp" ]; then REF_BETA_ARGS="--beta 0.0"; fi

@@ -20,6 +20,8 @@
 | `train.py` | DeepSpeed 训练端主程序（ZeRO-0，rank0 spawn 生成端；协议 mask 感知；run 偏离签名 + ckpt 撞名 fail-fast 护栏） |
 | `eval.py` | 评测入口（委托根目录 eval_vllm.py，协议 N=300 seed=42；--retool 多轮代码评测；per-item 明细默认落盘） |
 | `analysis.py` | eval 汇总表（**N-aware 95%CI + 同题配对 McNemar** 判定，替代旧 ±2pp 固定地板）+ `pair_eval` 跨 json 两两配对（可对照已灭失的 ckpt）+ record.jsonl 曲线 |
+| `preflight_gdn.py` | 起跑前置：GDN 反向护栏风险（Hopper × Triton 坏区间）。`run_gsm8k.sh` Pre-flight 3 自动调，命中即拦并给出修法。见 `docs/06` |
+| `probe_gdn_backend.py` | GDN 反向 kernel 后端探针：三条判据（对拍官方 naive 参考）+ 两条反证（禁用必 raise / 坏 triton 偏离量）+ tilelang JIT 预热。pod 上按 `docs/06` §6 使用 |
 | `tests/test_smoke_cpu.py` | 71 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名/跨 json 配对/抽取自检判据） |
 | `tests/test_retool_cpu.py` | 301 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏是核心学习点）（2026-09-14 实测口径） |
 
