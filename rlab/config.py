@@ -269,13 +269,19 @@ BASE = dict(
     gradient_clipping=0.0,   # DeepSpeed 梯度裁剪（0=不裁剪=历史口径；4B 大 lr 建议 1.0）
     # 【减法① 2026-09-11】gen_logps 来源（仅 retool 家族有效）：
     #   False = torch 副本在拼接序列上重算（历史口径；GPU0 多占 ~8G + 每步一次全序列前向）
-    #   True  = 逐轮 vLLM 采样 logprobs（SamplingParams(logprobs=0) 返回被采样 token 的
+    #   True  = 逐轮 vLLM 采样 logprobs（SamplingParams(logprobs=N) 返回被采样 token 的
     #           logprob）。多轮下每轮请求的上下文已含之前所有工具结果，故逐轮收集拼接
     #           == 在拼接序列上重算，数学严格同义，且完全绕开 prompt_logprobs（那条
     #           路径在本环境会 hang，正是 torch 副本存在的起因）。
     # 口径变化：logps 分母由 torch kernel 换 vLLM kernel（同为 bf16）——首次启用必须
     # 用 verify_gen_logps 对拍并把最大差写进报告。
     vllm_gen_logps=False,
+    # 【2026-09-15 真机实锤】N 的取值决定"报哪条路"：N=0（只报被采样 token）在 vLLM
+    # v0.19.1 + Qwen3.5 GDN 上**报错数**——同一 prompt/位置/token，N=0 报 -0.602，
+    # N=20（raw）报 -7.40、torch 独立重算 -7.400（prefill 位单点差 6.8 nat，训练对拍
+    # 的 max 12.8 同源）；N≥1（top-K 里挑被采样 token）与 torch 的差回落到 mean 0.02/
+    # max 0.23。故 vllm_gen_logps 档位建议 N≥1；默认 0 只为保留 A/B 与旧 run 可复现。
+    vllm_logprobs_n=0,
     verify_gen_logps=0,      # >0：前 N 组同时算两路并打印最大差（临时加载 torch 副本，验完释放）
 
     # ---- 系统提示（与 simple_grpo_v1 完全一致，保证可比）----

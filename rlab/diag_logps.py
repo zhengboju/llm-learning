@@ -947,6 +947,83 @@ def merge_main(args) -> int:
     return 0
 
 
+def lpmode_spread(forms: dict) -> dict:
+    """同一 (位置, token) 在多种**请求形态**下 vLLM 报的 logp 之间的极差。纯函数。
+
+    动机（真机 2026-09-15）：轨迹构建形态（max_tokens=T, logprobs=0）报 -0.602，
+    探针形态（max_tokens=1, logprobs=20）报 -7.40，torch 独立重算 -7.400。两个候选
+    变量（logprobs 的取值 vs max_tokens）必须分开量，才能把 bug 报到正确的地方。"""
+    vals = {k: v for k, v in forms.items() if v is not None}
+    if len(vals) < 2:
+        return {"n_forms": len(vals), "spread": None, "argmax": None, "argmin": None}
+    hi = max(vals, key=lambda k: vals[k])
+    lo = min(vals, key=lambda k: vals[k])
+    return {"n_forms": len(vals), "spread": vals[hi] - vals[lo],
+            "argmax": hi, "argmin": lo, "max": vals[hi], "min": vals[lo]}
+
+
+def run_lpmode_probe(cfg, args, rows):
+    """`--measure lpmode`：同一位置同一 token，四种请求形态各问一次 vLLM（不用 torch）。
+
+    形态（同 seed 采样；**logprobs 只影响上报、不影响采样**，故四条应采到同一 token
+    —— 若采到的 token 不同，那本身是另一个重大发现，直接打印）：
+      A: max_tokens=1, logprobs=0   （只报被采样 token，短请求）
+      B: max_tokens=1, logprobs=K   （top-K，短请求）
+      C: max_tokens=T, logprobs=K   （top-K，训练同形长短请求）
+      D: max_tokens=T, logprobs=0   （**训练/轨迹构建的实际形态**）
+    读法：A≈B 而 D 偏 → 是 max_tokens（生成型请求的上报路径）；
+          A≈D 而 B≈C 偏 → 是 logprobs 的取值（只报单 token 的那条路）。
+    D 与该 token 的"真值"（torch 或 B/C）之差 = 训练端 gen_logps 被污染的量。"""
+    from vllm import LLM, SamplingParams
+
+    kwargs = dict(gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
+                  disable_log_stats=True)
+    vpath = args.vllm_model_path or cfg["model_path"]
+    kwargs.update(vllm_kwargs_for_backend(args.vllm_backend, cfg))
+    T = int(args.lpmode_max_tokens)
+    print(f"[diag] lpmode 探针：model={vpath} K={args.k} T={T} kwargs={kwargs}", flush=True)
+    llm = LLM(model=vpath, **kwargs)
+    forms = {"A_K0_T1": dict(max_tokens=1, logprobs=0),
+             "B_KK_T1": dict(max_tokens=1, logprobs=max(1, args.k)),
+             "C_KK_TT": dict(max_tokens=T, logprobs=max(1, args.k)),
+             "D_K0_TT": dict(max_tokens=T, logprobs=0)}
+    built = {}
+    for name, kw in forms.items():
+        k2 = dict(n=1, temperature=1.0, top_p=1.0, top_k=-1, seed=cfg.get("seed"), **kw)
+        if _sp_logprobs_mode_supported(SamplingParams):
+            k2["logprobs_mode"] = "raw_logprobs"
+        built[name] = SamplingParams(**k2)
+    lens = normalize_prefix_lens(args.prefix_lens)
+    rows_out = []
+    for row in rows:
+        for L in [x for x in lens if x < len(row["ids"])]:
+            ctx = list(row["prompt_ids"]) + list(row["ids"][:L])
+            got, toks = {}, {}
+            for name, sp in built.items():
+                o = llm.generate([{"prompt_token_ids": ctx}], sp, use_tqdm=False)[0].outputs[0]
+                ids = list(o.token_ids or [])
+                if not ids:
+                    got[name] = None
+                    continue
+                toks[name] = int(ids[0])
+                d = (o.logprobs or [{}])[0] or {}
+                lp = d.get(toks[name])
+                got[name] = float(getattr(lp, "logprob", lp)) if lp is not None else None
+            sp_ = lpmode_spread(got)
+            rows_out.append({"provider": "vllm:lpmode", "q": row["q"], "L": L,
+                             "forms": got, "tokens": toks,
+                             "same_token": len(set(toks.values())) == 1,
+                             "spread": sp_.get("spread")})
+            same = len(set(toks.values())) == 1
+            print(f"[diag]   q={row['q']} L={L} token={toks} "
+                  f"{'✅四条同 token' if same else '⚠ 四条采到不同 token（本身是发现）'}")
+            print("[diag]     " + "  ".join(f"{k}={_fmt(v)}" for k, v in got.items())
+                  + f"   → 极差={_fmt(sp_.get('spread'))}"
+                  + (f"（{sp_['argmax']} 最高/{sp_['argmin']} 最低）"
+                     if sp_.get("spread") else ""), flush=True)
+    return "vllm:lpmode", rows_out
+
+
 def _fmt(v):
     return "None" if v is None else f"{v:.3g}"
 
@@ -976,13 +1053,19 @@ def main() -> int:
                          "keep 叠加，保证'探的档'就是'训练那一档'（键名错会被 vLLM 静默忽略）")
     ap.add_argument("--torch_path", default="fla", choices=("fla", "fallback"),
                     help="fallback=打桩强制走纯 torch GDN 回退实现（消融轴）")
-    ap.add_argument("--measure", default="prefill", choices=("prefill", "decode"),
+    ap.add_argument("--measure", default="prefill",
+                    choices=("prefill", "decode", "lpmode"),
                     help="prefill=前缀末位分布对拍（默认，两档消融用）；"
-                         "decode=逐位置被采样 logp 对拍（**训练口径**，且按 prefill/decode "
-                         "位置分开统计；只走 torch 侧，不需要 vLLM）")
+                         "decode=逐位置被采样 logp 对拍（**训练口径**，按 prefill/decode "
+                         "位置分开统计；只走 torch 侧）；"
+                         "lpmode=vLLM 上报路径探针（同一位置同一 token 四种请求形态，"
+                         "定位是 logprobs 取值还是 max_tokens 让报数失真）")
     ap.add_argument("--probe_default", action="store_true",
                     help="vLLM 侧同时测 default 口径（不传 logprobs_mode）并打印"
                          "'vLLM 自身口径差'——把测量口径差从跨引擎 Δ 里分出来")
+    ap.add_argument("--lpmode_max_tokens", type=int, default=32,
+                    help="--measure lpmode 的 T（生成长度形态；默认 32 够触发生成型"
+                         "上报路径，又不必真生成 3072 个 token）")
     ap.add_argument("--torch_device", type=int, default=None, help="None=默认 cuda")
     ap.add_argument("--n", type=int, default=8, help="题数")
     ap.add_argument("--k", type=int, default=20, help="top-K 深度")
@@ -1055,6 +1138,19 @@ def main() -> int:
         out_rows = run_torch_decode(cfg, args, rows)
         if args.out:
             _write_jsonl(args.out, out_rows)
+        return 0
+
+    if args.measure == "lpmode":
+        # 只问 vLLM：把"训练形态上报的数"与同一位置同一 token 的其它上报形态分开量
+        if args.providers != "vllm":
+            raise SystemExit("[diag] --measure lpmode 是 vLLM 侧的报数路径探针："
+                             "请用 --providers vllm")
+        tag, out_rows = run_lpmode_probe(cfg, args, rows)
+        print(f"[diag] provider={tag} 测了 {len(out_rows)} 点")
+        if args.out:
+            _write_jsonl(args.out, out_rows)
+        print("[diag] 读法：A≈B 而 D 偏 → 是 max_tokens（生成型请求的上报路径）；"
+              "A≈D 而 B≈C 偏 → 是 logprobs 取值（只报单 token 那条路）")
         return 0
 
     if args.providers == "vllm":

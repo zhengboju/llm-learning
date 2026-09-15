@@ -1707,8 +1707,9 @@ def test_vllm_gen_logps():
           and 'overrides["vllm_gen_logps"] = True' in tr)
     check("gen_worker 仅在需要时加载 torch 副本（含对拍窗口）",
           "if (not _use_vllm_logps) or _verify_budget > 0:" in ro)
-    check("SamplingParams 在 vLLM 路带 logprobs=0（+ logprobs_mode 字段探测）",
-          'kw["logprobs"] = 0' in ro and '"logprobs_mode" in _sp_fields' in ro)
+    check("SamplingParams 在 vLLM 路带 logprobs=N（cfg 可调，默认 0）+ logprobs_mode 字段探测",
+          'kw["logprobs"] = int(cfg.get("vllm_logprobs_n", 0) or 0)' in ro
+          and '"logprobs_mode" in _sp_fields' in ro)
     # 回归锁：权重同步处曾残留 gen_torch 悬空引用（pyflakes 抓到），无副本时必须跳过
     check("无 torch 副本时权重同步跳过它（不留悬空引用）",
           "gen_torch" not in ro and "if _torch_holder[0] is not None:" in ro)
@@ -2408,6 +2409,73 @@ def test_diag_counter_and_trajid():
           src.count('"traj_id"') >= 4 and src.count("traj_id(rows)") >= 3)
 
 
+def test_logprobs_n_fix_path():
+    """[AH] vLLM 上报路径修复档：`vllm_logprobs_n` + lpmode 探针（真机 2026-09-15）。
+
+    实锤：同一 prompt/位置/token，`logprobs=0` 报 -0.602，而 `logprobs=20`(raw) 报
+    -7.40、torch 独立重算 -7.400 —— 训练端 gen_logps 走的正是 N=0 这条形态，所以
+    对拍 max 12.8 / clip_frac 0.9% 量的是**上报 bug**，不是模型差。修复档 = 改用
+    N≥1（top-K 里挑被采样 token）并保持 fail-fast。"""
+    print("[AH] vLLM logprobs=N 修复档 + lpmode 形态探针")
+    import inspect
+
+    import rlab.rollout as R
+    from rlab.config import ALGO_DEFAULTS, BASE
+    from rlab.diag_logps import lpmode_spread
+
+    check("config 新增 vllm_logprobs_n（默认 0 = 保留旧行为便于 A/B）",
+          BASE.get("vllm_logprobs_n") == 0)
+    src = inspect.getsource(R.gen_worker)
+    check("make_retool_sps 用 cfg 的 vllm_logprobs_n 而不是硬编码 0",
+          'kw["logprobs"] = int(cfg.get("vllm_logprobs_n", 0) or 0)' in src)
+    check("raw_logprobs 仍显式声明（口径不被版本默认值左右）",
+          'kw["logprobs_mode"] = "raw_logprobs"' in src)
+    for algo in ("retool", "retool_math"):
+        check(f"{algo} preset 未偷偷覆盖 N（档位由 CLI 决定）",
+              "vllm_logprobs_n" not in ALGO_DEFAULTS.get(algo, {}))
+
+    # N≥1 时 vLLM 必须仍把被采样 token 放进返回字典 —— 缺了就 fail-fast 且提示别退回 N=0
+    class _LP(dict):
+        pass
+
+    class _Out:
+        def __init__(self, entries):
+            self.logprobs = entries
+
+    good = _Out([{7: type("L", (), {"logprob": -0.25})()},
+                 {9: type("L", (), {"logprob": -1.5})(), 3: type("L", (), {"logprob": -2.0})()}])
+    check("N≥1：从 top-K 字典里取被采样 token 的值",
+          R.sampled_logps_from_output(good, [7, 9]) == [-0.25, -1.5])
+    bad = _Out([{7: type("L", (), {"logprob": -0.25})()}, {3: type("L", (), {"logprob": -2.0})()}])
+    try:
+        R.sampled_logps_from_output(bad, [7, 9])
+        check("缺被采样 token → 必须 raise（不许静默）", False)
+    except ValueError as e:
+        check("缺被采样 token → raise 且提示别退回 N=0（那条路已被实锤不可信）",
+              "别退回 N=0" in str(e))
+    doc = R.sampled_logps_from_output.__doc__ or ""
+    check("函数 docstring 留档 2026-09-15 实锤（N=0 报数与分布不符）",
+          "2026-09-15" in doc and "-7.400" in doc)
+
+    st = lpmode_spread({"A_K0_T1": -0.602, "D_K0_TT": -0.602,
+                        "B_KK_T1": -7.40, "C_KK_TT": -7.40})
+    check("lpmode 极差能分辨'是 logprobs 取值'（A≈D 偏、B≈C 一致）",
+          abs(st["spread"] - 6.798) < 1e-6 and st["argmax"].startswith("A")
+          and st["argmin"].startswith("B"))
+    st2 = lpmode_spread({"A_K0_T1": -3.0, "B_KK_T1": -3.0,
+                         "C_KK_TT": -3.0, "D_K0_TT": -0.5})
+    check("lpmode 极差也能分辨'是 max_tokens'（A≈B≈C 偏、D 离群）",
+          st2["argmax"].startswith("D") and st2["argmin"].startswith("A"))
+    check("形态不足两个 → 不给极差（不许从单点编结论）",
+          lpmode_spread({"A_K0_T1": -1.0})["spread"] is None)
+    dsrc = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "diag_logps.py"), encoding="utf-8").read()
+    check("lpmode 模式的四种形态齐备（K0/KK × T1/TT）",
+          all(f'"{n}"' in dsrc for n in ("A_K0_T1", "B_KK_T1", "C_KK_TT", "D_K0_TT")))
+    check("lpmode 要求 vLLM provider（它是报数路径探针，不是跨引擎对拍）",
+          "--measure lpmode 是 vLLM 侧的报数路径探针" in dsrc)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -2449,6 +2517,7 @@ if __name__ == "__main__":
     test_diag_ablation_and_decode()
     test_diag_impl_label_and_mode()
     test_diag_counter_and_trajid()
+    test_logprobs_n_fix_path()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

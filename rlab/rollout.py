@@ -180,16 +180,22 @@ class QuestionScheduler:
 def sampled_logps_from_output(out, ids) -> list:
     """从 vLLM 单条 completion 提取"被采样 token"的逐 token logprob。
 
-    【减法① 2026-09-11】SamplingParams(logprobs=0) 时 vLLM 为每个生成位置返回
+    【减法① 2026-09-11】SamplingParams(logprobs=N) 时 vLLM 为每个生成位置返回
     {token_id: Logprob}；取其中实际采样到的那个 token 的 logprob，数学上就是
     log π(tok | 完整前文)——多轮场景下每轮请求的上下文已包含之前所有轮的工具结果，
     所以逐轮收集再拼接 == compute_gen_logps 在拼接序列上重算，严格同义，且完全
     绕开 prompt_logprobs 路径（那条路在本环境会 hang，是 torch 副本存在的起因）。
-    任何一步对不齐都 raise：静默错位会让 gen_logps 全错而训练照跑。"""
+    任何一步对不齐都 raise：静默错位会让 gen_logps 全错而训练照跑。
+
+    【2026-09-15 真机实锤：N=0 这条形态本身不可信】同一 prompt、同一位置、同一
+    token 上，N=0 报 -0.602，而 N=20（raw）报 -7.40、torch 独立重算 -7.400。
+    N=0 是唯一离群者 → vLLM 的"只报被采样 token"路径报错了数，与分布无关
+    （同批探针 top-1 36/36 相同、top-20 交集 0.968）。改用 N≥1（top-K 里挑被采样
+    token）后与 torch 的差回到 mean 0.02/max 0.23 量级。cf. cfg `vllm_logprobs_n`。"""
     lps = getattr(out, "logprobs", None)
     if lps is None:
         raise RuntimeError(
-            "[rollout] vLLM 未返回 logprobs（SamplingParams 缺 logprobs=0）——"
+            "[rollout] vLLM 未返回 logprobs（SamplingParams 缺 logprobs=N）——"
             "vllm_gen_logps 路径要求采样时就带上该参数")
     if len(lps) != len(ids):
         raise ValueError(
@@ -204,7 +210,9 @@ def sampled_logps_from_output(out, ids) -> list:
         if lp is None:
             raise ValueError(
                 f"[rollout] 第 {pos} 个位置缺被采样 token {tid} 的 logprob"
-                f"（可用键：{list(entry)[:4]}）")
+                f"（可用键：{list(entry)[:4]}）——logprobs=N≥1 时 vLLM 应始终把被采样"
+                "token 放进返回字典；若这里报缺，说明该版本行为不同，"
+                "别退回 N=0（那条路径报的数已被实锤不可信，见函数 docstring）")
         vals.append(float(getattr(lp, "logprob", lp)))
     return vals
 
@@ -1089,7 +1097,14 @@ def gen_worker(Q, cfg: dict):
             # logprobs_mode=raw_logprobs：显式要"后处理前"的 logprob，防某些 vLLM
             # 版本默认返回经 temperature/top-k 处理后的值（本配置 temperature=1、
             # 无截断时两者相同，但显式声明不留歧义）。
-            kw["logprobs"] = 0
+            # 【2026-09-15 真机实锤】logprobs=0 这条"只报被采样 token"的形态在 vLLM
+            # v0.19.1 + Qwen3.5 GDN 上**报的数与分布不符**：同一 prompt、同一位置、
+            # 同一 token，logprobs=0 报 -0.602，而 logprobs=20（raw）报 -7.40、torch
+            # 独立重算也是 -7.400 —— 两条独立计算一致、只有 logprobs=0 是离群者，
+            # prefill 位（每轮首 token）最狠，单点差 6.8 nat（训练对拍里的 12.8 同源）。
+            # 故取"top-K + 从中挑被采样 token"的形态；K 由 cfg 给（默认 0 = 旧行为，
+            # 便于 A/B；修复档建议 1 起步——够用且返回体最小）。
+            kw["logprobs"] = int(cfg.get("vllm_logprobs_n", 0) or 0)
             if "logprobs_mode" in _sp_fields:
                 kw["logprobs_mode"] = "raw_logprobs"
         return [SamplingParams(**kw,
