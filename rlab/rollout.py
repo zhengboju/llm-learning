@@ -864,6 +864,14 @@ def gen_worker(Q, cfg: dict):
     # 实机就是这么白烧了 2.5 分钟才看到一条 transformers 内部 traceback）。
     _use_vllm_logps = bool(cfg.get("vllm_gen_logps")) and cfg["algo"] in ("retool", "retool_math")
     _verify_budget = int(cfg.get("verify_gen_logps", 0) or 0)
+    # 【2026-09-15 实锤】Qwen3.5-4B + vLLM v0.19.1 + triton GDN prefill 下，vLLM 采样
+    # logprobs 不可复现（同一命令两次：token 一致率 2.91%，|Δlogp| p99=5.79、max=14.5）。
+    # 这个警告不是阻断，是给明确指向；若用户执意要 A/B，可以继续跑，但需对拍。
+    if _use_vllm_logps and "Qwen3.5-4B" in cfg.get("model_path", ""):
+        print("[rollout][警告] vllm_gen_logps=True 且 model_path 含 Qwen3.5-4B："
+              "本环境 vLLM 采样 logprobs 已实测不可复现，会把随机量注入 importance ratio；"
+              "建议改为 vllm_gen_logps=False（torch 副本重算，与训练前向同源）。"
+              "详见 docs/07-vllm-logprobs-non-determinism-4b.md", flush=True)
     if (not _use_vllm_logps) or _verify_budget > 0:
         _assert_torch_replica_loadable(cfg["model_path"])   # A1：复合 ckpt 进不了 torch
     _gen_kwargs = cfg.get("vllm_gen_kwargs") or {}

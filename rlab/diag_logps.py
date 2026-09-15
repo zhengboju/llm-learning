@@ -1158,6 +1158,103 @@ def run_lpmode_probe(cfg, args, rows):
     return "vllm:lpmode", rows_out
 
 
+def det_repeat_stats(items: list) -> dict:
+    """同一请求重复 N 次的结果归拢。纯函数（CPU 可测）。
+
+    items: [{"ids_prefix": [...], "dict_hash": "...", "top1": int, "lp_top1": float}, ...]
+
+    这是"跨实例一致性测试"的最小版本（标准 RL 框架把它当 CI）：先证明**引擎自己**
+    对同一输入确定，再谈训练侧与推理侧的对齐——否则任何对拍数字都无意义。
+
+    两层要分开看：
+      · n_unique_ids / n_unique_dicts：采到的 token 与**分布**是否可复现。分布不可复现
+        （dict_hash 变）意味着 **logits 本身**在变——这不是"seed 没生效"能解释的，
+        因为 logits 是输入（上下文）的确定函数，与 RNG 无关。
+      · first_call_differs：首次调用是否与后续不同（编译/autotuner 预热效应）。"""
+    if not items:
+        return {"n": 0}
+    ids = [tuple(x.get("ids_prefix") or []) for x in items]
+    hs = [x.get("dict_hash") for x in items]
+    lp = [x.get("lp_top1") for x in items]
+    lps = [v for v in lp if v is not None]
+    return {"n": len(items),
+            "n_unique_ids": len(set(ids)), "n_unique_dicts": len(set(hs)),
+            "ids_identical": len(set(ids)) == 1,
+            "dicts_identical": len(set(hs)) == 1,
+            "lp_top1_spread": (max(lps) - min(lps)) if len(lps) > 1 else 0.0,
+            "first_call_differs": (len(items) > 1
+                                   and (ids[0] != ids[-1] or hs[0] != hs[-1]))}
+
+
+def run_det_probe(cfg, args, rows):
+    """`--measure det`：**同一个请求在本进程内连续问 N 次**，看 token / top-K 字典是否逐位相同。
+
+    动机（2026-09-15 实锤）：`--diff_traj` 显示两次进程间 token 一致率仅 2.91%、max|Δlogp|=14.5。
+    但"跨进程不同"至少有四种来源，必须分层排除：
+      ① 我们的 harness（请求编排/seed 盐）；② 引擎本身不确定（kernel/归约）；
+      ③ 进程级一次性的东西（autotuner 选择、torch.compile 变体、CUDA graph 预热）；
+      ④ `seed` 没被真正使用。
+    本模式先把①②③分开：同进程、同上下文、同参数、同 seed，**背靠背**重复 N 次。
+      · N 次全同 → 引擎在本进程内确定 ⇒ 跨进程差异来自 ③（预热/调优/编译），
+        可查 vLLM 的 autotune/compile 缓存是否在两次进程间不一致；
+      · 本进程内就不同 → ①②：请把本输出原样贴给 vLLM（这是最小复现）。
+    另打印 top-1 的 logp，用于判断"只是 token 翻转"还是"分布整体在动"。"""
+    import hashlib
+
+    from vllm import LLM, SamplingParams
+
+    warn_if_default_backend(args, cfg)
+    kwargs = dict(gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
+                  disable_log_stats=True)
+    kwargs.update(vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {},
+                                         args.vllm_backend))
+    vpath = args.vllm_model_path or cfg["model_path"]
+    n_rep = max(2, int(args.det_repeat))
+    row = rows[0]
+    ctx = list(row["prompt_ids"])          # 固定上下文：prompt 本身（L=0），不带生成前缀
+    kw = dict(n=1, temperature=cfg.get("temperature", 1.0), top_p=cfg.get("top_p", 1.0),
+              top_k=cfg.get("top_k", -1), max_tokens=max(1, int(args.det_max_tokens)),
+              logprobs=max(1, args.k), seed=cfg.get("seed"))
+    if _sp_logprobs_mode_supported(SamplingParams):
+        kw["logprobs_mode"] = "raw_logprobs"
+    print(f"[diag] det 探针：model={vpath} 同请求背靠背 x{n_rep} "
+          f"（plen={len(ctx)} seed={cfg.get('seed')} 参数={ {k: v for k, v in kw.items() if k != 'logprobs_mode'} }）"
+          f" kwargs={kwargs}", flush=True)
+    llm = LLM(model=vpath, **kwargs)
+    sp = SamplingParams(**kw)
+    items, out_rows = [], []
+    for i in range(n_rep):
+        o = llm.generate([{"prompt_token_ids": ctx}], sp, use_tqdm=False)[0].outputs[0]
+        ids = list(o.token_ids or [])
+        d = {int(t): float(getattr(v, "logprob", v))
+             for t, v in ((o.logprobs or [{}])[0] or {}).items()}
+        top1 = max(d, key=d.get) if d else None
+        h = hashlib.sha1(",".join(f"{t}:{v:.6f}" for t, v in sorted(d.items()))
+                         .encode()).hexdigest()[:8]
+        items.append({"ids_prefix": ids[:8], "dict_hash": h, "top1": top1,
+                      "lp_top1": d.get(top1)})
+        out_rows.append({"provider": "vllm:det", "rep": i, "ids_prefix": ids[:8],
+                         "dict_hash": h, "top1": top1, "lp_top1": d.get(top1),
+                         "n_dict": len(d)})
+        print(f"[diag]   #{i + 1} ids[:8]={ids[:8]} top1={top1} "
+              f"lp(top1)={_fmt(d.get(top1))} topK字典hash={h}", flush=True)
+    st = det_repeat_stats(items)
+    print(f"[diag]   token 唯一数={st['n_unique_ids']}/{st['n']}；"
+          f"top-K 字典唯一数={st['n_unique_dicts']}/{st['n']}；"
+          f"top-1 logp 极差={_fmt(st['lp_top1_spread'])}", flush=True)
+    if st["dicts_identical"] and st["ids_identical"]:
+        print("[diag]   判读：本进程内**完全可复现** ⇒ 跨进程差异来自预热/调优/编译一类的"
+              "一次性状态（查 vLLM 的 autotune/compile 缓存两次进程是否一致）", flush=True)
+    elif not st["dicts_identical"]:
+        print("[diag]   判读：连 **top-K 字典**都变了 ⇒ **logits 本身不可复现**（分布都不同）。"
+              "这不是'seed 没生效'能解释的（logits 是上下文的确定函数、与 RNG 无关）——"
+              "请把本段输出贴给 vLLM 作最小复现；训练端继续用 torch 副本", flush=True)
+    else:
+        print("[diag]   判读：分布一致但采到的 token 不同 ⇒ 采样/RNG 层不确定（seed 用法问题），"
+              "训练端仍不能用它当 gen_logps", flush=True)
+    return "vllm:det", out_rows
+
+
 def _fmt(v):
     return "None" if v is None else f"{v:.3g}"
 
@@ -1272,12 +1369,16 @@ def main() -> int:
     ap.add_argument("--torch_path", default="fla", choices=("fla", "fallback"),
                     help="fallback=打桩强制走纯 torch GDN 回退实现（消融轴）")
     ap.add_argument("--measure", default="prefill",
-                    choices=("prefill", "decode", "lpmode"),
+                    choices=("prefill", "decode", "lpmode", "det"),
                     help="prefill=前缀末位分布对拍（默认，两档消融用）；"
                          "decode=逐位置被采样 logp 对拍（**训练口径**，按 prefill/decode "
                          "位置分开统计；只走 torch 侧）；"
-                         "lpmode=vLLM 上报路径探针（同一位置同一 token 四种请求形态，"
-                         "定位是 logprobs 取值还是 max_tokens 让报数失真）")
+                         "lpmode=vLLM 上报路径探针（同一位置同一 token 多种请求形态）；"
+                         "det=同请求背靠背重复 N 次（引擎自身的确定性下限，最小复现）")
+    ap.add_argument("--det_repeat", type=int, default=3,
+                    help="--measure det 的重复次数（默认 3；首次调用常与后续不同，别只跑 2）")
+    ap.add_argument("--det_max_tokens", type=int, default=8,
+                    help="--measure det 的生成长度（小：只要头几个 token 与首位置分布）")
     ap.add_argument("--probe_default", action="store_true",
                     help="vLLM 侧同时测 default 口径（不传 logprobs_mode）并打印"
                          "'vLLM 自身口径差'——把测量口径差从跨引擎 Δ 里分出来")
@@ -1368,6 +1469,15 @@ def main() -> int:
             raise SystemExit("[diag] 轨迹里没有 logps 字段——建轨迹时必须开 collect_logps"
                              "（--build_traj 的默认行为），decode 口径才有 vLLM 侧可比")
         out_rows = run_torch_decode(cfg, args, rows)
+        if args.out:
+            _write_jsonl(args.out, out_rows)
+        return 0
+
+    if args.measure == "det":
+        if args.providers != "vllm":
+            raise SystemExit("[diag] --measure det 是 vLLM 引擎自身的确定性探针："
+                             "请用 --providers vllm")
+        tag, out_rows = run_det_probe(cfg, args, rows)
         if args.out:
             _write_jsonl(args.out, out_rows)
         return 0

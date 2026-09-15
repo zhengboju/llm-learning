@@ -2578,6 +2578,36 @@ def test_logprobs_n_fix_path():
           and st["worst"][0]["same_tok"] is False)
     check("--diff_traj CLI 存在且纯函数可测",
           '--diff_traj' in dsrc and "def print_traj_diff" in dsrc)
+    # 引擎自身的确定性下限（跨实例一致性测试的最小版本）——先证明"引擎自己确定"，
+    # 再谈训练/推理对齐；否则任何对拍数字都无意义。
+    from rlab.diag_logps import det_repeat_stats
+    same = [{"ids_prefix": [1, 2], "dict_hash": "aa", "lp_top1": -0.1}] * 3
+    st_same = det_repeat_stats(same)
+    check("det：三次全同 → ids/dicts 都判定一致（可复现）",
+          st_same["ids_identical"] and st_same["dicts_identical"]
+          and st_same["n_unique_dicts"] == 1 and not st_same["first_call_differs"])
+    diff_d = [{"ids_prefix": [1, 2], "dict_hash": "aa", "lp_top1": -0.1},
+              {"ids_prefix": [1, 2], "dict_hash": "bb", "lp_top1": -0.9},
+              {"ids_prefix": [1, 2], "dict_hash": "cc", "lp_top1": -2.5}]
+    st_d = det_repeat_stats(diff_d)
+    check("det：分布不同（dict hash 变）必须单独判出来——这是'logits 不可复现'的证据",
+          st_d["ids_identical"] and not st_d["dicts_identical"]
+          and abs(st_d["lp_top1_spread"] - 2.4) < 1e-9)
+    diff_ids = [{"ids_prefix": [1, 2], "dict_hash": "aa", "lp_top1": -0.1},
+                {"ids_prefix": [3, 4], "dict_hash": "aa", "lp_top1": -0.1}]
+    st_i = det_repeat_stats(diff_ids)
+    check("det：分布一致但 token 不同 → 单独判为采样/RNG 层问题",
+          not st_i["ids_identical"] and st_i["dicts_identical"])
+    check("det 模式要求 vLLM provider 且三种判读都在源码里",
+          "--measure det 是 vLLM 引擎自身的确定性探针" in dsrc
+          and "logits 本身不可复现" in dsrc and "采样/RNG 层不确定" in dsrc)
+    check("我们的 logp 路径不用 flash-attn CE（纯 log_softmax+gather，已在对齐标准上）",
+          "log_softmax" in open(os.path.join(
+              os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+              "rlab", "losses.py"), encoding="utf-8").read()
+          and "cross_entropy" not in open(os.path.join(
+              os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+              "rlab", "losses.py"), encoding="utf-8").read())
 
 
 if __name__ == "__main__":

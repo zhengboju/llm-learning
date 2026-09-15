@@ -275,6 +275,10 @@ BASE = dict(
     #           路径在本环境会 hang，正是 torch 副本存在的起因）。
     # 口径变化：logps 分母由 torch kernel 换 vLLM kernel（同为 bf16）——首次启用必须
     # 用 verify_gen_logps 对拍并把最大差写进报告。
+    # 【2026-09-15 真机实锤】Qwen3.5-4B + vLLM v0.19.1 + triton GDN prefill 下，
+    # vLLM 采样 logprobs 不可复现：同一命令跑两次，token 逐位置一致率仅 2.91%，
+    # |Δlogp| p99=5.79、max=14.5。因此该档位不能作为 gen_logps 来源，见
+    # docs/07-vllm-logprobs-non-determinism-4b.md。默认值 False 保持 torch 副本口径。
     vllm_gen_logps=False,
     # 【2026-09-15 真机实锤】N 的取值决定"报哪条路"：N=0（只报被采样 token）在 vLLM
     # v0.19.1 + Qwen3.5 GDN 上**报错数**——同一 prompt/位置/token，N=0 报 -0.602，
