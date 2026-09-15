@@ -1849,7 +1849,7 @@ def test_pyflakes_undefined():
              "rlab/probe_difficulty.py", "rlab/extract_text_model.py",
              "rlab/model_loading.py", "rlab/materialize_mm_ckpt.py",
              "rlab/ref_server.py",
-             "rlab/data.py", "rlab/prepare_dapo_math.py",
+             "rlab/data.py", "rlab/prepare_dapo_math.py", "rlab/diag_logps.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
@@ -1981,6 +1981,170 @@ def test_length_runaway_signature():
     check("长度稳定 → 不误报 length_runaway", "length_runaway" not in codes2)
 
 
+def test_logps_diff_shape():
+    """[AC1] 对拍差异形态学：占比 / 前后半段 / 最差 k 点（2026-09-15 max=12.8 事故固化）。
+
+    事故的关键教训：**只看 max 会把"某一侧 logits 算错"误读成"尾部低概率 token 的
+    舍入"**——12.8 那一点 vLLM 的 logp=-0.946（p≈0.39），根本不是尾点。要当场分辨
+    "漂移增长"与"局部尖峰"，必须同时拿到越线占比、前后半段均值、最差点坐标。"""
+    print("[AC1] logps 对拍形态学（logps_diff_shape）")
+    from rlab.rollout import logps_diff_shape
+    # 行0：前 3 位 0.2（>0.1 但不 >1）、后 3 位 2.0（漂移形态）；行1：整体零差
+    gv = torch.tensor([[-1.0, -1.0, -1.0, -3.0, -4.0, -5.0],
+                       [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]])
+    gt = torch.tensor([[-1.2, -1.2, -1.2, -5.0, -6.0, -7.0],
+                       [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]])
+    mask = torch.ones(2, 6)
+    st = logps_diff_shape(gv, gt, mask)
+    check("有效位数 = mask 和", st["n"] == 12)
+    check("max/mean 与手算一致",
+          abs(st["max"] - 2.0) < 1e-6
+          and abs(st["mean"] - (3 * 0.2 + 3 * 2.0) / 12) < 1e-6)
+    check("frac>0.1 与 frac>1 分得开（单点 max 给不出的量）",
+          abs(st["frac_gt_01"] - 0.5) < 1e-6 and abs(st["frac_gt_1"] - 0.25) < 1e-6)
+    check("前后半段逐行切：后半段均值 > 前半段（漂移形态可读）",
+          st["half_mean_first"] is not None
+          and st["half_mean_second"] > st["half_mean_first"] * 2)
+    w5 = [w for w in st["worst"] if w["col"] == 5]
+    check("最差 3 点带行/列/两路原值（并列时取到哪三点不假定，只查集合与原值）",
+          len(st["worst"]) == 3 and {w["col"] for w in st["worst"]} == {3, 4, 5}
+          and all(w["row"] == 0 for w in st["worst"])
+          and w5 and abs(w5[0]["vllm"] - (-5.0)) < 1e-6
+          and abs(w5[0]["torch"] - (-7.0)) < 1e-6 and abs(w5[0]["d"] - 2.0) < 1e-6)
+    # 反证：g4 那种"一侧高概率、一侧认为不可能"必须在最差点里可读
+    gv2 = torch.tensor([[-0.946] + [-3.0] * 5])
+    gt2 = torch.tensor([[-13.750] + [-3.0] * 5])
+    st2 = logps_diff_shape(gv2, gt2, torch.ones(1, 6))
+    check("g4 形态：Δ≈12.8 且两侧原值都在（-0.946 / -13.75）",
+          abs(st2["worst"][0]["d"] - 12.804) < 1e-2
+          and abs(st2["worst"][0]["vllm"] - (-0.946)) < 1e-3
+          and abs(st2["worst"][0]["torch"] - (-13.75)) < 1e-3)
+    # 右 pad 不参与：mask=0 的列即使差很大也不能进统计
+    mask3 = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    gv3 = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
+    gt3 = torch.tensor([[-1.0, -1.0, -99.0, -99.0]])
+    st3 = logps_diff_shape(gv3, gt3, mask3)
+    check("pad 位（mask=0）不进统计", st3["n"] == 2 and st3["max"] < 1e-6)
+    check("全 mask=0 → 退化返回 n=0（调用方本来就会跳过）",
+          logps_diff_shape(gv3, gt3, torch.zeros(1, 4))["n"] == 0)
+
+
+def test_diag_logps_pure():
+    """[AC2] diag_logps 纯函数：前缀长/top-K 提取/成对判读/责任方结论。
+
+    诊断脚本的价值全在"判据能分辨两种假设"上，所以这几条必须锁死：confident
+    分歧必须由 g4 那种 (高, 极低) 触发、`None`（超 top-K）也必须算进去，而
+    同引擎 vs 跨引擎的结论必须分开打。"""
+    print("[AC2] diag_logps 纯函数（判据自检）")
+    from rlab.diag_logps import (aggregate, compare_rows, confident_disagreement,
+                                 engine_of, normalize_prefix_lens, rank_from_pairs,
+                                 topk_pairs, vllm_kwargs_for_backend, verdict)
+    check("前缀长：去重升序 + 恒含 0 + 去负",
+          normalize_prefix_lens("512,0,256,256,-8") == [0, 256, 512])
+    check("前缀长：按 cap 截断（超预算的 L 测不了）",
+          normalize_prefix_lens("0,256,1024,4096", cap=1024) == [0, 256, 1024])
+    check("前缀长：全非法 → 仍给出 [0]（首 token 位永远可测）",
+          normalize_prefix_lens("", cap=1024) == [0] and normalize_prefix_lens("x,y") == [0])
+
+    class _LP:
+        def __init__(self, v): self.logprob = v
+    entry = {5: _LP(-0.5), 9: _LP(-3.0), 7: None, 11: 0.25, 3: _LP(-1.0)}
+    pairs = topk_pairs(entry, 3)
+    check("top-K：按 logp 降序、None 剔除、截到 k",
+          [t for t, _ in pairs] == [11, 5, 3] and all(isinstance(v, float) for _, v in pairs))
+    check("top-K：vLLM 额外塞的被采样 token 会被 k 截掉（语义=top-k）",
+          len(topk_pairs({1: -0.1, 2: -0.2, 3: -9.0}, 2)) == 2)
+    check("排名：命中→1-based，未命中→None",
+          rank_from_pairs(pairs, 5) == 2 and rank_from_pairs(pairs, 999) is None)
+
+    check("confident 分歧：g4 形态 (高, 极低) → True",
+          confident_disagreement(-0.946, -13.75) and confident_disagreement(-13.75, -0.946))
+    check("confident 分歧：常规舍入级差异 → False",
+          not confident_disagreement(-1.0001, -1.0003))
+    check("confident 分歧：一侧超出 top-K(None) 按'排很后'处理",
+          confident_disagreement(None, -1.0) and not confident_disagreement(None, -20.0))
+
+    a = {"q": 0, "L": 0, "target": 101, "lp_target": -0.946, "target_rank": 1,
+         "topk": [[101, -0.946], [102, -1.5], [103, -2.0]]}
+    b = {"q": 0, "L": 0, "target": 101, "lp_target": -13.75, "target_rank": 900,
+         "topk": [[102, -1.4], [103, -1.9], [104, -2.1]]}
+    cr = compare_rows(a, b)
+    check("成对：top1 不一致 + 交集只有 2 个 + 目标差 12.8",
+          cr["top1_match"] is False and abs(cr["overlap"] - 2 / 3) < 1e-9
+          and abs(cr["target_d"] - 12.804) < 1e-2 and cr["confident"])
+    st = aggregate([cr, {"q": 0, "L": 256, "target_d": 1e-5, "top1_match": True,
+                         "overlap": 1.0, "max_abs_d_common": 1e-5,
+                         "target_missing": False, "confident": False,
+                         "lp_a": -1.0, "lp_b": -1.0, "rank_a": 1, "rank_b": 1}])
+    check("聚合：n / max / >1nat 占比 / 最差点排序",
+          st["n"] == 2 and abs(st["max_target_d"] - 12.804) < 1e-2
+          and abs(st["frac_big"] - 0.5) < 1e-9 and st["worst"][0]["L"] == 0
+          and set(st["per_L"]) == {0, 256})
+
+    # ---- verdict：三种结局必须分开打（判据的分辨力所在）----
+    def _mk(max_d, frac, conf=0):
+        return {"n": 10, "max_target_d": max_d, "frac_big": frac, "confident_n": conf,
+                "per_L": {}, "worst": [], "target_d_mean": max_d, "target_d_p99": max_d,
+                "top1_match_rate": 1.0, "overlap_mean": 1.0, "max_abs_d_common": max_d,
+                "target_missing_n": 0}
+    v_same = verdict({"torch:fla vs torch:fallback": _mk(6.0, 0.1),
+                      "torch:fla vs vllm:keep": _mk(6.0, 0.1)})
+    check("torch 内部两路就不一致 → 责任钉在 torch 侧前向实现",
+          any("同引擎跨 kernel" in s and "torch" in s for s in v_same)
+          and any("causal_conv1d" in s for s in v_same))
+    v_cross = verdict({"torch:fla vs vllm:keep": _mk(12.8, 0.04, conf=2),
+                       "torch:fallback vs vllm:keep": _mk(12.8, 0.04, conf=2)})
+    check("各自自洽、跨引擎才不一致 → 判为 kernel 口径差（给出回 torch 副本的解）",
+          any("两侧各自自洽" in s for s in v_cross)
+          and any("vllm_gen_logps=False" in s for s in v_cross))
+    v_ok = verdict({"torch:fla vs torch:fallback": _mk(1e-5, 0.0),
+                    "torch:fla vs vllm:keep": _mk(1e-5, 0.0)})
+    check("全都一致 → 判为不是 kernel（回到序列构造/对齐）",
+          any("不是 kernel" in s for s in v_ok))
+    check("只有跨引擎对（没做消融）→ 明确提示'无法定位责任方'",
+          any("没有消融" in s for s in verdict({"torch:fla vs vllm:keep": _mk(12.8, 0.04)})))
+
+    check("engine 标签解析", engine_of("vllm:triton") == "vllm"
+          and engine_of("torch:fallback") == "torch" and engine_of("torch") == "torch")
+    base = {"gdn_prefill_backend": "triton", "max_num_seqs": 32}
+    check("--vllm-backend keep 原样（对照档 = 训练口径）",
+          vllm_kwargs_for_backend(base, "keep") == base)
+    check("--vllm-backend none 去掉该键、其余保留",
+          vllm_kwargs_for_backend(base, "none") == {"max_num_seqs": 32})
+    check("--vllm-backend flashinfer 覆盖成该值",
+          vllm_kwargs_for_backend(base, "flashinfer")["gdn_prefill_backend"] == "flashinfer")
+
+
+def test_diag_logps_static():
+    """[AC3] diag_logps 的静态契约：CPU 判读路径不许 import torch/vllm（探针要能在
+    无 GPU 的机器上 merge），且 pyflakes 名单必须覆盖它（运行时路径的未定义名盲区）。"""
+    print("[AC3] diag_logps 静态契约")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = open(os.path.join(root, "rlab", "diag_logps.py"), encoding="utf-8").read()
+    head = src.split("def ", 1)[0]
+    top_imports = [l.strip() for l in head.splitlines()
+                   if l.strip().startswith(("import ", "from "))]
+    bad = [l for l in top_imports
+           if l.startswith(("import torch", "import vllm", "from torch", "from vllm"))]
+    check("模块顶层不 import vllm/torch（--merge 要在 CPU 上能跑）", bad == [])
+    check("provider 内部按需 import（vllm/torch 都在函数体里）",
+          "from vllm import LLM" in src and "import torch" in src)
+    check("三档 backend 与 torch 两档路径的 CLI 都在",
+          '"--vllm_backend"' in src and '"--torch_path"' in src
+          and 'choices=("fla", "fallback")' in src)
+    check("能与训练命令逐字对齐：模型路径/chat 模板/vllm_gen_kwargs 都能覆盖",
+          '"--model_path"' in src and '"--vllm_model_path"' in src
+          and '"--chat_template_kwargs"' in src
+          and '"--vllm_gen_kwargs"' in src and 'cfg["vllm_gen_kwargs"] = json.loads' in src)
+    check("路径不存在就当场停（防探错模型这种静默错误）",
+          "别用 preset 默认值探错模型" in src)
+    check("打桩找不到目标必须 raise（不许静默当 fla 档跑）",
+          "找不到任何可打的目标" in src or "打桩无从下手" in src)
+    test_src = open(os.path.join(root, "rlab", "tests", "test_retool_cpu.py"),
+                    encoding="utf-8").read()
+    check("pyflakes 名单覆盖 diag_logps（J 组）", '"rlab/diag_logps.py"' in test_src)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -2015,6 +2179,9 @@ if __name__ == "__main__":
     test_strip_left_pad()
     test_budget_guard_and_drift_stats()
     test_length_runaway_signature()
+    test_logps_diff_shape()
+    test_diag_logps_pure()
+    test_diag_logps_static()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

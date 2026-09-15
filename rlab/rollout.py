@@ -209,6 +209,54 @@ def sampled_logps_from_output(out, ids) -> list:
     return vals
 
 
+def logps_diff_shape(gv, gt, mask, k: int = 3) -> dict:
+    """对拍差异的**形态学**指标（纯张量函数，CPU 可测）。
+
+    【为什么不能只看 mean/p50/p99/max】2026-09-15 实机对拍出现 max=12.8，而
+    "12.8 是尾部低概率 token 的舍入"这个解释被同一次数据推翻：该点 vLLM 的
+    logp=-0.946（p≈0.39）、torch=-13.75（p≈1e-6）——一个被采样 token 两侧分布
+    实质不同，bf16 舍入（logit 级 ~0.1）物理上给不出 12.8 nat。要分辨"状态漂移"
+    与"局部 kernel 尖峰"，必须再要三样东西：
+      · frac>1 / frac>0.1：越线点的**占比**（单点 max 无法区分"1 个怪点"和"1% 全歪"）；
+      · 前后半段 mean|d|：**逐行**按该行有效位中点切（不按全局列切，防长行主导与
+        右 pad 混入）。后半段显著更大 = 递归状态累积漂移；两半相当 = 局部尖峰；
+      · 最差 k 点（行/列/两路原值）：尖峰是否紧贴工具段边界、是否落在列 0，
+        一眼可读——这正是需要回看的东西，事后不该只剩一个 max。
+
+    两路原值都取 float（gv 已是 float32，gt 上转），避免"比较时的 dtype 又把
+    两侧一起量化"这个旧坑（见 gen_logps_from_segs docstring）。"""
+    m = mask.bool()
+    gv_f, gt_f = gv.float(), gt.to(gv.dtype).float()
+    d = (gv_f[m] - gt_f[m]).abs()
+    out = {"n": int(d.numel())}
+    if d.numel() == 0:
+        return out
+    out["mean"] = float(d.mean())
+    out["p50"] = float(d.median())
+    out["p99"] = float(d.kthvalue(max(1, int(d.numel() * 0.99))).values)
+    out["max"] = float(d.max())
+    out["frac_gt_01"] = float((d > 0.1).float().mean())
+    out["frac_gt_1"] = float((d > 1.0).float().mean())
+    first, second = [], []
+    for r in range(int(m.shape[0])):
+        cols = m[r].nonzero().flatten()
+        if cols.numel() < 2:
+            continue
+        mid = cols.numel() // 2
+        row_d = (gv_f[r] - gt_f[r]).abs()
+        first.append(float(row_d[cols[:mid]].mean()))
+        second.append(float(row_d[cols[mid:]].mean()))
+    out["half_mean_first"] = (sum(first) / len(first)) if first else None
+    out["half_mean_second"] = (sum(second) / len(second)) if second else None
+    flat = m.nonzero()
+    vals, idx = d.topk(min(int(k), int(d.numel())))
+    out["worst"] = [{"row": int(flat[i][0]), "col": int(flat[i][1]),
+                     "vllm": float(gv_f[flat[i][0], flat[i][1]]),
+                     "torch": float(gt_f[flat[i][0], flat[i][1]]),
+                     "d": float(v)} for v, i in zip(vals.tolist(), idx.tolist())]
+    return out
+
+
 class LogpsVerifier:
     """vLLM 路 vs torch 路 gen_logps 对拍器（减法① 的口径验证闸门）。
 
@@ -222,6 +270,7 @@ class LogpsVerifier:
         self.on_finish = on_finish
         self.n = 0
         self.max_diff = 0.0
+        self.stats = []          # 每组的形态学指标（报告/事后分析用，见 logps_diff_shape）
 
     def wants(self) -> bool:
         return self.n < self.budget
@@ -247,6 +296,17 @@ class LogpsVerifier:
               f"| diff mean={mean:.3e} p50={p50:.3e} p99={p99:.3e} max={mx:.3e}"
               f"（有效位 {int(m.sum())}，最大差在 [行{pos[0]}, 列{pos[1]}]，"
               f"vLLM={float(gv[m][d.argmax()]):.3f} torch={float(gt.to(gv.dtype)[m][d.argmax()]):.3f}）",
+              flush=True)
+        # 形态学第二行（2026-09-15）：单点 max 定不了责，占比/前后半段/最差 k 点才能
+        st = logps_diff_shape(gv, gt, m)
+        self.stats.append(st)
+        _half = ("None" if st.get("half_mean_first") is None
+                 else f"{st['half_mean_first']:.2e}→{st['half_mean_second']:.2e}")
+        _worst = "  ".join(
+            f"[行{w['row']},列{w['col']} v={w['vllm']:.3f} t={w['torch']:.3f} Δ={w['d']:.2f}]"
+            for w in st.get("worst", []))
+        print(f"[rollout][verify]   形态: >0.1={st['frac_gt_01']:.2%} "
+              f">1={st['frac_gt_1']:.2%} 前后半段 mean|d| {_half} 最差{len(st.get('worst', []))}点 {_worst}",
               flush=True)
         if not self.wants() and self.on_finish is not None:
             self.on_finish()
