@@ -2512,6 +2512,45 @@ def test_logprobs_n_fix_path():
     check("告警只打印、不修改配置（不做静默改档）",
           warn_if_default_backend(_A("keep"), {}) is None)
 
+    # 【真机首个 lpmode 跑批的设计缺陷】原设计拿"各形态自采到的 token"当比较基准，
+    # 实测 36 点里 13 点四条采到**不同 token** → 那些点的四个 logp 不可比。归拢函数
+    # 必须只统计同 token 的点，并把两条轴分开（K 轴=logprobs 取值；T 轴=max_tokens）。
+    from rlab.diag_logps import lpmode_summary
+
+    def _row(q, L, forms, toks, tops=None, ref=None):
+        same = len(set(toks.values())) == 1
+        r = {"q": q, "L": L, "forms": forms, "tokens": toks,
+             "traj_target": ref, "same_token": same}
+        if tops:
+            r["tops"] = tops
+        return r
+
+    # 同 token、K 轴偏（A 与 B 差 2nat）但 T 轴字典完全相同 → 结论=logprobs=0 上报错
+    r1 = _row(0, 0, {"A_K0_T1": -2.0, "B_KK_T1": -4.0, "C_KK_TT": -4.0, "D_K0_TT": -2.0},
+              {"A_K0_T1": 7, "B_KK_T1": 7, "C_KK_TT": 7, "D_K0_TT": 7},
+              {"B_KK_T1": {7: -4.0, 8: -5.0}, "C_KK_TT": {7: -4.0, 8: -5.0}}, ref=7)
+    # 不同 token → 整点剔除，不许进极差
+    r2 = _row(1, 0, {"A_K0_T1": 0.0, "B_KK_T1": -9.0, "C_KK_TT": -9.0, "D_K0_TT": -9.0},
+              {"A_K0_T1": 1, "B_KK_T1": 2, "C_KK_TT": 2, "D_K0_TT": 2})
+    st = lpmode_summary([r1, r2])
+    check("lpmode 归拢：只统计同 token 的点（不同 token 的点剔除，不进极差）",
+          st["n"] == 2 and st["n_same_token"] == 1 and st["K_axis_T1"]["n"] == 1
+          and abs(st["K_axis_T1"]["max"] - 2.0) < 1e-9)
+    check("lpmode 归拢：T 轴用**字典**比较（此处 B==C → 字典相同、top-1 相同）",
+          st["T_axis_dicts"]["n_dicts_equal"] == 1
+          and st["T_axis_dicts"]["n_top1_same"] == 1
+          and st["T_axis_dicts"]["max_d_common"] == 0.0)
+    r3 = _row(2, 0, {"A_K0_T1": -1.0, "B_KK_T1": -1.0, "C_KK_TT": -1.0, "D_K0_TT": -1.0},
+              {"A_K0_T1": 7, "B_KK_T1": 7, "C_KK_TT": 7, "D_K0_TT": 7},
+              {"B_KK_T1": {7: -1.0, 8: -9.0}, "C_KK_TT": {7: -1.0, 8: -2.0}}, ref=7)
+    st3 = lpmode_summary([r3])
+    check("lpmode 归拢：字典不同 → 能测出交集上的 token 差（T 轴影响 logits 的证据）",
+          st3["T_axis_dicts"]["n_dicts_equal"] == 0
+          and abs(st3["T_axis_dicts"]["max_d_common"] - 7.0) < 1e-9
+          and st3["K_axis_T1"]["max"] == 0.0)
+    check("建轨迹可指定 logprobs=N（验证修复档必须与训练 cfg 同 N）",
+          dsrc.count("build_logprobs_n") >= 3 and "logprobs=int(logprobs_n or 0)" in dsrc)
+
 
 if __name__ == "__main__":
     test_extract()

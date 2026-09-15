@@ -497,7 +497,7 @@ def _build_prompts(cfg, args):
     return out
 
 
-def build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens):
+def build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens, logprobs_n=0):
     """用**训练同口径**采样参数跑一条固定轨迹，逐位置记录采样 logp（= 训练用 gen_logps）。
 
     【必须与 rollout.make_retool_sps 逐字同源，含 logprobs_mode】真机 2026-09-15 实测：
@@ -509,7 +509,7 @@ def build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens):
 
     kw = dict(n=1, temperature=cfg["temperature"], top_p=cfg["top_p"],
               top_k=cfg.get("top_k", 50), max_tokens=max_tokens,
-              logprobs=0, seed=cfg.get("seed"))
+              logprobs=int(logprobs_n or 0), seed=cfg.get("seed"))
     if _sp_logprobs_mode_supported(SamplingParams):
         kw["logprobs_mode"] = "raw_logprobs"     # 与 make_retool_sps 同源
     sp = SamplingParams(**kw)
@@ -610,10 +610,14 @@ def run_vllm(cfg, args, rows, lens):
               "训练口径的地板仍以 --verify_gen_logps 为准", flush=True)
     if args.build_traj:
         max_tokens = args.max_traj_tokens or max(lens)
-        print(f"[diag] 建轨迹：max_tokens={max_tokens}")
-        rows = build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens)
+        print(f"[diag] 建轨迹：max_tokens={max_tokens} "
+              f"logprobs={int(args.build_logprobs_n or 0)}"
+              f"{'（N=0：真机上报的数与分布不符，见 docs 与 logprobs 实锤）' if not args.build_logprobs_n else ''}")
+        rows = build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens,
+                               logprobs_n=args.build_logprobs_n)
         for _r in rows:                 # 轨迹出自哪一档 vLLM（decode 口径判读要用）
             _r["vllm_tag"] = tag
+            _r["build_logprobs_n"] = int(args.build_logprobs_n or 0)
         if args.traj_out:
             _write_jsonl(args.traj_out, rows)
     else:
@@ -963,6 +967,80 @@ def lpmode_spread(forms: dict) -> dict:
             "argmax": hi, "argmin": lo, "max": vals[hi], "min": vals[lo]}
 
 
+def lpmode_summary(rows: list) -> dict:
+    """把 lpmode 逐点读数归拢成两条轴的判据。纯函数（CPU 可测）。
+
+    【真机 2026-09-15 首个 lpmode 跑批暴露的设计缺陷】原设计假设"logprobs 只影响上报、
+    不影响采样"，故用"各形态自己采到的 token"做比较基准 —— 实测 36 点里 **13 点四条
+    采到不同 token**，这些点的四个 logp 根本不是同一个 token 的值，不可比（旧版会把
+    它们算进极差，得出假结论）。本函数只统计**同 token** 的点。
+
+    两条轴（同 token 才统计）：
+      · K 轴：A(T1,K0) vs B(T1,K) 与 D(TT,K0) vs C(TT,K) —— "只报单 token"那条路是否报错；
+      · T 轴：A(T1,K0) vs D(TT,K0) 与 B(T1,K) vs C(TT,K) 的**分布级**比较（top-K 字典
+        是否相同、交集上最大 token 差）—— max_tokens 是否影响 logits 本身。
+    T 轴用**字典**比较是关键：若同一上下文下 B 与 C 的 top-K 逐 token 相同，却被报出
+    不同的单 token logp，那只能是"报数"问题；若字典本身就不同，那是 logits 数值随请求
+    形态变化（训练档 T=round_gen_tokens 反而要用它自己那一档验证）。"""
+    def _pay(rows_, a, b):
+        ds = [abs(r["forms"][a] - r["forms"][b]) for r in rows_
+              if r.get("same_token") and r["forms"].get(a) is not None
+              and r["forms"].get(b) is not None]
+        return {"n": len(ds), "mean": (sum(ds) / len(ds)) if ds else None,
+                "max": max(ds) if ds else None,
+                "frac_gt_1": (sum(1 for d in ds if d > BIG_NAT) / len(ds)) if ds else None}
+
+    def _dictcmp(rows_, a, b):
+        outs = []
+        for r in rows_:
+            ta, tb = r.get("tops", {}).get(a), r.get("tops", {}).get(b)
+            if not ta or not tb:
+                continue
+            common = set(ta) & set(tb)
+            outs.append({"same": ta == tb,
+                         "top1_same": (max(ta, key=ta.get) == max(tb, key=tb.get)),
+                         "max_d_common": (max(abs(ta[t] - tb[t]) for t in common)
+                                          if common else None)})
+        dd = [o["max_d_common"] for o in outs if o["max_d_common"] is not None]
+        return {"n": len(outs), "n_dicts_equal": sum(1 for o in outs if o["same"]),
+                "n_top1_same": sum(1 for o in outs if o["top1_same"]),
+                "max_d_common": max(dd) if dd else None,
+                "mean_d_common": (sum(dd) / len(dd)) if dd else None}
+
+    same = [r for r in rows if r.get("same_token")]
+    return {"n": len(rows), "n_same_token": len(same),
+            "n_diff_token": len(rows) - len(same),
+            "K_axis_T1": _pay(same, "A_K0_T1", "B_KK_T1"),
+            "K_axis_TT": _pay(same, "D_K0_TT", "C_KK_TT"),
+            "T_axis_K0": _pay(same, "A_K0_T1", "D_K0_TT"),
+            "T_axis_dicts": _dictcmp(rows, "B_KK_T1", "C_KK_TT")}
+
+
+def print_lpmode_summary(rows: list):
+    st = lpmode_summary(rows)
+    print(f"[diag] lpmode 汇总：n={st['n']}，四条同 token {st['n_same_token']} 点、"
+          f"不同 token {st['n_diff_token']} 点（后者不可比，已剔除）", flush=True)
+    for k in ("K_axis_T1", "K_axis_TT", "T_axis_K0"):
+        v = st[k]
+        print(f"[diag]   {k}: n={v['n']} mean|Δ|={_fmt(v['mean'])} max={_fmt(v['max'])} "
+              f">1nat={_pctfmt(v['frac_gt_1'])}", flush=True)
+    d = st["T_axis_dicts"]
+    print(f"[diag]   T_axis_dicts（B vs C 的 top-K 字典）：n={d['n']} "
+          f"字典完全相同 {d['n_dicts_equal']} 点、top-1 相同 {d['n_top1_same']} 点、"
+          f"交集上 max|Δ|={_fmt(d['max_d_common'])}（mean={_fmt(d['mean_d_common'])})",
+          flush=True)
+    kax = max([st["K_axis_T1"]["max"] or 0, st["K_axis_TT"]["max"] or 0])
+    tax = max([st["T_axis_K0"]["max"] or 0, d["max_d_common"] or 0])
+    print("[diag]   判读：" + (
+        "K 轴与 T 轴都不可忽略 → 既改 logprobs 取值、也要在**训练自己那一档 T** 下复验"
+        if kax > BIG_NAT and tax > BIG_NAT else
+        "K 轴显著、T 轴可忽略 → 是 logprobs=0 的上报路径（改用 N≥1 即可）"
+        if kax > BIG_NAT else
+        "T 轴显著、K 轴可忽略 → 是 max_tokens 影响 logits（请求形态相关数值），"
+        "训练档必须自证" if tax > BIG_NAT else
+        "两轴都小 → 报数没问题，回到轨迹/上下文错配去查"), flush=True)
+
+
 def warn_if_default_backend(args, cfg):
     """未指定 --vllm_backend 时，提前说清"这一档会走 FlashInfer GDN，且本 pod 会炸"。
 
@@ -1025,7 +1103,7 @@ def run_lpmode_probe(cfg, args, rows):
     for row in rows:
         for L in [x for x in lens if x < len(row["ids"])]:
             ctx = list(row["prompt_ids"]) + list(row["ids"][:L])
-            got, toks = {}, {}
+            got, toks, tops = {}, {}, {}
             for name, sp in built.items():
                 o = llm.generate([{"prompt_token_ids": ctx}], sp, use_tqdm=False)[0].outputs[0]
                 ids = list(o.token_ids or [])
@@ -1033,21 +1111,30 @@ def run_lpmode_probe(cfg, args, rows):
                     got[name] = None
                     continue
                 toks[name] = int(ids[0])
-                d = (o.logprobs or [{}])[0] or {}
-                lp = d.get(toks[name])
-                got[name] = float(getattr(lp, "logprob", lp)) if lp is not None else None
-            sp_ = lpmode_spread(got)
-            rows_out.append({"provider": "vllm:lpmode", "q": row["q"], "L": L,
-                             "forms": got, "tokens": toks,
-                             "same_token": len(set(toks.values())) == 1,
-                             "spread": sp_.get("spread")})
+                d = {int(t): float(getattr(v, "logprob", v))
+                     for t, v in ((o.logprobs or [{}])[0] or {}).items()}
+                tops[name] = d
+                got[name] = d.get(toks[name])
+            # 训练真正消费的是**轨迹里那个 token**（不是各形态各自采到的）——单列出来，
+            # K>0 形态的字典里能查到它就给值；K=0 形态只有它自己采的那一个。
+            ref = int(row["ids"][L])
+            ref_vals = {n: tops.get(n, {}).get(ref) for n in built}
+            sp_ = lpmode_spread({n: ref_vals[n] if ref_vals[n] is not None else got[n]
+                                 for n in built})
             same = len(set(toks.values())) == 1
-            print(f"[diag]   q={row['q']} L={L} token={toks} "
-                  f"{'✅四条同 token' if same else '⚠ 四条采到不同 token（本身是发现）'}")
-            print("[diag]     " + "  ".join(f"{k}={_fmt(v)}" for k, v in got.items())
-                  + f"   → 极差={_fmt(sp_.get('spread'))}"
-                  + (f"（{sp_['argmax']} 最高/{sp_['argmin']} 最低）"
-                     if sp_.get("spread") else ""), flush=True)
+            rows_out.append({"provider": "vllm:lpmode", "q": row["q"], "L": L,
+                             "traj_target": ref, "forms": got, "ref_forms": ref_vals,
+                             "tokens": toks, "tops": tops,
+                             "same_token": same, "spread": sp_.get("spread")})
+            print(f"[diag]   q={row['q']} L={L} 采样 token={toks} "
+                  f"{'✅四条同 token' if same else '⚠ 四条采到不同 token（该点不可比）'}")
+            print("[diag]     各形态自采 token 的 logp: "
+                  + "  ".join(f"{k}={_fmt(v)}" for k, v in got.items())
+                  + f"   → 极差={_fmt(sp_.get('spread'))}")
+            print("[diag]     训练用的那个 token " + str(ref) + ": "
+                  + "  ".join(f"{k}={_fmt(ref_vals[k])}" for k in built)
+                  + "   （— = 该形态字典里没有它）", flush=True)
+    print_lpmode_summary(rows_out)
     return "vllm:lpmode", rows_out
 
 
@@ -1093,6 +1180,10 @@ def main() -> int:
     ap.add_argument("--lpmode_max_tokens", type=int, default=32,
                     help="--measure lpmode 的 T（生成长度形态；默认 32 够触发生成型"
                          "上报路径，又不必真生成 3072 个 token）")
+    ap.add_argument("--build_logprobs_n", type=int, default=0,
+                    help="建轨迹时的 logprobs=N（0=历史形态，已被真机实锤报数与分布"
+                         "不符；验证修复档时给 ≥1，**必须与训练 cfg vllm_logprobs_n "
+                         "一致**，否则验的不是训练那一档）")
     ap.add_argument("--torch_device", type=int, default=None, help="None=默认 cuda")
     ap.add_argument("--n", type=int, default=8, help="题数")
     ap.add_argument("--k", type=int, default=20, help="top-K 深度")
