@@ -656,101 +656,65 @@ def _vllm_config_readback(llm, key: str, max_depth: int = 4, max_objs: int = 400
     return None, hints[:12]
 
 
-def _is_multimodal_ckpt(path: str) -> bool:
-    """config.json 是**复合多模态** config（vocab_size 落在 text_config 里、顶层没有）？
-
-    docs/04 A1 的现场形状：torch 侧 AutoModelForCausalLM 拿复合 config 喂文本类 →
-    `'Qwen3_5Config' object has no attribute 'vocab_size'`。
-    **只用于拼错误信息，不作拦截判据**——形状是数据、能不能构造是数据×环境，环境一升级
-    （transformers 5.17 起会自己解包 text_config，2026-09-14 实机验证）形状判据就会从
-    "保护"翻转成"误杀"；真判据见 `_assert_torch_replica_loadable` 的 meta 预检。
-    读不到/坏 json 一律 False（宁可不拦，不可错拦）。
-    """
-    try:
-        with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
-            c = json.load(f)
-    except (OSError, ValueError):
-        return False
-    return "vocab_size" not in c and "text_config" in c
-
-
 def _probe_torch_construct(model_path: str) -> dict:
-    """在 **meta 设备**上真构造一次 AutoModelForCausalLM，**两条口径分别探**。
+    """在 **meta 设备**上真构造一次 AutoModelForCausalLM，**喂与真实加载同一个 config**。
 
-    走的是与真实加载**同一条**类解析 + `__init__` 路径（A1 就发生在这一步），但 meta
-    张量不分配内存/显存、只记形状，所以毫秒~秒级、零资源代价。
+    返回 {"error": 错误串|None, "composite": bool, "model_type": str}。
 
-    口径 a（auto）：`AutoConfig.from_pretrained` → `from_config(顶层 cfg)`。裸 torch 进程
-        下 transformers ≥5.17 会自己解包 text_config，此口径即通（2026-09-15 本地实测）。
-    口径 b（explicit）：显式喂 `cfg.text_config`，**绕开 auto 解析与 isinstance 解包**。
-        进程内 import 过 vLLM 后若 vLLM 换了 config 类，口径 a 会抛 A1，而 b 不经过
-        那个判断——这是"抽取产物到底还需不需要"的关键待验点。
+    【为什么必须同源】2026-09-15 实机教训：首版用 `from_config(顶层 cfg)` 探，而真实加载
+    走 `from_pretrained(目录)` 的**自动解包**——前者自己会解包（本地实测两条都通），后者在
+    gen 进程（import 过 vLLM）里不解包。于是预检在随后崩溃之前打印了"通过"：**预检通过的
+    那条路，恰好不是会坏的那条路**。现在预检与加载共用
+    `rlab.model_loading.resolve_load_config`，喂的输入相同，结论才可迁移。
 
-    返回 {"auto": 三态, "explicit": 三态, "composite": bool}，三态取值：
-      "ok"  = 本口径构造通过；"n/a" = 本 ckpt 没这个口径（纯文本 ckpt 无 text_config）；
-      错误串 = 构造失败。**【必须三态】**"无此口径"与"口径可用"若都记 None，调用方就分不清
-      "改用显式 config"和"这 ckpt 根本没有 text_config"，会给出误导性的处置。
-    不打印、不抛——由调用方决定口径（同一份结论要给加载点用，避免"探了 A、跑了 B"）。
+    与真实加载同一条**类解析 + `__init__`** 路径（A1 就发生在这一步），但 meta 张量只记
+    形状、不分配内存/显存，毫秒~秒级、零资源代价。不打印、不抛——由调用方处置。
     """
-    from transformers import AutoConfig, AutoModelForCausalLM
-    out = {"auto": "n/a", "explicit": "n/a", "composite": False}
+    from rlab.model_loading import resolve_load_config
+    from transformers import AutoModelForCausalLM
+
+    out = {"error": None, "composite": False, "model_type": "?"}
     try:
-        cfg = AutoConfig.from_pretrained(model_path)
+        cfg, composite = resolve_load_config(model_path)
     except Exception as e:
-        out["auto"] = out["explicit"] = f"{type(e).__name__}: {e}"
+        out["error"] = f"{type(e).__name__}: {e}"
         return out
-    text_cfg = getattr(cfg, "text_config", None)
-    out["composite"] = text_cfg is not None
-    for name, _c in (("auto", cfg), ("explicit", text_cfg)):
-        if _c is None:
-            continue                     # 保持 "n/a"
-        out[name] = "ok"
-        try:
-            with torch.device("meta"):
-                _m = AutoModelForCausalLM.from_config(_c)
-            del _m
-        except Exception as e:
-            out[name] = f"{type(e).__name__}: {e}"
+    out["composite"], out["model_type"] = composite, getattr(cfg, "model_type", "?")
+    try:
+        with torch.device("meta"):
+            _m = AutoModelForCausalLM.from_config(cfg)
+        del _m
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
     return out
 
 
-# torch 副本的加载口径：预检在 LLM() 之前定，加载点照用（避免"探了 A、跑了 B"）
-_REPLICA_MODE = {"explicit_text_config": False}
-
-
 def _assert_torch_replica_loadable(model_path: str) -> None:
-    """fail-fast：torch 侧副本能不能加载？**真预检一次**，而不是猜 config 的形状。
+    """fail-fast：torch 侧副本能不能加载？**用与真实加载同一个 config** 真构造一次。
 
     【为什么不能按形状判】2026-09-14 实测的不对称：同一份复合 ckpt，train 侧（裸 torch
     进程）两次 run 都加载成功，gen 侧（进程内 import 过 vLLM）必抛 A1——差别在
     **环境/进程**，不在 ckpt 形状。按形状判会在环境修好（或换 transformers/vLLM 版本）
     之后**误杀合法启动**，而这正是"宁可不拦，不可错拦"要避免的。
-    【判据】两条口径分别探（见 _probe_torch_construct）：口径 a（auto）通 → 照常加载；
-    a 不通而 b（显式 text_config）通 → 记下口径给加载点，**此时连抽取产物都不需要**；
-    两条都不通且像 A1 → fail-fast 并给两条改法；其他失败 → 只告警、交给真实加载定夺。
+    【判据】resolve_load_config 解析出的 config（复合 ckpt 即其 text_config——与加载
+    同源）在 meta 上构造得出来 → 放行；报错含 vocab_size（A1 特征）→ fail-fast 给两条
+    改法；其他失败 → 只告警，交给真实加载定夺。
     """
     r = _probe_torch_construct(model_path)
-    if r["auto"] == "ok":
+    if r["error"] is None:
         print(f"[rollout] torch 副本预检通过：本进程可构造 {model_path}"
-              f"（多模态/文本 ckpt 的 torch 侧加载形态已确认可用）", flush=True)
+              f"（口径={'显式 text_config' if r['composite'] else '顶层 config'}"
+              f"/{r['model_type']}，与真实加载同一个 config）", flush=True)
         return
-    if r["explicit"] == "ok":
-        _REPLICA_MODE["explicit_text_config"] = True
-        print(f"[rollout] torch 副本预检：auto 口径构造失败（{r['auto'][:70]}），"
-              f"但**显式 text_config** 口径通过 → 副本改用显式 config 加载"
-              f"（绕开本进程被改写的 auto 解析）。跑通即证明**不再需要**预抽的纯文本 ckpt。",
-              flush=True)
-        return
-    err = r["auto"]
+    err = r["error"]
     if "vocab_size" in err:
-        # 纯文本 ckpt 没有 explicit 口径（"n/a"）——别把那句写成"口径也不通"，那是两回事
-        _exp = "" if r["explicit"] == "n/a" else f"  显式 text_config 口径也不通：{r['explicit']}\n"
         raise RuntimeError(
-            f"[rollout] torch 侧副本无法加载（{model_path}）：auto 口径 {err}\n"
-            f"{_exp}"
+            f"[rollout] torch 侧副本无法加载（{model_path}）：{err}\n"
             f"  这是 docs/04 A1（复合多模态 config 喂文本类），gen 侧副本是它的第三个"
             f"入口（用 --verify_gen_logps 做对拍时踩到）。"
-            f"{'该 ckpt 顶层确实没有 vocab_size（在 text_config 里）——本环境两条口径都绕不过。' if _is_multimodal_ckpt(model_path) else ''}\n"
+            f"{'该 ckpt 顶层确实没有 vocab_size（在 text_config 里）。' if r['composite'] else ''}"
+            f"注意本预检已与加载同源（复合 ckpt 显式喂 text_config），仍失败说明该口径"
+            f"在本进程里也绕不过去。\n"
             f"  改法一（定版分裂加载）：model_path=<纯文本目录，如 /root/Qwen3.5-4B-text> "
             f"+ --vllm_model_path <多模态目录>；\n"
             f"  改法二（放弃对拍窗口）：去掉 --verify_gen_logps（副本只在 vllm_gen_logps "
@@ -856,13 +820,11 @@ def gen_worker(Q, cfg: dict):
         set(getattr(SamplingParams, "__dataclass_fields__", {}) or {})
     _torch_holder = [None]
     if (not _use_vllm_logps) or _verify_budget > 0:
-        # A1 护栏已在 LLM() 之前拦过**并按需选定口径**（_REPLICA_MODE）——加载必须照
-        # 预检结论走，否则"探了 auto、跑了 explicit"等于护栏白设。防静默缺键见
-        # rlab.model_loading.load_causal_lm。
+        # A1 护栏已在 LLM() 之前拦过。加载与预检**同源**（rlab.model_loading.resolve_load_config）：
+        # 探的输入就是跑的输入，不存在"探了 A、跑了 B"。
         _torch_holder[0] = load_causal_lm(
             cfg["model_path"], dtype=torch.bfloat16,
-            attn_implementation=cfg.get("attn_implementation", "sdpa"),
-            explicit_text_config=_REPLICA_MODE["explicit_text_config"]).cuda().eval()
+            attn_implementation=cfg.get("attn_implementation", "sdpa")).cuda().eval()
         print(f"[rollout] torch gen_logps 副本已加载"
               f"{'（仅用于前 %d 组对拍，验完释放）' % _verify_budget if _use_vllm_logps else ''}")
     else:

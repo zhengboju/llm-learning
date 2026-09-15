@@ -992,8 +992,8 @@ def test_vllm_gen_kwargs():
     # 不是"config 是不是复合形状"——同一份复合 ckpt 在 train 侧（裸 torch）两次 run 都
     # 加载成功、在 gen 侧（import 过 vLLM）必抛 A1，差别在**环境**不在形状；按形状判会在
     # 环境修好之后误杀合法启动（重装环境后就正好落在这一条上）。
-    from rlab.rollout import (_assert_torch_replica_loadable, _is_multimodal_ckpt,
-                              _probe_torch_construct)
+    from rlab.rollout import _assert_torch_replica_loadable, _probe_torch_construct
+    from rlab.model_loading import resolve_load_config
     import rlab.rollout as _ro
 
     def _mk_cfg(cfg_dict):
@@ -1002,57 +1002,72 @@ def test_vllm_gen_kwargs():
             json.dump(cfg_dict, f)
         return d
 
-    check("复合形状判定（只用于错误信息，不再作拦截判据）",
-          _is_multimodal_ckpt(_mk_cfg({"text_config": {"vocab_size": 1},
-                                       "vision_config": {}})) is True
-          and _is_multimodal_ckpt(_mk_cfg({"vocab_size": 248320})) is False
-          and _is_multimodal_ckpt("/nope/nope") is False)
-
-    # 判据四分支：替身注入预检结果（真预检见下）。两条口径分开探（2026-09-15）：
-    # 口径 a=auto（顶层 cfg），口径 b=显式 text_config（绕开被 vLLM 改写的 auto 解析）。
-    _orig_probe = _ro._probe_torch_construct
-    _orig_mode = dict(_ro._REPLICA_MODE)
-
-    def _stub(auto, explicit, composite=True):
-        return lambda p: {"auto": auto, "explicit": explicit, "composite": composite}
-
+    # 【2026-09-15 假绿灯】预检必须喂**与真实加载同一个 config**。实机：预检探顶层复合
+    # cfg（from_config 自己会解包）、加载走 from_pretrained 的自动解包（gen 进程不解包）
+    # → 预检在崩溃前打印"通过"。判据只能锚在"同源"上：预检与加载共用 resolve_load_config。
+    # 替身用 llava 而非 qwen3_5：本机 transformers 4.41 不认识 qwen3_5（开发机不装 5.x
+    # 依赖），而判据要保的是"复合 ckpt → 解析出 text_config"这条逻辑，与具体架构无关。
+    _mm = _mk_cfg({"model_type": "llava",
+                   "text_config": {"model_type": "llama", "vocab_size": 128},
+                   "vision_config": {"model_type": "clip_vision_model", "hidden_size": 32,
+                                     "image_size": 8, "patch_size": 4, "num_hidden_layers": 1,
+                                     "num_attention_heads": 1, "intermediate_size": 32},
+                   "architectures": ["LlavaForConditionalGeneration"]})
+    _txt = _mk_cfg({"model_type": "llama", "vocab_size": 128})
+    check("复合 ckpt 解析出 text_config（显式喂它，不靠自动解包）",
+          resolve_load_config(_mm)[1] is True
+          and resolve_load_config(_mm)[0].model_type == "llama")
+    check("纯文本 ckpt 解析出顶层 config（原样加载，行为零变化）",
+          resolve_load_config(_txt)[1] is False
+          and resolve_load_config(_txt)[0].model_type == "llama")
+    check("坏目录直接抛（不静默当成纯文本 ckpt 放行）",
+          _raises(lambda: resolve_load_config("/nope/nope"), Exception))
+    # 同源判据走**行为**（不数源码文本）：给解析函数装替身，预检与加载都必须经过它——
+    # 假绿灯的根因就是"预检自己解析了一份、加载又解析了一份"，两者分叉。
+    import rlab.model_loading as _ml
+    _orig_resolve = _ml.resolve_load_config
+    _called = []
     try:
-        _ro._probe_torch_construct = _stub(
-            "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'",
-            "AttributeError: 显式口径也 vocab_size")
-        check("两条口径都报 A1 -> RuntimeError（拦，带两条改法）",
+        _ml.resolve_load_config = lambda p: (_called.append(p), _orig_resolve(p))[1]
+        _probe_torch_construct("gpt2")
+        check("预检经过 resolve_load_config（同源，不是各解析一份）", _called == ["gpt2"])
+
+        class _Sentinel(Exception):
+            pass
+
+        def _boom(p):
+            raise _Sentinel(p)
+
+        _ml.resolve_load_config = _boom
+        check("加载也经过 resolve_load_config（同一份解析）",
+              _raises(lambda: _ml.load_causal_lm("gpt2", dtype=torch.float32), _Sentinel))
+    finally:
+        _ml.resolve_load_config = _orig_resolve
+
+    # 判据三分支：替身注入预检结果（真预检见下）
+    _orig_probe = _ro._probe_torch_construct
+    try:
+        _ro._probe_torch_construct = lambda p: {
+            "error": "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'",
+            "composite": True, "model_type": "qwen3_5_text"}
+        check("预检报 A1 特征 -> RuntimeError（拦，带两条改法）",
               _raises(lambda: _assert_torch_replica_loadable("/x"), RuntimeError))
-        _ro._REPLICA_MODE["explicit_text_config"] = False
-        _ro._probe_torch_construct = _stub(
-            "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'", "ok")
-        check("auto 不通但显式 text_config 通 -> 放行不拦（免抽取的关键分支）",
+        _ro._probe_torch_construct = lambda p: {
+            "error": "ValueError: meta 预检自身的限制", "composite": False, "model_type": "gpt2"}
+        check("预检报非 A1 -> 只告警放行（反证：否则预检的怪癖会误杀合法启动）",
               _assert_torch_replica_loadable("/x") is None)
-        check("且把口径记给加载点（探了 A 却跑 B = 护栏白设）",
-              _ro._REPLICA_MODE["explicit_text_config"] is True)
-        _ro._REPLICA_MODE["explicit_text_config"] = False
-        _ro._probe_torch_construct = _stub("ValueError: meta 预检自身的限制", "n/a", False)
-        check("口径 a 报非 A1 -> 只告警放行（反证：否则预检的怪癖会误杀合法启动）",
-              _assert_torch_replica_loadable("/x") is None)
-        check("纯文本 ckpt 的 'n/a'（无此口径）不被当成'可用'而误改口径",
-              _ro._REPLICA_MODE["explicit_text_config"] is False)
-        _ro._probe_torch_construct = _stub("ok", "n/a", False)
-        check("口径 a 通过 -> 放行且不改口径",
-              _assert_torch_replica_loadable("/x") is None
-              and _ro._REPLICA_MODE["explicit_text_config"] is False)
+        _ro._probe_torch_construct = lambda p: {
+            "error": None, "composite": False, "model_type": "gpt2"}
+        check("预检通过 -> 放行", _assert_torch_replica_loadable("/x") is None)
     finally:
         _ro._probe_torch_construct = _orig_probe
-        _ro._REPLICA_MODE.update(_orig_mode)
 
-    # 真预检（不注入替身）：meta 构造零显存零内存，结论与真实加载同路径
-    check("真预检：可加载的小模型 auto 口径 ok（gpt2 本地缓存）",
-          _probe_torch_construct("gpt2")["auto"] == "ok")
-    check("真预检：纯文本 ckpt 的 explicit 记为 'n/a'（无此口径 ≠ 失败）",
-          _probe_torch_construct("gpt2")["explicit"] == "n/a"
+    # 真预检（不注入替身）：meta 构造零显存零内存，喂的 config 与真实加载同源
+    check("真预检：可加载的小模型返回 error=None（gpt2 本地缓存）",
+          _probe_torch_construct("gpt2")["error"] is None
           and _probe_torch_construct("gpt2")["composite"] is False)
-    _bad = _probe_torch_construct(tempfile.mkdtemp())
-    check("真预检：坏目录/缺 config 两条口径都返回错误串而不抛",
-          isinstance(_bad["auto"], str) and _bad["auto"] not in ("ok", "n/a")
-          and _bad["explicit"] not in ("ok", "n/a"))
+    check("真预检：坏目录/缺 config 返回错误串而不抛",
+          isinstance(_probe_torch_construct(tempfile.mkdtemp())["error"], str))
 
     check("空 kwargs 直接放行（不触发 vLLM import，CPU 可测）",
           _check_vllm_gen_kwargs({}) is None)

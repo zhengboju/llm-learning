@@ -2,45 +2,55 @@
 """rlab/model_loading.py — torch 侧 causal LM 的统一加载口径 + 防"静默缺键"护栏。
 
 【为什么需要】Qwen3.5-4B 官方 ckpt 是**多模态复合体**（config 顶层没有 vocab_size，
-它在 text_config 里），而 rlab 全链路按纯文本 causal LM 设计：
-  · transformers ≥5.16 自带 `"qwen3_5_text": PrefixChange(prefix_to_remove="language_model")`
-    映射（conversion_mapping.py），≥5.17 的 from_pretrained 还会**自己解包** text_config
-    → 裸 torch 进程直连多模态目录即可，主干权重与多模态主干**逐位相等**（2026-09-15 本地
-    5.17.0 + 微型复合 ckpt 实测：missing=[]、前向 hidden_states max|Δ|=0）；仓库里 09-14
-    的现场记录也一致（rollout.py:699：train 侧两次 run 都加载成功）。
-  · 但**进程内 import 过 vLLM 之后**构造会抛 A1（`'Qwen3_5Config' object has no attribute
-    'vocab_size'`）——同 ckpt 同版本，差别只在**进程环境**（vLLM 可能注册了自己的 config
-    类，令 isinstance 式的解包判断失效）。此时用 `explicit_text_config=True` 显式喂
-    text_config，绕开 auto 解析与解包判断。
+它在 text_config 里），而 rlab 全链路按纯文本 causal LM 设计。复合 config 不能直接喂
+文本模型类，必须先把 text_config 解出来——三种做法的可靠性差别极大：
+
+  · 靠 transformers **自动解包**（`AutoModelForCausalLM.from_pretrained(目录)` 不带 config）：
+    **随进程环境翻转**。2026-09-15 实机（同一份 ckpt、同一台机、同一次 run）：train 进程
+    （裸 torch）解包成功，gen 进程（进程内 import 过 vLLM）不解包 → `AttributeError:
+    'Qwen3_5Config' object has no attribute 'vocab_size'`（docs/04 A1）。差别只在进程。
+  · 靠预检"复刻真实加载路径"：复刻不全 = 假绿灯。同一次 run 里预检用 `from_config(顶层
+    cfg)` 探、真实加载走 `from_pretrained(目录)` 的自动解包——前者自己会解包、后者在 gen
+    进程里不会，于是预检在随后崩溃之前**打印了"通过"**。
+  · **显式喂 text_config**（本模块做法）：不依赖任何自动解包语义，两个进程同一条路。
+    本地 5.17.0 + 微型复合 ckpt 逐位核对：`from_pretrained(目录, config=text_config)` →
+    missing=[]、主干权重与多模态主干逐位相等、前向 hidden_states max|Δ|=0。
+    键名的字面量映射（`model.language_model.X` -> `model.X`）仍由 transformers 内置的
+    "qwen3_5_text" 转换映射负责（5.16 起）。
 
 【护栏：为什么必须显式炸】若 transformers 回退到没有该映射的版本，from_pretrained 对
 缺键**只打 warning 就放行**——模型带着一堆**随机初始化**权重继续训练。实测（2026-09-15，
-摘掉内置映射后同一份 ckpt）：missing 56/55 个张量，进程不报错。这类失败完全静默，
+摘掉内置映射后同一份 ckpt）：missing 56/55 个张量，进程一声不响。这类失败完全静默，
 判据只能自己立：`missing_keys` 必须为空。unexpected 不拦——多模态目录里的 vision 键
 被文本模型忽略属预期。
 """
 
 
-def load_causal_lm(model_path: str, *, dtype, attn_implementation: str | None = None,
-                   explicit_text_config: bool = False):
-    """加载 causal LM，并**防静默缺键**（missing_keys 非空即抛）。返回模型（不搬设备）。
+def resolve_load_config(model_path: str):
+    """解析出**加载时真正要喂给模型类**的 config。返回 (config, is_composite)。
 
-    explicit_text_config=True：复合 ckpt 显式喂 text_config（vLLM 进程内的 A1 兜底）。
-    纯文本 ckpt 传 True 会直接报错——别把"没这个口径"静默当成"不需要"。
+    这是"预检探的输入"与"真实加载跑的输入"的**唯一来源**——两者必须调同一个函数，
+    否则会分叉成假绿灯（见模块 docstring 第二条）。
+    复合多模态 ckpt → 返回其 text_config；纯文本 ckpt → 返回顶层 config。
     """
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig
 
+    cfg = AutoConfig.from_pretrained(model_path)
+    text_cfg = getattr(cfg, "text_config", None)
+    return (text_cfg, True) if text_cfg is not None else (cfg, False)
+
+
+def load_causal_lm(model_path: str, *, dtype, attn_implementation: str | None = None):
+    """加载 causal LM：口径 = resolve_load_config + 防静默缺键。返回模型（不搬设备）。"""
+    from transformers import AutoModelForCausalLM
+
+    cfg, composite = resolve_load_config(model_path)
     kwargs = {"torch_dtype": dtype}
+    if composite:
+        # 显式喂 text_config：绕开"自动解包随进程环境翻转"。纯文本 ckpt 保持原样加载。
+        kwargs["config"] = cfg
     if attn_implementation:
         kwargs["_attn_implementation"] = attn_implementation
-    if explicit_text_config:
-        cfg = AutoConfig.from_pretrained(model_path)
-        text_cfg = getattr(cfg, "text_config", None)
-        if text_cfg is None:
-            raise RuntimeError(
-                f"{model_path} 不是多模态复合 config（无 text_config），"
-                "不需要 explicit_text_config——请检查预检口径是否用错")
-        kwargs["config"] = text_cfg
 
     model, info = AutoModelForCausalLM.from_pretrained(
         model_path, output_loading_info=True, **kwargs)
