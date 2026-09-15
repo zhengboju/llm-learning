@@ -1252,6 +1252,19 @@ def test_attn_impl():
           sh_src.count('--attn_implementation "$ATTN_IMPL"') == 2 and _inj_i < _argv_i)
     check("train.py CLI choices 含 flash_attention_2",
           '"flash_attention_2"' in train_src and "--attn_implementation" in train_src)
+    # 【2026-09-15 pod 实机】显式传 config 后，私有名 _attn_implementation 会漏给
+    # __init__（TypeError: unexpected keyword argument）——三处加载点全中。判据锚在
+    # "真正传出去的 kwargs"上（纯函数，本地 CPU 可测，不必真加载模型）。
+    from rlab.model_loading import build_load_kwargs
+    _kw = build_load_kwargs(object(), True, torch.bfloat16, "flash_attention_2")
+    check("显式 config 时 attn 走**公开名**（私有名会被漏给 __init__ → pod TypeError）",
+          _kw.get("attn_implementation") == "flash_attention_2"
+          and "_attn_implementation" not in _kw)
+    check("复合 ckpt 把 config 显式带上；纯文本 ckpt 不带（原样加载，行为零变化）",
+          "config" in _kw
+          and "config" not in build_load_kwargs(object(), False, torch.bfloat16))
+    check("不传 attn_implementation 时不带该键（用 config 自带口径）",
+          "attn_implementation" not in build_load_kwargs(object(), False, torch.float32))
 
 
 def test_materialize_mm():

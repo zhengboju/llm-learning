@@ -40,20 +40,35 @@ def resolve_load_config(model_path: str):
     return (text_cfg, True) if text_cfg is not None else (cfg, False)
 
 
-def load_causal_lm(model_path: str, *, dtype, attn_implementation: str | None = None):
-    """加载 causal LM：口径 = resolve_load_config + 防静默缺键。返回模型（不搬设备）。"""
-    from transformers import AutoModelForCausalLM
+def build_load_kwargs(cfg, composite: bool, dtype, attn_implementation: str | None = None) -> dict:
+    """构造 from_pretrained 的实参。**纯函数**——本地 CPU 就能测，不必真加载模型。
 
-    cfg, composite = resolve_load_config(model_path)
+    【attn 为什么必须用公开名】私有名 `_attn_implementation` 只在"**不传** config"时才
+    被 `AutoConfig.from_pretrained(**kwargs)` 顺手 setattr 到 config 上；一旦显式传 config，
+    AutoConfig 不参与解析，私有名就原样漏进 `cls(config, **model_kwargs)` →
+    `TypeError: Qwen3_5ForCausalLM.__init__() got an unexpected keyword argument
+    '_attn_implementation'`（pod 实机 2026-09-15，ref_server 最先炸——三处加载点全中）。
+    公开名由 from_pretrained 自己消费：`config._attn_implementation =
+    kwargs.pop("attn_implementation")`（modeling_utils.py:1424），与传不传 config 无关；
+    FA2 可用性校验照旧发生在模型 `__init__`（同一处），行为不变。
+    """
     kwargs = {"torch_dtype": dtype}
     if composite:
         # 显式喂 text_config：绕开"自动解包随进程环境翻转"。纯文本 ckpt 保持原样加载。
         kwargs["config"] = cfg
     if attn_implementation:
-        kwargs["_attn_implementation"] = attn_implementation
+        kwargs["attn_implementation"] = attn_implementation
+    return kwargs
 
+
+def load_causal_lm(model_path: str, *, dtype, attn_implementation: str | None = None):
+    """加载 causal LM：口径 = resolve_load_config + 防静默缺键。返回模型（不搬设备）。"""
+    from transformers import AutoModelForCausalLM
+
+    cfg, composite = resolve_load_config(model_path)
     model, info = AutoModelForCausalLM.from_pretrained(
-        model_path, output_loading_info=True, **kwargs)
+        model_path, output_loading_info=True,
+        **build_load_kwargs(cfg, composite, dtype, attn_implementation))
     missing = sorted(info.get("missing_keys") or [])
     if missing:
         raise RuntimeError(
