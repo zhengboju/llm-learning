@@ -794,6 +794,51 @@ def _assert_torch_replica_loadable(model_path: str) -> None:
           flush=True)
 
 
+def map_attention_backend(backend: str, known_keys) -> dict:
+    """把"显式指定 attention backend"映射成本版 vLLM 认识的键名。纯函数（CPU 可测）。
+
+    【2026-09-15 真机】`VLLM_BATCH_INVARIANT=1` 在 v0.19.1 里存在（envs.py:78），但直接
+    开会启动即失败：
+      RuntimeError: VLLM batch_invariant mode requires an attention backend in
+      ['FLASH_ATTN','TRITON_ATTN','FLASH_ATTN_MLA','TRITON_MLA'], but got 'None'
+    因为该检查跑在 backend 解析**之前**，必须显式给。键名跨版本有
+    `attention_config={"backend": ...}` 与 `attention_backend=...` 两形态——**问注册表**而
+    不硬编码（同 _check_vllm_gen_kwargs）；两个都没有就 raise：静默忽略会让"开了确定性档"
+    变成"其实没开"。"""
+    if "attention_config" in known_keys:
+        return {"attention_config": {"backend": str(backend)}}
+    if "attention_backend" in known_keys:
+        return {"attention_backend": str(backend)}
+    raise RuntimeError(
+        f"[rollout] 本版 vLLM 的引擎参数里既没有 attention_config 也没有 attention_backend"
+        f"（已知键样例：{sorted(k for k in known_keys if 'attn' in k)[:8]}）——"
+        "无法显式指定 attention backend，VLLM_BATCH_INVARIANT=1 会启动即失败")
+
+
+def attention_backend_kwargs(backend: str) -> dict:
+    """从 vLLM 自己的 CLI 注册表取键名（探测不到就 raise，不静默）。"""
+    import argparse
+    from vllm.engine.arg_utils import EngineArgs
+
+    parser = argparse.ArgumentParser(add_help=False)
+    EngineArgs.add_cli_args(parser)
+    return map_attention_backend(backend, {a.dest for a in parser._actions})
+
+
+def batch_invariant_guard(enabled, attention_backend) -> None:
+    """确定性档的前置检查（fail-fast 在引擎构造之前）。纯逻辑，CPU 可测。
+
+    真机代价：`VLLM_BATCH_INVARIANT=1` 而没给 attention backend → 引擎初始化时抛
+    RuntimeError（白等一次 ~17s 的引擎启动）；反过来给了 backend 但没开确定性档，
+    则"确定性"这个前提其实不成立——所以两件事必须同时声明。"""
+    if enabled and not attention_backend:
+        raise RuntimeError(
+            "[rollout] vllm_batch_invariant=True 但没有 vllm_attention_backend："
+            "vLLM 的 batch-invariant 检查跑在 attention backend 解析之前，会直接抛 "
+            "RuntimeError（requires an attention backend in ['FLASH_ATTN', ...], got 'None'）。"
+            "请同时给 --vllm_attention_backend FLASH_ATTN（或 TRITON_ATTN）")
+
+
 def _check_vllm_gen_kwargs(kwargs: dict) -> None:
     """fail-fast：在**构造 LLM 之前**把 vLLM 不认识的引擎参数键名拦下。
 
@@ -875,6 +920,20 @@ def gen_worker(Q, cfg: dict):
     if (not _use_vllm_logps) or _verify_budget > 0:
         _assert_torch_replica_loadable(cfg["model_path"])   # A1：复合 ckpt 进不了 torch
     _gen_kwargs = cfg.get("vllm_gen_kwargs") or {}
+    # 【2026-09-15】确定性档：真机实测不开时同进程背靠背同请求的 top-K 字典 3/3 不同、
+    # top-1 logp 抖动 0.19nat；开 VLLM_BATCH_INVARIANT=1 + 显式 attention backend 后
+    # 3/3 全同（spread=0）。env 必须在 vLLM 读取之前设好（envs 是惰性 lambda，本进程内
+    # 设置即可），故放在这里一次性设置 + 前置检查。
+    _attn_be = cfg.get("vllm_attention_backend")
+    batch_invariant_guard(bool(cfg.get("vllm_batch_invariant")), _attn_be)
+    if cfg.get("vllm_batch_invariant"):
+        os.environ["VLLM_BATCH_INVARIANT"] = "1"
+        print("[rollout] 已开 VLLM_BATCH_INVARIANT=1（确定性档：会关 custom all-reduce、"
+              "改用确定性 kernel，吞吐有代价）", flush=True)
+    if _attn_be:
+        _gen_kwargs = dict(_gen_kwargs)
+        _gen_kwargs.update(attention_backend_kwargs(_attn_be))
+        print(f"[rollout] attention backend={_attn_be} → {_gen_kwargs}", flush=True)
     _check_vllm_gen_kwargs(_gen_kwargs)   # 键名错 = 静默忽略 = 修复白做，必须构造前拦
     vllm_gen = LLM(model=cfg.get("vllm_model_path") or cfg["model_path"],
                    gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),

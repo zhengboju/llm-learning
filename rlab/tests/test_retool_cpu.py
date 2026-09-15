@@ -2619,6 +2619,32 @@ def test_logprobs_n_fix_path():
     check("--attention_backend 已接线到所有 LLM() 入口（backend 档 + attention 档）",
           dsrc.count("vllm_extra_kwargs(cfg, args)") >= 3
           and '"--attention_backend"' in dsrc)
+    # 【真机 19:xx】VLLM_BATCH_INVARIANT=1 + 显式 attention backend → det 3/3 全同（spread=0）。
+    # 训练端要能用同一套：config 两个键 + train.py 两个 flag + gen_worker 设 env/前置检查。
+    from rlab.config import BASE
+    from rlab.rollout import batch_invariant_guard
+    check("config 新增 vllm_batch_invariant / vllm_attention_backend（默认关）",
+          BASE.get("vllm_batch_invariant") is False
+          and BASE.get("vllm_attention_backend") is None)
+    trsrc = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    ro = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "rollout.py"), encoding="utf-8").read()
+    check("train.py 暴露 --vllm_batch_invariant 与 --vllm_attention_backend",
+          '"--vllm_batch_invariant"' in trsrc and '"--vllm_attention_backend"' in trsrc
+          and 'overrides["vllm_batch_invariant"] = True' in trsrc)
+    check("gen_worker 设 VLLM_BATCH_INVARIANT=1 并把 attention backend 并进引擎参数",
+          'os.environ["VLLM_BATCH_INVARIANT"] = "1"' in ro
+          and "_gen_kwargs.update(attention_backend_kwargs(_attn_be))" in ro)
+    check("确定性档前置检查：开了但没有 backend → raise（别白等一次引擎启动）",
+          batch_invariant_guard(False, None) is None
+          and batch_invariant_guard(True, "FLASH_ATTN") is None)
+    try:
+        batch_invariant_guard(True, None)
+        check("开了确定性档但缺 attention backend → 必须 raise", False)
+    except RuntimeError as e:
+        check("开了确定性档但缺 attention backend → raise 且给出正确 flag",
+              "vllm_attention_backend" in str(e))
     check("我们的 logp 路径不用 flash-attn CE（纯 log_softmax+gather，已在对齐标准上）",
           "log_softmax" in open(os.path.join(
               os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

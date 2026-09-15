@@ -492,6 +492,14 @@ def main():
                          "首次启用请配 --verify_gen_logps 对拍）")
     ap.add_argument("--verify_gen_logps", type=int, default=None,
                     help="前 N 组同时算两路 gen_logps 并打印最大差，验完释放 torch 副本")
+    ap.add_argument("--vllm_batch_invariant", action="store_true",
+                    help="开 vLLM 确定性档（VLLM_BATCH_INVARIANT=1）。真机实测：不开时同进程"
+                         "背靠背同请求的 top-K 字典 3/3 不同、top-1 logp 抖动 0.19nat；"
+                         "开了 3/3 全同。**必须同时给 --vllm_attention_backend**"
+                         "（否则引擎启动即 RuntimeError），见 docs/07")
+    ap.add_argument("--vllm_attention_backend", default=None,
+                    help="显式 attention backend（如 FLASH_ATTN）。batch-invariant 要求；"
+                         "键名由本版 vLLM 注册表自证，不硬编码")
     ap.add_argument("--fwd_batch_chunk", type=int, default=None,
                     help="分块前向每次过 backbone 的行数（默认 1=逐行=历史口径；"
                          ">1 减少 kernel/调度开销，显存峰值线性增长；四处共用同一"
@@ -536,6 +544,8 @@ def main():
     if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk
     if args.vllm_gen_logps: overrides["vllm_gen_logps"] = True
     if args.verify_gen_logps is not None: overrides["verify_gen_logps"] = args.verify_gen_logps
+    if args.vllm_batch_invariant: overrides["vllm_batch_invariant"] = True
+    if args.vllm_attention_backend: overrides["vllm_attention_backend"] = args.vllm_attention_backend
     if args.vllm_gen_kwargs:   # 类型闸在 config.get_config（非 dict 在生成端只会表现为"进程已退出"）
         overrides["vllm_gen_kwargs"] = json.loads(args.vllm_gen_kwargs)
 

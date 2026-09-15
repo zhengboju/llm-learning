@@ -1158,35 +1158,19 @@ def run_lpmode_probe(cfg, args, rows):
 
 
 def map_attention_backend(backend: str, known_keys) -> dict:
-    """把"显式指定 attention backend"映射成本版 vLLM 认识的键名。纯函数（CPU 可测）。
+    """转发到 rollout 的纯函数（单一实现；diag 与训练端用同一套判据）。
 
-    为什么需要（真机 2026-09-15 19:03）：`VLLM_BATCH_INVARIANT=1` 在 v0.19.1 里确实存在
-    （envs.py 注册了该键），但引擎初始化直接抛：
-      RuntimeError: VLLM batch_invariant mode requires an attention backend in
-      ['FLASH_ATTN', 'TRITON_ATTN', ...], but got 'None'. Please use --attention-backend
-      or attention_config ...
-    即 batch-invariant 的检查跑在 backend 解析**之前**，必须显式给。键名跨版本有
-    `attention_config={"backend": ...}` 与 `attention_backend=...` 两种形态——**问注册表
-    而不是硬编码**（同 _check_vllm_gen_kwargs 的做法），两个都没有就 raise：静默忽略会
-    让"开了 batch-invariant"变成"其实没开"，本项目栽过多次。"""
-    if "attention_config" in known_keys:
-        return {"attention_config": {"backend": str(backend)}}
-    if "attention_backend" in known_keys:
-        return {"attention_backend": str(backend)}
-    raise RuntimeError(
-        f"[diag] 本版 vLLM 的引擎参数里既没有 attention_config 也没有 attention_backend"
-        f"（已知键样例：{sorted(k for k in known_keys if 'attn' in k)[:8]}）——"
-        "无法显式指定 attention backend，VLLM_BATCH_INVARIANT=1 会启动即失败")
+    真机 2026-09-15：`VLLM_BATCH_INVARIANT=1` 存在但引擎启动即抛
+    "requires an attention backend ... got 'None'"——该检查跑在 backend 解析之前；
+    键名跨版本两形态（attention_config / attention_backend），实现见 rollout。"""
+    from rlab.rollout import map_attention_backend as _impl
+    return _impl(backend, known_keys)
 
 
 def attention_backend_kwarg(backend: str) -> dict:
-    """从 vLLM 自己的 CLI 注册表取键名（探测不到就 raise，不静默）。"""
-    import argparse
-
-    from vllm.engine.arg_utils import EngineArgs
-    parser = argparse.ArgumentParser(add_help=False)
-    EngineArgs.add_cli_args(parser)
-    return map_attention_backend(backend, {a.dest for a in parser._actions})
+    """转发到 rollout 的注册表映射（单一实现，避免两处漂移）。"""
+    from rlab.rollout import attention_backend_kwargs
+    return attention_backend_kwargs(backend)
 
 
 def vllm_extra_kwargs(cfg, args) -> dict:

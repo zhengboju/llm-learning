@@ -286,6 +286,12 @@ BASE = dict(
     # 的 max 12.8 同源）；N≥1（top-K 里挑被采样 token）与 torch 的差回落到 mean 0.02/
     # max 0.23。故 vllm_gen_logps 档位建议 N≥1；默认 0 只为保留 A/B 与旧 run 可复现。
     vllm_logprobs_n=0,
+    # 【2026-09-15 真机】vLLM 采样确定性档：不开时同一请求**同进程背靠背**三次的 top-K
+    # 字典 3/3 不同、top-1 logp 抖动 0.19 nat（det 探针）；开 VLLM_BATCH_INVARIANT=1 +
+    # 显式 attention backend 后 3/3 全同（spread=0）。代价：关 custom all-reduce、
+    # 用确定性 kernel，吞吐下降——是"用 vLLM logps 省 8G"能否成立的前提。见 docs/07。
+    vllm_batch_invariant=False,
+    vllm_attention_backend=None,   # 如 "FLASH_ATTN"；batch-invariant 要求，缺了会启动即失败
     verify_gen_logps=0,      # >0：前 N 组同时算两路并打印最大差（临时加载 torch 副本，验完释放）
 
     # ---- 系统提示（与 simple_grpo_v1 完全一致，保证可比）----
