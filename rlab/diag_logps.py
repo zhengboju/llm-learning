@@ -1162,6 +1162,90 @@ def _fmt(v):
     return "None" if v is None else f"{v:.3g}"
 
 
+def traj_diff_stats(rows_a: list, rows_b: list) -> dict:
+    """**同一设置建两次轨迹**的逐位置对比（纯函数）。
+
+    为什么需要它（真机 2026-09-15 18:28）：lpmode 的噪声地板（同形态 B 问两次）
+    与"换开关"的差异同量级（值 mean|Δ| 0.074/max 0.54；top-K 字典 **0/36 相同**、
+    交集上 max|Δ|=5.98）——于是"哪个开关让读数变了"这个问题在当前设计下**无法回答**。
+    但 lpmode 探针把 5 种请求形态交错着打，本身可能扰动引擎状态（autotuner/kernel
+    选择/编译变体），所以那个噪声地板是**上界**。要回答"训练档可不可复现"，必须在
+    **训练自己那一档、单形态**下重复：同命令 --build_traj 跑两次，比两次的 token 与
+    逐位置 logp。
+
+    读法：若两次轨迹的 token 全同、|Δlogp| 约 0 → 训练档可复现，那 6.8nat 的离群是
+    **系统性**的（可修）；若两次就大面积不同 → 训练端的 gen_logps 本身带随机量，
+    唯一可靠的路是 torch 副本（同源重算）。"""
+    by_q = {r["q"]: r for r in rows_b}
+    ds, same_pos, tok_same, tok_cmp = [], 0, 0, 0
+    d0, drest, worst = [], [], []
+    for ra in rows_a:
+        rb = by_q.get(ra["q"])
+        if rb is None:
+            continue
+        ia, ib = list(ra.get("ids") or []), list(rb.get("ids") or [])
+        la, lb = list(ra.get("logps") or []), list(rb.get("logps") or [])
+        n = min(len(ia), len(ib), len(la), len(lb))
+        if n:
+            same_pos += 1
+        for pos in range(n):
+            tok_cmp += 1
+            tok_same += int(ia[pos] == ib[pos])
+            if la[pos] is None or lb[pos] is None:
+                continue
+            d = abs(float(la[pos]) - float(lb[pos]))
+            ds.append(d)
+            (d0 if pos == 0 else drest).append(d)
+            worst.append({"q": ra["q"], "pos": pos, "a": float(la[pos]),
+                          "b": float(lb[pos]), "d": d,
+                          "same_tok": ia[pos] == ib[pos]})
+    if not ds:
+        return {"n": 0, "note": "两次轨迹没有可比位置（键不同/缺 logps？）"}
+    ds_sorted = sorted(ds)
+    d0s, drs = sorted(d0), sorted(drest)
+    return {"n": len(ds), "n_questions": same_pos,
+            "token_match_rate": (tok_same / tok_cmp) if tok_cmp else None,
+            "mean": sum(ds) / len(ds), "p50": ds_sorted[len(ds_sorted) // 2],
+            "p99": ds_sorted[min(len(ds_sorted) - 1, int(0.99 * len(ds_sorted)))],
+            "max": ds_sorted[-1],
+            "frac_gt_1": sum(1 for d in ds if d > BIG_NAT) / len(ds),
+            "frac_gt_01": sum(1 for d in ds if d > 0.1) / len(ds),
+            "pos0_mean": (sum(d0s) / len(d0s)) if d0s else None,
+            "pos0_max": d0s[-1] if d0s else None,
+            "rest_mean": (sum(drs) / len(drs)) if drs else None,
+            "rest_max": drs[-1] if drs else None,
+            "worst": sorted(worst, key=lambda w: -w["d"])[:5]}
+
+
+def print_traj_diff(a_path, b_path):
+    rows_a, rows_b = _read_jsonl(a_path), _read_jsonl(b_path)
+    st = traj_diff_stats(rows_a, rows_b)
+    print(f"[diag] 两次建轨迹对比：{a_path} vs {b_path}")
+    if not st.get("n"):
+        print("[diag]   " + st.get("note", "无可比位置"))
+        return 1
+    print(f"[diag]   逐位置 n={st['n']}（{st['n_questions']} 题）；"
+          f"**token 逐位置一致率={_pctfmt(st['token_match_rate'])}**")
+    print(f"[diag]   |Δlogp|: mean={st['mean']:.3g} p50={st['p50']:.3g} "
+          f"p99={st['p99']:.3g} max={st['max']:.3g}  >0.1={_pctfmt(st['frac_gt_01'])} "
+          f">1nat={_pctfmt(st['frac_gt_1'])}")
+    print(f"[diag]   位置0（每轮首 token）: mean={_fmt(st['pos0_mean'])} "
+          f"max={_fmt(st['pos0_max'])}｜其余位置: mean={_fmt(st['rest_mean'])} "
+          f"max={_fmt(st['rest_max'])}")
+    for w in st["worst"]:
+        print(f"[diag]   最差点 q={w['q']} pos={w['pos']} a={w['a']:.3f} "
+              f"b={w['b']:.3f} Δ={w['d']:.3f} token相同={w['same_tok']}")
+    tok_ok = (st["token_match_rate"] or 0) >= 0.999
+    rep_ok = st["mean"] < 0.01 and st["p99"] < 0.1
+    print("[diag]   判读：" + (
+        "两次轨迹**完全可复现** → 训练档稳定，此前 6.8nat 的离群是系统性的（可修）"
+        if tok_ok and rep_ok else
+        f"训练档**不可复现**（token 一致率 {_pctfmt(st['token_match_rate'])}、"
+        f"|Δ| p99={st['p99']:.3g}）→ 训练端 gen_logps 自带随机量，"
+        "唯一同源的路是 torch 副本（vllm_gen_logps=False）"))
+    return 0
+
+
 def _pctfmt(v):
     return "None" if v is None else f"{100 * v:.2f}%"
 
@@ -1204,6 +1288,9 @@ def main() -> int:
                     help="建轨迹时的 logprobs=N（0=历史形态，已被真机实锤报数与分布"
                          "不符；验证修复档时给 ≥1，**必须与训练 cfg vllm_logprobs_n "
                          "一致**，否则验的不是训练那一档）")
+    ap.add_argument("--diff_traj", nargs=2, metavar=("A", "B"),
+                    help="比较两次 --build_traj 产出的 jsonl（token 一致率 + 逐位置 "
+                         "|Δlogp|）。这是'训练档在自己那一档 T 下是否可复现'的判据。")
     ap.add_argument("--torch_device", type=int, default=None, help="None=默认 cuda")
     ap.add_argument("--n", type=int, default=8, help="题数")
     ap.add_argument("--k", type=int, default=20, help="top-K 深度")
@@ -1221,6 +1308,9 @@ def main() -> int:
         if not args.merge:
             ap.error("--merge 后面要跟至少一个 jsonl")
         return merge_main(args)
+
+    if args.diff_traj:
+        return print_traj_diff(args.diff_traj[0], args.diff_traj[1])
 
     from rlab.config import get_config
     cfg = get_config(args.algo, use_wandb=False)
@@ -1259,9 +1349,13 @@ def main() -> int:
         print(f"[diag] 复用轨迹 {args.traj_in}：{len(rows)} 题")
     elif args.build_traj and args.providers == "vllm":
         rows = _build_prompts(cfg, args)
+    elif args.diff_traj:
+        # 上面已经处理，这里是兜底
+        pass
     else:
         raise SystemExit(
-            "[diag] 要么 --build-traj（且 --providers vllm），要么 --traj-in <jsonl>：\n"
+            "[diag] 要么 --build-traj（且 --providers vllm），要么 --traj-in <jsonl>，"
+            "要么 --diff-traj A.jsonl B.jsonl：\n"
             "  跨 provider 比较必须共用同一条轨迹，否则'换进程顺便换了前缀'会让结论无法归因。")
 
     if args.measure == "decode":

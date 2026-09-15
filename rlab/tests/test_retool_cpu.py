@@ -2565,6 +2565,19 @@ def test_logprobs_n_fix_path():
           and abs(st4["noise_dicts"]["max_d_common"] - 2.5) < 1e-9)
     check("噪声地板大时的判读优先于任何开关归因（先承认读数不可复现）",
           "噪声地板本身就大" in dsrc and "此时不能把差异归给任何开关" in dsrc)
+    # 同一设置 --build_traj 两次的 diff 工具：决定训练档在自己那一档是否可复现
+    from rlab.diag_logps import traj_diff_stats
+    a = [{"q": 0, "ids": [1, 2, 3], "logps": [-0.5, -1.0, -2.0]}]
+    b = [{"q": 0, "ids": [1, 2, 4], "logps": [-0.6, -1.1, -3.0]}]
+    st = traj_diff_stats(a, b)
+    check("diff_traj 算 token 一致率、逐位置 |Δlogp| 形态、位置 0 与其余分开",
+          st["n"] == 3 and abs(st["token_match_rate"] - 2 / 3) < 1e-9
+          and abs(st["pos0_max"] - 0.1) < 1e-9 and abs(st["rest_max"] - 1.0) < 1e-9)
+    check("diff_traj 给出最差点（训练档不可复现时从哪冒出来的）",
+          len(st["worst"]) > 0 and st["worst"][0]["pos"] == 2
+          and st["worst"][0]["same_tok"] is False)
+    check("--diff_traj CLI 存在且纯函数可测",
+          '--diff_traj' in dsrc and "def print_traj_diff" in dsrc)
 
 
 if __name__ == "__main__":
