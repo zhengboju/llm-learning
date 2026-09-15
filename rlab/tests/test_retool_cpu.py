@@ -1008,26 +1008,51 @@ def test_vllm_gen_kwargs():
           and _is_multimodal_ckpt(_mk_cfg({"vocab_size": 248320})) is False
           and _is_multimodal_ckpt("/nope/nope") is False)
 
-    # 判据三分支：替身注入预检结果（真预检见下）
+    # 判据四分支：替身注入预检结果（真预检见下）。两条口径分开探（2026-09-15）：
+    # 口径 a=auto（顶层 cfg），口径 b=显式 text_config（绕开被 vLLM 改写的 auto 解析）。
     _orig_probe = _ro._probe_torch_construct
+    _orig_mode = dict(_ro._REPLICA_MODE)
+
+    def _stub(auto, explicit, composite=True):
+        return lambda p: {"auto": auto, "explicit": explicit, "composite": composite}
+
     try:
-        _ro._probe_torch_construct = lambda p: (
-            "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'")
-        check("预检报 A1 特征 -> RuntimeError（拦，带两条改法）",
+        _ro._probe_torch_construct = _stub(
+            "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'",
+            "AttributeError: 显式口径也 vocab_size")
+        check("两条口径都报 A1 -> RuntimeError（拦，带两条改法）",
               _raises(lambda: _assert_torch_replica_loadable("/x"), RuntimeError))
-        _ro._probe_torch_construct = lambda p: "ValueError: meta 预检自身的限制"
-        check("预检报非 A1 -> 只告警放行（反证：否则预检的怪癖会误杀合法启动）",
+        _ro._REPLICA_MODE["explicit_text_config"] = False
+        _ro._probe_torch_construct = _stub(
+            "AttributeError: 'Qwen3_5Config' object has no attribute 'vocab_size'", "ok")
+        check("auto 不通但显式 text_config 通 -> 放行不拦（免抽取的关键分支）",
               _assert_torch_replica_loadable("/x") is None)
-        _ro._probe_torch_construct = lambda p: None
-        check("预检通过 -> 放行", _assert_torch_replica_loadable("/x") is None)
+        check("且把口径记给加载点（探了 A 却跑 B = 护栏白设）",
+              _ro._REPLICA_MODE["explicit_text_config"] is True)
+        _ro._REPLICA_MODE["explicit_text_config"] = False
+        _ro._probe_torch_construct = _stub("ValueError: meta 预检自身的限制", "n/a", False)
+        check("口径 a 报非 A1 -> 只告警放行（反证：否则预检的怪癖会误杀合法启动）",
+              _assert_torch_replica_loadable("/x") is None)
+        check("纯文本 ckpt 的 'n/a'（无此口径）不被当成'可用'而误改口径",
+              _ro._REPLICA_MODE["explicit_text_config"] is False)
+        _ro._probe_torch_construct = _stub("ok", "n/a", False)
+        check("口径 a 通过 -> 放行且不改口径",
+              _assert_torch_replica_loadable("/x") is None
+              and _ro._REPLICA_MODE["explicit_text_config"] is False)
     finally:
         _ro._probe_torch_construct = _orig_probe
+        _ro._REPLICA_MODE.update(_orig_mode)
 
     # 真预检（不注入替身）：meta 构造零显存零内存，结论与真实加载同路径
-    check("真预检：可加载的小模型返回 None（gpt2 本地缓存）",
-          _probe_torch_construct("gpt2") is None)
-    check("真预检：坏目录/缺 config 返回错误串而不抛",
-          isinstance(_probe_torch_construct(tempfile.mkdtemp()), str))
+    check("真预检：可加载的小模型 auto 口径 ok（gpt2 本地缓存）",
+          _probe_torch_construct("gpt2")["auto"] == "ok")
+    check("真预检：纯文本 ckpt 的 explicit 记为 'n/a'（无此口径 ≠ 失败）",
+          _probe_torch_construct("gpt2")["explicit"] == "n/a"
+          and _probe_torch_construct("gpt2")["composite"] is False)
+    _bad = _probe_torch_construct(tempfile.mkdtemp())
+    check("真预检：坏目录/缺 config 两条口径都返回错误串而不抛",
+          isinstance(_bad["auto"], str) and _bad["auto"] not in ("ok", "n/a")
+          and _bad["explicit"] not in ("ok", "n/a"))
 
     check("空 kwargs 直接放行（不触发 vLLM import，CPU 可测）",
           _check_vllm_gen_kwargs({}) is None)
@@ -1186,9 +1211,16 @@ def test_attn_impl():
     with open("rlab/run_gsm8k.sh", encoding="utf-8") as f:
         sh_src = f.read()
     check("train.py 加载点走 cfg（无硬编码 sdpa）",
-          '_attn_implementation=cfg.get("attn_implementation", "sdpa")' in train_src)
+          'attn_implementation=cfg.get("attn_implementation", "sdpa")' in train_src)
     check("rollout.py gen 副本加载点走 cfg",
-          '_attn_implementation=cfg.get("attn_implementation", "sdpa")' in rollout_src)
+          'attn_implementation=cfg.get("attn_implementation", "sdpa")' in rollout_src)
+    # 【2026-09-15 收口】三处加载统一走 rlab.model_loading.load_causal_lm：口径（多模态
+    # 目录直连/显式 text_config）与防静默缺键护栏只有一份实现——比逐个字面断言更能保契约。
+    check("三处 torch 加载点统一收口到 load_causal_lm",
+          all("load_causal_lm(" in s for s in (train_src, rollout_src, ref_src)))
+    check("收口后不再有裸 AutoModelForCausalLM.from_pretrained 加载点",
+          all("AutoModelForCausalLM.from_pretrained" not in s
+              for s in (train_src, rollout_src, ref_src)))
     check("ref_server.py FA2 档位自动降 bf16（FA2 不支持 fp32）",
           'torch.bfloat16 if attn_implementation == "flash_attention_2"' in ref_src)
     # 【2026-09-14 修脆性断言】原判据是字面串 '--attn_implementation "$ATTN_IMPL" "$@"'，
@@ -1787,7 +1819,7 @@ def test_pyflakes_undefined():
              "rlab/protocol.py", "rlab/reward.py", "rlab/losses.py", "rlab/sync.py",
              "rlab/sandbox.py", "rlab/analysis.py", "rlab/probe_retool_gen.py",
              "rlab/probe_difficulty.py", "rlab/extract_text_model.py",
-             "rlab/materialize_mm_ckpt.py",
+             "rlab/model_loading.py", "rlab/materialize_mm_ckpt.py",
              "rlab/ref_server.py",
              "rlab/data.py", "rlab/prepare_dapo_math.py",
              "eval_vllm_one.py", "eval_vllm.py"]

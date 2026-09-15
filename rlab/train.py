@@ -37,6 +37,7 @@ import torch.multiprocessing as mp
 
 from rlab.config import ds_config, get_config
 from rlab.losses import ALGOS, compute_loss, forward_per_token_logps
+from rlab.model_loading import load_causal_lm
 from rlab.protocol import decode_batch
 
 
@@ -154,7 +155,7 @@ def guard_ckpt_collision(out_dir: str, cfg: dict) -> None:
 
 def run_training(cfg, args):
     import deepspeed
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
 
     deepspeed.init_distributed()
 
@@ -180,9 +181,11 @@ def run_training(cfg, args):
                 "权重同步失败）-> 训练端中止。检查 run_gsm8k.sh 的卡位与显存编排。")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model_path"], torch_dtype=torch.bfloat16,
-        _attn_implementation=cfg.get("attn_implementation", "sdpa"))
+    # 加载收口到 rlab.model_loading：多模态目录可直连（5.17 自带前缀映射+解包），
+    # 且缺键会显式炸（否则缺映射的版本会带着随机初始化权重静默开训）。
+    model = load_causal_lm(
+        cfg["model_path"], dtype=torch.bfloat16,
+        attn_implementation=cfg.get("attn_implementation", "sdpa"))
     # 【2026-09-11 4B】8-bit 优化器在 DS initialize 前构建并传入（ds_config 相应
     # 省略 optimizer 段）：bnb AdamW8bit 把 m/v 量化到 8bit（32G->8G），step 全程
     # GPU、无 offload、无 RAM 压力。数值口径声明见 config.optim_8bit 注释。

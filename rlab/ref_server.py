@@ -31,6 +31,7 @@ import threading
 import torch
 
 from rlab.losses import forward_per_token_logps
+from rlab.model_loading import load_causal_lm
 from rlab.protocol import bytes_list_to_list, bytes_to_tensor, make_bytes_list, tensor_to_bytes
 
 
@@ -112,7 +113,7 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
                device="cuda", attn_implementation="sdpa", batch_chunk=1):
     from bottle import Bottle, request
     from bottle import run as bottle_run
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     # FA2 仅支持 bf16/fp16：flash_attention_2 档位下 ref 自动降 bf16（ref 冻结
@@ -120,9 +121,11 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
     # config.attn_implementation 注释，报告需声明）。其余档位维持 fp32 历史口径。
     ref_dtype = torch.bfloat16 if attn_implementation == "flash_attention_2" \
         else torch.float32
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=ref_dtype,
-        _attn_implementation=attn_implementation).to(device)
+    # 收口到 rlab.model_loading：多模态目录可直连，缺键显式炸（ref 静默用随机权重
+    # 会让 KL 基准整体失真，且不会有任何报错）
+    ref_model = load_causal_lm(
+        model_path, dtype=ref_dtype,
+        attn_implementation=attn_implementation).to(device)
     ref_model.eval()
     ref_model.requires_grad_(False)
     print(f"[ref_server] mode={mode} device={device} port={port} "
