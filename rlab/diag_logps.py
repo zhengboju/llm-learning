@@ -584,6 +584,7 @@ def run_vllm(cfg, args, rows, lens):
     from rlab.rollout import _check_vllm_gen_kwargs, _vllm_config_readback
 
     kw = vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {}, args.vllm_backend)
+    warn_if_default_backend(args, cfg)
     _check_vllm_gen_kwargs(kw)      # 键名错 = 静默忽略（与 gen_worker 同一闸门）
     model_path = cfg.get("vllm_model_path") or cfg["model_path"]
     print(f"[diag] vLLM provider: model={model_path} kwargs={kw or '{}'}")
@@ -962,6 +963,30 @@ def lpmode_spread(forms: dict) -> dict:
             "argmax": hi, "argmin": lo, "max": vals[hi], "min": vals[lo]}
 
 
+def warn_if_default_backend(args, cfg):
+    """未指定 --vllm_backend 时，提前说清"这一档会走 FlashInfer GDN，且本 pod 会炸"。
+
+    【真机两次实锤】2026-09-15 16:44 与 18:07：默认档 = FlashInfer GDN prefill，
+    其 kernel 是 JIT 编译的，ninja 调 nvcc 把宿主 RAM 打爆 → `died with SIGKILL: 9`
+    → `Engine core initialization failed`，白等一次引擎初始化。而本脚本的很多问题
+    （尤其 logprobs 上报路径）与 backend 无关，先跑 triton 拿到结论更划算。
+
+    **只告警、不擅自改档**：静默替换被测配置正是本项目反复禁止的那类操作。
+    """
+    if args.vllm_backend not in (None, "keep"):
+        return
+    if (cfg.get("vllm_gen_kwargs") or {}).get("gdn_prefill_backend"):
+        return
+    print("[diag][警告] 未指定 --vllm_backend：本档将用 vLLM 默认的 **FlashInfer GDN "
+          "prefill**，该 kernel 需 JIT 编译——本 pod 宿主 RAM 紧，已两次实锤\n"
+          "        ninja 被 SIGKILL(9) → Engine core initialization failed。\n"
+          "        若不需要 FlashInfer 这一档（logprobs 上报路径与 backend 无关）："
+          "加 --vllm_backend triton。\n"
+          "        若确实要它：`MAX_JOBS=1` 串行编译降峰值（不保证），"
+          "并 export VLLM_ENABLE_V1_MULTIPROCESSING=0 让引擎进程内跑（省一份宿主 RAM）。",
+          flush=True)
+
+
 def run_lpmode_probe(cfg, args, rows):
     """`--measure lpmode`：同一位置同一 token，四种请求形态各问一次 vLLM（不用 torch）。
 
@@ -981,6 +1006,7 @@ def run_lpmode_probe(cfg, args, rows):
     vpath = args.vllm_model_path or cfg["model_path"]
     kwargs.update(vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {},
                                          args.vllm_backend))
+    warn_if_default_backend(args, cfg)
     T = int(args.lpmode_max_tokens)
     print(f"[diag] lpmode 探针：model={vpath} K={args.k} T={T} kwargs={kwargs}", flush=True)
     llm = LLM(model=vpath, **kwargs)

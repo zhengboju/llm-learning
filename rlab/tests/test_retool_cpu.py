@@ -2486,6 +2486,31 @@ def test_logprobs_n_fix_path():
           == {"gdn_prefill_backend": "flashinfer"}
           and vllm_kwargs_for_backend({"gdn_prefill_backend": "flashinfer"}, "none") == {}
           and vllm_kwargs_for_backend({}, "triton") == {"gdn_prefill_backend": "triton"})
+    # 【真机两次实锤】默认档 = FlashInfer GDN（JIT）→ ninja 被 SIGKILL(9) → 引擎初始化失败。
+    # 前置告警必须存在且**只告警不改档**（静默替换被测配置是本项目禁止的操作）。
+    import io
+    from contextlib import redirect_stdout
+    from rlab.diag_logps import warn_if_default_backend
+
+    class _A:
+        def __init__(self, b):
+            self.vllm_backend = b
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        warn_if_default_backend(_A("keep"), {})
+    out = buf.getvalue()
+    check("默认档会走 FlashInfer → 打印前置告警（含 triton 与 MAX_JOBS 两条处置）",
+          "FlashInfer" in out and "--vllm_backend triton" in out and "MAX_JOBS=1" in out
+          and "VLLM_ENABLE_V1_MULTIPROCESSING=0" in out)
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        warn_if_default_backend(_A("triton"), {})
+        warn_if_default_backend(_A("keep"), {"vllm_gen_kwargs": {"gdn_prefill_backend": "triton"}})
+    check("显式指定 backend 或 preset 已带 gdn_prefill_backend → 不告警（不噪音）",
+          buf2.getvalue() == "")
+    check("告警只打印、不修改配置（不做静默改档）",
+          warn_if_default_backend(_A("keep"), {}) is None)
 
 
 if __name__ == "__main__":
