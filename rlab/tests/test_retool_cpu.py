@@ -1146,6 +1146,20 @@ def test_split_load_remap():
     check("非 tied 目标可保留 lm_head（参数化退路）", out2.get("lm_head.weight") == "t3")
     check("张量对象原样搬运（不 copy 数据）",
           all(isinstance(t, str) for t in out.values()))
+    # 【2026-09-16 实机】save_pretrained 按 _checkpoint_conversion_mapping 逆向写回
+    # model.language_model.X（config 仍是文本类）→ 产物是"多模态权重 + 文本 config"。
+    # 映射必须幂等，否则产出 model.language_model.language_model.X 对不上骨架。
+    mm_sd = [("model.language_model.embed_tokens.weight", "t0"),
+             ("model.language_model.norm.weight", "t2"),
+             ("model.language_model.lm_head.weight", "t3"),   # tied 的多模态形态
+             ("model.language_model.layers.0.linear_attn.A_log", "t4")]
+    out_mm = dict(remap_text_to_multimodal(mm_sd))
+    check("已是多模态布局 -> 原样透传（幂等，不产出双前缀）",
+          out_mm["model.language_model.embed_tokens.weight"] == "t0"
+          and out_mm["model.language_model.layers.0.linear_attn.A_log"] == "t4"
+          and not any("language_model.language_model" in k for k in out_mm))
+    check("多模态形态的 tied lm_head 同样丢弃",
+          "model.language_model.lm_head.weight" not in out_mm)
     try:
         remap_text_to_multimodal([("visual.weight", "t")])
         check("未知键名 fail-fast", False)
@@ -1348,6 +1362,15 @@ def test_materialize_mm():
         check("骨架合并：未知键 fail-fast", False)
     except KeyError:
         check("骨架合并：未知键 fail-fast（映射表不许静默漏同步）", True)
+    # 【2026-09-16 实机 crash 的最小复现】旧 ckpt = 多模态权重 + 文本 config：
+    # 幂等映射后能直接并进骨架；修复前这里会产出双前缀并对不上 base_keys。
+    merged_mm, _ = merge_text_into_skeleton(
+        {"model.language_model.embed_tokens.weight": t_emb}, skel,
+        base_keys={"model.language_model.embed_tokens.weight",
+                   "model.visual.patch_embed.weight"})
+    check("幂等映射：已多模态布局的旧 ckpt 也能并进骨架（不产双前缀）",
+          merged_mm["model.language_model.embed_tokens.weight"] is t_emb
+          and not any("language_model.language_model" in k for k in merged_mm))
 
     # 落盘口径：骨架分片流式读（只留非语言键）→ 产物=单文件权重 + 骨架非权重文件
     mm_dir = tempfile.mkdtemp()
