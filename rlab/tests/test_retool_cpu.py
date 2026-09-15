@@ -2094,8 +2094,11 @@ def test_diag_logps_pure():
           and any("causal_conv1d" in s for s in v_same))
     v_cross = verdict({"torch:fla vs vllm:keep": _mk(12.8, 0.04, conf=2),
                        "torch:fallback vs vllm:keep": _mk(12.8, 0.04, conf=2)})
-    check("各自自洽、跨引擎才不一致 → 判为 kernel 口径差（给出回 torch 副本的解）",
-          any("两侧各自自洽" in s for s in v_cross)
+    check("只做了跨引擎、没做任何内部消融 → 现象确认但**不许**写成'各自自洽'",
+          any("内部消融不完整" in s for s in v_cross)
+          # 注意用 startswith 判"没把它当结论下发"：注释里那句「还不能断言"两侧各自自洽"」
+          # 本身含这个词，子串匹配会自己骗自己（本项目栽过的同类坑）
+          and not any(s.startswith("**两侧各自自洽") for s in v_cross)
           and any("vllm_gen_logps=False" in s for s in v_cross))
     v_ok = verdict({"torch:fla vs torch:fallback": _mk(1e-5, 0.0),
                     "torch:fla vs vllm:keep": _mk(1e-5, 0.0)})
@@ -2103,6 +2106,20 @@ def test_diag_logps_pure():
           any("不是 kernel" in s for s in v_ok))
     check("只有跨引擎对（没做消融）→ 明确提示'无法定位责任方'",
           any("没有消融" in s for s in verdict({"torch:fla vs vllm:keep": _mk(12.8, 0.04)})))
+    # 【不许过度解读】两侧内部消融都干净、只有跨引擎不一致 → 才允许下"kernel 口径差"结论
+    v_full = verdict({"torch:fla vs torch:fallback": _mk(1e-5, 0.0),
+                      "vllm:keep vs vllm:none": _mk(1e-5, 0.0),
+                      "torch:fla vs vllm:keep": _mk(12.8, 0.04)})
+    check("两侧内部消融都干净 + 跨引擎不一致 → 判为 kernel 口径差",
+          any(s.startswith("**两侧各自自洽") for s in v_full)
+          and not any("内部消融不完整" in s for s in v_full))
+    # 只有 torch 侧有内部对：允许下结论，但必须注明 vLLM 侧"未验证"（vLLM 那档常因
+    # FlashInfer GDN 的 JIT OOM-kill 跑不起来，这个缺口必须显式写出来）
+    v_half = verdict({"torch:fla vs torch:fallback": _mk(1e-5, 0.0),
+                      "vllm:keep vs vllm:none": _mk(9.0, 0.3),
+                      "torch:fla vs vllm:keep": _mk(12.8, 0.04)})
+    check("vLLM 侧自己有内部分歧 → 责任钉在 vLLM 侧前向实现",
+          any("同引擎跨 kernel" in s and "vllm" in s for s in v_half))
 
     check("engine 标签解析", engine_of("vllm:triton") == "vllm"
           and engine_of("torch:fallback") == "torch" and engine_of("torch") == "torch")

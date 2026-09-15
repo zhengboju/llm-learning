@@ -24,7 +24,7 @@
 | `probe_gdn_backend.py` | GDN 反向 kernel 后端探针：前置闸门（tilelang **真 import** 通过，`find_spec` 类代理判据会假阳性）+ 三条判据（对拍官方 naive 参考）+ 两条反证（禁用必 raise / 坏 triton 偏离量）+ tilelang JIT 预热。pod 上按 `docs/06` §6 使用 |
 | `diag_logps.py` | **gen_logps 不一致的责任方定位**：固定轨迹 + 前缀长扫描，逐点复现 `|Δlogp|`（同 top-K 与目标 token 排名）；vLLM backend（`--vllm-backend`）与 torch GDN 路径（`--torch-path fallback`）两条消融轴跨进程跑，`--merge` 在 CPU 上算成对矩阵并判"责任在 vLLM 侧 / torch 侧 / 跨引擎口径差 / 不是 kernel" |
 | `tests/test_smoke_cpu.py` | 71 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名/跨 json 配对/抽取自检判据） |
-| `tests/test_retool_cpu.py` | 354 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏 + 对拍形态学/诊断判据 + 键名映射判据是核心学习点）（2026-09-15 实测口径） |
+| `tests/test_retool_cpu.py` | 356 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏 + 对拍形态学/诊断判据 + 键名映射判据是核心学习点）（2026-09-15 实测口径） |
 
 ## 算法切换对照
 

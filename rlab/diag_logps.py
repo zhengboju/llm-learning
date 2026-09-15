@@ -234,6 +234,8 @@ def verdict(pair_stats: dict) -> list:
     same = {k: v for k, v in pair_stats.items()
             if engine_of(k.split(" vs ")[0]) == engine_of(k.split(" vs ")[1])}
     cross = {k: v for k, v in pair_stats.items() if k not in same}
+    # 哪些引擎**做过**内部消融（同引擎两档）——"各自自洽"这句话只对它们成立
+    engines_with_internal = {engine_of(k.split(" vs ")[0]) for k in same}
     bad_same = {k: v for k, v in same.items() if _unstable(v)}
     bad_cross = {k: v for k, v in cross.items() if _unstable(v)}
     out = []
@@ -250,36 +252,61 @@ def verdict(pair_stats: dict) -> list:
                        "核对 fla/tilelang 后端是否真的生效（用 rlab/probe_gdn_backend.py），"
                        "再复跑本诊断直到 torch:fla vs torch:fallback 塌到噪声。")
         if any(engine_of(k.split(" vs ")[0]) == "vllm" for k in bad_same):
-            out.append("vLLM 侧优先动作：换 `--vllm-backend` 的另一档（triton / none / flashinfer）"
+            out.append("vLLM 侧优先动作：换 `--vllm_backend` 的另一档（triton / none / flashinfer）"
                        "并与这一档逐位对比；若两档都远离 torch，则 vLLM 的 GDN kernel 数值不可信。")
         if bad_cross:
             out.append("跨引擎也不一致（这是被追查的那个现象本身）："
                        + "；".join(bad_cross) + "。先修上面同引擎的那一支。")
     elif bad_cross:
-        out.append("**两侧各自自洽、跨引擎才不一致**："
-                   + "；".join(f"{k}（max|Δlogp|={v['max_target_d']:.3g}，"
-                               f">1nat 占 {100 * (v['frac_big'] or 0):.2f}%）"
-                               for k, v in bad_cross.items())
-                   + " → kernel 口径差是本质，不是某一侧写错了代码。")
-        out.append("该形态下的唯一严格解：gen_logps 用 torch 副本算（`vllm_gen_logps=False`，"
-                   "严格同源、clip_frac≈0）；要继续用 vLLM 路，就得把这条残差当面量化"
-                   "（`[train][口径]` 的 clip_frac / approx_kl 地板）并接受它污染诊断量。")
+        _unverified = [e for e in ("vllm", "torch") if e not in engines_with_internal]
+        _detail = "；".join(f"{k}（max|Δlogp|={v['max_target_d']:.3g}，"
+                            f">1nat 占 {100 * (v['frac_big'] or 0):.2f}%）"
+                            for k, v in bad_cross.items())
+        if _unverified:
+            # 现象确认，但"各自自洽"这句话还没有证据支撑——不许把它写成结论
+            out.append(f"**跨引擎不一致（现象确认），但内部消融不完整**：{_detail}"
+                       f" → {'、'.join(_unverified)} 侧没做内部消融，"
+                       f"**还不能断言\"两侧各自自洽\"**（见下面注意项）。")
+            out.append("在此之前可先止血：gen_logps 切回 torch 副本算"
+                       "（`vllm_gen_logps=False`，与训练端严格同源、clip_frac≈0）——"
+                       "它不依赖本诊断的最终归属。")
+        else:
+            out.append(f"**两侧各自自洽、跨引擎才不一致**：{_detail}"
+                       " → kernel 口径差是本质，不是某一侧写错了代码。")
+            out.append("该形态下的唯一严格解：gen_logps 用 torch 副本算（`vllm_gen_logps=False`，"
+                       "严格同源、clip_frac≈0）；要继续用 vLLM 路，就得把这条残差当面量化"
+                       "（`[train][口径]` 的 clip_frac / approx_kl 地板）并接受它污染诊断量。")
     else:
         out.append("各 provider 在这一点上一致（无 >1 nat 分歧、无 confident 分歧）"
                    " → 不是 kernel 问题，回到**序列构造/对齐**去查：多轮工具段拼接、"
                    "mask 有效位、左 pad 剥离、logprobs 与 ids 的逐位置对齐。")
+    # 【不许过度解读】"各自自洽"只对**做过内部消融**的引擎成立。实践中最常见的缺口是
+    # vLLM 那一档跑不起来（FlashInfer GDN 的 JIT 会 OOM-kill 宿主进程，见 docs/04），
+    # 于是只剩 torch 侧有内部对——这时不能把结论写成"kernel 口径差是本质"。
+    for _e in ("vllm", "torch"):
+        if _e not in engines_with_internal:
+            out.append(
+                f"注意：本次没有 **{_e} 侧内部消融**（同一引擎的两个 kernel/路径档），"
+                f"所以\"各自自洽\"对 {_e} 侧只是**未验证**——要钉死责任方还差一档"
+                + ("（torch 侧最便宜：不需要 vLLM，换 --torch_path 再跑同一轨迹）。"
+                   if _e == "torch" else
+                   "（vLLM 侧：换 --vllm_backend 档；若 FlashInfer JIT 把宿主 RAM 打爆，"
+                   "至少把\"未验证\"如实写进结论，别当成已验证）。"))
     if not same:
-        out.append("提示：本次 merge 里没有同引擎对（只有跨引擎）——**没有消融就无法定位责任方**，"
-                   "请补跑 `--torch-path fallback` 与/或另一个 `--vllm-backend`。")
+        out.append("提示：本次 merge 里一个同引擎对都没有——**没有消融就无法定位责任方**，"
+                   "请补跑 `--torch_path fallback` 与/或另一个 `--vllm_backend`。")
     return out
 
 
 def vllm_kwargs_for_backend(base_kwargs: dict, backend: str) -> dict:
-    """按 --vllm-backend 生成引擎参数（纯函数）。
+    """按 --vllm_backend 生成引擎参数（纯函数）。
 
-    keep = 原样用 preset 的 vllm_gen_kwargs（= 训练口径，消融的对照档）；
-    none = 去掉 gdn_prefill_backend（走 vLLM 默认实现）；
-    其它 = 设成该值（如 triton / flashinfer）。"""
+    keep = 原样用 preset 的 vllm_gen_kwargs（**不含 CLI 传的那些**——训练命令若用
+    `--vllm_gen_kwargs '{"gdn_prefill_backend": "triton"}'` 传过，本脚本要用
+    同名 flag 补上，否则探的不是训练那一档）；
+    none = 去掉 gdn_prefill_backend（走 vLLM 默认 = FlashInfer GDN，**会 JIT 编译**，
+    宿主 RAM 紧时直接 OOM-kill，见 docs/04）；
+    其它 = 设成该值（triton 免 JIT，最稳）。"""
     kw = dict(base_kwargs or {})
     if backend in (None, "keep"):
         return kw
