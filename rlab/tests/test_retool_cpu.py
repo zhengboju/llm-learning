@@ -2601,6 +2601,24 @@ def test_logprobs_n_fix_path():
     check("det 模式要求 vLLM provider 且三种判读都在源码里",
           "--measure det 是 vLLM 引擎自身的确定性探针" in dsrc
           and "logits 本身不可复现" in dsrc and "采样/RNG 层不确定" in dsrc)
+    # batch-invariant 要求显式 attention backend（真机 19:03 启动即 RuntimeError）。
+    # 键名跨版本两形态 → 必须问注册表映射，两个都没有就 raise（不许静默忽略）。
+    from rlab.diag_logps import map_attention_backend
+    check("attention backend 键名映射：有 attention_config 用 dict 形态",
+          map_attention_backend("FLASH_ATTN", {"attention_config", "gdn_prefill_backend"})
+          == {"attention_config": {"backend": "FLASH_ATTN"}})
+    check("attention backend 键名映射：只有 attention_backend 时用平铺形态",
+          map_attention_backend("TRITON_ATTN", {"attention_backend"})
+          == {"attention_backend": "TRITON_ATTN"})
+    try:
+        map_attention_backend("FLASH_ATTN", {"gdn_prefill_backend"})
+        check("两个键都没有 → 必须 raise（否则'开了 batch-invariant'是假的）", False)
+    except RuntimeError as e:
+        check("两个键都没有 → raise 且说明后果（静默忽略 = 假绿灯）",
+              "VLLM_BATCH_INVARIANT=1" in str(e))
+    check("--attention_backend 已接线到所有 LLM() 入口（backend 档 + attention 档）",
+          dsrc.count("vllm_extra_kwargs(cfg, args)") >= 3
+          and '"--attention_backend"' in dsrc)
     check("我们的 logp 路径不用 flash-attn CE（纯 log_softmax+gather，已在对齐标准上）",
           "log_softmax" in open(os.path.join(
               os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

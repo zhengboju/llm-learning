@@ -583,7 +583,7 @@ def run_vllm(cfg, args, rows, lens):
 
     from rlab.rollout import _check_vllm_gen_kwargs, _vllm_config_readback
 
-    kw = vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {}, args.vllm_backend)
+    kw = vllm_extra_kwargs(cfg, args)
     warn_if_default_backend(args, cfg)
     _check_vllm_gen_kwargs(kw)      # 键名错 = 静默忽略（与 gen_worker 同一闸门）
     model_path = cfg.get("vllm_model_path") or cfg["model_path"]
@@ -1098,8 +1098,7 @@ def run_lpmode_probe(cfg, args, rows):
     kwargs = dict(gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
                   disable_log_stats=True)
     vpath = args.vllm_model_path or cfg["model_path"]
-    kwargs.update(vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {},
-                                         args.vllm_backend))
+    kwargs.update(vllm_extra_kwargs(cfg, args))
     warn_if_default_backend(args, cfg)
     T = int(args.lpmode_max_tokens)
     print(f"[diag] lpmode 探针：model={vpath} K={args.k} T={T} kwargs={kwargs}", flush=True)
@@ -1158,6 +1157,50 @@ def run_lpmode_probe(cfg, args, rows):
     return "vllm:lpmode", rows_out
 
 
+def map_attention_backend(backend: str, known_keys) -> dict:
+    """把"显式指定 attention backend"映射成本版 vLLM 认识的键名。纯函数（CPU 可测）。
+
+    为什么需要（真机 2026-09-15 19:03）：`VLLM_BATCH_INVARIANT=1` 在 v0.19.1 里确实存在
+    （envs.py 注册了该键），但引擎初始化直接抛：
+      RuntimeError: VLLM batch_invariant mode requires an attention backend in
+      ['FLASH_ATTN', 'TRITON_ATTN', ...], but got 'None'. Please use --attention-backend
+      or attention_config ...
+    即 batch-invariant 的检查跑在 backend 解析**之前**，必须显式给。键名跨版本有
+    `attention_config={"backend": ...}` 与 `attention_backend=...` 两种形态——**问注册表
+    而不是硬编码**（同 _check_vllm_gen_kwargs 的做法），两个都没有就 raise：静默忽略会
+    让"开了 batch-invariant"变成"其实没开"，本项目栽过多次。"""
+    if "attention_config" in known_keys:
+        return {"attention_config": {"backend": str(backend)}}
+    if "attention_backend" in known_keys:
+        return {"attention_backend": str(backend)}
+    raise RuntimeError(
+        f"[diag] 本版 vLLM 的引擎参数里既没有 attention_config 也没有 attention_backend"
+        f"（已知键样例：{sorted(k for k in known_keys if 'attn' in k)[:8]}）——"
+        "无法显式指定 attention backend，VLLM_BATCH_INVARIANT=1 会启动即失败")
+
+
+def attention_backend_kwarg(backend: str) -> dict:
+    """从 vLLM 自己的 CLI 注册表取键名（探测不到就 raise，不静默）。"""
+    import argparse
+
+    from vllm.engine.arg_utils import EngineArgs
+    parser = argparse.ArgumentParser(add_help=False)
+    EngineArgs.add_cli_args(parser)
+    return map_attention_backend(backend, {a.dest for a in parser._actions})
+
+
+def vllm_extra_kwargs(cfg, args) -> dict:
+    """本脚本所有 LLM() 入口共用的引擎参数：backend 档 + （可选）显式 attention backend。"""
+    kw = vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {}, args.vllm_backend)
+    attn = getattr(args, "attention_backend", None)
+    if attn:
+        a = attention_backend_kwarg(attn)
+        print(f"[diag] 显式 attention backend：{attn} → {a}"
+              f"（batch-invariant 模式要求；键名取自本版 vLLM 注册表）", flush=True)
+        kw.update(a)
+    return kw
+
+
 def det_repeat_stats(items: list) -> dict:
     """同一请求重复 N 次的结果归拢。纯函数（CPU 可测）。
 
@@ -1206,8 +1249,7 @@ def run_det_probe(cfg, args, rows):
     warn_if_default_backend(args, cfg)
     kwargs = dict(gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
                   disable_log_stats=True)
-    kwargs.update(vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {},
-                                         args.vllm_backend))
+    kwargs.update(vllm_extra_kwargs(cfg, args))
     vpath = args.vllm_model_path or cfg["model_path"]
     n_rep = max(2, int(args.det_repeat))
     row = rows[0]
@@ -1379,6 +1421,10 @@ def main() -> int:
                     help="--measure det 的重复次数（默认 3；首次调用常与后续不同，别只跑 2）")
     ap.add_argument("--det_max_tokens", type=int, default=8,
                     help="--measure det 的生成长度（小：只要头几个 token 与首位置分布）")
+    ap.add_argument("--attention_backend", default=None,
+                    help="显式指定 attention backend（如 FLASH_ATTN）。"
+                         "VLLM_BATCH_INVARIANT=1 要求它，否则引擎启动即 RuntimeError；"
+                         "键名（attention_config/attention_backend）由本版 vLLM 注册表自证")
     ap.add_argument("--probe_default", action="store_true",
                     help="vLLM 侧同时测 default 口径（不传 logprobs_mode）并打印"
                          "'vLLM 自身口径差'——把测量口径差从跨引擎 Δ 里分出来")
