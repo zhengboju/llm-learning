@@ -2421,7 +2421,7 @@ def test_logprobs_n_fix_path():
 
     import rlab.rollout as R
     from rlab.config import ALGO_DEFAULTS, BASE
-    from rlab.diag_logps import lpmode_spread
+    from rlab.diag_logps import lpmode_spread, vllm_kwargs_for_backend
 
     check("config 新增 vllm_logprobs_n（默认 0 = 保留旧行为便于 A/B）",
           BASE.get("vllm_logprobs_n") == 0)
@@ -2474,6 +2474,18 @@ def test_logprobs_n_fix_path():
           all(f'"{n}"' in dsrc for n in ("A_K0_T1", "B_KK_T1", "C_KK_TT", "D_K0_TT")))
     check("lpmode 要求 vLLM provider（它是报数路径探针，不是跨引擎对拍）",
           "--measure lpmode 是 vLLM 侧的报数路径探针" in dsrc)
+    # 【真机首跑 crash】新调用点把参数顺序写反（(backend, cfg) 而非 (dict, backend)）
+    # → ValueError: dictionary update sequence element #0 has length 1。参数顺序错误
+    # 静态检查抓不到，但"所有调用点必须是 (dict/空dict, backend)"可以静态锁。
+    import re as _re
+    calls = _re.findall(r"vllm_kwargs_for_backend\(([^)]*)\)", dsrc)
+    check("vllm_kwargs_for_backend 的所有调用点参数顺序正确（第一个是 dict 来源）",
+          len(calls) >= 2 and all("args.vllm_backend" not in c.split(",")[0] for c in calls))
+    check("vllm_kwargs_for_backend 纯函数：keep/none/其它三档语义",
+          vllm_kwargs_for_backend({"gdn_prefill_backend": "flashinfer"}, "keep")
+          == {"gdn_prefill_backend": "flashinfer"}
+          and vllm_kwargs_for_backend({"gdn_prefill_backend": "flashinfer"}, "none") == {}
+          and vllm_kwargs_for_backend({}, "triton") == {"gdn_prefill_backend": "triton"})
 
 
 if __name__ == "__main__":

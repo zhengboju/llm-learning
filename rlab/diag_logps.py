@@ -979,7 +979,8 @@ def run_lpmode_probe(cfg, args, rows):
     kwargs = dict(gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),
                   disable_log_stats=True)
     vpath = args.vllm_model_path or cfg["model_path"]
-    kwargs.update(vllm_kwargs_for_backend(args.vllm_backend, cfg))
+    kwargs.update(vllm_kwargs_for_backend(cfg.get("vllm_gen_kwargs") or {},
+                                         args.vllm_backend))
     T = int(args.lpmode_max_tokens)
     print(f"[diag] lpmode 探针：model={vpath} K={args.k} T={T} kwargs={kwargs}", flush=True)
     llm = LLM(model=vpath, **kwargs)
