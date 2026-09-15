@@ -2550,6 +2550,21 @@ def test_logprobs_n_fix_path():
           and st3["K_axis_T1"]["max"] == 0.0)
     check("建轨迹可指定 logprobs=N（验证修复档必须与训练 cfg 同 N）",
           dsrc.count("build_logprobs_n") >= 3 and "logprobs=int(logprobs_n or 0)" in dsrc)
+    # 噪声地板：同形态重复档 B2 必须存在，否则无法区分"形态的系统性差异"与
+    # "同一形态自己就不可复现"（真机首跑 13/36 点四条采到不同 token 已提示后者可能）
+    check("lpmode 有同形态重复档 B2_KK_T1（仪器的噪声地板）",
+          '"B2_KK_T1"' in dsrc and "noise_B_vs_B2" in dsrc)
+    r4 = _row(3, 0, {"A_K0_T1": -1.0, "B_KK_T1": -1.0, "C_KK_TT": -1.0, "D_K0_TT": -1.0,
+                     "B2_KK_T1": -3.5},
+              {"A_K0_T1": 7, "B_KK_T1": 7, "C_KK_TT": 7, "D_K0_TT": 7, "B2_KK_T1": 7},
+              {"B_KK_T1": {7: -1.0}, "C_KK_TT": {7: -1.0}, "B2_KK_T1": {7: -3.5}}, ref=7)
+    st4 = lpmode_summary([r4])
+    check("lpmode 归拢给出噪声地板（同形态两次 max|Δ| 与字典是否相同）",
+          abs(st4["noise_B_vs_B2"]["max"] - 2.5) < 1e-9
+          and st4["noise_dicts"]["n_dicts_equal"] == 0
+          and abs(st4["noise_dicts"]["max_d_common"] - 2.5) < 1e-9)
+    check("噪声地板大时的判读优先于任何开关归因（先承认读数不可复现）",
+          "噪声地板本身就大" in dsrc and "此时不能把差异归给任何开关" in dsrc)
 
 
 if __name__ == "__main__":

@@ -1010,6 +1010,10 @@ def lpmode_summary(rows: list) -> dict:
     same = [r for r in rows if r.get("same_token")]
     return {"n": len(rows), "n_same_token": len(same),
             "n_diff_token": len(rows) - len(same),
+            # 噪声地板：同一形态重复问一次。它若与各轴差异同量级，那"某个开关导致
+            # 差异"的说法就不成立，先得承认读数本身不可复现。
+            "noise_B_vs_B2": _pay(same, "B_KK_T1", "B2_KK_T1"),
+            "noise_dicts": _dictcmp(rows, "B_KK_T1", "B2_KK_T1"),
             "K_axis_T1": _pay(same, "A_K0_T1", "B_KK_T1"),
             "K_axis_TT": _pay(same, "D_K0_TT", "C_KK_TT"),
             "T_axis_K0": _pay(same, "A_K0_T1", "D_K0_TT"),
@@ -1020,25 +1024,37 @@ def print_lpmode_summary(rows: list):
     st = lpmode_summary(rows)
     print(f"[diag] lpmode 汇总：n={st['n']}，四条同 token {st['n_same_token']} 点、"
           f"不同 token {st['n_diff_token']} 点（后者不可比，已剔除）", flush=True)
-    for k in ("K_axis_T1", "K_axis_TT", "T_axis_K0"):
+    for k in ("noise_B_vs_B2", "K_axis_T1", "K_axis_TT", "T_axis_K0"):
         v = st[k]
         print(f"[diag]   {k}: n={v['n']} mean|Δ|={_fmt(v['mean'])} max={_fmt(v['max'])} "
               f">1nat={_pctfmt(v['frac_gt_1'])}", flush=True)
+    nd = st["noise_dicts"]
+    print(f"[diag]   noise_dicts（同形态两次的 top-K 字典）：n={nd['n']} "
+          f"完全相同 {nd['n_dicts_equal']} 点、交集 max|Δ|={_fmt(nd['max_d_common'])}",
+          flush=True)
     d = st["T_axis_dicts"]
     print(f"[diag]   T_axis_dicts（B vs C 的 top-K 字典）：n={d['n']} "
           f"字典完全相同 {d['n_dicts_equal']} 点、top-1 相同 {d['n_top1_same']} 点、"
           f"交集上 max|Δ|={_fmt(d['max_d_common'])}（mean={_fmt(d['mean_d_common'])})",
           flush=True)
+    noise = max([st["noise_B_vs_B2"]["max"] or 0, nd["max_d_common"] or 0])
     kax = max([st["K_axis_T1"]["max"] or 0, st["K_axis_TT"]["max"] or 0])
     tax = max([st["T_axis_K0"]["max"] or 0, d["max_d_common"] or 0])
-    print("[diag]   判读：" + (
-        "K 轴与 T 轴都不可忽略 → 既改 logprobs 取值、也要在**训练自己那一档 T** 下复验"
-        if kax > BIG_NAT and tax > BIG_NAT else
-        "K 轴显著、T 轴可忽略 → 是 logprobs=0 的上报路径（改用 N≥1 即可）"
-        if kax > BIG_NAT else
-        "T 轴显著、K 轴可忽略 → 是 max_tokens 影响 logits（请求形态相关数值），"
-        "训练档必须自证" if tax > BIG_NAT else
-        "两轴都小 → 报数没问题，回到轨迹/上下文错配去查"), flush=True)
+    if noise > BIG_NAT or nd["n_dicts_equal"] < max(1, nd["n"]):
+        verdict = (f"⚠ 噪声地板本身就大（同形态两次 max|Δ|={_fmt(noise)}，"
+                   f"字典相同 {nd['n_dicts_equal']}/{nd['n']}）——**读数不可复现**，"
+                   "此时不能把差异归给任何开关：先查是否与调度/批组成有关"
+                   "（VLLM_ENABLE_V1_MULTIPROCESSING、并发、prefix cache）")
+    elif kax > BIG_NAT and tax > BIG_NAT:
+        verdict = "K 轴与 T 轴都不可忽略 → 既改 logprobs 取值、也要在**训练自己那一档 T** 下复验"
+    elif kax > BIG_NAT:
+        verdict = "K 轴显著、T 轴可忽略 → 是 logprobs=0 的上报路径（改用 N≥1 即可）"
+    elif tax > BIG_NAT:
+        verdict = ("T 轴显著、K 轴可忽略 → max_tokens 影响 logits（请求形态相关数值），"
+                   "训练档必须自证")
+    else:
+        verdict = "两轴都在噪声内 → 报数没问题，回到轨迹/上下文错配去查"
+    print(f"[diag]   判读：{verdict}", flush=True)
 
 
 def warn_if_default_backend(args, cfg):
@@ -1091,7 +1107,11 @@ def run_lpmode_probe(cfg, args, rows):
     forms = {"A_K0_T1": dict(max_tokens=1, logprobs=0),
              "B_KK_T1": dict(max_tokens=1, logprobs=max(1, args.k)),
              "C_KK_TT": dict(max_tokens=T, logprobs=max(1, args.k)),
-             "D_K0_TT": dict(max_tokens=T, logprobs=0)}
+             "D_K0_TT": dict(max_tokens=T, logprobs=0),
+             # B 的**重复档**：同形态再问一次 = 本仪器的噪声地板。没有它就无法区分
+             # "请求形态导致系统性差异"与"同一形态自己都不可复现"（真机首跑里四条
+             # 采到不同 token 已经提示采样并非形态无关，这条对照必须显式存在）。
+             "B2_KK_T1": dict(max_tokens=1, logprobs=max(1, args.k))}
     built = {}
     for name, kw in forms.items():
         k2 = dict(n=1, temperature=1.0, top_p=1.0, top_k=-1, seed=cfg.get("seed"), **kw)
