@@ -69,6 +69,47 @@ python -m rlab.diag_logps --diff_traj rlab_out/diff1/traj1.jsonl rlab_out/diff2/
 
 这是**决定性证据**：同一设置、同 seed、同 backend、同模型，两次建轨迹的采样 token 和上报 logp 都完全不是一回事。
 
+### 5. det：最小复现——RNG 是好的，logits 不是
+
+`--measure det`（同一进程、背靠背、同参同 seed、同一 prompt 320 token，重复 3 次）：
+
+```text
+#1 ids[:8]=[1206, 1423, 279, 3140, 6572, 1442, 7308, 393] top1=1206 lp(top1)=-0.224  topK字典hash=09b11456
+#2 ids[:8]=[1206, 1423, 279, 3140, 6572, 1442, 7308, 393] top1=1206 lp(top1)=-0.0348 topK字典hash=b0f99712
+#3 ids[:8]=[1206, 1423, 279, 3140, 6572, 1442, 7308, 393] top1=1206 lp(top1)=-0.0759 topK字典hash=2e2189e8
+
+token 唯一数=1/3；top-K 字典唯一数=3/3；top-1 logp 极差=0.19
+```
+
+两条结论都很硬：
+
+- **RNG 没问题**：三次采到完全相同的 token 序列 ⇒ "seed 没生效/没对齐"这个常见归因被排除。
+- **logits 不确定**：同一个位置、同一个 token，引擎自己报的 logp 在 -0.035 / -0.076 / -0.224 之间跳（0.19 nat，等价于 p 从 0.97 到 0.80）。这是**同一进程内背靠背**的结果，因此跨进程预热、编译缓存、autotuner 一次性状态都解释不了它；探针里也没有任何 harness 变量。
+
+机制推断：前向的**归约顺序**不固定（split-K / atomic 累加、按批量选择的 kernel），bf16 下表现为 ~0.2 nat 的 logit 抖动；头部抖 0.2 nat 已足以让近并列 token 互换 → 轨迹分叉（这是 2.91% 的来源）。tail token 因为 softmax 分母被 argmax 主导，抖动直接落在 logp 上（lpmode 实测交集 max|Δ| 5.98）。
+
+### 6. batch-invariant 这一步尚未完成
+
+`VLLM_BATCH_INVARIANT` 在 v0.19.1 里**确实存在**（`vllm/envs.py:78` 注册），但直接开会启动即失败：
+
+```text
+RuntimeError: VLLM batch_invariant mode requires an attention backend in
+['FLASH_ATTN', 'TRITON_ATTN', 'FLASH_ATTN_MLA', 'TRITON_MLA'], but got 'None'
+```
+
+原因是 batch-invariant 的检查跑在 attention backend 解析**之前**，必须显式指定。工具已支持：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_BATCH_INVARIANT=1 PYTHONHASHSEED=0 \
+  python -m rlab.diag_logps --build_traj --model_path /root/Qwen3.5-4B --providers vllm \
+  --vllm_backend triton --attention_backend FLASH_ATTN --measure det --det_repeat 3 \
+  --out rlab_out/diag2/det_batchinv.jsonl
+```
+
+判据：若 `top-K 字典唯一数=1/3` 且 top-1 logp 极差≈0 → 可复现性被修好，那时才值得重新评估 vLLM logps 路线（但还需过 torch 对拍这一关）；若仍 3/3 → 此路不通，torch 副本是终局。
+
+代价提示：batch-invariant 会关掉 custom all-reduce、改用确定性 kernel（失败运行的 config 里已可见 `disable_custom_all_reduce=True`），吞吐会掉。所以即使它能修好可复现性，也是一个 **VRAM（torch 副本 8–9G）vs 吞吐** 的取舍。
+
 ## 结论与处置
 
 1. **vLLM 的采样 logprobs 在本环境不可复现**——不是某个参数没调对，而是同一请求两次运行就会给出不同分布的 tail / 不同 token / 不同 logp。尾部（rank≥2）数值基本随机。
