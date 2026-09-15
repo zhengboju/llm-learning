@@ -4,11 +4,14 @@
 # 一个进程只评一个模型（vLLM显存随进程退出干净释放）；多模型=多进程并行，同卡几个进程就各给 --gpu_mem≈1/N
 # 用法: CUDA_VISIBLE_DEVICES=0 python eval_vllm_one.py --name dapo200 --model /path/step_200 --n 300 --gpu_mem 0.26 --out eval_v_dapo200.json
 import argparse
+import atexit
 import hashlib
 import json
 import random
 import os
 import re
+import shutil
+import tempfile
 from transformers import AutoTokenizer
 
 # 【spawn 递归引爆防护】vLLM V1 默认用 multiprocessing spawn 启动 EngineCore 子进程，
@@ -20,6 +23,10 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", required=True, help="模型/checkpoint 路径")
+parser.add_argument("--mm_base", default=None,
+                    help="纯文本 Qwen3.5 ckpt 的多模态骨架目录（A2 自动物化用）；"
+                         "None=先查该 ckpt 的 run_info.json 里训练时的 model_path，"
+                         "再查 rlab 配置。")
 parser.add_argument("--name", default=None, help="表内显示名，默认取路径末2段")
 parser.add_argument("--n", type=int, default=300)
 parser.add_argument("--seed", type=int, default=42)
@@ -225,11 +232,84 @@ if not sample:
 sample = [it for it, _ in _kept]
 prompts = [p for _, p in _kept]
 
+# ---------- B：旧 ckpt 自动物化（vLLM A2 兜底）----------
+# 2026-09-16 起新 step_N 存盘即多模态壳（train.save_checkpoint），vLLM 直读；这里管
+# 两类历史产物：① 09-16 之前存下的 step_N（Qwen3_5TextConfig）；② -text 纯文本目录。
+# vLLM 对它们会在 processor 构造阶段直接 TypeError（A2），先物化到临时目录再起引擎。
+def _needs_mm_materialize(model_path: str) -> bool:
+    """True = 纯文本 Qwen3.5 目录（vLLM 的 A2 崩法），需要先物化成多模态壳。
+
+    复合目录（config 有 text_config）→ False；非 Qwen3.5（Qwen2.5 无多模态路由）
+    → False。判不出来也返回 False：宁可不物化，不可错物化（把好模型评成别的）。
+    """
+    try:
+        from rlab.model_loading import resolve_load_config
+        if resolve_load_config(model_path)[1]:
+            return False
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as f:
+            mt = str(json.load(f).get("model_type", ""))
+        return mt.startswith("qwen3_5")
+    except Exception:
+        return False
+
+
+def _find_mm_base(model_path: str, cli_mm_base, cfg):
+    """找可用的多模态骨架目录：--mm_base > ckpt 的 run_info.json > rlab 配置。
+
+    只接受**真复合目录**（resolve_load_config 判有 text_config）——模型路径的默认值
+    （如 /root/Qwen2.5-3B）在 Qwen3.5 评测里是错的，必须由判据挡掉，不能盲信配置。
+    """
+    from rlab.model_loading import resolve_load_config
+    cands = [cli_mm_base]
+    try:
+        with open(os.path.join(model_path, "run_info.json"), encoding="utf-8") as f:
+            _ri = json.load(f)
+        cands.append(_ri.get("model_path"))
+        cands.append((_ri.get("config") or {}).get("vllm_model_path"))
+    except Exception:
+        pass
+    cands.append(cfg.get("vllm_model_path") or cfg.get("model_path"))
+    for c in cands:
+        if not c or not os.path.isdir(c):
+            continue
+        try:
+            if resolve_load_config(c)[1]:
+                return c
+        except Exception:
+            continue
+    return None
+
+
+_model_for_vllm = args.model
+if _needs_mm_materialize(args.model):
+    _mm_base = _find_mm_base(args.model, args.mm_base, _rcfg)
+    if not _mm_base:
+        raise RuntimeError(
+            f"{args.model} 是纯文本 Qwen3.5 checkpoint（vLLM 的 A2：Qwen3_5TextConfig "
+            "被路由到多模态实现，processor 构造直接 TypeError），但找不到可用的多模态骨架。\n"
+            "  修法一：显式给骨架 --mm_base /root/Qwen3.5-4B\n"
+            "  修法二：先手工物化再评：\n"
+            f"    python -m rlab.materialize_mm_ckpt --text_ckpt {args.model} \\\n"
+            f"        --mm_base /root/Qwen3.5-4B --out {args.model}_mm")
+    _mm_tmp = tempfile.mkdtemp(prefix="_eval_mm_",
+                               dir=os.path.dirname(os.path.abspath(args.model)) or ".")
+    from rlab.materialize_mm_ckpt import materialize_mm_checkpoint
+    print(f"  [物化] {args.model} 是纯文本 ckpt（vLLM A2）→ 多模态壳（临时）: {_mm_tmp}")
+    materialize_mm_checkpoint(args.model, _mm_base, _mm_tmp)
+    atexit.register(shutil.rmtree, _mm_tmp, ignore_errors=True)
+    _model_for_vllm = _mm_tmp
+
 # ---------- vLLM 批量生成 ----------
 print(f"[2/3] vLLM 生成并评分 ... {name}: {args.model}")
 from vllm import LLM, SamplingParams
-llm = LLM(model=args.model, gpu_memory_utilization=args.gpu_mem,
-          max_model_len=args.max_len, dtype="bfloat16")
+# 【与训练同档】引擎参数从 rlab 配置取（BASE 默认 {"gdn_prefill_backend": "triton"}）：
+# 评测端构造 vLLM 时同样会触发 GDN prefill 的 FlashInfer JIT 现场编译（宿主 RAM 紧时
+# ninja 被 SIGKILL、无 traceback），不设档就会与训练静默分叉——Δacc 里混进 kernel 变量。
+_vllm_kwargs = dict(_rcfg.get("vllm_gen_kwargs") or {})
+if _vllm_kwargs:
+    print(f"  vLLM 引擎参数（与训练同一份配置）: {_vllm_kwargs}")
+llm = LLM(model=_model_for_vllm, gpu_memory_utilization=args.gpu_mem,
+          max_model_len=args.max_len, dtype="bfloat16", **_vllm_kwargs)
 
 code_used = code_ok = None
 if is_retool_family:

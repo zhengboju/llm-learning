@@ -27,6 +27,9 @@ parser.add_argument("--per_gpu", type=int, default=1,
 parser.add_argument("--gpu_mem", type=float, default=None, help="单进程vLLM显存占比，默认自动=0.78/per_gpu")
 parser.add_argument("--skip_base", action="store_true")
 parser.add_argument("--base_path", default="/root/Qwen2.5-3B")
+parser.add_argument("--mm_base", default=None,
+                    help="纯文本 Qwen3.5 ckpt 的多模态骨架目录（A2 自动物化用）；"
+                         "None=由 eval_vllm_one.py 从 ckpt 的 run_info.json 里取")
 parser.add_argument("--show", type=int, default=0)
 parser.add_argument("--split", default="test", choices=["test", "train"],
                     help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
@@ -38,6 +41,13 @@ args = parser.parse_args()
 
 base_path = args.base_path
 GPU_MEM = args.gpu_mem if args.gpu_mem is not None else round(0.78 / max(1, args.per_gpu), 3)
+# 本次评测实际用的 vLLM 引擎档（与 eval_vllm_one.py 同源：rlab 配置）。落进 _meta，
+# 事后核对 Δacc 时能自证"训练/评测是不是同一 kernel 档"（此前无处可查）。
+try:
+    from rlab.config import get_config as _get_config
+    VLLM_KWARGS = dict(_get_config(args.algo or "grpo", use_wandb=False).get("vllm_gen_kwargs") or {})
+except Exception:
+    VLLM_KWARGS = None
 
 
 def _auto_label(p, used):
@@ -119,6 +129,8 @@ def run_one(gpu, idx, name, path):
         cmd += ["--eval_task", args.eval_task]
     if args.show:
         cmd += ["--show", str(args.show)]
+    if args.mm_base:
+        cmd += ["--mm_base", args.mm_base]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
     # 竞态兜底：同卡实例退出释放显存撞上另一实例的初始化剖析 → AssertionError。
     # 该失败只发生在启动窗口期，冷却后重试几乎必成，最多试3次。
@@ -176,6 +188,7 @@ if failures:
 results["_meta"] = {"base_path": base_path, "tuned": args.tuned, "n": args.n,
                     "seed": args.seed, "split": args.split, "algo": args.algo,
                     "eval_task": args.eval_task, "gpus": gpus, "per_gpu": args.per_gpu,
+                    "mm_base": args.mm_base, "vllm_gen_kwargs": VLLM_KWARGS,
                     "failures": [list(x) for x in failures],
                     "created": time.strftime("%Y-%m-%d %H:%M:%S")}
 with open(args.out, "w", encoding="utf-8") as f:
