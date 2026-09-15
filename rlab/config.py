@@ -102,11 +102,18 @@ BASE = dict(
     # 换算可学带仅 1.2%——全是协议失败不是能力失败）。官方实测思考模式下"很少写代码"。
     # Qwen2.5 模板不引用该 jinja 变量，传入无副作用。
     chat_template_kwargs=None,
-    # 【2026-09-11 多模态 Qwen3.5 分裂加载】vLLM 生成用的 checkpoint 路径
-    # （None=model_path 同一份）。Qwen3.5-4B 官方权重是多模态复合体：vLLM 只认
-    # 多模态版（纯文本 qwen3_5_text 被它路由到多模态实现崩），torch 侧只能加载
-    # extract_text_model.py 抽出的纯文本版 → model_path=纯文本（torch 三处加载）、
-    # vllm_model_path=原多模态，权重同步经 sync.remap_text_to_multimodal 映射键名。
+    # 【2026-09-15 口径更正：不再需要分裂加载】Qwen3.5-4B 官方权重是多模态复合体，
+    # 但 c991f84 之后 torch 侧可**直连**该目录（load_causal_lm 显式喂 text_config，
+    # 见 model_loading），vLLM 侧本来就读它 → **统一用一份 /root/Qwen3.5-4B 即可**，
+    # 本键保持 None。注意两件事互不相同：
+    #   · 加载：一份目录两边都读得动（已解决）；
+    #   · 权重同步：torch 内存里的参数名是纯文本布局（model.X / lm_head.*），vLLM
+    #     多模态实现的参数名是 model.language_model.X → **键名映射仍然必须做**，
+    #     判据由 sync.need_text_to_mm_remap 按"键名形态"给（与目录是否相同无关），
+    #     生成端启动行会打印"权重同步键名映射: 开/关"自证。
+    # 本键只在需要**回退**分裂加载时使用：老 transformers 缺 qwen3_5_text 前缀转换
+    # 映射（A1：复合 config 喂文本类崩）时，用 extract_text_model.py 抽一份纯文本
+    # ckpt 当 model_path，并把本键指向原多模态目录（映射恒开）。
     vllm_model_path=None,
     # 【2026-09-11 4B OOM】DeepSpeed zero stage（0=默认，3B 全态 ~60G 历史可比）。
     # 4B bf16 优化器全态 = fp32 master+m+v ~48G + bf16 权重/梯度 16G ≈ 64G 静态，

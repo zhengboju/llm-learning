@@ -14,8 +14,7 @@
 4B 训练命令（本机 2×H20 96G + RAM 60G 约束下的唯一可行组合）：
 
 ```bash
-bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
-    --vllm_model_path /root/Qwen3.5-4B \
+bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
     --chat_template_kwargs '{"enable_thinking": false}' \
     --gen_gpu_mem 0.30 \
     --micro_rows 1 \
@@ -24,6 +23,16 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
     --difficulty_path rlab_out/difficulty_probe_4b_v4.jsonl \
     --lr 5e-6
 ```
+
+> **2026-09-15 模型路径口径更正（原命令是 `-text` + `--vllm_model_path`）**：
+> c991f84 之后 torch 侧可直连复合 ckpt（`load_causal_lm` 显式喂 text_config + 缺键
+> fail-fast），**统一用一份 `/root/Qwen3.5-4B` 即可**，`--vllm_model_path` 不必再传。
+> 注意：**加载能读 ≠ 同步能对上**——torch 参数名是纯文本布局（`model.X`/`lm_head.*`），
+> vLLM 多模态实现要 `model.language_model.X`，**键名映射照旧要做**，由
+> `sync.need_text_to_mm_remap` 按"键名形态"判定（统一目录也判 True），生成端启动行
+> `[rollout] 权重同步键名映射: 开/关` 自证；同步侧另有"送进去的张量一个都没被认领
+> → 直接 raise"的兜底。抽取纯文本 ckpt 降级为**回退方案**（老 transformers 缺
+> `qwen3_5_text` 前缀映射、撞 A1 时才用）。
 
 > **2026-09-14 补 `--lr 5e-6`**：本命令块此前漏了这个 flag，而 `retool_math` preset
 > **不含 `lr` 键**（落到 BASE 默认 1e-6）——照抄会静默跑成 5 倍小的学习率。

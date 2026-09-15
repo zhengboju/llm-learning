@@ -28,13 +28,20 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty \
 
 ## 1. 协议层（决定成败，最优先）
 
-- [x] **模型资产：先抽取纯文本 checkpoint**（2026-09-11 实锤）。官方 Qwen3.5-4B 是
-  原生多模态（`Qwen3_5ForConditionalGeneration`，vocab_size 在 text_config 里），
-  rlab 全链路按纯文本 causal LM 设计——`AutoModelForCausalLM` 对复合 config 直接
-  崩（Qwen3_5Config.vocab_size MISSING）。不适配多模态包装的原因：权重名多一层
-  前缀打崩 sync.py 权重同步 + vision tower 白占优化器显存。用
+- [x] **模型资产：统一用一份 `/root/Qwen3.5-4B`（2026-09-15 口径更正；抽取不是必需）**。
+  官方 Qwen3.5-4B 是原生多模态（`Qwen3_5ForConditionalGeneration`，vocab_size 在
+  text_config 里），rlab 全链路按纯文本 causal LM 设计——最初 `AutoModelForCausalLM`
+  对复合 config 直接崩（Qwen3_5Config.vocab_size MISSING），于是走了"抽纯文本"
+  这条路。**c991f84 起 torch 侧收口到 `model_loading.load_causal_lm`（显式喂
+  text_config + 缺键 fail-fast），复合 ckpt 可直连** → `model_path` 直接用
+  `/root/Qwen3.5-4B`，`--vllm_model_path` 不必再传。
+  **但"加载读得动"≠"同步对得上"**：torch 内存里的参数名是纯文本布局（`model.X`），
+  vLLM 多模态实现要 `model.language_model.X` → **键名映射照旧要做**，判据由
+  `sync.need_text_to_mm_remap` 按"键名形态"给（与两份 checkpoint 是否同目录无关），
+  生成端启动行 `[rollout] 权重同步键名映射: 开/关` 自证。抽取只在**回退**时需要：
+  老 transformers 缺 `qwen3_5_text` 前缀转换映射（A1）时，用
   `python -m rlab.extract_text_model --src /root/Qwen3.5-4B --dst /root/Qwen3.5-4B-text`
-  一次性抽取（内置 logits 对拍自检），此后 model_path 一律用 dst。
+  抽一份纯文本 ckpt 当 `model_path`，并传 `--vllm_model_path /root/Qwen3.5-4B`。
   已核对：pad=`<|endoftext|>`(248044)/eos=`<|im_end|>`(248046)，语义模式与
   Qwen2.5 相同，代码零硬编码 id，协议无需改；vocab 248k 比 2.5 大 63%，
   gen_logps logits 峰值相应上浮（§3 显存注意项）。

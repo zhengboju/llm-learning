@@ -34,10 +34,12 @@ bf16/kernel 的常规数值差（logit 级 ~0.1 nat）不可能把 0.39 变成 1
 本判据不能替代真机结论：**先跑，再看 verdict() 打了哪一支**。
 
 用法（pod，建议 GPU0 跑 vLLM/GPU1 跑 torch，避免同卡共居；**不要与训练同时跑**——
-两条路都要独占显存。命令里的模型路径/开关照抄本次训练命令，探的档才是训练那一档）：
+两条路都要独占显存。路径与开关照抄本次训练命令：2026-09-15 起统一用一份复合 ckpt
+/root/Qwen3.5-4B，torch 侧可直连（显式喂 text_config），**不再需要 -text 分裂目录**；
+若训练命令里还有 --vllm_model_path/--vllm_gen_kwargs/--chat_template_kwargs，一并抄过来）：
     # ① 建轨迹（同时测 vLLM 这一档）
     CUDA_VISIBLE_DEVICES=0 python -m rlab.diag_logps --build_traj \
-        --model_path /root/Qwen3.5-4B-text --vllm_model_path /root/Qwen3.5-4B \
+        --model_path /root/Qwen3.5-4B \
         --chat_template_kwargs '{"enable_thinking": false}' --providers vllm \
         --traj_out rlab_out/diag/traj.jsonl --out rlab_out/diag/vllm_preset.jsonl
     # ② vLLM 换一档 backend（消融轴 1；训练若传过 --vllm_gen_kwargs 也要补上）
@@ -45,10 +47,10 @@ bf16/kernel 的常规数值差（logit 级 ~0.1 nat）不可能把 0.39 变成 1
         --providers vllm --vllm_backend none --out rlab_out/diag/vllm_none.jsonl
     # ③ torch 两条前向路径（消融轴 2；不需要 vLLM，可放 GPU1）
     CUDA_VISIBLE_DEVICES=1 python -m rlab.diag_logps --traj_in rlab_out/diag/traj.jsonl \
-        --model_path /root/Qwen3.5-4B-text --providers torch --torch_path fla \
+        --model_path /root/Qwen3.5-4B --providers torch --torch_path fla \
         --out rlab_out/diag/torch_fla.jsonl
     CUDA_VISIBLE_DEVICES=1 python -m rlab.diag_logps --traj_in rlab_out/diag/traj.jsonl \
-        --model_path /root/Qwen3.5-4B-text --providers torch --torch_path fallback \
+        --model_path /root/Qwen3.5-4B --providers torch --torch_path fallback \
         --out rlab_out/diag/torch_fb.jsonl
     # ④ 判读（CPU，无需 GPU）
     python -m rlab.diag_logps --merge rlab_out/diag/vllm_preset.jsonl \

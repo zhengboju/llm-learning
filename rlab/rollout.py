@@ -44,7 +44,7 @@ from rlab.data import filter_qas_by_difficulty, load_difficulty_table, load_qas
 from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, forward_per_token_logps
-from rlab.model_loading import load_causal_lm
+from rlab.model_loading import load_causal_lm, resolve_load_config
 from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, sanitize_tool_text,
                            segment_mask_from_spans, tensor_to_bytes)
@@ -52,7 +52,7 @@ from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math)
 from rlab.sandbox import run_code
-from rlab.sync import remap_text_to_multimodal, sync_weights_into_vllm
+from rlab.sync import need_text_to_mm_remap, remap_text_to_multimodal, sync_weights_into_vllm
 
 # 清除分布式环境变量（gen worker 进程内 vLLM 不允许看到 DeepSpeed 的 WORLD_SIZE 等）
 _DEEPSPEED_ENV_KEYS = [
@@ -775,8 +775,11 @@ def _assert_torch_replica_loadable(model_path: str) -> None:
             f"{'该 ckpt 顶层确实没有 vocab_size（在 text_config 里）。' if r['composite'] else ''}"
             f"注意本预检已与加载同源（复合 ckpt 显式喂 text_config），仍失败说明该口径"
             f"在本进程里也绕不过去。\n"
-            f"  改法一（定版分裂加载）：model_path=<纯文本目录，如 /root/Qwen3.5-4B-text> "
-            f"+ --vllm_model_path <多模态目录>；\n"
+            f"  改法一（先查 transformers 版本）：要能加载复合 ckpt 必须有 qwen3_5_text "
+            f"的前缀转换映射（`model.language_model.X` -> `model.X`，5.16 起内置）；"
+            f"版本对就直接用统一目录 /root/Qwen3.5-4B（键名映射会自动开）。\n"
+            f"  改法二（回退分裂加载）：model_path=<extract_text_model 抽出的纯文本目录> "
+            f"+ --vllm_model_path <原多模态目录>；\n"
             f"  改法二（放弃对拍窗口）：去掉 --verify_gen_logps（副本只在 vllm_gen_logps "
             f"档位做对拍时才加载）。")
     print(f"[rollout][警告] torch 副本预检失败但**不像 A1**，继续让真实加载定夺：{err}",
@@ -947,11 +950,24 @@ def gen_worker(Q, cfg: dict):
     # 把整段标签作废。None 只应出现在"训练端用旧协议裸传 state_dict"的兼容路径。
     policy_version = [0]
     health = _HealthMonitor()
-    # 分裂加载判定：vLLM 用另一份 checkpoint（多模态）时，同步需做键名映射
-    _split_load = bool(cfg.get("vllm_model_path"))
-    if _split_load:
-        print(f"[rollout] 分裂加载: vLLM={cfg['vllm_model_path']} | torch={cfg['model_path']}"
-              "（同步走 remap_text_to_multimodal 键名映射）")
+    # 键名映射判定：【2026-09-15 澄清】判据是**两端模型的键名形态**，不是"两份
+    # checkpoint 是不是同一个目录"。torch 侧一律按纯文本类加载（model.X/lm_head.*），
+    # vLLM 侧吃多模态复合体时参数叫 model.language_model.X → 统一目录也必须映射。
+    # 旧判据 `bool(vllm_model_path)` 会在"统一用一份复合 ckpt"时给出 False（映射被
+    # 静默关掉 → 同步全落空），见 sync.need_text_to_mm_remap 的 docstring。
+    _vllm_path = cfg.get("vllm_model_path") or cfg["model_path"]
+    try:
+        _vk_composite = bool(resolve_load_config(_vllm_path)[1])
+    except Exception as _e:
+        _vk_composite = False
+        print(f"[rollout][警告] 解析 vLLM 侧 config 失败（{type(_e).__name__}: {_e}）"
+              "——键名映射退回旧判据（只看 vllm_model_path 是否显式给出）", flush=True)
+    _need_remap = need_text_to_mm_remap(vllm_checkpoint_composite=_vk_composite,
+                                        vllm_model_path_set=bool(cfg.get("vllm_model_path")))
+    print(f"[rollout] 权重同步键名映射: {'开' if _need_remap else '关'}"
+          f"（torch={cfg['model_path']} 纯文本布局 → vLLM={_vllm_path} "
+          f"{'多模态复合体' if _vk_composite else '同布局'}；判据=键名形态而非目录异同）",
+          flush=True)
 
     def try_update_model():
         nonlocal pushes
@@ -974,10 +990,11 @@ def gen_worker(Q, cfg: dict):
         print(f"[rollout] recving new model ... (version={gen_version})")
         try:
             # 顺序强制：先 vLLM 后 torch 副本，两者必须保持同一份权重
-            # 分裂加载（多模态 vLLM + 纯文本 torch）时同步走键名映射
+            # 键名映射开着时（判据见上面 need_text_to_mm_remap：torch 纯文本布局 →
+            # vLLM 多模态布局，统一目录也算）同步走 remap_text_to_multimodal
             path = sync_weights_into_vllm(
                 vllm_gen, state_dict,
-                name_remap=remap_text_to_multimodal if _split_load else None)
+                name_remap=remap_text_to_multimodal if _need_remap else None)
             if _torch_holder[0] is not None:
                 # 副本必须与 vLLM 同步（顺序强制：先 vLLM 后副本），否则 gen_logps
                 # 会用旧策略算——vllm_gen_logps 档位下无副本，跳过即可（不改语义）

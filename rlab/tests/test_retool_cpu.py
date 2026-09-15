@@ -2145,6 +2145,60 @@ def test_diag_logps_static():
     check("pyflakes 名单覆盖 diag_logps（J 组）", '"rlab/diag_logps.py"' in test_src)
 
 
+def test_remap_decision_unified_ckpt():
+    """[AD] 键名映射判据改口径：统一目录仍必须映射（2026-09-15 澄清）。
+
+    【为什么必须有这组】c991f84 之后 torch 能直连复合 ckpt，"统一用一份
+    /root/Qwen3.5-4B"成了自然写法——而旧判据 `bool(cfg['vllm_model_path'])` 会把
+    这种情况判成"不需要映射"，于是 torch 发的 `model.layers.X` 撞上 vLLM 多模态的
+    `model.language_model.X`，同步**一个张量都认领不了**。加载能不能读 ≠ 同步能不能
+    对上：判据必须是键名形态。"""
+    print("[AD] 键名映射判据（统一目录 vs 分裂目录 vs Qwen2.5）")
+    from rlab.sync import need_text_to_mm_remap, vllm_load_weights
+    check("统一目录（vLLM 侧是复合 ckpt、没传 vllm_model_path）→ **仍要映射**",
+          need_text_to_mm_remap(vllm_checkpoint_composite=True,
+                                vllm_model_path_set=False) is True)
+    check("分裂加载（显式 --vllm_model_path）→ 映射（旧行为不变）",
+          need_text_to_mm_remap(vllm_checkpoint_composite=True,
+                                vllm_model_path_set=True) is True)
+    check("Qwen2.5/同布局（vLLM 侧 config 无 text_config）→ 不映射（映射反而不该做）",
+          need_text_to_mm_remap(vllm_checkpoint_composite=False,
+                                vllm_model_path_set=False) is False)
+    check("config 读不出来但用户显式给了 flag → 恒映射（唯一可靠信号）",
+          need_text_to_mm_remap(vllm_checkpoint_composite=False,
+                                vllm_model_path_set=True) is True)
+
+    # ---- 同步侧的兜底：一个张量都没认领 = 键名体系不匹配，必须当场炸 ----
+    class _ModelZero:
+        def load_weights(self, items): return []
+    class _ModelOk:
+        def load_weights(self, items): return ["a", "b"]
+    class _ModelNone:
+        def load_weights(self, items): return None
+    items = [("model.embed_tokens.weight", "t")]
+    try:
+        vllm_load_weights(_ModelZero(), items)
+        check("loaded=0 且 sent>0 → RuntimeError（不许当成功）", False)
+    except RuntimeError as e:
+        check("loaded=0 且 sent>0 → RuntimeError（不许当成功）",
+              "一个都没被认领" in str(e) and "need_text_to_mm_remap" in str(e))
+    check("正常计数进日志（stacked 融合下 loaded<sent 属常态）",
+          vllm_load_weights(_ModelOk(), items) == "loaded 2/1 tensors")
+    check("loaded=None（老版本不返回清单）只告警不拦（宁可不拦不可错拦）",
+          vllm_load_weights(_ModelNone(), items) == "loaded 0/1 tensors")
+
+    # ---- gen_worker 接线：判据来自 need_text_to_mm_remap，不再是 vllm_model_path ----
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    check("gen_worker 用 need_text_to_mm_remap 判定（旧 _split_load 判据已废）",
+          "need_text_to_mm_remap(" in ro and "_split_load" not in ro)
+    check("判定结果同时用于 name_remap 与启动行自证",
+          "name_remap=remap_text_to_multimodal if _need_remap else None" in ro
+          and "权重同步键名映射" in ro)
+    check("判据按 vLLM 侧 ckpt 是否复合体算（resolve_load_config 同源）",
+          "resolve_load_config(_vllm_path)" in ro)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -2182,6 +2236,7 @@ if __name__ == "__main__":
     test_logps_diff_shape()
     test_diag_logps_pure()
     test_diag_logps_static()
+    test_remap_decision_unified_ckpt()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

@@ -12,7 +12,7 @@
 | `data.py` | 数据加载（GSM8K 默认 modelscope，HF 仅回落 + CPU fixture；`RLAB_DATA_SOURCE=hf` 可强制 HF） |
 | `reward.py` | acc/format/overlong 三组件 + 阶段2 retool 奖励（math_verify 线程安全：timeout=None） |
 | `losses.py` | **核心**：advantage 三模式 + 六算法 loss（grpo/dapo/dr_grpo/cispo/gspo/rfpp）+ retool 复用 grpo |
-| `sync.py` | 权重同步（apply_model 优先 + V0 兜底 + fail-fast） |
+| `sync.py` | 权重同步（apply_model 优先 + V0 兜底 + fail-fast + "一个张量都没认领"必炸）+ **文本→多模态键名映射判据** `need_text_to_mm_remap`（按键名形态判，统一目录也要映射） |
 | `rollout.py` | 生成端 worker（vLLM 采样 + torch gen_logps 副本 + dynamic sampling + 阶段2 多轮代码交织） |
 | `sandbox.py` | 阶段2：subprocess 隔离代码沙箱（超时/内存上限/输出截断） |
 | `health.py` | 训练期健康检查：窗口签名告警（信号恒死/平坦/退化/截断），历史 bug 的直接探测 |
@@ -24,7 +24,7 @@
 | `probe_gdn_backend.py` | GDN 反向 kernel 后端探针：前置闸门（tilelang **真 import** 通过，`find_spec` 类代理判据会假阳性）+ 三条判据（对拍官方 naive 参考）+ 两条反证（禁用必 raise / 坏 triton 偏离量）+ tilelang JIT 预热。pod 上按 `docs/06` §6 使用 |
 | `diag_logps.py` | **gen_logps 不一致的责任方定位**：固定轨迹 + 前缀长扫描，逐点复现 `|Δlogp|`（同 top-K 与目标 token 排名）；vLLM backend（`--vllm-backend`）与 torch GDN 路径（`--torch-path fallback`）两条消融轴跨进程跑，`--merge` 在 CPU 上算成对矩阵并判"责任在 vLLM 侧 / torch 侧 / 跨引擎口径差 / 不是 kernel" |
 | `tests/test_smoke_cpu.py` | 71 项 CPU 冒烟测试（losses 解析值/协议/reward/数据/eval 统计口径/run 签名/跨 json 配对/抽取自检判据） |
-| `tests/test_retool_cpu.py` | 343 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏 + 对拍形态学/诊断判据是核心学习点）（2026-09-15 实测口径） |
+| `tests/test_retool_cpu.py` | 354 项阶段2 验收（mask 错/对 A/B + 多轮循环 + 健康检查滚动门 + ckpt 撞名护栏 + 对拍形态学/诊断判据 + 键名映射判据是核心学习点）（2026-09-15 实测口径） |
 
 ## 算法切换对照
 
