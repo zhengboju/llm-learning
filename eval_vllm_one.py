@@ -232,6 +232,40 @@ if not sample:
 sample = [it for it, _ in _kept]
 prompts = [p for _, p in _kept]
 
+# ---------- 起引擎前的显存前置检查（fail-fast 在 vLLM init_device 之前）----------
+def _mem_shortfall(gpu_mem: float, free: int, total: int):
+    """纯函数：显存请求 vs 当前空闲。不够 → 返回带改法的说明；够 → None。"""
+    want = gpu_mem * total
+    if want <= free:
+        return None
+    used = total - free
+    hint = max(0.05, (free / total) * 0.9) if total else 0.0
+    return (
+        f"GPU 空闲显存不够：请求 gpu_mem={gpu_mem:.2f} → {want / 2**30:.1f} GiB，"
+        f"但只剩 {free / 2**30:.1f}/{total / 2**30:.1f} GiB"
+        f"（{used / 2**30:.1f} GiB 被别的进程占着，常见是训练端/上一次 eval 没退干净）。\n"
+        f"  修法：降 --gpu_mem 到 ≈{hint:.2f}（留 10% 余量）；或换空闲卡 --gpus；"
+        "或等训练结束。\n  看占用者：nvidia-smi")
+
+
+def _gpu_mem_preflight(gpu_mem: float, device: int = 0) -> None:
+    """【2026-09-16 真机】--gpus 0,1 时 GPU1 被训练占着（空闲 35.4/95 GiB），默认
+    gpu_mem=0.78 → 白等一次 materialize+引擎初始化，最后只拿到 vLLM 一行 ValueError
+    （"Free memory ... less than desired GPU memory utilization"）。提前把三个数
+    （空闲/总量/请求）与改法打出来。判不了就不拦（无 CUDA / 老 torch）。"""
+    try:
+        import torch
+        free, total = torch.cuda.mem_get_info(device)
+    except Exception as exc:
+        print(f"  [GPU][警告] 显存前置检查跳过（{type(exc).__name__}: {exc}）")
+        return
+    print(f"  [GPU] 空闲 {free / 2**30:.1f}/{total / 2**30:.1f} GiB；"
+          f"请求 gpu_mem={gpu_mem:.2f} → {gpu_mem * total / 2**30:.1f} GiB")
+    msg = _mem_shortfall(gpu_mem, free, total)
+    if msg:
+        raise RuntimeError(msg)
+
+
 # ---------- B：旧 ckpt 自动物化（vLLM A2 兜底）----------
 # 2026-09-16 起新 step_N 存盘即多模态壳（train.save_checkpoint），vLLM 直读；这里管
 # 两类历史产物：① 09-16 之前存下的 step_N（Qwen3_5TextConfig）；② -text 纯文本目录。
@@ -308,6 +342,7 @@ from vllm import LLM, SamplingParams
 _vllm_kwargs = dict(_rcfg.get("vllm_gen_kwargs") or {})
 if _vllm_kwargs:
     print(f"  vLLM 引擎参数（与训练同一份配置）: {_vllm_kwargs}")
+_gpu_mem_preflight(args.gpu_mem)
 llm = LLM(model=_model_for_vllm, gpu_memory_utilization=args.gpu_mem,
           max_model_len=args.max_len, dtype="bfloat16", **_vllm_kwargs)
 

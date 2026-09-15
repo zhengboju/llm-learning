@@ -1448,6 +1448,30 @@ def test_eval_spawn_guard():
           guard in src)
     check("守卫在 vLLM import 之前（spawn 发生在 LLM() 初始化，env 须先于其生效）",
           src.index(guard) < src.index("from vllm import"))
+    # 【2026-09-16 真机】--gpus 0,1 时 GPU1 被训练占着（空闲 35.4/95 GiB），默认
+    # gpu_mem=0.78 → 白等一次 materialize+引擎初始化才拿到一行 ValueError。
+    check("eval_vllm_one.py 起引擎前做显存前置检查（三个数 + 可执行改法，fail-fast）",
+          "def _mem_shortfall(" in src and "def _gpu_mem_preflight(" in src
+          and src.index("_gpu_mem_preflight(args.gpu_mem)")
+          < src.index("llm = LLM(model=_model_for_vllm"))
+    eval_cli = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "eval.py"), encoding="utf-8").read()
+    check("rlab.eval 透传 --gpu_mem/--mm_base（否则卡被占时无法从统一入口降档）",
+          '"--gpu_mem", str(args.gpu_mem)' in eval_cli
+          and '"--mm_base", args.mm_base' in eval_cli)
+    # 判据行为自检：脚本不可 import（顶层就要 --model 并起 vLLM），故只取该纯函数的
+    # AST 源码 exec 出来测——"能不能分辨够用/不够用"必须真跑，不能只数源码文本。
+    import ast as _ast
+    _fn = next(n for n in _ast.parse(src).body
+               if isinstance(n, _ast.FunctionDef) and n.name == "_mem_shortfall")
+    _ns = {}
+    exec(compile(_ast.Module(body=[_fn], type_ignores=[]), "<mem>", "exec"), _ns)
+    _ms = _ns["_mem_shortfall"]
+    _G = 2 ** 30
+    check("显存判据：够用放行 / 不够时给出 gpu_mem 上限（35.4/95 vs 0.78 实机档）",
+          _ms(0.30, 35 * _G, 95 * _G) is None
+          and "gpu_mem" in _ms(0.78, 35 * _G, 95 * _G)
+          and _ms(0.78, 80 * _G, 95 * _G) is None)
 
 
 def test_eval_thinking_switch():
