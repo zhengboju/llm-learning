@@ -17,12 +17,61 @@ gen_logps 副本/训练端三处都要改。一次性抽取纯文本 checkpoint 
 产出 /dst（纯文本 Qwen3_5ForCausalLM + tokenizer + chat template）。之后探针/
 训练/评测的 model_path 一律用 --dst；脚本内置分层自检（见 _selfcheck：同权重同路径
 逐位对拍为主判据，wrapper 路径偏差单列），不通过会显式报错而不是静默产出坏 ckpt。
+
+注意：本脚本全程 CPU，但 pod 上装了 fla（vLLM 跑 Qwen3.5 GDN 的依赖），必须在 import
+modeling 之前显式屏蔽掉它，否则 CPU 自检前向会被塞进 fla 的 triton kernel 崩掉——
+根因见 _force_torch_reference_kernels。
 """
 
 import argparse
+import importlib.util
 import os
+import sys
 
 import torch
+
+
+def _force_torch_reference_kernels() -> list[str]:
+    """屏蔽 fla / causal_conv1d，让线性注意力分派回落到 modeling 内的纯 torch 参考实现。
+
+    症状（2026-09-14 pod 实跑）：纯 CPU 自检前向崩在
+    `fla/ops/gated_delta_rule/chunk.py` → `l2norm_fwd` 的 triton kernel，报
+    `ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)`。
+
+    根因：transformers 的 `use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule",
+    "fla")` 是**纯 import 期**决策——`importlib.import_module("fla")` 一成功就换成 fla 的
+    triton 实现，**完全不看张量在哪个设备上**。pod 装了 fla（vLLM GDN 的依赖），于是 CPU
+    前向也被塞进 triton kernel。旁证：日志里 `causal_conv1d_fn` 那句 "falling back to its
+    reference PyTorch implementation" 是同一个装饰器，只因 pod 没装 causal_conv1d 而正常回落。
+
+    规避：把包名在 sys.modules 里置 None（CPython 语义：再次 import 抛 ModuleNotFoundError），
+    装饰器的 except 分支即取回参考实现——纯 torch、设备无关，且对拍两侧同路径，① 的逐位
+    判据不受影响。自检只有几个 7-token 前向，参考实现的慢无所谓。
+    注：USE_HUB_KERNELS=0 挡不住这条路径（它只关掉 kernels 包的 hub 实现，不管原包装回退）。
+    若将来要改跑 GPU 自检（省时间但有显存占用），删掉这个调用即可。
+
+    返回真正被屏蔽掉的包名（"装了"才改变分派，"本机没装"不算）——供日志与回归测试断言。
+    """
+    blocked = []
+    for pkg in ("fla", "causal_conv1d"):   # 两者都是 CUDA-only 的 triton/cuda 扩展
+        # 先探测"装没装"（find_spec 不执行模块），再看 sys.modules——判据要能分辨
+        # "本机没装"（本就没走加速路径）与"装了但被我们屏蔽"（才是真正改变了分派）
+        if importlib.util.find_spec(pkg) is not None:
+            blocked.append(pkg)
+        sys.modules[pkg] = None            # type: ignore[assignment]
+    print("[extract] 线性注意力走纯 torch 参考实现（屏蔽了加速 kernel: "
+          f"{', '.join(blocked) if blocked else '无，本机未装'}）")
+    # 真探针：上面的 print 只是"声明"，这里确认屏蔽**真的**生效（否则自检会以 triton
+    # 那句误导性的报错崩掉，看不出是分派没挡住）
+    for pkg in blocked:
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            continue
+        raise RuntimeError(
+            f"屏蔽 {pkg} 失败（import 仍成功）——装饰器会再次取到加速实现，"
+            "自检会在 triton kernel 里以 'cpu tensor?' 崩掉")
+    return blocked
 
 
 def _selfcheck(full, backbone, causal, tok, ids) -> None:
@@ -32,8 +81,8 @@ def _selfcheck(full, backbone, causal, tok, ids) -> None:
     不是缺陷：
       ① 对拍两侧是两条**不同代码路径**——`full(...)` 走多模态复合 wrapper（自己构造
          position_ids/attention_mask），`causal(...)` 是裸文本模型。同权重不同路径在
-         bf16 下逐层舍入，32 层混合线性注意力（无 flash-linear-attention 时走参考实现）
-         累积到 1e-1 量级属正常，与"权重抄错"无关。
+         bf16 下逐层舍入，32 层混合线性注意力（本脚本已强制走纯 torch 参考实现，见
+         _force_torch_reference_kernels）累积到 1e-1 量级属正常，与"权重抄错"无关。
       ② 阈值是**绝对值**，与 logits 量纲无关，且卡在噪声地板上（0.1017 只超线 1.7%）。
 
     新判据分三层，①②＋反证是硬闸，③ 只报数不拦：
@@ -149,6 +198,9 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     args = ap.parse_args()
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
+
+    # 必须在 import modeling 之前：kernel 分派发生在装饰器求值（模块 import 期）
+    _force_torch_reference_kernels()
 
     from transformers import AutoConfig, AutoTokenizer
     from transformers.models.qwen3_5 import (Qwen3_5ForCausalLM,
