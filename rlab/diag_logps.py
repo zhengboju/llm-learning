@@ -211,14 +211,42 @@ def aggregate(rows: list) -> dict:
 
 
 def aggregate_flat(rows: list) -> dict:
-    """per-L 的轻量版（不递归 per_L/worst，避免结构套娃）。纯函数。"""
+    """per-L 的轻量版（不递归 per_L/worst，避免结构套娃）。纯函数。
+
+    带 max_abs_d_common：它是**分布级**指标（两侧 top-K 交集上最大的 token 差），
+    与 target_d（只看被采样那一个 token）回答的是两个问题——
+      · 分布级也差 → logits/kernel 真的不同；
+      · 只有 target_d 差、分布级一致 → 更像是"报数/取样位置"错了（vLLM 报 logprob
+        的那条路与算分布的那条路不一致）。
+    真机 2026-09-15 的 L=0 极值（torch -7.40 vs vLLM -0.60）必须靠这一对指标分辨。"""
     tds = [r["target_d"] for r in rows if r["target_d"] is not None]
+    cds = [r["max_abs_d_common"] for r in rows if r["max_abs_d_common"] is not None]
     return {"n": len(rows),
             "target_d_mean": (sum(tds) / len(tds)) if tds else None,
             "max_target_d": max(tds) if tds else None,
+            "max_abs_d_common": max(cds) if cds else None,
             "confident_n": sum(1 for r in rows if r["confident"]),
             "top1_match_rate": (sum(1 for r in rows if r["top1_match"]) / len(rows))
                                if rows else None}
+
+
+def traj_id(rows: list) -> str:
+    """轨迹指纹（内容哈希，纯函数）：**同一轨迹才能比**这条契约的机械执行者。
+
+    真机 2026-09-15 教训：`--build_traj` 会**覆盖** traj.jsonl，于是"旧的 vLLM 结果 +
+    新的 torch 结果"会带着重叠的 (q, L) 键被 merge —— 它们其实在看**不同的 token、
+    不同的上下文**，而报告里只会显示一个正常的差异数字（无声的错答案）。指纹不同
+    的 provider 对必须拒绝比较。"""
+    import hashlib
+    h = hashlib.sha1()
+    for r in sorted(rows, key=lambda x: x.get("q", -1)):
+        h.update(str(r.get("q")).encode())
+        h.update(b"|")
+        h.update(",".join(str(t) for t in (r.get("prompt_ids") or [])).encode())
+        h.update(b"|")
+        h.update(",".join(str(t) for t in (r.get("ids") or [])).encode())
+        h.update(b";")
+    return h.hexdigest()[:12]
 
 
 def engine_of(provider: str) -> str:
@@ -358,19 +386,27 @@ def _qwen_gdn_modules() -> list:
 
 
 def force_torch_gdn_fallback(*, enable: bool = True) -> dict:
-    """强制 transformers 走纯 torch 的 GDN 回退实现，返回打桩报告。
+    """强制 transformers 走纯 torch 的 GDN 回退实现（enable=True 时），返回打桩报告。
 
     **必须在 load_causal_lm 之前调用**：有的版本在层 __init__ 里就把实现定死
     （此时 load 之后再打桩无效），有的版本在 forward 里现查 —— 提前打桩两种都覆盖。
 
-    两条 import 形态都打：建模模块自己的绑定（`from ...utils import is_fla_available`）
-    与 `transformers.utils.import_utils.is_fla_available`（模块内 `import ... as` 形态）。
-    找不到任何可打的目标 → raise：**判据必须能分辨"打了桩"和"没找到地方打"**，
-    否则"fallback 档跑出来的数"可能根本还是 fla 算的（静默假绿灯，本项目栽过多次）。
+    【2026-09-15 观测与干预必须分离】计数器**无条件安装**（它只是包一层调用计数，
+    不改任何行为），`enable` 只控制"把 is_fla_available 打桩成 False"这一干预。
+    旧版在 enable=False 时整段 early-return，于是 `--torch_path fla` 档根本没装计数器，
+    标签自证只能报 `unknown`（fla 计数 0、参考实现计数 0）——**"没观测"被读成了
+    "没跑实现"**，同一类假绿灯。现在任何一档都有计数，标签才有事实依据。
+
+    打点目标覆盖两种 import 形态：建模模块自身的绑定（`from fla... import X`）与
+    fla 包内的算子（函数体内 `import`）——**打桩/计数要打在真实开关上**，上一轮就是
+    打在一个不存在的名字上（patched=[]）而白忙一场。
+
+    打桩目标（enable=True）找不到 → raise：判据必须能分辨"打了桩"和"没找到地方打"。
     """
-    report = {"enabled": bool(enable), "patched": [], "counters": {}, "errors": []}
+    report = {"enabled": bool(enable), "patched": [], "counters": {},
+              "errors": [], "fla_module": None}
     if not enable:
-        return report
+        pass    # 仍然继续装计数器（见 docstring）
     mods = []
     try:
         from transformers.utils import import_utils as _iu
@@ -382,18 +418,26 @@ def force_torch_gdn_fallback(*, enable: bool = True) -> dict:
             mods.append(sys.modules[name])
         except KeyError:
             continue
+    # fla 包内的算子：transformers 若在函数体内 import，只有打在这里才拦得到
+    try:
+        import importlib
+        fla_mod = importlib.import_module("fla.ops.gated_delta_rule")
+        mods.append(fla_mod)
+        report["fla_module"] = getattr(fla_mod, "__name__", "fla.ops.gated_delta_rule")
+    except Exception:
+        pass    # 没装 fla 是常态（本档就是要在没 fla 时证明走的是参考实现）
     if not mods:
         raise RuntimeError("[diag] 找不到任何 Qwen3.5/3-Next 建模模块——"
-                           "--torch-path fallback 无法打桩（别把它当 fla 档跑）")
+                           "本档的计数器装不上，标签只能是 unknown（别当有效档解读）")
     for mod in mods:
         nm = getattr(mod, "__name__", repr(mod))
-        if hasattr(mod, "is_fla_available"):
+        if enable and hasattr(mod, "is_fla_available"):
             if not getattr(mod, "_rlab_gdn_patched", False):
                 mod._rlab_gdn_orig_is_fla = mod.is_fla_available
             mod.is_fla_available = lambda *a, **kw: False
             mod._rlab_gdn_patched = True
             report["patched"].append(f"{nm}.is_fla_available")
-        # 计数器：证"回退实现真的被走到"，而不是只证"我打了桩"
+        # 计数器：证"哪条实现真的被走到"，而不是只证"我打了桩"
         for attr in ("torch_chunk_gated_delta_rule", "chunk_gated_delta_rule",
                      "fused_recurrent_gated_delta_rule"):
             fn = getattr(mod, attr, None)
@@ -408,7 +452,7 @@ def force_torch_gdn_fallback(*, enable: bool = True) -> dict:
                 _wrapped._rlab_orig = fn
                 setattr(mod, attr, _wrapped)
                 report["counters"][f"{nm}.{attr}"] = box
-    if not report["patched"] and not report["counters"]:
+    if enable and not report["patched"] and not report["counters"]:
         raise RuntimeError("[diag] 建模模块里既没有 is_fla_available 也没有 GDN 算子名——"
                            "打桩无从下手，本档数据不可信")
     return report
@@ -575,6 +619,8 @@ def run_vllm(cfg, args, rows, lens):
         rows = [r for r in rows if r.get("ids")]
 
     sp_raw = _probe_sp(SamplingParams, args.k, cfg.get("seed"), "raw")
+    _tid = traj_id(rows)
+    print(f"[diag] 轨迹指纹 traj_id={_tid}（merge 靠它拒绝跨轨迹比较）", flush=True)
     sp_alt = (_probe_sp(SamplingParams, args.k, cfg.get("seed"), "default")
               if args.probe_default else None)
     if sp_alt is not None:
@@ -591,7 +637,7 @@ def run_vllm(cfg, args, rows, lens):
             pairs = topk_pairs(entry, args.k)
             target = int(row["ids"][L])
             lp = dict(pairs).get(target)
-            rec = {"provider": tag, "q": row["q"], "L": L,
+            rec = {"provider": tag, "q": row["q"], "L": L, "traj_id": _tid,
                    "plen": len(row["prompt_ids"]), "target": target,
                    "lp_target": lp, "target_rank": rank_from_pairs(pairs, target),
                    "top1": pairs[0][0] if pairs else None,
@@ -678,8 +724,12 @@ def run_torch(cfg, args, rows, lens):
     model = model.to(dev).eval()
     print(f"[diag] torch provider: model={cfg['model_path']} device={dev} "
           f"path={args.torch_path} attn={cfg.get('attn_implementation', 'sdpa')}")
+    print(f"[diag] 可用打点：{list(rep['counters']) or '（一个都没装上）'}；"
+          f"fla 包={rep.get('fla_module')}；patched={rep['patched']}", flush=True)
 
     tag = f"torch:{args.torch_path}"
+    _tid = traj_id(rows)
+    print(f"[diag] 轨迹指纹 traj_id={_tid}（merge 靠它拒绝跨轨迹比较）", flush=True)
     out_rows = []
     for row in rows:
         for L in lens:
@@ -697,7 +747,7 @@ def run_torch(cfg, args, rows, lens):
             target = int(row["ids"][L])
             lp = float(lp_row[target])
             rank = int((lp_row > lp_row[target]).sum().item()) + 1
-            out_rows.append({"provider": tag, "q": row["q"], "L": L,
+            out_rows.append({"provider": tag, "q": row["q"], "L": L, "traj_id": _tid,
                              "plen": len(row["prompt_ids"]), "target": target,
                              "lp_target": lp, "target_rank": rank,
                              "top1": pairs[0][0] if pairs else None,
@@ -813,15 +863,16 @@ def run_torch_decode(cfg, args, rows):
               f"{sum(ms) / len(ms):.3g}  全局 max|Δ|={mx:.3g}  >1nat={100 * big:.2f}%")
     print("[diag] 判读：若 prefill 远差于 decode，则责任在 vLLM 的 chunk/prefill kernel"
           "（训练期对拍的中位差被占比 0.03% 的 prefill 位掩盖）；两者都差则两路都不对。")
-    return out_rows_from_decode(agg)
+    return out_rows_from_decode(agg, traj_id(rows))
 
 
-def out_rows_from_decode(agg: dict) -> list:
+def out_rows_from_decode(agg: dict, tid: str = None) -> list:
     """decode 口径的汇总行（供落盘留档；不参与 provider 矩阵 merge）。"""
-    out = [{"provider": "torch:decode", "measure": "decode"}]
+    out = [{"provider": "torch:decode", "measure": "decode", "traj_id": tid}]
     for k, ss in agg.items():
         n = sum(s["n"] for s in ss)
-        out.append({"provider": "torch:decode", "measure": "decode", "segment": k,
+        out.append({"provider": "torch:decode", "measure": "decode", "traj_id": tid,
+                    "segment": k,
                     "n": n,
                     "mean_abs_d": sum(s["mean"] * s["n"] for s in ss) / max(1, n),
                     "max_abs_d": max(s["max"] for s in ss),
@@ -854,8 +905,20 @@ def merge_main(args) -> int:
         return 2
     print(f"[diag] merge {len(providers)} 个 provider：" + "，".join(
         f"{p}({len(v)} 点)" for p, v in sorted(providers.items())))
+    # 【同一轨迹才能比】traj_id 不同 = 两边的 (q, L) 键看着一样，实际是不同 token/上下文。
+    # 真机教训：--build_traj 会覆盖 traj.jsonl，旧 vLLM 结果 + 新 torch 结果混着 merge
+    # 会给出一个"正常"的差异数字——无声的错答案比报错危险得多。
+    tids = {p: sorted({r.get("traj_id") for r in v.values() if r.get("traj_id")})
+            for p, v in providers.items()}
+    for p, t in sorted(tids.items()):
+        if len(t) > 1:
+            print(f"[diag][警告] {p} 内部混了多个轨迹（{t}）——请只喂同一次运行的文件")
     pair_stats = {}
     for a, b in itertools.combinations(sorted(providers), 2):
+        if tids[a] and tids[b] and not (set(tids[a]) & set(tids[b])):
+            print(f"[diag] ⚠ 跳过 {a} vs {b}：轨迹不同（{tids[a]} vs {tids[b]}）——"
+                  "同一 (q,L) 键指向的 token/上下文不同，比较无意义")
+            continue
         keys = sorted(set(providers[a]) & set(providers[b]))
         if not keys:
             continue
@@ -870,7 +933,8 @@ def merge_main(args) -> int:
               f"confident={st['confident_n']}  目标缺 top-K={st['target_missing_n']}")
         print("[diag]   per-L: " + "  ".join(
             f"L={L}:mean={_fmt(v['target_d_mean'])}/max={_fmt(v['max_target_d'])}"
-            f"/conf={v['confident_n']}" for L, v in st["per_L"].items()))
+            f"/dist={_fmt(v.get('max_abs_d_common'))}/conf={v['confident_n']}"
+            for L, v in st["per_L"].items()))
         for w in st["worst"]:
             if (w["target_d"] or 0) > BIG_NAT:
                 print(f"[diag]   最差点 q={w['q']} L={w['L']} target={w['target']}: "

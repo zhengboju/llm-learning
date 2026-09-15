@@ -2348,6 +2348,66 @@ def test_diag_impl_label_and_mode():
           "跳过 {path}：无 provider 字段" in src)
 
 
+def test_diag_counter_and_trajid():
+    """[AG] 观测与干预分离 + 轨迹指纹（真机 2026-09-15 两条工具缺陷）。
+
+    ① `--torch_path fla` 档报 `实际实现=unknown`（fla 计数 0、参考实现计数 0）——
+       不是环境问题：旧版 `force_torch_gdn_fallback(enable=False)` 直接 early-return，
+       **根本没装计数器**，于是"没观测"被读成"没跑实现"。计数器必须无条件安装。
+    ② `--build_traj` 会**覆盖** traj.jsonl：旧 vLLM 结果 + 新 torch 结果混着 merge 时，
+       (q, L) 键照样重叠，但指的是不同的 token/上下文 → 会给出一个"正常"的差异数字。
+       必须用轨迹指纹硬拦。"""
+    print("[AG] 计数器无条件安装 + merge 拒绝跨轨迹比较")
+    import sys
+    import types
+    import rlab.diag_logps as D
+
+    fake = types.ModuleType("fake_modeling_qwen3_5_for_test")
+    calls = {"n": 0}
+
+    def torch_chunk_gated_delta_rule(*a, **kw):
+        calls["n"] += 1
+        return "ref"
+
+    fake.torch_chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+    sys.modules[fake.__name__] = fake
+    orig_mods = D._qwen_gdn_modules
+    D._qwen_gdn_modules = lambda: [fake.__name__]
+    try:
+        rep_obs = D.force_torch_gdn_fallback(enable=False)
+        check("enable=False（观测档）也装计数器——不再 early-return",
+              any("torch_chunk_gated_delta_rule" in k for k in rep_obs["counters"]))
+        fake.torch_chunk_gated_delta_rule(1, 2)
+        cnt = [b["n"] for k, b in rep_obs["counters"].items()
+               if "torch_chunk_gated_delta_rule" in k]
+        check("计数随调用递增（且原函数语义不变）",
+              cnt == [1] and calls["n"] == 1)
+        check("观测档不打桩（patched 为空，只看不动）", rep_obs["patched"] == [])
+        tag, ok, _why = D.torch_impl_tag("fla", rep_obs)
+        check("有计数就能给出事实标签：实际是 torch 参考实现 → 不冒充 fla",
+              tag == "torch:torch_ref" and ok is False)
+    finally:
+        D._qwen_gdn_modules = orig_mods
+        sys.modules.pop(fake.__name__, None)
+
+    a = [{"q": 0, "prompt_ids": [1, 2], "ids": [3, 4]},
+         {"q": 1, "prompt_ids": [5], "ids": [6]}]
+    b = [{"q": 0, "prompt_ids": [1, 2], "ids": [3, 4]},
+         {"q": 1, "prompt_ids": [5], "ids": [7]}]      # 只差一个 token
+    check("轨迹指纹：同轨迹同 id / 差一个 token 就不同 id",
+          D.traj_id(a) == D.traj_id(list(reversed(a))) and D.traj_id(a) != D.traj_id(b))
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = open(os.path.join(root, "rlab", "diag_logps.py"), encoding="utf-8").read()
+    check("merge 按 traj_id 跳过跨轨迹的 provider 对（并存证内部混轨迹）",
+          "轨迹不同（" in src and "tids[a] and tids[b]" in src
+          and "内部混了多个轨迹" in src)
+    check("per-L 同时给 target 差与分布差（分辨'算错'与'报数错'）",
+          "/dist=" in src and 'v.get(\'max_abs_d_common\')' in src)
+    check("轨迹指纹随行落盘（三个 provider 路径都写 traj_id）",
+          src.count('"traj_id"') >= 4 and src.count("traj_id(rows)") >= 3)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -2388,6 +2448,7 @@ if __name__ == "__main__":
     test_remap_decision_unified_ckpt()
     test_diag_ablation_and_decode()
     test_diag_impl_label_and_mode()
+    test_diag_counter_and_trajid()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
