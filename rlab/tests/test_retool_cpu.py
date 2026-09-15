@@ -2227,19 +2227,19 @@ def test_diag_ablation_and_decode():
     另外把口径分清：训练期对拍量的是逐位置被采样 logp（位置 0 走 prefill、≥1 走
     decode），而 diag 默认只测前缀末位（prefill）——两者形态差一个数量级是正常的。"""
     print("[AE] 消融自证 + prefill/decode 口径分离")
-    from rlab.diag_logps import (ablation_confirmed, aggregate, decode_diff_stats,
-                                 verdict)
+    from rlab.diag_logps import (decode_diff_stats, aggregate, verdict, torch_impl_tag)
 
     rep = {"patched": ["m.is_fla_available"],
            "counters": {"m.torch_chunk_gated_delta_rule": {"n": 84},
                         "m.chunk_gated_delta_rule": {"n": 0}}}
-    ok_f, why_f = ablation_confirmed(rep, "fallback")
-    check("计数 >0 → fallback 档被证实（回退实现真的跑了）", ok_f and "84" in why_f)
-    ok_a, why_a = ablation_confirmed(rep, "fla")
-    check("要 fla 档但 fla 计数为 0 → **未证实**（不能当 fla 档解读）",
-          (not ok_a) and "不是 fla" in why_a)
-    check("没有计数器 → 一律未证实（'打了桩'不等于'换了实现'）",
-          ablation_confirmed({"patched": ["x"], "counters": {}}, "fallback")[0] is False)
+    tag_f, ok_f, why_f = torch_impl_tag("fallback", rep)
+    check("计数 >0 → fallback 档被证实（回退实现真的跑了）",
+          ok_f and tag_f == "torch:torch_ref" and "84" in why_f)
+    _tag_a, ok_a, why_a = torch_impl_tag("fla", rep)
+    check("要 fla 档但 fla 计数为 0 → **未达成**（不能当 fla 档解读）",
+          (not ok_a) and "fla 计数 0" in why_a)
+    check("没有计数器 → 一律未达成（'打了桩'不等于'换了实现'）",
+          torch_impl_tag("fallback", {"patched": ["x"], "counters": {}})[1] is False)
 
     # 逐位全 0 的同引擎对 = 消融作废嫌疑，不能当"自洽"证据
     def _zero_pair(engine="torch"):
@@ -2288,6 +2288,66 @@ def test_diag_ablation_and_decode():
                             plen=3)["all"]["n"] == 5)
 
 
+def test_diag_impl_label_and_mode():
+    """[AF] 标签必须反映实际实现 + vLLM 自身口径差（真机 2026-09-15 两条实锤）。
+
+    ① `--torch_path fla` 与 `fallback` 逐位相同、计数器显示两次都是
+       `torch_chunk_gated_delta_rule`(840 次)、fla 计数 0、`patched=[]`
+       → "fla 档"是假的：打桩目标在本版建模模块里不存在，且 transformers 的 GDN
+       快路径被 `causal_conv1d` 缺失挡着。标签不改就会把同源数据当两档比。
+    ② 同一 (prompt, 位置, token)，轨迹构建的 `logprobs=0`（旧版没设 logprobs_mode）
+       与探针的 `logprobs=20 + raw_logprobs` 差到 1.12 nat——**vLLM 自身口径差**，
+       必须先量出来，否则跨引擎 Δ 里混着测量差。"""
+    print("[AF] 实现标签自证 + vLLM 自身口径差")
+    from rlab.diag_logps import internal_mode_delta, torch_impl_tag
+    rep = {"patched": [],
+           "counters": {"transformers.models.qwen3_5.modeling_qwen3_5"
+                        ".torch_chunk_gated_delta_rule": {"n": 840},
+                        "transformers.models.qwen3_next.modeling_qwen3_next"
+                        ".torch_chunk_gated_delta_rule": {"n": 0}}}
+    tag, ok, why = torch_impl_tag("fla", rep)
+    check("请求 fla 但实际是 torch 参考实现 → 标签改为 torch:torch_ref 且标记未达成",
+          tag == "torch:torch_ref" and ok is False and "840" in why)
+    tag2, ok2, _ = torch_impl_tag("fallback", rep)
+    check("请求 fallback 且回退实现真的跑了 → 达成（标签=torch:torch_ref）",
+          tag2 == "torch:torch_ref" and ok2 is True)
+    rep_fla = {"patched": ["m.is_fast_path_available"],
+               "counters": {"m.chunk_gated_delta_rule": {"n": 84},
+                            "m.torch_chunk_gated_delta_rule": {"n": 0}}}
+    check("装了 causal_conv1d 走 fla 后 → fla 档名副其实",
+          torch_impl_tag("fla", rep_fla)[0] == "torch:fla"
+          and torch_impl_tag("fla", rep_fla)[1] is True)
+    check("无计数器（既没 fla 也没参考实现被打点）→ 标签 unknown，不冒充",
+          torch_impl_tag("fla", {"patched": [], "counters": {}})[0] == "torch:unknown")
+
+    rows = [{"lp_target": -0.112, "lp_target_default": -1.0, "top1": 11},
+            {"lp_target": -1.0, "lp_target_default": -1.0, "top1": 22},
+            {"lp_target": -2.0, "lp_target_default": -2.0, "top1": 33},
+            {"lp_target": -0.5, "lp_target_default": -3.0, "top1": 44},
+            {"lp_target": -0.5, "lp_target_default": None, "top1": 55}]
+    st = internal_mode_delta(rows)
+    check("vLLM 自身口径差：只统计两侧都有的点（缺的跳过）",
+          st["n"] == 4 and abs(st["mean"] - (0.888 + 0 + 0 + 2.5) / 4) < 1e-6)
+    check("vLLM 自身口径差：>1nat 占比与 max 都能报出来（真机 max 1.12）",
+          abs(st["max"] - 2.5) < 1e-6 and abs(st["frac_gt_1"] - 0.25) < 1e-6)
+    check("全缺 → n=0（调用方不打印，不产生假 0 结论）",
+          internal_mode_delta([{"lp_target": 1.0}])["n"] == 0)
+
+    # 轨迹构建的 SamplingParams 必须与 rollout.make_retool_sps 同源（含 logprobs_mode）
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = open(os.path.join(root, "rlab", "diag_logps.py"), encoding="utf-8").read()
+    build = src.split("def build_traj_vllm", 1)[1].split("def _read_jsonl", 1)[0]
+    check("建轨迹的 SP 显式设 raw_logprobs（旧版漏设 → 与训练口径差 1.12 nat）",
+          'kw["logprobs_mode"] = "raw_logprobs"' in build and "logprobs=0" in build)
+    check("探针提供 default 档（用于量 vLLM 自身口径差）",
+          "def _probe_sp" in src and 'mode == "raw"' in src
+          and '"--probe_default"' in src)
+    check("落盘前标签改成实际实现（不许把同源数据当两档）",
+          '_r["provider"] = tag' in src)
+    check("merge 跳过轨迹文件而不是拦掉整次 merge",
+          "跳过 {path}：无 provider 字段" in src)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -2327,6 +2387,7 @@ if __name__ == "__main__":
     test_diag_logps_static()
     test_remap_decision_unified_ckpt()
     test_diag_ablation_and_decode()
+    test_diag_impl_label_and_mode()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

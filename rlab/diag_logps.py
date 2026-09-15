@@ -454,12 +454,21 @@ def _build_prompts(cfg, args):
 
 
 def build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens):
-    """用**训练同口径**采样参数跑一条固定轨迹，逐位置记录采样 logp（= 训练用 gen_logps）。"""
+    """用**训练同口径**采样参数跑一条固定轨迹，逐位置记录采样 logp（= 训练用 gen_logps）。
+
+    【必须与 rollout.make_retool_sps 逐字同源，含 logprobs_mode】真机 2026-09-15 实测：
+    同一 (prompt, 位置, token)，"logprobs=0 且不设 logprobs_mode"（本条旧写法）与
+    "logprobs=20 + raw_logprobs"（探针）给出的 logp 可差 1.12 nat——**vLLM 自己的
+    口径就差这么多**。训练端 make_retool_sps 是显式设了 raw_logprobs 的，所以轨迹
+    构建也必须显式设，否则 decode 口径拿到的 vLLM 侧根本不是训练那个量。"""
     from rlab.rollout import sampled_logps_from_output
 
-    sp = SamplingParams(n=1, temperature=cfg["temperature"], top_p=cfg["top_p"],
-                        top_k=cfg.get("top_k", 50), max_tokens=max_tokens,
-                        logprobs=0, seed=cfg.get("seed"))
+    kw = dict(n=1, temperature=cfg["temperature"], top_p=cfg["top_p"],
+              top_k=cfg.get("top_k", 50), max_tokens=max_tokens,
+              logprobs=0, seed=cfg.get("seed"))
+    if _sp_logprobs_mode_supported(SamplingParams):
+        kw["logprobs_mode"] = "raw_logprobs"     # 与 make_retool_sps 同源
+    sp = SamplingParams(**kw)
     for row in rows:
         out = llm.generate([{"prompt_token_ids": row["prompt_ids"]}], sp, use_tqdm=False)[0]
         co = out.outputs[0]
@@ -504,19 +513,25 @@ def _sp_logprobs_mode_supported(SamplingParams) -> bool:
     return "logprobs_mode" in fields
 
 
-def _raw_topk_sp(SamplingParams, k: int, seed):
-    """探查"模型原始分布"的采样参数：温度 1、无截断 + 显式 raw_logprobs。
+def _probe_sp(SamplingParams, k: int, seed, mode: str):
+    """探查请求的 SamplingParams。mode='raw' → 显式 raw_logprobs；
+    mode='default' → **不传** logprobs_mode（走该 vLLM 版本的默认口径）。
 
-    为什么不用训练采样参数：我们要的是**分布本身**，不是被 top_k/top_p 截断后的
-    后处理分布。temperature=1/top_p=1/top_k=-1 让 raw 与 processed 两种口径重合
-    ——于是即便这个 vLLM 版本没有 logprobs_mode 字段，读到的也是原始分布（不留歧义）。
-    max_tokens=1：只要那个位置的一行分布，不生成。
-    """
+    为什么要能发 default 档：真机上"logprobs=0 不设 mode"（轨迹构建）与
+    "logprobs=20 + raw"（探针）对同一 (位置, token) 差到 1.12 nat——先把**口径**
+    这一项单独量出来，才能判断跨引擎的 Δ 里有多少是测量差异、多少是模型差异。
+    温度/截断都设成恒等（1.0/1.0/-1），让 raw 与 processed 在数学上一致，
+    剩下的差就只能是实现口径。"""
     kw = dict(n=1, max_tokens=1, temperature=1.0, top_p=1.0, top_k=-1,
               logprobs=max(1, int(k)), seed=seed)
-    if _sp_logprobs_mode_supported(SamplingParams):
+    if mode == "raw" and _sp_logprobs_mode_supported(SamplingParams):
         kw["logprobs_mode"] = "raw_logprobs"
     return SamplingParams(**kw)
+
+
+def _raw_topk_sp(SamplingParams, k: int, seed):
+    """兼容旧签名：默认 raw 档。"""
+    return _probe_sp(SamplingParams, k, seed, "raw")
 
 
 def run_vllm(cfg, args, rows, lens):
@@ -559,55 +574,90 @@ def run_vllm(cfg, args, rows, lens):
     else:
         rows = [r for r in rows if r.get("ids")]
 
-    sp = _raw_topk_sp(SamplingParams, args.k, cfg.get("seed"))
+    sp_raw = _probe_sp(SamplingParams, args.k, cfg.get("seed"), "raw")
+    sp_alt = (_probe_sp(SamplingParams, args.k, cfg.get("seed"), "default")
+              if args.probe_default else None)
+    if sp_alt is not None:
+        print("[diag] 同时测 default 口径（不传 logprobs_mode）——"
+              "用于把'vLLM 自身口径差'从跨引擎 Δ 里分出来", flush=True)
     out_rows = []
     for row in rows:
         for L in lens:
             if L >= len(row["ids"]):
                 continue
             ctx = list(row["prompt_ids"]) + list(row["ids"][:L])
-            res = llm.generate([{"prompt_token_ids": ctx}], sp, use_tqdm=False)[0]
+            res = llm.generate([{"prompt_token_ids": ctx}], sp_raw, use_tqdm=False)[0]
             entry = res.outputs[0].logprobs[0]
             pairs = topk_pairs(entry, args.k)
             target = int(row["ids"][L])
             lp = dict(pairs).get(target)
-            out_rows.append({"provider": tag, "q": row["q"], "L": L,
-                             "plen": len(row["prompt_ids"]), "target": target,
-                             "lp_target": lp, "target_rank": rank_from_pairs(pairs, target),
-                             "top1": pairs[0][0] if pairs else None,
-                             "topk": [[t, round(v, 6)] for t, v in pairs]})
+            rec = {"provider": tag, "q": row["q"], "L": L,
+                   "plen": len(row["prompt_ids"]), "target": target,
+                   "lp_target": lp, "target_rank": rank_from_pairs(pairs, target),
+                   "top1": pairs[0][0] if pairs else None,
+                   "topk": [[t, round(v, 6)] for t, v in pairs]}
+            if sp_alt is not None:
+                res2 = llm.generate([{"prompt_token_ids": ctx}], sp_alt, use_tqdm=False)[0]
+                p2 = topk_pairs(res2.outputs[0].logprobs[0], args.k)
+                rec["lp_target_default"] = dict(p2).get(target)
+                rec["top1_default"] = p2[0][0] if p2 else None
+            out_rows.append(rec)
             if lp is not None and lp >= CONFIDENT_HI:
                 print(f"[diag]   q={row['q']} L={L}: vLLM 认为目标 p={pow(2.718281828, lp):.3g}"
                       f"（logp={lp:.3f}，rank={rank_from_pairs(pairs, target)}）")
             elif lp is None:
                 print(f"[diag]   q={row['q']} L={L}: 目标**不在 vLLM top-{args.k}** 内")
+    _print_internal_mode_delta(out_rows)
     return tag, out_rows
 
 
-def ablation_confirmed(report: dict, want: str) -> tuple:
-    """打桩是否**真的换掉**了实现？返回 (确认, 理由)。纯函数（CPU 可测）。
+def internal_mode_delta(rows: list) -> dict:
+    """同一位置同一 token，raw 口径 vs default 口径的 |Δlogp| 统计。纯函数。
 
-    计数器就是为此存在的：真机首次实测 torch:fla vs torch:fallback 逐位全 0——
-    要么两条实现真的一个 bit 都不差（不同 kernel 不可能），要么这一档根本没换。
-    判据不能只说"我打了桩"（patched 非空就够的话，等于自证），必须看**目标实现
-    被调用的次数**。counters 里没有任何键覆盖 want → 无法确认 → 判未确认。"""
+    这是**不涉及 torch** 的量：它只问"vLLM 自己两次报数一致吗"。真机实测有 1.12 nat
+    的点——若这个量不可忽略，那么跨引擎 Δ 里就混着测量口径差，不能全算到模型头上。"""
+    ds = [abs(r["lp_target"] - r["lp_target_default"]) for r in rows
+          if r.get("lp_target") is not None and r.get("lp_target_default") is not None]
+    top1_flip = sum(1 for r in rows
+                    if r.get("top1") is not None and r.get("top1_default") is not None
+                    and r["top1"] != r["top1_default"])
+    if not ds:
+        return {"n": 0}
+    return {"n": len(ds), "mean": sum(ds) / len(ds), "max": max(ds),
+            "frac_gt_1": sum(1 for d in ds if d > BIG_NAT) / len(ds),
+            "top1_flip": top1_flip}
+
+
+def _print_internal_mode_delta(rows: list):
+    st = internal_mode_delta(rows)
+    if not st.get("n"):
+        return
+    print(f"[diag] vLLM 自身口径差（raw vs default，同一位置同一 token）：n={st['n']} "
+          f"mean|Δ|={st['mean']:.3g} max|Δ|={st['max']:.3g} "
+          f">1nat={100 * st['frac_gt_1']:.2f}% top-1 翻转={st['top1_flip']}", flush=True)
+    print("[diag] 判读：这个量若与跨引擎 Δ 同量级，则先把口径钉死（统一 logprobs_mode、"
+          "统一 logprobs 参数形态）再谈'谁算错了'", flush=True)
+
+
+def torch_impl_tag(requested: str, report: dict) -> tuple:
+    """本档**实际**跑的是哪个实现 → (tag, 请求是否达成, 说明)。纯函数（CPU 可测）。
+
+    【真机事故：标签会说谎】2026-09-15 实测 `--torch_path fla` 与 `--torch_path fallback`
+    逐位相同；计数器显示两次跑的都是 `torch_chunk_gated_delta_rule` 840 次、fla 计数 0
+    ——原因是打桩目标（`is_fla_available`）在本版建模模块里根本不存在（`patched=[]`），
+    而 transformers 的 GDN 快路径还被 `causal_conv1d` 缺失挡着，于是"fla 档"其实也是
+    纯 torch 参考实现。标签必须反映事实，否则 merge 会拿两个同源数据当两个档比。"""
     counters = report.get("counters") or {}
-    if not counters:
-        return False, ("没有任何算子计数器（建模模块里找不到 GDN 算子名）——"
-                       "无法证明本档换过实现")
-    hits = {k: box.get("n", 0) for k, box in counters.items()}
-    fallback_hits = sum(n for k, n in hits.items() if "torch_chunk_gated_delta_rule" in k)
-    fla_hits = sum(n for k, n in hits.items()
-                   if "torch_chunk_gated_delta_rule" not in k)
-    if want == "fallback":
-        if fallback_hits > 0:
-            return True, f"纯 torch 回退实现被调用 {fallback_hits} 次"
-        return False, (f"回退实现计数为 0（全部计数 {hits}）——打桩没生效，"
-                       "本档与 fla 档很可能是同一实现")
-    if fla_hits > 0:
-        return True, f"fla 实现被调用 {fla_hits} 次"
-    return False, (f"fla 实现计数为 0（全部计数 {hits}）——本档实际走的不是 fla，"
-                   "别把它当 fla 档解读")
+    def _hits(sel):
+        return sum(box.get("n", 0) for k, box in counters.items() if sel(k))
+    fb = _hits(lambda k: "torch_chunk_gated_delta_rule" in k)
+    fla = _hits(lambda k: "torch_chunk_gated_delta_rule" not in k)
+    impl = "fla" if fla > 0 else ("torch_ref" if fb > 0 else "unknown")
+    want = {"fallback": "torch_ref"}.get(requested, requested)   # 请求名 → 实现名
+    ok = (impl == want)
+    why = (f"实际实现={impl}（fla 计数 {fla}、torch 参考实现计数 {fb}，"
+           f"patched={report.get('patched')}）")
+    return (f"torch:{impl}", ok, why)
 
 
 def run_torch(cfg, args, rows, lens):
@@ -656,15 +706,25 @@ def run_torch(cfg, args, rows, lens):
                   f"（vLLM 采样时的 logp={row['logps'][L]:.3f}，"
                   f"Δ={abs(row['logps'][L] - lp):.3f}）")
     report_counters(rep)
-    # 【判据自证】打了桩 ≠ 换了实现（真机首次实测就撞上逐位全 0）。确认不了就别产出
-    # 数据文件——否则 merge 会把它当"两种 kernel 一致"的证据，得到反向结论。
-    ok, why = ablation_confirmed(rep, args.torch_path)
+    # 【标签必须反映事实】真机事故：--torch_path fla 实际跑的是纯 torch 参考实现
+    # （打桩目标 is_fla_available 在本版建模模块里不存在，且 transformers 的 GDN
+    # 快路径被 causal_conv1d 缺失挡着）→ 两次运行逐位相同。若照旧把它标成 torch:fla，
+    # merge 会拿两个同源数据当两个档比，得出"torch 侧自洽"的反向结论。
+    tag, ok, why = torch_impl_tag(args.torch_path, rep)
+    print(f"[diag] 本档实现自证：{why}")
     if not ok:
-        raise RuntimeError(f"[diag] --torch_path {args.torch_path} 的消融**未被证实**：{why}\n"
-                           "  影响：本档与另一档很可能是同一实现，merge 出来的\"一致\"是假的。\n"
-                           "  处置：把上面的 patched/counters 原样贴出来核对；"
-                           "或换另一档（fla/fallback）重跑。**不要**把本次结果当消融证据。")
-    print(f"[diag] 消融自证通过：{why}")
+        if args.torch_path == "fallback":
+            raise RuntimeError(
+                f"[diag] 请求 --torch_path fallback 但**没换掉实现**：{why}\n"
+                "  处置：先看 patched/counters 定位真正的路由开关（本版 GDN 快路径还被 "
+                "`causal_conv1d` 缺失挡着：装上它才会走 fla）；装好再重跑本档。")
+        print(f"[diag][警告] 请求 {args.torch_path} 档，实际实现是 {tag}——"
+              f"本次数据按**实际实现**标注（{tag}），不要当成 {args.torch_path} 档解读。\n"
+              "  想真正拿到 fla 档：pod 上 `pip install causal_conv1d`（日志一直在喊它缺失）"
+              "后重跑——transformers 的 GDN 快路径依赖它。")
+    # 落盘前把标签改成实际实现（out_rows 里的 provider 字段）
+    for _r in out_rows:
+        _r["provider"] = tag
     return tag, out_rows
 
 
@@ -782,7 +842,10 @@ def merge_main(args) -> int:
             raise SystemExit(f"[diag] 读不了 {path}（--merge 只吃 --out 产出的 jsonl）："
                              f"{type(e).__name__}: {e}")
         if not rows or "provider" not in rows[0]:
-            raise SystemExit(f"[diag] {path} 里没有 provider 字段——不是本脚本产出的结果文件")
+            # 目录里常混着轨迹文件（rlab_out/diag/*.jsonl 一把喂进来）——跳过并说明，
+            # 不要因为它把整次 merge 拦掉（真机上就卡在这一步过）
+            print(f"[diag] 跳过 {path}：无 provider 字段（轨迹文件？只喂 --out 产出的结果）")
+            continue
         for row in rows:
             providers.setdefault(row["provider"], {})[(row["q"], row["L"])] = row
     if len(providers) < 2:
@@ -853,6 +916,9 @@ def main() -> int:
                     help="prefill=前缀末位分布对拍（默认，两档消融用）；"
                          "decode=逐位置被采样 logp 对拍（**训练口径**，且按 prefill/decode "
                          "位置分开统计；只走 torch 侧，不需要 vLLM）")
+    ap.add_argument("--probe_default", action="store_true",
+                    help="vLLM 侧同时测 default 口径（不传 logprobs_mode）并打印"
+                         "'vLLM 自身口径差'——把测量口径差从跨引擎 Δ 里分出来")
     ap.add_argument("--torch_device", type=int, default=None, help="None=默认 cuda")
     ap.add_argument("--n", type=int, default=8, help="题数")
     ap.add_argument("--k", type=int, default=20, help="top-K 深度")
