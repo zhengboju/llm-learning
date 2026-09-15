@@ -2216,6 +2216,78 @@ def test_remap_decision_unified_ckpt():
           "resolve_load_config(_vllm_path)" in ro)
 
 
+def test_diag_ablation_and_decode():
+    """[AE] 消融自证 + 训练口径（prefill/decode 分离）。
+
+    【为什么必须有】真机首次消融实测 `torch:fla vs torch:fallback` **逐位全 0**——
+    两条不同 kernel 不可能一个 bit 都不差，真相是"这一档根本没换实现"。这类假对照
+    比没有对照更危险：它会产出一个看起来干净的"自洽"结论。两条防线：
+      ① 生成端：计数器证明目标实现真的被调用过，否则**拒绝产出**数据文件；
+      ② 判读端：逐位相同的同引擎对不算消融证据，反而要打"作废嫌疑"。
+    另外把口径分清：训练期对拍量的是逐位置被采样 logp（位置 0 走 prefill、≥1 走
+    decode），而 diag 默认只测前缀末位（prefill）——两者形态差一个数量级是正常的。"""
+    print("[AE] 消融自证 + prefill/decode 口径分离")
+    from rlab.diag_logps import (ablation_confirmed, aggregate, decode_diff_stats,
+                                 verdict)
+
+    rep = {"patched": ["m.is_fla_available"],
+           "counters": {"m.torch_chunk_gated_delta_rule": {"n": 84},
+                        "m.chunk_gated_delta_rule": {"n": 0}}}
+    ok_f, why_f = ablation_confirmed(rep, "fallback")
+    check("计数 >0 → fallback 档被证实（回退实现真的跑了）", ok_f and "84" in why_f)
+    ok_a, why_a = ablation_confirmed(rep, "fla")
+    check("要 fla 档但 fla 计数为 0 → **未证实**（不能当 fla 档解读）",
+          (not ok_a) and "不是 fla" in why_a)
+    check("没有计数器 → 一律未证实（'打了桩'不等于'换了实现'）",
+          ablation_confirmed({"patched": ["x"], "counters": {}}, "fallback")[0] is False)
+
+    # 逐位全 0 的同引擎对 = 消融作废嫌疑，不能当"自洽"证据
+    def _zero_pair(engine="torch"):
+        return {"n": 5, "identical": True, "max_target_d": 0.0, "frac_big": 0.0,
+                "confident_n": 0, "per_L": {}, "worst": [], "target_d_mean": 0.0,
+                "target_d_p99": 0.0, "top1_match_rate": 1.0, "overlap_mean": 1.0,
+                "max_abs_d_common": 0.0, "target_missing_n": 0}
+    def _bad(m, f=0.2, c=2):
+        return {"n": 5, "identical": False, "max_target_d": m, "frac_big": f,
+                "confident_n": c, "per_L": {}, "worst": [], "target_d_mean": m,
+                "target_d_p99": m, "top1_match_rate": 0.8, "overlap_mean": 0.8,
+                "max_abs_d_common": m, "target_missing_n": 0}
+    v = verdict({"torch:fla vs torch:fallback": _zero_pair(),
+                 "vllm:keep vs vllm:none": _bad(0.0, 0.0, 0),   # vLLM 侧自己一致
+                 "torch:fla vs vllm:keep": _bad(1.84)})
+    check("逐位全 0 的同引擎对 → 打'消融作废嫌疑'并说明更像没换实现",
+          any("消融作废嫌疑" in s and "没换实现" in s for s in v))
+    check("该对被剔除后，torch 侧等于**没做**消融（不许当'自洽'）",
+          any("没有 **torch 侧内部消融**" in s for s in v))
+    check("清白的 vLLM 内配对仍被认可 → 不许连坐（结论不写成'两侧都未验证'）",
+          not any("没有 **vllm 侧内部消融**" in s for s in v))
+
+    # 逐位相同判定本身：全 0 → identical；有一个点差异 → 不是
+    rows0 = [{"q": 0, "L": 0, "target_d": 0.0, "top1_match": True,
+              "max_abs_d_common": 0.0, "overlap": 1.0, "confident": False,
+              "target_missing": False}]
+    rows1 = [dict(rows0[0]), {"q": 0, "L": 256, "target_d": 1e-9, "top1_match": True,
+                              "max_abs_d_common": 0.0, "overlap": 1.0,
+                              "confident": False, "target_missing": False}]
+    check("aggregate.identical：全 0 → True，出现任何非 0 → False",
+          aggregate(rows0)["identical"] is True and aggregate(rows1)["identical"] is False)
+
+    # ---- decode 口径：位置 0（prefill 路）与 ≥1（decode 路）必须分开统计 ----
+    torch_lps = torch.tensor([[0.0, -1.0, -2.0, -3.0, -4.0, -5.0]])  # 对 ids[:,1:]
+    vllm_lps = [9.0, -1.0, -2.0, -3.0, -4.0, -5.0]      # 位置 0 故意差 9 nat
+    st = decode_diff_stats(vllm_lps, torch_lps, plen=1)
+    check("decode：prefill 位（位置 0）单列，max|Δ|=9",
+          st["prefill"]["n"] == 1 and abs(st["prefill"]["max"] - 9.0) < 1e-6)
+    check("decode：位置 ≥1 全部为 0 → 训练口径的'紧致主体'可复现",
+          st["decode"]["n"] == 5 and st["decode"]["max"] < 1e-9)
+    check("decode：分段数 = prefill 1 + decode n-1 = 全部",
+          st["prefill"]["n"] + st["decode"]["n"] == st["all"]["n"] == 6)
+    check("decode：plen 偏移正确（prompt 长 3 时取 torch 的 [2:8]）",
+          decode_diff_stats([0.0] * 5,
+                            torch.tensor([[0., 0., -1., -2., -3., -4., -5., -6.]]),
+                            plen=3)["all"]["n"] == 5)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -2254,6 +2326,7 @@ if __name__ == "__main__":
     test_diag_logps_pure()
     test_diag_logps_static()
     test_remap_decision_unified_ckpt()
+    test_diag_ablation_and_decode()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

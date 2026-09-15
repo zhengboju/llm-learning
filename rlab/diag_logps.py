@@ -185,8 +185,17 @@ def aggregate(rows: list) -> dict:
         per_L.setdefault(r["L"], []).append(r)
     worst = sorted([r for r in rows if r["target_d"] is not None],
                    key=lambda r: -r["target_d"])[:3]
+    # 【逐位相同 = 可疑，不是好消息】消融的意义在于"换了实现、数会变"。同引擎对若
+    # **一个 bit 都不差**（35 点全 0、top-1 全同、top-20 交集无差），最可能的解释不是
+    # "两条 kernel 完美一致"，而是**这一档根本没换实现**（打桩没命中/两档其实同路）。
+    # 真机首次实测就撞上了：torch:fla vs torch:fallback 全 0。
+    identical = bool(n) and all(
+        (r["target_d"] in (None, 0.0)) and r["top1_match"]
+        and (r["max_abs_d_common"] in (None, 0.0)) and (r["overlap"] in (None, 1.0))
+        for r in rows)
     return {
         "n": n,
+        "identical": identical,
         "top1_match_rate": (sum(1 for r in rows if r["top1_match"]) / n) if n else None,
         "overlap_mean": (sum(ovs) / len(ovs)) if ovs else None,
         "max_abs_d_common": max(cds) if cds else None,
@@ -234,6 +243,9 @@ def verdict(pair_stats: dict) -> list:
     same = {k: v for k, v in pair_stats.items()
             if engine_of(k.split(" vs ")[0]) == engine_of(k.split(" vs ")[1])}
     cross = {k: v for k, v in pair_stats.items() if k not in same}
+    # 逐位相同的同引擎对**不算消融证据**（见 aggregate.identical 的注释：更像"没换实现"）
+    _void = {k: v for k, v in same.items() if v.get("identical")}
+    same = {k: v for k, v in same.items() if k not in _void}
     # 哪些引擎**做过**内部消融（同引擎两档）——"各自自洽"这句话只对它们成立
     engines_with_internal = {engine_of(k.split(" vs ")[0]) for k in same}
     bad_same = {k: v for k, v in same.items() if _unstable(v)}
@@ -295,6 +307,12 @@ def verdict(pair_stats: dict) -> list:
     if not same:
         out.append("提示：本次 merge 里一个同引擎对都没有——**没有消融就无法定位责任方**，"
                    "请补跑 `--torch_path fallback` 与/或另一个 `--vllm_backend`。")
+    for k, v in _void.items():
+        out.append(f"⚠ **消融作废嫌疑**：{k} 逐位完全相同（n={v['n']}，target|Δ| 全 0、"
+                   "top-1 全同、top-20 交集无差）。两条不同实现不可能一个 bit 都不差——"
+                   "更像是**这一档根本没换实现**（打桩没命中/两档同路）。该对不能当作"
+                   "\"两种 kernel 一致\"的证据；先看生成端 stdout 的 `[diag] 计数器 ...`："
+                   "目标实现计数为 0 = 打桩没生效，换 --torch_path 或补 vLLM 侧那一档。")
     return out
 
 
@@ -534,6 +552,8 @@ def run_vllm(cfg, args, rows, lens):
         max_tokens = args.max_traj_tokens or max(lens)
         print(f"[diag] 建轨迹：max_tokens={max_tokens}")
         rows = build_traj_vllm(llm, SamplingParams, cfg, rows, max_tokens)
+        for _r in rows:                 # 轨迹出自哪一档 vLLM（decode 口径判读要用）
+            _r["vllm_tag"] = tag
         if args.traj_out:
             _write_jsonl(args.traj_out, rows)
     else:
@@ -562,6 +582,32 @@ def run_vllm(cfg, args, rows, lens):
             elif lp is None:
                 print(f"[diag]   q={row['q']} L={L}: 目标**不在 vLLM top-{args.k}** 内")
     return tag, out_rows
+
+
+def ablation_confirmed(report: dict, want: str) -> tuple:
+    """打桩是否**真的换掉**了实现？返回 (确认, 理由)。纯函数（CPU 可测）。
+
+    计数器就是为此存在的：真机首次实测 torch:fla vs torch:fallback 逐位全 0——
+    要么两条实现真的一个 bit 都不差（不同 kernel 不可能），要么这一档根本没换。
+    判据不能只说"我打了桩"（patched 非空就够的话，等于自证），必须看**目标实现
+    被调用的次数**。counters 里没有任何键覆盖 want → 无法确认 → 判未确认。"""
+    counters = report.get("counters") or {}
+    if not counters:
+        return False, ("没有任何算子计数器（建模模块里找不到 GDN 算子名）——"
+                       "无法证明本档换过实现")
+    hits = {k: box.get("n", 0) for k, box in counters.items()}
+    fallback_hits = sum(n for k, n in hits.items() if "torch_chunk_gated_delta_rule" in k)
+    fla_hits = sum(n for k, n in hits.items()
+                   if "torch_chunk_gated_delta_rule" not in k)
+    if want == "fallback":
+        if fallback_hits > 0:
+            return True, f"纯 torch 回退实现被调用 {fallback_hits} 次"
+        return False, (f"回退实现计数为 0（全部计数 {hits}）——打桩没生效，"
+                       "本档与 fla 档很可能是同一实现")
+    if fla_hits > 0:
+        return True, f"fla 实现被调用 {fla_hits} 次"
+    return False, (f"fla 实现计数为 0（全部计数 {hits}）——本档实际走的不是 fla，"
+                   "别把它当 fla 档解读")
 
 
 def run_torch(cfg, args, rows, lens):
@@ -610,7 +656,117 @@ def run_torch(cfg, args, rows, lens):
                   f"（vLLM 采样时的 logp={row['logps'][L]:.3f}，"
                   f"Δ={abs(row['logps'][L] - lp):.3f}）")
     report_counters(rep)
+    # 【判据自证】打了桩 ≠ 换了实现（真机首次实测就撞上逐位全 0）。确认不了就别产出
+    # 数据文件——否则 merge 会把它当"两种 kernel 一致"的证据，得到反向结论。
+    ok, why = ablation_confirmed(rep, args.torch_path)
+    if not ok:
+        raise RuntimeError(f"[diag] --torch_path {args.torch_path} 的消融**未被证实**：{why}\n"
+                           "  影响：本档与另一档很可能是同一实现，merge 出来的\"一致\"是假的。\n"
+                           "  处置：把上面的 patched/counters 原样贴出来核对；"
+                           "或换另一档（fla/fallback）重跑。**不要**把本次结果当消融证据。")
+    print(f"[diag] 消融自证通过：{why}")
     return tag, out_rows
+
+
+# --------------------------------------------------------------------------
+# 口径对齐：训练期对拍量的是**逐位置被采样 logp**（decode 路），不是"前缀末位分布"。
+# 两者是不同的 vLLM kernel：prefill/chunk 路 vs 带 KV 状态的 decode 路。真机实测
+# 两者形态差一个数量级（diag 的 prefill 位 mean|Δ|≈0.33 nat，训练对拍 p50≈1e-5），
+# 所以"prefill 位差得多"与"训练口径地板很小"可以同时成立——必须分开量。
+# --------------------------------------------------------------------------
+def decode_diff_stats(vllm_lps: list, torch_lps, plen: int) -> dict:
+    """逐位置 |Δlogp|（vLLM 采样值 vs torch 重算），并**按 prefill/decode 分开**。
+
+    vllm_lps: 轨迹构建时记录的逐位置采样 logp（= 训练真用的 gen_logps）
+    torch_lps: torch 在整条拼接序列上的逐位置 logp（(1, T-1)，对 ids[:,1:]）
+    plen: prompt 长（轨迹 token t 的 logp 取自 torch_lps[t + plen - 1]）
+    返回 {"prefill": {...}, "decode": {...}, "all": {...}}——三份都用 logps_diff_shape，
+    于是与训练期对拍器的形态学指标同源（frac>1 / 最差点等可直接比）。
+
+    **为什么要分**：位置 0 的 logits 由 prefill（chunk）路算，位置 ≥1 由 decode 路算。
+    真机数据（2026-09-15）：diag 只测 prefill 位 → mean|Δ|≈0.33 nat、>1nat 14%；
+    训练对拍覆盖全部位置（其中 prefill 位只占 8/24000≈0.03%）→ p50≈1e-5。两者不矛盾，
+    是**两个不同的 kernel 对**。分开量才能回答"到底哪条路在错"。"""
+    import torch
+
+    from rlab.rollout import logps_diff_shape   # 与训练期对拍器同源的形态学指标
+
+    n = min(len(vllm_lps), int(torch_lps.shape[1]) - (plen - 1))
+    if n <= 0:
+        return {}
+    gv = torch.tensor([list(vllm_lps[:n])])
+    gt = torch_lps[:, plen - 1:plen - 1 + n]
+    mask_all = torch.ones(1, n)
+    out = {"n": n, "all": logps_diff_shape(gv, gt, mask_all)}
+    for name, idx in (("prefill", [0]), ("decode", list(range(1, n)))):
+        if not idx:
+            out[name] = None
+            continue
+        m = torch.zeros(1, n)
+        m[0, idx] = 1.0
+        out[name] = logps_diff_shape(gv, gt, m)
+    return out
+
+
+def run_torch_decode(cfg, args, rows):
+    """训练口径复现：逐位置被采样 logp 对比 + prefill/decode 分离（不需要 vLLM）。"""
+    import torch
+
+    from rlab.losses import forward_per_token_logps
+    from rlab.model_loading import load_causal_lm
+    from rlab.rollout import _assert_torch_replica_loadable
+
+    _assert_torch_replica_loadable(cfg["model_path"])
+    torch_device = f"cuda:{args.torch_device}" if args.torch_device is not None else "cuda"
+    model = load_causal_lm(cfg["model_path"], dtype=torch.bfloat16,
+                           attn_implementation=cfg.get("attn_implementation", "sdpa"))
+    model = model.to(torch_device).eval()
+    tags = {r.get("vllm_tag") for r in rows if r.get("vllm_tag")}
+    print(f"[diag] 口径=decode（逐位置被采样 logp）；轨迹来自 {tags or '未知 backend'}；"
+          f"device={torch_device}")
+    agg = {}
+    for row in rows:
+        if not row.get("logps"):
+            print(f"[diag] q={row['q']} 跳过：轨迹没带 logps（建轨迹时未开 collect_logps）")
+            continue
+        ids = list(row["prompt_ids"]) + list(row["ids"])
+        with torch.inference_mode():
+            lp = forward_per_token_logps(model, torch.tensor([ids], device=torch_device),
+                                         seq_chunk=512, batch_chunk=1)
+        st = decode_diff_stats(row["logps"], lp.cpu(), len(row["prompt_ids"]))
+        print(f"[diag] q={row['q']} n={st['n']}："
+              f"prefill mean|Δ|={_fmt(st['prefill']['mean'])} max={_fmt(st['prefill']['max'])}"
+              f"（最差 v={st['prefill']['worst'][0]['vllm']:.2f}/"
+              f"t={st['prefill']['worst'][0]['torch']:.2f}）｜"
+              f"decode mean|Δ|={_fmt(st['decode']['mean'])} p99={_fmt(st['decode']['p99'])} "
+              f"max={_fmt(st['decode']['max'])} >1nat={_pctfmt(st['decode']['frac_gt_1'])}")
+        for k in ("prefill", "decode"):
+            agg.setdefault(k, []).append(st[k])
+    print("\n[diag] ===== 训练口径汇总（位置 0 = prefill 路，位置 ≥1 = decode 路）=====")
+    for k in ("prefill", "decode"):
+        if k not in agg:
+            continue
+        ms = [s["mean"] for s in agg[k]]
+        mx = max(s["max"] for s in agg[k])
+        big = sum(s["n"] * s["frac_gt_1"] for s in agg[k]) / max(1, sum(s["n"] for s in agg[k]))
+        print(f"[diag] {k:>7}: 位置 {sum(s['n'] for s in agg[k])}  题均 mean|Δ|="
+              f"{sum(ms) / len(ms):.3g}  全局 max|Δ|={mx:.3g}  >1nat={100 * big:.2f}%")
+    print("[diag] 判读：若 prefill 远差于 decode，则责任在 vLLM 的 chunk/prefill kernel"
+          "（训练期对拍的中位差被占比 0.03% 的 prefill 位掩盖）；两者都差则两路都不对。")
+    return out_rows_from_decode(agg)
+
+
+def out_rows_from_decode(agg: dict) -> list:
+    """decode 口径的汇总行（供落盘留档；不参与 provider 矩阵 merge）。"""
+    out = [{"provider": "torch:decode", "measure": "decode"}]
+    for k, ss in agg.items():
+        n = sum(s["n"] for s in ss)
+        out.append({"provider": "torch:decode", "measure": "decode", "segment": k,
+                    "n": n,
+                    "mean_abs_d": sum(s["mean"] * s["n"] for s in ss) / max(1, n),
+                    "max_abs_d": max(s["max"] for s in ss),
+                    "frac_gt_1": (sum(s["n"] * s["frac_gt_1"] for s in ss) / max(1, n))})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -693,6 +849,10 @@ def main() -> int:
                          "keep 叠加，保证'探的档'就是'训练那一档'（键名错会被 vLLM 静默忽略）")
     ap.add_argument("--torch_path", default="fla", choices=("fla", "fallback"),
                     help="fallback=打桩强制走纯 torch GDN 回退实现（消融轴）")
+    ap.add_argument("--measure", default="prefill", choices=("prefill", "decode"),
+                    help="prefill=前缀末位分布对拍（默认，两档消融用）；"
+                         "decode=逐位置被采样 logp 对拍（**训练口径**，且按 prefill/decode "
+                         "位置分开统计；只走 torch 侧，不需要 vLLM）")
     ap.add_argument("--torch_device", type=int, default=None, help="None=默认 cuda")
     ap.add_argument("--n", type=int, default=8, help="题数")
     ap.add_argument("--k", type=int, default=20, help="top-K 深度")
@@ -752,6 +912,20 @@ def main() -> int:
         raise SystemExit(
             "[diag] 要么 --build-traj（且 --providers vllm），要么 --traj-in <jsonl>：\n"
             "  跨 provider 比较必须共用同一条轨迹，否则'换进程顺便换了前缀'会让结论无法归因。")
+
+    if args.measure == "decode":
+        # 训练口径：逐位置被采样 logp 对比（vLLM 侧的值来自建轨迹时记录的 logps，
+        # 所以本模式**不需要 vLLM**——轨迹是哪一档建的，判读就归属哪一档）
+        if args.providers == "vllm":
+            raise SystemExit("[diag] --measure decode 走的是 torch 侧重算：请用 "
+                             "--providers torch（vLLM 侧的逐位置 logp 已在轨迹里）")
+        if not any(r.get("logps") for r in rows):
+            raise SystemExit("[diag] 轨迹里没有 logps 字段——建轨迹时必须开 collect_logps"
+                             "（--build_traj 的默认行为），decode 口径才有 vLLM 侧可比")
+        out_rows = run_torch_decode(cfg, args, rows)
+        if args.out:
+            _write_jsonl(args.out, out_rows)
+        return 0
 
     if args.providers == "vllm":
         tag, out_rows = run_vllm(cfg, args, rows, lens)
