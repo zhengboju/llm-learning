@@ -71,10 +71,25 @@ def window_check(hist, *, retool=False, max_clen=None):
 
     # --- 签名④b：retool 末段截断（轮长上限切断 final 答案——retool 家族真正的
     # 截断失败模式；clen 顶满上限检查探不到它，因为每轮各自 cap 在 round_gen_tokens）
-    if retool and _wmean([h.get("trunc_rate", 0.0) for h in hist[-k:]]) > 0.2:
-        alerts.append(("retool_trunc",
-                       "最近 32 组 >20% 样本的末段被轮长上限切断 → final 答案被截、"
-                       "acc 结构性受损，建议调大 round_gen_tokens 或 max_rounds"))
+    # 【2026-09-17 阈值口径修正】旧规则是"绝对 >20%"。协议定版（concise 提示 +
+    # 6144/14336）后训练起点截断率实测就是 **22.7%**（探针 512 条），旧规则会在第一个
+    # 检查窗口必然误报一次——检测器对已知基线叫狼来了，真信号（截断在膨胀）就被淹掉。
+    # 改成**基线锚定**：绝对 >40% 仍立即报（起点就烂/坍缩），否则只在"窗口比开局涨
+    # ≥8pp"时报，与 length_runaway 同一设计（只看"在涨"）。
+    if retool:
+        _tr_w = _wmean([h.get("trunc_rate", 0.0) for h in hist[-k:]])
+        _tr_0 = _wmean([h.get("trunc_rate", 0.0) for h in hist[:k]])
+        if _tr_w > 0.40:
+            alerts.append(("retool_trunc",
+                           f"末段截断率绝对高位（{_tr_w:.0%} >40%）→ final 答案被切、"
+                           "acc 结构性受损。查：单轮预算/提示是否与探针定版一致"
+                           "（定版起点实测 22.7%），或长度是否在膨胀（见 length_runaway）"))
+        elif n >= 64 and _tr_w - _tr_0 >= 0.08:
+            alerts.append(("retool_trunc",
+                           f"末段截断率较开局涨 {(_tr_w - _tr_0) * 100:.0f}pp"
+                           f"（{_tr_0:.0%}→{_tr_w:.0%}）→ 截断在膨胀（长度膨胀的下游）。"
+                           "查：①round_gen_tokens 是否被静默改动（核对签名）；"
+                           "②模型是否学会用满预算（clen 曲线）；③提示是否被换回旧版"))
 
     # --- 签名④c：长度膨胀（2026-09-12 新增，本轮静默跑废的直接签名）
     # 事故形态：outcome-only ±1 奖励下"更长的轨迹答对率 75.4%"（corr(clen,acc)=

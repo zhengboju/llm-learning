@@ -628,6 +628,16 @@ def test_retool_math_fixes():
              "trunc_rate": 0.5} for _ in range(40)]
     codes = {c for c, _ in window_check(hist, retool=True)}
     check("retool 末段截断 >20% → retool_trunc", "retool_trunc" in codes)
+    # 【2026-09-17】阈值改基线锚定：定版协议（concise 提示 + 6144/14336）的训练起点
+    # 截断率实测 22.7%，旧的"绝对 >20%"会在第一个窗口必然误报（叫狼来了会淹掉真信号）。
+    hist_base = [{"acc": 0.3, "fmt": 0.9, "clen": 300.0, "code_rate": 0.5,
+                  "trunc_rate": 0.23} for _ in range(40)]
+    check("定版起点截断率 23% 恒定 → 不误报（旧口径会必然误报）",
+          "retool_trunc" not in {c for c, _ in window_check(hist_base, retool=True)})
+    hist_rise = [{"acc": 0.3, "fmt": 0.9, "clen": 300.0, "code_rate": 0.5,
+                  "trunc_rate": 0.23 if i < 32 else 0.35} for i in range(96)]
+    check("截断率较开局涨 12pp → 报警（截断在膨胀）",
+          "retool_trunc" in {c for c, _ in window_check(hist_rise, retool=True)})
     hist_ok = [{"acc": 0.3, "fmt": 0.9, "clen": 300.0, "code_rate": 0.5,
                 "trunc_rate": 0.0} for _ in range(40)]
     codes = {c for c, _ in window_check(hist_ok, retool=True)}
