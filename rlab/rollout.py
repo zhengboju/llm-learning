@@ -839,6 +839,23 @@ def batch_invariant_guard(enabled, attention_backend) -> None:
             "请同时给 --vllm_attention_backend FLASH_ATTN（或 TRITON_ATTN）")
 
 
+def gdn_backend_missing(vllm_path, gen_kwargs) -> bool:
+    """Qwen3.5 系 + 生效引擎参数里没有 `gdn_prefill_backend` ⇒ 会落到 FlashInfer GDN prefill。
+
+    【2026-09-16 为什么单独一条】自本日起 `BASE.vllm_gen_kwargs` 默认就含
+    `{"gdn_prefill_backend": "triton"}`，但 **默认 ≠ 兜底**：`--vllm_gen_kwargs` 是
+    **整体替换**（train.py 写 overrides → config.get_config 的 `cfg.update`），
+    所以"只想再加一个键"（例如 `enable_prefix_caching`）时若不把 triton 一并写回，
+    就会静默掉回 FlashInfer——正是 2026-09-14 那个**无 traceback** 的 SIGKILL 档。
+    对照：`--vllm_attention_backend` 没有这个陷阱（rollout 里是 merge 进副本）。
+
+    纯逻辑，CPU 可测；调用点只告警不擅自改档（静默替换被测配置是禁止操作）。
+    """
+    if "Qwen3.5" not in str(vllm_path or ""):
+        return False                       # 非 GDN 模型：该键本就不被使用，缺了也无害
+    return not (gen_kwargs or {}).get("gdn_prefill_backend")
+
+
 def _check_vllm_gen_kwargs(kwargs: dict) -> None:
     """fail-fast：在**构造 LLM 之前**把 vLLM 不认识的引擎参数键名拦下。
 
@@ -934,6 +951,15 @@ def gen_worker(Q, cfg: dict):
         _gen_kwargs = dict(_gen_kwargs)
         _gen_kwargs.update(attention_backend_kwargs(_attn_be))
         print(f"[rollout] attention backend={_attn_be} → {_gen_kwargs}", flush=True)
+    if gdn_backend_missing(cfg.get("vllm_model_path") or cfg.get("model_path"),
+                           _gen_kwargs):
+        print("[rollout][警告] 本档 vllm_gen_kwargs 里没有 gdn_prefill_backend，"
+              "Qwen3.5 的 GDN prefill 会落到 **FlashInfer JIT**——本 pod 已两次实锤："
+              "ninja 调 nvcc 打爆宿主 RAM → 生成端被 SIGKILL(9)、无 traceback、"
+              "训练端只看到「生成端进程已退出」。\n"
+              "        改法（注意 `--vllm_gen_kwargs` 是整体替换，默认的 triton 要写回）："
+              " --vllm_gen_kwargs '{\"gdn_prefill_backend\": \"triton\"}'"
+              "（要与别的键合并就一并写在同一个 JSON 里）。", flush=True)
     _check_vllm_gen_kwargs(_gen_kwargs)   # 键名错 = 静默忽略 = 修复白做，必须构造前拦
     vllm_gen = LLM(model=cfg.get("vllm_model_path") or cfg["model_path"],
                    gpu_memory_utilization=float(cfg.get("gen_gpu_mem", 0.45)),

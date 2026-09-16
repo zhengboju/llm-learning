@@ -1125,6 +1125,29 @@ def test_vllm_gen_kwargs():
           '_vllm_kwargs = dict(_rcfg.get("vllm_gen_kwargs") or {})' in eval_src
           and "**_vllm_kwargs)" in eval_src)
 
+    # 【2026-09-16 默认 triton ≠ 兜底】--vllm_gen_kwargs 是**整体替换**：只想加一个键
+    # （如 enable_prefix_caching）却没把 triton 写回，就会静默掉回 FlashInfer GDN JIT ——
+    # 即 2026-09-14 那个无 traceback 的 SIGKILL 档。默认值救不了它，必须有前置告警。
+    from rlab.rollout import gdn_backend_missing
+
+    check("默认档（dict 里带 triton）→ 不告警（不噪音）",
+          gdn_backend_missing("/root/Qwen3.5-4B",
+                              {"gdn_prefill_backend": "triton"}) is False)
+    check("整体替换成只含新键 → 判定缺档（真陷阱：默认值不兜底）",
+          gdn_backend_missing("/root/Qwen3.5-4B",
+                              {"enable_prefix_caching": True}) is True)
+    check("显式空档 {}（有意的 FlashInfer 消融）→ 同样判定缺档",
+          gdn_backend_missing("/root/Qwen3.5-4B", {}) is True)
+    check("非 GDN 模型（Qwen2.5-3B）缺键不告警（该键本就不被使用）",
+          gdn_backend_missing("/root/Qwen2.5-3B", {}) is False)
+    check("vLLM 路径缺失时不误报", gdn_backend_missing(None, {}) is False)
+    check("gen_worker 在 LLM 构造前就打印该告警（不白烧一次引擎初始化才崩）",
+          "gdn_backend_missing(cfg.get(" in rollout_src
+          and rollout_src.index("gdn_backend_missing(cfg.get(")
+          < rollout_src.index("vllm_gen = LLM("))
+    check("CLI help 仍写明「整体替换」（语义不能悄悄变成 merge）",
+          "整体替换" in train_src)
+
 
 def test_split_load_remap():
     print("[Q] 分裂加载键名映射：多模态 vLLM + 纯文本 torch（Qwen3.5 实锤）")
