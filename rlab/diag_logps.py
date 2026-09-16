@@ -37,6 +37,12 @@ bf16/kernel 的常规数值差（logit 级 ~0.1 nat）不可能把 0.39 变成 1
 两条路都要独占显存。路径与开关照抄本次训练命令：2026-09-15 起统一用一份复合 ckpt
 /root/Qwen3.5-4B，torch 侧可直连（显式喂 text_config），**不再需要 -text 分裂目录**；
 若训练命令里还有 --vllm_model_path/--vllm_gen_kwargs/--chat_template_kwargs，一并抄过来）：
+
+JSON 参数（--chat_template_kwargs/--vllm_gen_kwargs）必须作为**单个 argv** 传入。推荐把公共
+参数放 bash 数组并用 `"${COMMON[@]}"` 展开；若写成 `COMMON="... 某JSON ..."` 再裸展开
+`$COMMON`，shell 会按空格把 JSON 切成多段（`{"a":` 与 `false}`），argparse 报
+`unrecognized arguments: false}`（2026-09-15 实踩）。下例用单引号整词传入：
+
     # ① 建轨迹（同时测 vLLM 这一档）
     CUDA_VISIBLE_DEVICES=0 python -m rlab.diag_logps --build_traj \
         --model_path /root/Qwen3.5-4B \
