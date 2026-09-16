@@ -630,6 +630,36 @@ def test_retool_math_fixes():
           [r["Q"] for r in dapo_exclude_dev(pool, [{"question": "q", "answer": "0"}])]
           == ["q1", "q2", "q3"])
 
+    # 【2026-09-16】train.jsonl 的"已剔除 dev"是**声明**不是自证：真机见到
+    # 1,791,200 条（=17,912×100）的可疑产物，而 dev 污染正是 2026-09-09 事件的根因。
+    # 契约必须当场核实 → 掉出 dev 题就大声告警并剔除；池子规模按 Q 去重后如实打印。
+    import io as _io
+    from contextlib import redirect_stdout as _rso
+
+    from rlab.data import pool_dup_note, verify_train_pool_clean
+
+    buf = _io.StringIO()
+    with _rso(buf):
+        kept2 = verify_train_pool_clean(pool, dev)
+    check("train.jsonl 核实：含 dev 题 → 剔除 + 告警（不静默放行）",
+          [r["Q"] for r in kept2] == ["q1", "q3"]
+          and "held-out" in buf.getvalue() and "prepare_dapo_math" in buf.getvalue())
+    buf2 = _io.StringIO()
+    with _rso(buf2):
+        same = verify_train_pool_clean(pool, [])
+    check("train.jsonl 核实：无 dev 可核时原样返回且不告警（不噪音）",
+          same == pool and buf2.getvalue() == "")
+    check("池子规模证据：无重复 → 无附注（保持旧日志逐字可比）",
+          pool_dup_note(pool) == "")
+    dup_rows = pool + pool                      # 3 题 × 2 份
+    check("池子规模证据：重复池 → 打出 Q 去重后的真实题数与份数",
+          "3 题" in pool_dup_note(dup_rows) and "2.0 份/题" in pool_dup_note(dup_rows))
+    check("池子规模证据：空池不炸", pool_dup_note([]) == "")
+    dsrc2 = open("rlab/data.py", encoding="utf-8").read()
+    check("load_dapo_math_train 真的接上了核实与规模证据（不是只定义了纯函数）",
+          "verify_train_pool_clean(rows, dev_rows)" in dsrc2
+          and "pool_dup_note(rows)" in dsrc2)
+
     # 题目级动态采样（丢弃率 81% 根因修复的契约锁）
     from rlab.rollout import filter_question_pool
     QAs = [{"Q": f"q{i}", "A": "1"} for i in range(10)]
@@ -2823,6 +2853,15 @@ def test_logprobs_n_fix_path():
           and "cross_entropy" not in open(os.path.join(
               os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
               "rlab", "losses.py"), encoding="utf-8").read())
+
+    # 【2026-09-16】vllm_gen_logps 的 Qwen3.5 警告必须**分档**：确定性档已经把可复现性
+    # 修好（docs/07 §9），开了档还照旧喊"不可复现"就是把"已修复"当"已知坏"用。
+    rollout_src2 = open("rlab/rollout.py", encoding="utf-8").read()
+    check("vllm_gen_logps 警告分档：开确定性档走提示分支（指向 docs/07 §9）",
+          "确定性档已开" in rollout_src2 and "docs/07 §9" in rollout_src2)
+    check("vllm_gen_logps 警告分档：未开档仍给两条修法（torch 副本 / batch-invariant）",
+          "**未开确定性档**" in rollout_src2
+          and "--vllm_batch_invariant --vllm_attention_backend FLASH_ATTN" in rollout_src2)
 
 
 if __name__ == "__main__":

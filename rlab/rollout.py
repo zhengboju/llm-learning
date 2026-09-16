@@ -928,12 +928,24 @@ def gen_worker(Q, cfg: dict):
     _verify_budget = int(cfg.get("verify_gen_logps", 0) or 0)
     # 【2026-09-15 实锤】Qwen3.5-4B + vLLM v0.19.1 + triton GDN prefill 下，vLLM 采样
     # logprobs 不可复现（同一命令两次：token 一致率 2.91%，|Δlogp| p99=5.79、max=14.5）。
-    # 这个警告不是阻断，是给明确指向；若用户执意要 A/B，可以继续跑，但需对拍。
+    # 【2026-09-16 修好】`VLLM_BATCH_INVARIANT=1` + 显式 attention backend 后跨进程
+    # 逐位可复现（100.00%、Δ=0），跨引擎残差 max 0.78nat、step-1 clip_frac 0.0008
+    # ≈ torch 副本地板 0.0007（docs/07 §9）。所以这条警告必须**分档**说——否则开了
+    # 确定性档还照旧吓人，等于把"已修复"当"已知坏"用。
     if _use_vllm_logps and "Qwen3.5-4B" in cfg.get("model_path", ""):
-        print("[rollout][警告] vllm_gen_logps=True 且 model_path 含 Qwen3.5-4B："
-              "本环境 vLLM 采样 logprobs 已实测不可复现，会把随机量注入 importance ratio；"
-              "建议改为 vllm_gen_logps=False（torch 副本重算，与训练前向同源）。"
-              "详见 docs/07-vllm-logprobs-non-determinism-4b.md", flush=True)
+        if cfg.get("vllm_batch_invariant"):
+            print("[rollout] vllm_gen_logps=True 且确定性档已开（VLLM_BATCH_INVARIANT=1）："
+                  "本环境实测跨进程逐位可复现（token 一致率 100%、|Δlogp|=0），"
+                  "跨引擎残差 max≈0.78nat、step-1 clip_frac 0.0008 ≈ torch 副本地板 0.0007。"
+                  "注意：开档会改变采样数值本身，**跨档的数字不可比**。详见 docs/07 §9",
+                  flush=True)
+        else:
+            print("[rollout][警告] vllm_gen_logps=True 且 model_path 含 Qwen3.5-4B，"
+                  "**未开确定性档**：本环境 vLLM 采样 logprobs 已实测不可复现（同一命令"
+                  "两次 token 一致率 2.91%、max 14.5nat），会把随机量注入 importance ratio；"
+                  "两条修法——① vllm_gen_logps=False（torch 副本重算，与训练前向同源）；"
+                  "② 加 --vllm_batch_invariant --vllm_attention_backend FLASH_ATTN"
+                  "（实测可复现，见 docs/07 §9）。", flush=True)
     if (not _use_vllm_logps) or _verify_budget > 0:
         _assert_torch_replica_loadable(cfg["model_path"])   # A1：复合 ckpt 进不了 torch
     _gen_kwargs = cfg.get("vllm_gen_kwargs") or {}

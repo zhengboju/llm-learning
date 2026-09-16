@@ -184,19 +184,62 @@ def dapo_exclude_dev(rows: list, dev_rows: list) -> list:
     return [r for r in rows if str(r.get("Q") or "").strip() not in dev_qs]
 
 
+def verify_train_pool_clean(rows: list, dev_rows: list) -> list:
+    """纯函数：把「train.jsonl 已剔除 dev」这条**声明**核实成证据。
+
+    【为什么不能只信文件名】该文件由 prepare_dapo_math 写，但任何别的流程都能重写它
+    （真机 2026-09-16 见到 1,791,200 条 = 17,912×100 的产物，明显不是本仓库脚本的
+    输出）。而 2026-09-09 的同池污染事件正是这个后果：dev 题被完整训过还当 held-out
+    用，评测数字虚高。**契约（训练池 ∩ held-out = ∅）比文件名的语义重要**。
+
+    掉出东西 = 该文件不是干净产物 → 当场剔除并大声告警（不静默缩水，也不放行）。
+    """
+    if not dev_rows:
+        return rows                     # 没读到 dev 就无从核（评估路径会单独报错）
+    kept = dapo_exclude_dev(rows, dev_rows)
+    if len(kept) != len(rows):
+        print(f"[data][警告] train.jsonl 含 {len(rows) - len(kept)} 条 held-out(dev) 题："
+              f"该文件并非本仓库 prepare 脚本的产物（或被别的流程覆盖）。已当场剔除 "
+              f"{len(rows)} -> {len(kept)}；建议重跑 "
+              f"python -m rlab.prepare_dapo_math --dev-size 500 取干净产物", flush=True)
+    return kept
+
+
+def pool_dup_note(rows: list) -> str:
+    """纯函数：池子规模的可核证据——按 Q 文本去重后的题数与重复份数。
+
+    【2026-09-16 真机】训练池日志是 1,791,200 条 = 17,912×100，与 DAPO-Math-17k
+    的规模不符。**重复本身不破坏调度**（QuestionScheduler 的 streak/黑名单按题面
+    文本 keyed，同一题的重复条目会被一并跳过），但会白占宿主内存、并让"池子有多大"
+    的判断失真。故每次加载都把去重后的真实题数打出来（集合只存已存在字符串的引用，
+    1.79M 条约 20-30MB 瞬时开销，付得起）。"""
+    if not rows:
+        return ""
+    uni = len({r.get("Q") for r in rows})
+    if uni == len(rows):
+        return ""
+    return f"｜Q 文本去重后 {uni} 题（重复 {len(rows) / max(uni, 1):.1f} 份/题）"
+
+
 def load_dapo_math_train() -> list:
     """训练池。优先本地 train.jsonl（prepare 产物，已剔除 dev）；否则加载全量
     17k 并按 dev.jsonl 剔除 dev 题——保证训练池与 held-out 不相交。
 
     【2026-09-09 审查修复】旧版直接返回全量 17k：即使跑了 prepare 脚本，dev 题
     依然在训练池里（prepare 只写文件、训练路径根本不读 train.jsonl），dev=50 题
-    被完整训过还拿来当评测集。"""
+    被完整训过还拿来当评测集。
+    【2026-09-16 补】读 train.jsonl 这条路以前"信任文件名"，现在当场核实
+    （verify_train_pool_clean）并打印池子真实规模（pool_dup_note）。"""
     ms_err = None
     train_jsonl = os.path.join(_DAPO_LOCAL_DIR, "train.jsonl")
     if os.path.exists(train_jsonl):
         rows = _read_qa_jsonl(train_jsonl)
         if rows:
-            print(f"[data] DAPO-Math 训练池 via 本地 train.jsonl（已剔除 dev）: {len(rows)} 条")
+            dev_path = os.path.join(_DAPO_LOCAL_DIR, "dev.jsonl")
+            dev_rows = _read_qa_jsonl(dev_path) if os.path.exists(dev_path) else []
+            rows = verify_train_pool_clean(rows, dev_rows)
+            print(f"[data] DAPO-Math 训练池 via 本地 train.jsonl（已剔除 dev）: "
+                  f"{len(rows)} 条{pool_dup_note(rows)}")
             return rows
     # 1) 尝试 modelscope（训练机默认；HF 镜像也可能通）
     if DATA_SOURCE in ("ms", "auto"):
