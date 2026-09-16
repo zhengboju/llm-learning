@@ -29,6 +29,14 @@ def main():
     ap.add_argument("--gpus", default="0", help="评测用卡；默认 0 号（与生成端共卡需错峰）")
     ap.add_argument("--per_gpu", type=int, default=1,
                     help="每卡同时跑的模型进程数；1=卡内串行（默认，防OOM）")
+    ap.add_argument("--gpu_mem", type=float, default=None,
+                    help="单进程 vLLM 显存占比（占总显存）；None=自动 0.78/per_gpu。"
+                         "【与训练共卡/卡被占时必须降】4B bf16 权重 8.6G，卡上空闲 "
+                         "35G 时给 0.30 即可；否则 vLLM 在建 worker 时抛 "
+                         "'Free memory ... less than desired'")
+    ap.add_argument("--mm_base", default=None,
+                    help="纯文本 Qwen3.5 ckpt 的多模态骨架目录（旧 ckpt 自动物化用）；"
+                         "None=由 ckpt 的 run_info.json / rlab 配置推断")
     ap.add_argument("--split", default="test", choices=("test", "train"),
                     help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
@@ -53,6 +61,10 @@ def main():
            "--base_path", args.base_path]
     if args.skip_base:
         cmd.append("--skip_base")
+    if args.gpu_mem is not None:
+        cmd += ["--gpu_mem", str(args.gpu_mem)]
+    if args.mm_base:
+        cmd += ["--mm_base", args.mm_base]
     if args.retool:
         cmd.append("--retool")
     if algo is not None:

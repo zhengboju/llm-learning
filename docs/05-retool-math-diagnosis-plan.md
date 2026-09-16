@@ -356,6 +356,12 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 评测（对齐 §7.1 路线：`materialize_mm_ckpt` 物化 → `eval_vllm.py` 调度 → `eval_vllm_all.json`，
 N=500 / greedy / seed=42），然后走 `pair_eval` 三方配对：
 
+> **【2026-09-16 更新·真统一】不再需要手工物化**：训练存盘已直接产出 vLLM 可直读的多模态壳
+> （`train.save_checkpoint` → `write_mm_checkpoint`，`step_N` 键名 `model.language_model.*` +
+> 骨架复合 config/processor；`save_mm_checkpoint=True` 默认开）。python 直接指 `step_N` 即可。
+> 09-16 之前的旧 `step_N`（文本格式）由 `eval_vllm_one.py` 自动物化到临时目录兜底
+> （找不到骨架时给 `--mm_base /root/Qwen3.5-4B`）。下文的 `step_200_mm` 字样是当时的产物名。
+
 ```bash
 cp eval_vllm_all.json eval_vllm_all.p1b.json     # 新一轮产物，别覆盖（旧 json 是唯一遗物）
 python -m rlab.analysis --eval-json eval_vllm_all.p1b.json \

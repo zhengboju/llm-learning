@@ -914,16 +914,20 @@ def test_vllm_gen_kwargs():
 
     2026-09-14 事故：Qwen3.5 的 GDN prefill 默认 FlashInfer JIT（现场 nvcc），编译
     窗口与三方搬权重的启动期重合 → 生成端被 OOM-killer 以 SIGKILL 带走、**无任何
-    Python traceback**，训练端只看到"生成端进程已退出"。规避=透传
-    gdn_prefill_backend="triton"（免 nvcc）。本测试覆盖：默认零变化 / 类型闸 /
-    回读容错 / 签名可见性 / 接线（真机才有 vLLM，接线用源码断言兜住）。"""
+    Python traceback**，训练端只看到"生成端进程已退出"。2026-09-16 起默认档改为
+    gdn_prefill_backend="triton"（免 nvcc），训练 rollout 与评测读同一份配置。
+    本测试覆盖：默认档 / 覆盖方式 / 类型闸 / 回读容错 / 签名可见性 / 接线
+    （真机才有 vLLM，接线用源码断言兜住）。"""
     print("[P2] vLLM 引擎参数透传：gdn_prefill_backend=triton 免起跑期 JIT 编译")
     from rlab.rollout import _check_vllm_gen_kwargs, _vllm_config_readback
     from rlab.train import run_signature
 
     cfg = get_config("retool_math", use_wandb=False)
-    check("BASE 默认 vllm_gen_kwargs=None（不传任何引擎参数，历史档位零变化）",
-          cfg["vllm_gen_kwargs"] is None)
+    check("BASE 默认 vllm_gen_kwargs 已含 gdn_prefill_backend=triton（2026-09-16 默认改档）",
+          cfg["vllm_gen_kwargs"] == {"gdn_prefill_backend": "triton"})
+    check("传 '{}' 可整体关掉（回到 vLLM 默认 = FlashInfer）",
+          get_config("retool_math", use_wandb=False,
+                     vllm_gen_kwargs={})["vllm_gen_kwargs"] == {})
     check("CLI JSON 反序列化形态（与 chat_template_kwargs 同一解析套路）",
           json.loads('{"gdn_prefill_backend": "triton"}')
           == {"gdn_prefill_backend": "triton"})
@@ -1083,14 +1087,19 @@ def test_vllm_gen_kwargs():
     else:
         print("  -- 本机无 vLLM：键名闸的真机判据回落为下面的接线断言")
 
-    # 签名可见性：kernel 换了（triton vs flashinfer）不能算同配方——但**不设该键时
-    # 历史签名串必须逐字不变**，否则旧 ckpt 全成"外来签名"，同签名重跑被护栏误拦
+    # 签名可见性：kernel 换了（triton vs flashinfer）不能算同配方——默认档现在就是
+    # triton，故新 run 必然带 -vk 段；只有**显式关掉该键**（vllm_gen_kwargs=None）时
+    # 历史签名串逐字不变，旧 ckpt 仍算同签名（刻意的：不传档 = 同一配方）。
     sig0 = run_signature(cfg)
-    check("不设该键：签名无 vk 段（历史串逐字不变 -> 旧 ckpt 仍算同签名）",
-          "-vk" not in sig0)
-    sig_vk = run_signature({**cfg, "vllm_gen_kwargs": {"gdn_prefill_backend": "triton"}})
-    check("设了该键 -> 签名尾部追加 -vk<键=值>（纯追加，前缀不变）",
-          sig_vk.endswith("-vkgdn_prefill_backend=triton") and sig_vk.startswith(sig0))
+    check("默认档带 triton：签名含 -vkgdn_prefill_backend=triton（不静默换档）",
+          sig0.endswith("-vkgdn_prefill_backend=triton"))
+    sig_none = run_signature({**cfg, "vllm_gen_kwargs": None})
+    check("显式关掉该键：签名无 vk 段（历史串逐字不变 -> 旧 ckpt 仍算同签名）",
+          "-vk" not in sig_none and sig0.startswith(sig_none))
+    sig_vk = run_signature({**cfg, "vllm_gen_kwargs": {"gdn_prefill_backend": "flashinfer"}})
+    check("换档 -> 签名尾部追加 -vk<键=值>（纯追加，前缀不变）",
+          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer")
+          and sig_vk.startswith(sig_none))
     check("多个键按 key 排序（同配方两次 run 签名逐字可比）",
           run_signature({**cfg, "vllm_gen_kwargs": {"b": 1, "a": 2}})
           .endswith("-vka=2,b=1"))
@@ -1109,6 +1118,12 @@ def test_vllm_gen_kwargs():
     check("train.py CLI --vllm_gen_kwargs 映射到 overrides",
           '"--vllm_gen_kwargs"' in train_src
           and 'overrides["vllm_gen_kwargs"] = json.loads(args.vllm_gen_kwargs)' in train_src)
+    # 【评测同档】评测端曾完全不传 gdn_prefill_backend：训练换了 kernel 而评测没换，
+    # Δacc 里混进 kernel 变量，且评测自己也会撞 FlashInfer JIT（无 traceback）。
+    eval_src = open("eval_vllm_one.py", encoding="utf-8").read()
+    check("eval_vllm_one.py 从 rlab 配置取 vllm_gen_kwargs 并展开进 LLM(**kwargs)",
+          '_vllm_kwargs = dict(_rcfg.get("vllm_gen_kwargs") or {})' in eval_src
+          and "**_vllm_kwargs)" in eval_src)
 
 
 def test_split_load_remap():
@@ -1131,6 +1146,20 @@ def test_split_load_remap():
     check("非 tied 目标可保留 lm_head（参数化退路）", out2.get("lm_head.weight") == "t3")
     check("张量对象原样搬运（不 copy 数据）",
           all(isinstance(t, str) for t in out.values()))
+    # 【2026-09-16 实机】save_pretrained 按 _checkpoint_conversion_mapping 逆向写回
+    # model.language_model.X（config 仍是文本类）→ 产物是"多模态权重 + 文本 config"。
+    # 映射必须幂等，否则产出 model.language_model.language_model.X 对不上骨架。
+    mm_sd = [("model.language_model.embed_tokens.weight", "t0"),
+             ("model.language_model.norm.weight", "t2"),
+             ("model.language_model.lm_head.weight", "t3"),   # tied 的多模态形态
+             ("model.language_model.layers.0.linear_attn.A_log", "t4")]
+    out_mm = dict(remap_text_to_multimodal(mm_sd))
+    check("已是多模态布局 -> 原样透传（幂等，不产出双前缀）",
+          out_mm["model.language_model.embed_tokens.weight"] == "t0"
+          and out_mm["model.language_model.layers.0.linear_attn.A_log"] == "t4"
+          and not any("language_model.language_model" in k for k in out_mm))
+    check("多模态形态的 tied lm_head 同样丢弃",
+          "model.language_model.lm_head.weight" not in out_mm)
     try:
         remap_text_to_multimodal([("visual.weight", "t")])
         check("未知键名 fail-fast", False)
@@ -1312,6 +1341,101 @@ def test_materialize_mm():
     except KeyError:
         check("纯视觉骨架 fail-fast（语言键无处落位=配置错误）", True)
 
+    # ---- A/B：存盘即多模态壳 / 评测自动物化（2026-09-16 真统一）----
+    from rlab.materialize_mm_ckpt import (load_mm_skeleton, materialize_mm_checkpoint,
+                                          merge_text_into_skeleton, read_mm_key_index,
+                                          write_mm_checkpoint)
+    from safetensors.torch import load_file, save_file
+
+    skel = {"model.visual.patch_embed.weight": t_vis}
+    merged2, st2 = merge_text_into_skeleton(text_sd, skel)
+    check("骨架合并：语言键落到 model.language_model.*、tied lm_head 丢弃、非语言键原样",
+          merged2["model.language_model.embed_tokens.weight"] is t_emb
+          and "lm_head.weight" not in merged2
+          and merged2["model.visual.patch_embed.weight"] is t_vis
+          and st2 == {"text_substituted": 2, "base_kept": 1})
+    check("骨架合并：dtype 对齐存盘档（fp32 master -> bf16）",
+          merge_text_into_skeleton(text_sd, skel, dtype=torch.bfloat16)[0]
+          ["model.language_model.embed_tokens.weight"].dtype == torch.bfloat16)
+    try:
+        merge_text_into_skeleton({"foo.weight": t_norm}, skel)
+        check("骨架合并：未知键 fail-fast", False)
+    except KeyError:
+        check("骨架合并：未知键 fail-fast（映射表不许静默漏同步）", True)
+    # 【2026-09-16 实机 crash 的最小复现】旧 ckpt = 多模态权重 + 文本 config：
+    # 幂等映射后能直接并进骨架；修复前这里会产出双前缀并对不上 base_keys。
+    merged_mm, _ = merge_text_into_skeleton(
+        {"model.language_model.embed_tokens.weight": t_emb}, skel,
+        base_keys={"model.language_model.embed_tokens.weight",
+                   "model.visual.patch_embed.weight"})
+    check("幂等映射：已多模态布局的旧 ckpt 也能并进骨架（不产双前缀）",
+          merged_mm["model.language_model.embed_tokens.weight"] is t_emb
+          and not any("language_model.language_model" in k for k in merged_mm))
+
+    # 落盘口径：骨架分片流式读（只留非语言键）→ 产物=单文件权重 + 骨架非权重文件
+    mm_dir = tempfile.mkdtemp()
+    save_file({"model.language_model.embed_tokens.weight": torch.randn(4, 3),
+               "model.language_model.norm.weight": torch.randn(4),
+               "model.visual.patch_embed.weight": t_vis},
+              os.path.join(mm_dir, "model-00001-of-00001.safetensors"),
+              metadata={"format": "pt"})
+    with open(os.path.join(mm_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"model_type": "qwen3_5",
+                   "text_config": {"model_type": "qwen3_5_text"}}, f)
+    skel_loaded = load_mm_skeleton(mm_dir)
+    check("load_mm_skeleton 流式只留非语言键（8G 语言权重不进训练/评测进程内存）",
+          list(skel_loaded) == ["model.visual.patch_embed.weight"])
+    check("read_mm_key_index 只读头部拿全键名（含语言键，零张量加载）",
+          read_mm_key_index(mm_dir) == {"model.language_model.embed_tokens.weight",
+                                        "model.language_model.norm.weight",
+                                        "model.visual.patch_embed.weight"})
+    out_dir = os.path.join(tempfile.mkdtemp(), "step_1")
+    stats = write_mm_checkpoint(text_sd, mm_dir, out_dir, skeleton=skel_loaded,
+                                dtype=torch.bfloat16)
+    check("write_mm_checkpoint 落单文件权重 + 从骨架拷 config（vLLM 多模态路由依赖）",
+          os.path.isfile(os.path.join(out_dir, "model.safetensors"))
+          and os.path.isfile(os.path.join(out_dir, "config.json"))
+          and stats["text_substituted"] == 2 and stats["base_kept"] == 1)
+    back = load_file(os.path.join(out_dir, "model.safetensors"))
+    check("落盘产物：语言键=多模态布局、视觉键在、tied lm_head 不在",
+          "model.language_model.embed_tokens.weight" in back
+          and "model.visual.patch_embed.weight" in back
+          and "lm_head.weight" not in back)
+    check("产物 config 是复合体（torch 侧 resolve_load_config 也能再读 = 真统一）",
+          "text_config" in json.load(open(os.path.join(out_dir, "config.json"))))
+    # 骨架模式丢了"骨架语言键全覆盖"自检 → 用只读头部的全键名把"文本键必须命中"补回来
+    try:
+        write_mm_checkpoint({**text_sd, "model.dummy.weight": t_norm}, mm_dir,
+                            os.path.join(tempfile.mkdtemp(), "bad"), skeleton=skel_loaded)
+        check("骨架键索引自检 fail-fast", False)
+    except KeyError:
+        check("骨架键索引自检 fail-fast（只读头部拿全键名，多出的键当场拦）", True)
+
+    # 目录级物化（eval 兜底与离线 CLI 共用同一条路径）
+    text_dir = tempfile.mkdtemp()
+    save_file({"model.embed_tokens.weight": t_emb, "model.norm.weight": t_norm},
+              os.path.join(text_dir, "model.safetensors"), metadata={"format": "pt"})
+    out2 = os.path.join(tempfile.mkdtemp(), "step_2")
+    materialize_mm_checkpoint(text_dir, mm_dir, out2)
+    back2 = load_file(os.path.join(out2, "model.safetensors"))
+    check("materialize_mm_checkpoint：文本目录 -> vLLM 可直读的多模态壳",
+          "model.language_model.embed_tokens.weight" in back2
+          and "model.visual.patch_embed.weight" in back2)
+
+    # A/B 接线（无 GPU 机器上能验的部分：配置默认 + 源码断言）
+    check("config 默认 save_mm_checkpoint=True（存盘即多模态壳）",
+          get_config("retool_math", use_wandb=False).get("save_mm_checkpoint") is True)
+    train_src = open("rlab/train.py", encoding="utf-8").read()
+    check("train.py 存盘走 save_checkpoint -> write_mm_checkpoint（复合模型不再裸 save_pretrained）",
+          "def save_checkpoint(" in train_src
+          and "write_mm_checkpoint(sd, mm_base, save_name" in train_src
+          and "_fmt = save_checkpoint(cfg, engine, tokenizer, save_name, sd)" in train_src)
+    eval_src = open("eval_vllm_one.py", encoding="utf-8").read()
+    check("eval_vllm_one.py 检测纯文本 ckpt 并自动物化（旧 ckpt 兜底，免手工）",
+          "def _needs_mm_materialize(" in eval_src
+          and "materialize_mm_checkpoint(args.model, _mm_base, _mm_tmp)" in eval_src
+          and "atexit.register(shutil.rmtree, _mm_tmp" in eval_src)
+
 
 def test_eval_spawn_guard():
     print("[V] eval spawn 递归引爆防护：vLLM V1 spawn 子进程重执行 eval_vllm_one.py "
@@ -1324,6 +1448,30 @@ def test_eval_spawn_guard():
           guard in src)
     check("守卫在 vLLM import 之前（spawn 发生在 LLM() 初始化，env 须先于其生效）",
           src.index(guard) < src.index("from vllm import"))
+    # 【2026-09-16 真机】--gpus 0,1 时 GPU1 被训练占着（空闲 35.4/95 GiB），默认
+    # gpu_mem=0.78 → 白等一次 materialize+引擎初始化才拿到一行 ValueError。
+    check("eval_vllm_one.py 起引擎前做显存前置检查（三个数 + 可执行改法，fail-fast）",
+          "def _mem_shortfall(" in src and "def _gpu_mem_preflight(" in src
+          and src.index("_gpu_mem_preflight(args.gpu_mem)")
+          < src.index("llm = LLM(model=_model_for_vllm"))
+    eval_cli = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "eval.py"), encoding="utf-8").read()
+    check("rlab.eval 透传 --gpu_mem/--mm_base（否则卡被占时无法从统一入口降档）",
+          '"--gpu_mem", str(args.gpu_mem)' in eval_cli
+          and '"--mm_base", args.mm_base' in eval_cli)
+    # 判据行为自检：脚本不可 import（顶层就要 --model 并起 vLLM），故只取该纯函数的
+    # AST 源码 exec 出来测——"能不能分辨够用/不够用"必须真跑，不能只数源码文本。
+    import ast as _ast
+    _fn = next(n for n in _ast.parse(src).body
+               if isinstance(n, _ast.FunctionDef) and n.name == "_mem_shortfall")
+    _ns = {}
+    exec(compile(_ast.Module(body=[_fn], type_ignores=[]), "<mem>", "exec"), _ns)
+    _ms = _ns["_mem_shortfall"]
+    _G = 2 ** 30
+    check("显存判据：够用放行 / 不够时给出 gpu_mem 上限（35.4/95 vs 0.78 实机档）",
+          _ms(0.30, 35 * _G, 95 * _G) is None
+          and "gpu_mem" in _ms(0.78, 35 * _G, 95 * _G)
+          and _ms(0.78, 80 * _G, 95 * _G) is None)
 
 
 def test_eval_thinking_switch():

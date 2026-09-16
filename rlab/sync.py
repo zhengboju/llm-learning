@@ -72,16 +72,30 @@ def remap_text_to_multimodal(sd_items, lm_prefix="model.language_model.",
     已按 vLLM qwen3_5.py 源码核实（2026-09-11）：
     wrapper 的 load_weights = AutoWeightsLoader(+hf_to_vllm_mapper)，原始
     checkpoint 的 "model.language_model.X" 键名验证可被加载——映射产出同形态：
-      "model.X"       -> "model.language_model.X"
-      "lm_head.*"     -> 丢弃（Qwen3.5-4B tie_word_embeddings=True，原
-                         checkpoint 无此键；torch state_dict 的 lm_head 是共享
-                         张量重复键，发给 AutoWeightsLoader 会报未知参数）
+      "model.X"                -> "model.language_model.X"
+      "model.language_model.X" -> 原样透传（**幂等**，见下）
+      "lm_head.*"              -> 丢弃（Qwen3.5-4B tie_word_embeddings=True，原
+                                  checkpoint 无此键；torch state_dict 的 lm_head 是
+                                  共享张量重复键，发给 AutoWeightsLoader 会报未知参数）
     未知键名 fail-fast：映射表必须与真实布局核对过，静默漏同步 = 生成端用旧权重。
+
+    【2026-09-16 幂等是必须的，不是防御性编程】`save_pretrained` 会按 transformers 的
+    `_checkpoint_conversion_mapping` 把**文本模型的 model.X 逆向写回
+    model.language_model.X**（它想让产物能以原 checkpoint 形态再加载），但 config 仍写
+    文本类 → 落盘产物是"**多模态权重 + 文本 config**"的混合体（`step_50` 实机踩到）。
+    这种 ckpt 喂进本函数若再前缀一次，就产出
+    `model.language_model.language_model.X` 并对不上 vLLM/骨架键名。
     """
     out = []
+    tied_mm = lm_prefix + "lm_head.weight"
     for name, tensor in sd_items:
         if name.startswith("lm_head."):
             if drop_tied_lm_head:
+                continue
+            out.append((name, tensor))
+        elif name.startswith(lm_prefix):
+            # 已是多模态布局：原样透传（幂等）。tied lm_head 的两种形态都丢。
+            if drop_tied_lm_head and name == tied_mm:
                 continue
             out.append((name, tensor))
         elif name.startswith("model."):

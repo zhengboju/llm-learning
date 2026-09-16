@@ -115,6 +115,15 @@ BASE = dict(
     # 映射（A1：复合 config 喂文本类崩）时，用 extract_text_model.py 抽一份纯文本
     # ckpt 当 model_path，并把本键指向原多模态目录（映射恒开）。
     vllm_model_path=None,
+    # 【2026-09-16 真统一：存盘即多模态壳】复合（多模态）模型训练时，step_N 直接按
+    # vLLM 可直读的多模态格式落盘（键名 model.language_model.* + 骨架的复合 config/
+    # processor），不再写"实例化那个类"的文本格式。动机：c991f84 只统一了 torch 侧
+    # **加载源**，存盘产物仍是 Qwen3_5TextConfig → eval 独立进程起 vLLM 直接 TypeError
+    # （A2），只能靠 materialize_mm_ckpt 补格式 = "假统一"。
+    # 关掉（False）= 回到旧文本格式（Qwen2.5 口径）；此时 eval 端会自动物化兜底
+    # （eval_vllm_one.py），或手工 python -m rlab.materialize_mm_ckpt。
+    # 非复合模型（Qwen2.5-3B）恒走文本格式，本键不参与。
+    save_mm_checkpoint=True,
     # 【2026-09-11 4B OOM】DeepSpeed zero stage（0=默认，3B 全态 ~60G 历史可比）。
     # 4B bf16 优化器全态 = fp32 master+m+v ~48G + bf16 权重/梯度 16G ≈ 64G 静态，
     # 动态（检查点包+重算瞬态+math 注意力 T²）顶满 95G——第一步 backward 差
@@ -212,18 +221,27 @@ BASE = dict(
     gen_gpu_mem=0.45,        # 生成端 vLLM 显存占比（GPU0 = ref~7G + vLLM + 副本~7G
                              # + logits 瞬时峰~12G，0.45×96 总计 ~70G < 96G；2026-09-09
                              # 提速：旧 0.35 的 KV 池对 3B+GQA 大量闲置）
-    # 【2026-09-14 起跑期 OOM-kill】vLLM 引擎参数透传（None=不传，历史行为零变化）。
-    # 直接进 gen_worker 的 LLM(**kwargs)，键名用 vLLM 的**下划线**形态：
-    #   CLI --gdn-prefill-backend triton  →  {"gdn_prefill_backend": "triton"}
-    # 首例用途与动机（症状→根因）：Qwen3.5 的 GDN 线性注意力层，vLLM 默认走
-    # **FlashInfer JIT 现场编译**（不是 AOT 预编译件）。编译窗口恰好落在 ref/gen/
-    # train 三方同时把 4B 权重搬进主机内存的启动期，nvcc 的宿主 RAM 峰值把 60G
-    # 容器顶爆：ninja 被 OOM-killer 以 SIGKILL 带走（日志里只有 "ninja ... died
-    # with <Signals.SIGKILL>"、零编译输出），紧接着生成端进程也被杀——**没有任何
-    # Python traceback**，训练端只看到一句"生成端进程已退出"，排查方向被带偏到
-    # 显存/权重同步。triton 后端不需要 nvcc，从根上消掉这段起跑期编译（代价只在
-    # prefill，而负载是 3072 token 的 decode 为主，占比小）。
-    vllm_gen_kwargs=None,
+    # 【2026-09-14 起跑期 OOM-kill；2026-09-16 起默认改档】vLLM 引擎参数透传，直接进
+    # gen_worker 的 LLM(**kwargs)，键名用 vLLM 的**下划线**形态：默认
+    # {"gdn_prefill_backend": "triton"}。
+    # 【为什么默认 triton 而不是 vLLM 的 FlashInfer】Qwen3.5 的 GDN 线性注意力层在
+    # vLLM 里默认走 FlashInfer GDN prefill，而它是 **JIT 现场编译**（不是 AOT 预编译件，
+    # 缓存不跨 pod）。编译窗口恰好落在 ref/gen/train 三方把权重搬进主机内存的启动期：
+    # nvcc/ninja 的宿主 RAM 峰值把 60G 容器顶爆，ninja 被 OOM-killer 以 SIGKILL 带走
+    # （日志只有 "ninja ... died with <Signals.SIGKILL>"、零编译输出），紧接着生成端
+    # 进程也被杀——**没有任何 Python traceback**，训练端只看到"生成端进程已退出"
+    # （2026-09-14 事故，见 docs/05）。triton 后端不需要 nvcc，从根上消掉这段起跑期
+    # 编译；代价只在 prefill，而负载是 3072 token 的 decode 为主，占比小。
+    # 【训练与评测必须同档】评测端（eval_vllm_one.py）读同一份配置并把本 dict 展开进
+    # LLM(**kwargs)——它构造引擎时同样会付这笔 JIT，两边不能静默分叉（否则 Δacc 里会
+    # 混进 kernel 变量）。
+    # 【覆盖方式】CLI --vllm_gen_kwargs 整体替换本 dict（传 '{}' = 一个引擎参数都不传，
+    # 回到 vLLM 默认 FlashInfer；传 {"gdn_prefill_backend": "flashinfer"} = 显式换档）。
+    # 结果进 run_signature（-vkgdn_prefill_backend=triton）：旧同配方重跑对不上，这正是
+    # 要的——kernel 档确实变了。
+    # 【非 GDN 模型（Qwen2.5-3B）】vLLM 里它只是不被使用的引擎参数，传了是惰性的；但它
+    # 仍进签名——3B 新 run 与旧 3B checkpoint 不再同签名（刻意的：引擎参数档变了）。
+    vllm_gen_kwargs={"gdn_prefill_backend": "triton"},
     ref_server_host="localhost",
     ref_server_port=59875,
     wandb_project="rlab",
@@ -445,7 +463,7 @@ def get_config(algo: str, **overrides) -> dict:
         cfg["fwd_batch_chunk"] = int(_env_bc)
     # vLLM 引擎参数透传的类型闸：非 dict（如 CLI 递了 JSON 数组/字符串）若原样进
     # LLM(**x)，会以 TypeError 在**生成端子进程**里炸——而生成端崩溃的表现只是训练端
-    # 一句"生成端进程已退出"（见 config.vllm_gen_kwargs 注释里的同类盲区）。在配置层
+    # 一句"生成端进程已退出"（见 BASE.vllm_gen_kwargs 注释里的同类盲区）。在配置层
     # fail-fast，错误才留在能排查的地方。
     _vk = cfg.get("vllm_gen_kwargs")
     if _vk is not None and not isinstance(_vk, dict):

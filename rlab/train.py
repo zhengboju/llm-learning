@@ -153,6 +153,44 @@ def guard_ckpt_collision(out_dir: str, cfg: dict) -> None:
             f"  确认是同签名重跑则不会触发本护栏（本护栏只在签名不同/缺失时拦）。")
 
 
+_MM_SKELETON = None   # 进程内缓存骨架的非语言张量（~1G）；每次存盘重读 8G base 不值
+
+
+def _is_composite_model(path: str) -> bool:
+    """模型目录是不是多模态复合体（config 里有 text_config）。"""
+    from rlab.model_loading import resolve_load_config
+    return bool(resolve_load_config(path)[1])
+
+
+def save_checkpoint(cfg, engine, tokenizer, save_name, sd) -> str:
+    """存盘：复合（多模态）模型 → vLLM 可直读的多模态壳；纯注意力模型 → 原文本格式。
+
+    【2026-09-16 真统一】c991f84 统一的是 **torch 侧加载源**（一份复合目录两边都能
+    读），但 `save_pretrained` 写出的是**实例化那个类**的 config/键名 = 文本格式
+    （Qwen3_5TextConfig + `model.X`）。eval 是独立进程、只能从磁盘读，vLLM 对文本
+    格式直接 TypeError（A2）——于是"评测的输入"并不是"训练的输入"的同一格式，得靠
+    materialize_mm_ckpt 补，那就是"假统一"。
+    现在存盘即多模态壳（键名 `model.language_model.*` + 骨架的复合 config/processor），
+    torch（resolve_load_config 认复合、内置 qwen3_5_text 前缀转换映射负责剥前缀）与
+    vLLM 都直读 `step_N`，`materialize_mm_ckpt` 退化成旧 ckpt 的补格式工具。
+    """
+    global _MM_SKELETON
+    mm_base = cfg.get("vllm_model_path") or cfg["model_path"]
+    if cfg.get("save_mm_checkpoint", True) and _is_composite_model(mm_base):
+        from rlab.materialize_mm_ckpt import load_mm_skeleton, write_mm_checkpoint
+        if _MM_SKELETON is None:
+            print(f"[train] 读多模态骨架（流式，只留非语言键）: {mm_base}", flush=True)
+            _MM_SKELETON = load_mm_skeleton(mm_base)
+        stats = write_mm_checkpoint(sd, mm_base, save_name, skeleton=_MM_SKELETON,
+                                    dtype=torch.bfloat16)
+        return (f"多模态壳：替换 {stats['text_substituted']} 语言键 / "
+                f"保留 {stats['base_kept']} 非语言键")
+    # 非复合（Qwen2.5-3B）：历史文本格式，零变化
+    engine.module.save_pretrained(save_name, state_dict=sd)
+    tokenizer.save_pretrained(save_name)
+    return "文本格式（非复合模型，历史口径）"
+
+
 def run_training(cfg, args):
     import deepspeed
     from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
@@ -403,10 +441,11 @@ def run_training(cfg, args):
                 os.makedirs(save_name, exist_ok=True)
                 sd = engine.module.state_dict()
                 sd = type(sd)({k: v.cpu() for k, v in sd.items()})
-                engine.module.save_pretrained(save_name, state_dict=sd)
-                tokenizer.save_pretrained(save_name)
+                # 【2026-09-16】存盘即多模态壳（复合模型）：eval 直读 step_N，不再需要
+                # 手工 materialize（"训练的输入"与"评测的输入"同一格式）。
+                _fmt = save_checkpoint(cfg, engine, tokenizer, save_name, sd)
                 write_run_info(os.path.join(save_name, "run_info.json"), cfg)
-                print(f"[train] saved -> {save_name}")
+                print(f"[train] saved -> {save_name}（{_fmt}）")
             dist.barrier()
 
 
@@ -451,11 +490,20 @@ def main():
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
     ap.add_argument("--vllm_gen_kwargs", default=None,
-                    help='JSON dict 透传 vLLM 引擎构造参数（键名用下划线形态）。'
-                         '首例：\'{"gdn_prefill_backend": "triton"}\' —— Qwen3.5 的 '
-                         'GDN prefill 默认走 FlashInfer JIT 现场编译，该编译窗口与'
-                         '三方搬权重的启动期重合会撞宿主 RAM 上限（生成端被 SIGKILL '
-                         '带走、无 traceback）；triton 后端免 nvcc')
+                    help='JSON dict **整体替换** vLLM 引擎构造参数（键名用下划线形态）。'
+                         '默认已含 \'{"gdn_prefill_backend": "triton"}\'——Qwen3.5 的 '
+                         'GDN prefill 默认走 FlashInfer JIT 现场编译，该编译窗口与三方'
+                         '搬权重的启动期重合会撞宿主 RAM 上限（生成端被 SIGKILL 带走、'
+                         '无 traceback）；triton 后端免 nvcc。传 \'{}\' 回到 vLLM 默认'
+                         '（FlashInfer），传 \'{"gdn_prefill_backend": "flashinfer"}\' '
+                         '显式换回该档；评测端读的是同一份配置')
+    ap.add_argument("--save_mm_checkpoint", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="复合（多模态）模型存盘为 vLLM 可直读的多模态壳。"
+                         "【2026-09-16 真统一】默认开：step_N 键名 model.language_model.*、"
+                         "config/processor 继承骨架，eval 直指 step_N（不再需要手工 "
+                         "materialize_mm_ckpt）。--no-save_mm_checkpoint 回到旧文本格式"
+                         "（eval 端会自动物化兜底，代价是每次都付一次合并开销）")
     ap.add_argument("--zero_stage", type=int, default=None,
                     help="DeepSpeed zero stage（默认 0；4B 用 2 = 优化器态 offload "
                          "CPU，GPU1 静态 64G->24G）")
@@ -548,6 +596,8 @@ def main():
     if args.vllm_attention_backend: overrides["vllm_attention_backend"] = args.vllm_attention_backend
     if args.vllm_gen_kwargs:   # 类型闸在 config.get_config（非 dict 在生成端只会表现为"进程已退出"）
         overrides["vllm_gen_kwargs"] = json.loads(args.vllm_gen_kwargs)
+    if args.save_mm_checkpoint is not None:
+        overrides["save_mm_checkpoint"] = args.save_mm_checkpoint
 
     cfg = get_config(args.algo, **overrides)
     # 【2026-09-12】偏离签名先算好再打印/落盘：wandb run name 与 run_info.json 同源，
