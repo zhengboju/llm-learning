@@ -185,6 +185,19 @@ def pair_eval(path_a: str, path_b: str, name_a: str, name_b: str) -> str:
     return "\n".join(lines)
 
 
+def _sess_label(sess: int) -> str:
+    """会话显示标签：0..25 → A..Z，之后 S26/S27…。
+
+    【2026-09-17 真机】旧版写死 `"ABCDEFGH"[sess_ids[i]]`，第 9 个会话直接
+    `IndexError: string index out of range` —— 而 record.jsonl 是**追加写**的，
+    同一 out_dir 下"验收跑 + 正式跑 + 中途重启"叠在一个文件里是常态（真机这次
+    就是这么崩的：`--record` 整个不可用，正好卡在"训练期曲线是唯一判别证据"
+    的时刻）。标签只用于显示，不得因为会话数多于字母表长度而拒绝出表。"""
+    if 0 <= sess < 26:
+        return chr(ord("A") + sess)
+    return f"S{sess}"
+
+
 def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
     """按 upload 批次滑动平均 acc/fmt/code 率与完成长度（retool 诊断用）。
 
@@ -238,10 +251,16 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
                 fmt_t = lambda x: time.strftime("%m-%d %H:%M:%S", time.localtime(x))
                 when = f" [{fmt_t(span[0])} ~ {fmt_t(span[1])}]"
             sess_lines.append(
-                f"会话{s}: 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/16:.0f}步）"
+                f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/16:.0f}步）"
                 f" acc={a:.1f}% fmt={ff:.1f}% code={c:.1f}%{when}")
-    out = ["| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap | 阶段 | 会话 |",
+    out = [f"| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap | 阶段 | 会话 |",
            "|---|---|---|---|---|---|---|---|"]
+    if sess_span:
+        out.insert(0, f"> record 共 {len(sess_span)} 个会话（间隔>{SESS_GAP_S:.0f}s 切分）"
+                      f"——追加写文件，多会话 = 同一 out_dir 被重启/多 run 混用；"
+                      f"末尾会话才是最近一次 run，且同签名重跑会覆盖 step_N，"
+                      f"评测前先核 `step_N/run_info.json` 的 started。")
+        out.insert(1, "")
     for i in range(0, len(accs), window):
         chunk_a, chunk_f, chunk_c = accs[i:i + window], fmts[i:i + window], codes[i:i + window]
         chunk_l = clens[i:i + window]
@@ -255,7 +274,7 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
         else:
             len_col = "— | —"
         ph_col = phases[i] if i < len(phases) else "—"
-        sess_col = "ABCDEFGH"[sess_ids[i]] if i < len(sess_ids) else "—"
+        sess_col = _sess_label(sess_ids[i]) if i < len(sess_ids) else "—"
         out.append(f"| {i}~{i + len(chunk_a)} | {sum(chunk_a) / len(chunk_a) * 100:.1f}% "
                    f"| {sum(chunk_f) / len(chunk_f) * 100:.1f}% | {code_col} "
                    f"| {len_col} | {ph_col} | {sess_col} |")

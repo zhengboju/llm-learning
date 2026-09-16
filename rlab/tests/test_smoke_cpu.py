@@ -402,6 +402,28 @@ def test_eval_stats_and_signature():
     check("拼错模型名 → 列出可用名字（不静默空表）",
           "找不到" in missing and "m200" in missing)
 
+    print("[G] summarize_record 多会话（record 追加写 = 常态）")
+    # 【2026-09-17 真机】`"ABCDEFGH"[sess]` 在第 9 个会话 IndexError → `--record`
+    # 整个不可用，而训练期曲线恰是"权重坏了 vs 存盘坏了"的唯一判别证据。
+    from rlab.analysis import summarize_record, _sess_label
+    check("会话标签：A..Z 之后不溢出", _sess_label(0) == "A" and _sess_label(7) == "H"
+          and _sess_label(8) == "I" and _sess_label(30) == "S30")
+    _rec = os.path.join(_dir, "record.jsonl")
+    with open(_rec, "w", encoding="utf-8") as f:
+        for s in range(12):                      # 12 个会话，跨过旧的 8 上限
+            for _ in range(2):
+                f.write(_json.dumps({
+                    "t": 1000.0 + s * 300.0, "algo": "retool_math",
+                    "acc": [1.0] * 4 + [0.0] * 4, "fmt": [1.0] * 8,
+                    "clen": [2000] * 8, "code_used": [1] * 8, "code_ok": [1] * 8,
+                    "trunc_final": [0] * 8, "gen_version": s * 16, "phase": "cold",
+                }, ensure_ascii=False) + "\n")
+    _rtbl = summarize_record(_rec)
+    check("≥9 个会话不再 IndexError，且逐会话汇总齐全",
+          "共 12 个会话" in _rtbl and "会话A(#0)" in _rtbl and "会话L(#11)" in _rtbl)
+    check("多会话提示把『同签名重跑会覆盖 step_N』写进表头（防评到上一轮的 ckpt）",
+          "run_info.json" in _rtbl)
+
 
 if __name__ == "__main__":
     test_advantages()
