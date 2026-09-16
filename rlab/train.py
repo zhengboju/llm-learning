@@ -473,6 +473,17 @@ def main():
     ap.add_argument("--difficulty_path", default=None,
                     help="probe_difficulty.py 产出的通过率表；设置后训练池只保留"
                          "通过率在 difficulty_band 内的题（离线难度预过滤）")
+    # 【2026-09-17 补 CLI 缺口】band 是过滤器的**唯一可调旋钮**，但此前只能改
+    # config.py 源码 —— 而它决定的正是本轮的病根：band(0,1) 会把 1/8、1/4 这类
+    # **lopsided 组**（8 条里只有 1-2 条对）留在池子里，那种组里正向 advantage
+    # 只发给"幸运那一条"，RL 学到的是运气不是解题。band 收窄到 (0.25,0.75)
+    # （k=8 时=只留 3~5 对）正是把训练分布钉在"对错各半、±1 有信息量"的区间。
+    ap.add_argument("--difficulty_band", type=float, nargs=2, default=None,
+                    metavar=("LO", "HI"),
+                    help="难度带开区间 (lo, hi)：保留 n_correct/k 严格落在其中的题"
+                         "（默认 0.0 1.0 = DAPO 口径：去掉全错/全对；要同时去掉 "
+                         "lopsided 组就传 0.25 0.75）。注意表中缺失的题一律丢弃"
+                         "——探针没覆盖到的题不会进训练池")
     ap.add_argument("--seed", type=int, default=None,
                     help="固定训练种子（抽题顺序+生成采样），阶段1 起对比实验必带")
     ap.add_argument("--chat_template_kwargs", default=None,
@@ -582,6 +593,11 @@ def main():
     if args.port is not None: overrides["ref_server_port"] = args.port
     if args.no_log: overrides["use_wandb"] = False
     if args.difficulty_path: overrides["difficulty_path"] = args.difficulty_path
+    if args.difficulty_band is not None:
+        _lo, _hi = (float(x) for x in args.difficulty_band)
+        if not (0.0 <= _lo < _hi <= 1.0):
+            raise SystemExit(f"--difficulty_band 需满足 0<=lo<hi<=1，收到 {_lo},{_hi}")
+        overrides["difficulty_band"] = (_lo, _hi)
     if args.seed is not None: overrides["seed"] = args.seed
     if args.chat_template_kwargs:
         overrides["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)

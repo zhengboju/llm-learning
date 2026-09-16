@@ -932,6 +932,22 @@ def test_difficulty_filter():
     kept3, st3 = filter_qas_by_difficulty(qas, table, lo=0.0, hi=0.0)
     check("空 band：结果为空但 missing/总数口径不变（供 gen_worker fail-fast）",
           kept3 == [] and st3["total"] == 6 and st3["missing"] == 1)
+    # 【2026-09-17 真机 bg1 崩溃后的推论】band(0,1) 会留下 lopsided 组（8 条里只有
+    # 1-2 条对）：那种组里正向 advantage 只发给"幸运那一条"，RL 学到的是运气。
+    # band 收窄到 (0.25,0.75) 且 k=8 → 只留 3~5 对（对错各半、±1 有信息量）。
+    _q8 = [{"Q": f"m{i}", "A": "1"} for i in range(9)]
+    _t8 = {f"m{nc}": {"k": 8, "n_correct": nc} for nc in range(9)}
+    _k8, _s8 = filter_qas_by_difficulty(_q8, _t8, lo=0.25, hi=0.75)
+    check("k=8 + band(0.25,0.75)：只留 3~5 对，1/2/6/7/8 对全出清（治 lopsided 组）",
+          [x["Q"] for x in _k8] == ["m3", "m4", "m5"]
+          and _s8["band_out"] == 4 and _s8["p_zero"] == 1 and _s8["p_one"] == 1)
+    # band 是过滤器的唯一旋钮，此前只能改 config.py 源码（bg1 崩后补 CLI）
+    import inspect as _insb
+    import rlab.train as _TB
+    _tsrcb = _insb.getsource(_TB.main)
+    check("train.py 暴露 --difficulty_band 并接线（含 0<=lo<hi<=1 校验）",
+          '"--difficulty_band"' in _tsrcb
+          and 'overrides["difficulty_band"] = (_lo, _hi)' in _tsrcb)
 
     # 表加载：坏行/非法行静默跳过（探针逐题追加写，崩溃可能留截断行）
     with tempfile.TemporaryDirectory() as td:
