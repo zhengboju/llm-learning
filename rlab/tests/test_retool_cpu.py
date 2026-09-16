@@ -709,6 +709,60 @@ def test_retool_math_fixes():
     check("prepare 脚本三步齐备：去重 → 按题面切 → 落盘复读断言（缺一即回到事故）",
           "dedup_questions(records)" in psrc and "split_train_dev(records" in psrc
           and "_read_qa_jsonl(args.output_dir" in psrc)
+
+    # 【2026-09-16 事故·跨模块缝隙·绿字下的全错】normalize_row 曾返回
+    # {"question","answer"}，而 dedup/split 读 "Q"/"A" → 两边都 .get() 到 None →
+    # **1,791,700 行塌成 1 条**，报告却写"重复 1791700 份/题（均匀且无多解：可比）"。
+    # 两个模块各自的测试都是绿的，缝隙没人测。这条端到端断言就是那条缝隙。
+    from rlab.data import require_qa_rows
+    from rlab.prepare_dapo_math import normalize_row
+
+    raw = [{"prompt": [{"content": "Q1"}], "reward_model": {"ground_truth": "1"}},
+           {"prompt": [{"content": "Q2"}], "reward_model": {"ground_truth": "2"}}] * 3
+    norm = [r for r in (normalize_row(i, x) for i, x in enumerate(raw)) if r]
+    check("缝隙：normalize_row 产出规范键名 Q/A（不是 question/answer）",
+          len(norm) == 6 and all("Q" in r and "A" in r and "question" not in r for r in norm))
+    _n_dd, _n_st = dedup_questions(norm)
+    check("缝隙：normalize_row 的输出能被去重正确消费（修复前整池塌成 1 条）",
+          _n_st["n_in"] == 6 and _n_st["n_out"] == 2 and _n_st["n_unique_q"] == 2)
+    _n_tr, _n_dv = split_train_dev(_n_dd, 1, 42)
+    check("缝隙：去重输出能被切分正确消费（修复前 KeyError）",
+          len(_n_tr) == 1 and len(_n_dv) == 1)
+    try:
+        require_qa_rows([{"question": "q", "answer": "a"}], "测试")
+        check("护栏：别名键名必须 fail-fast（不许塌成 1 条还报「可比」）", False)
+    except RuntimeError as e:
+        check("护栏：别名键名必须 fail-fast（不许塌成 1 条还报「可比」）",
+              "Q/A" in str(e) and "question" in str(e))
+    try:
+        dedup_questions([{"Q": "", "A": "a"}])
+        check("护栏：空题面也必须拦（空串会被当成同一个键合并）", False)
+    except RuntimeError as e:
+        check("护栏：空题面也必须拦（空串会被当成同一个键合并）", "Q/A" in str(e))
+
+    # prepare **端到端**（打桩数据源，不触网）：main() 的「去重 → 切分 → 落盘 → 复读」
+    # 全链。此前 main() 无任何测试——事故就发生在 main 拼装这三步的地方。
+    import sys as _sys
+    import tempfile as _tf
+    from pathlib import Path as _P
+
+    import rlab.prepare_dapo_math as _ppm
+    from rlab.data import _read_qa_jsonl as _rq
+
+    _saved_loader, _saved_argv = _ppm._load_records, _sys.argv
+    _ppm._load_records = lambda: [{"Q": f"q{i}", "A": "1"} for i in range(5) for _ in range(4)]
+    try:
+        with _tf.TemporaryDirectory() as _td:
+            _sys.argv = ["prepare_dapo_math", "--output-dir", _td, "--dev-size", "2"]
+            with _rso(_io.StringIO()):
+                _ppm.main()
+            _tr = _rq(str(_P(_td) / "train.jsonl"))
+            _dv = _rq(str(_P(_td) / "dev.jsonl"))
+        check("prepare 端到端（打桩源）：去重生效 + 落盘 train/dev 题面不相交",
+              len(_tr) == 3 and len(_dv) == 2
+              and not ({r["Q"] for r in _tr} & {r["Q"] for r in _dv}))
+    finally:
+        _ppm._load_records, _sys.argv = _saved_loader, _saved_argv
     dsrc2 = open("rlab/data.py", encoding="utf-8").read()
     check("load_dapo_math_train 两条加载路都接上去重（不是只定义了纯函数）",
           dsrc2.count("return _finalize_train_pool(rows") == 3

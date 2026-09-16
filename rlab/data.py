@@ -205,6 +205,30 @@ def verify_train_pool_clean(rows: list, dev_rows: list) -> list:
     return kept
 
 
+def require_qa_rows(rows: list, where: str = "") -> None:
+    """fail-fast：行必须是**规范键名** `{"Q","A"}` 且都非空。
+
+    【2026-09-16 事故·绿字下的全错】prepare_dapo_math 的 normalize_row 曾产出
+    `{"question","answer"}`，而去重/切分读的是 `"Q"/"A"` → 两边都用 `.get()` 拿
+    到 `None`，于是 **1,791,700 行被"去重"成 1 条**，报告还写着"重复 1791700 份/题
+    （均匀且无多解：与去重前可比）"——一个看起来完全健康的输出，建立在全错的输入上。
+
+    教训与项目里"恒定常数=系统性 bug 签名"同源：**键名不匹配必须在入口拦**，
+    不能让下游用 `.get()` 的 None 兜底（那会把"缺少数据"变成"数据都一样"）。
+    故意用 `[]` 而非 `.get()` 的语义在这里：缺键是错误，不是空值。
+    """
+    for i, r in enumerate(rows):
+        q, a = r.get("Q"), r.get("A")
+        if not (isinstance(q, str) and q.strip()) or not (isinstance(a, str) and a.strip()):
+            tag = f"{where}：" if where else ""
+            raise RuntimeError(
+                f"[data] {tag}第 {i} 行的 Q/A 缺失或非字符串"
+                f"（本行键={sorted(r)[:6]}，Q={q!r}，A={a!r}）\n"
+                f"  规范键名是 Q/A；写成了 question/answer 之类的别名会让整池"
+                f"塌成 1 条而报告依旧'均匀可比'（2026-09-16 prepare 事故）。\n"
+                f"  翻译层应放在读入处（如 data._read_qa_jsonl），不要散在下游。")
+
+
 def dedup_questions(rows: list) -> tuple:
     """纯函数：按 **(Q, A) 对**精确去重，返回 `(新池, 统计)`。
 
@@ -223,6 +247,7 @@ def dedup_questions(rows: list) -> tuple:
     ——**不均匀重复下的去重会改变题目分布**，那种情况与去重前的 run 不可比。
     """
     q_count, q_ans, seen, out = {}, {}, set(), []
+    require_qa_rows(rows, "去重输入")     # 键名不匹配 → 当场炸，不许塌成 1 条
     for r in rows:
         q, a = r.get("Q"), r.get("A")
         q_count[q] = q_count.get(q, 0) + 1

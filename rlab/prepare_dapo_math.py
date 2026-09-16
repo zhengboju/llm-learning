@@ -46,8 +46,10 @@ def normalize_row(idx, row):
     a = str(gt or "").strip()
     if not q or not a:
         return None
-    return {"id": str(row.get("extra_info", {}).get("index") or idx), "question": q,
-            "answer": a, "data_source": str(row.get("data_source") or "dapo_math")}
+    # 【规范键名铁律】必须返回 Q/A（不是 question/answer）：去重/切分/剔除 dev 全链
+    # 都按 Q/A 取键，别名会让整池塌成 1 条（2026-09-16 事故，见 data.require_qa_rows）。
+    return {"Q": q, "A": a, "id": str(row.get("extra_info", {}).get("index") or idx),
+            "data_source": str(row.get("data_source") or "dapo_math")}
 
 
 def split_train_dev(records: list, dev_size: int, seed: int) -> tuple:
@@ -62,6 +64,8 @@ def split_train_dev(records: list, dev_size: int, seed: int) -> tuple:
     真实行数由调用方打印）。
     """
     groups = {}
+    from rlab.data import require_qa_rows          # 懒导入：本脚本要能独立运行
+    require_qa_rows(records, "prepare 切分输入")
     for r in records:
         groups.setdefault(r["Q"], []).append(r)
     qs = list(groups)
