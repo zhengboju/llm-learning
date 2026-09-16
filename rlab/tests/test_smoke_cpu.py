@@ -370,6 +370,37 @@ def test_eval_stats_and_signature():
           and info["max_rounds"] == 2 and info["save_steps"] == 50)
     check("run_info 仍保留完整 cfg（2026-09-11 provenance 契约不破）", len(info["config"]) > 50)
 
+    # 【2026-09-17】系统提示偏离进签名：提示是协议的一半（难度表 = 模型×提示×预算），
+    # 不进签名就会把"新提示下探的表"配"旧提示的 run"当同一配方对照。
+    print("[G] 系统提示偏离进签名（-sp<hash6>）")
+    from rlab.config import default_system_prompt
+    check("default_system_prompt: retool_math/retool 各有 preset，其余取 BASE",
+          "code_interpreter" in default_system_prompt("retool_math")
+          and "[TOOL RESULT]" in default_system_prompt("retool")
+          and default_system_prompt("grpo") == get_config("grpo", use_wandb=False)["system_prompt"])
+    _sp_default = get_config("retool_math", use_wandb=False)
+    check("默认提示的签名不含 -sp（历史签名串逐字不变 → P1b 对照口径与 ckpt 护栏不破）",
+          "-sp" not in run_signature(_sp_default))
+    _sp_new = default_system_prompt("retool_math") + "\nBe concise."
+    _sig_sp = run_signature({**_sp_default, "system_prompt": _sp_new})
+    check("提示偏离 → 追加 -sp<hash6>", "-sp" in _sig_sp and len(_sig_sp.split("-sp")[1]) == 6)
+    check("提示指纹对内容敏感（差一个字符即变）",
+          run_signature({**_sp_default, "system_prompt": _sp_new + " "}) != _sig_sp)
+    check("两个 -sp 标签不影响其它字段（前缀仍逐字一致）",
+          _sig_sp.startswith(run_signature(_sp_default)))
+    # 候选提示文件：只在显式 --system_prompt_file 时生效，默认档零影响
+    _spf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "prompts", "retool_math_concise.txt")
+    check("候选提示文件存在且保留协议要件（围栏范例/工具标记/boxed 收尾）",
+          os.path.exists(_spf) and all(
+              s in open(_spf, encoding="utf-8").read()
+              for s in ("```python", "[TOOL RESULT]", "\\boxed{<your final answer>}")))
+    check("候选提示只增不删（行数变多且三处新增语句都在）",
+          len(open(_spf, encoding="utf-8").read().strip().splitlines()) >
+          len(default_system_prompt("retool_math").splitlines())
+          and all(s in open(_spf, encoding="utf-8").read() for s in
+                  ("Be concise", "no comments", "As soon as you have the answer")))
+
     print("[G] summarize_eval 表格口径")
     _j = os.path.join(_dir, "eval.json")
     _json.dump({"BASE": {"acc": 0.466, "fmt": 0.53, "both": 0.466, "n": 500},

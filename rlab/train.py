@@ -14,6 +14,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -35,7 +36,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from rlab.config import ds_config, get_config
+from rlab.config import default_system_prompt, ds_config, get_config
 from rlab.losses import ALGOS, compute_loss, forward_per_token_logps
 from rlab.model_loading import load_causal_lm
 from rlab.protocol import decode_batch
@@ -87,10 +88,18 @@ def run_signature(cfg: dict) -> str:
     # 同签名重跑会被 guard_ckpt_collision 误拦。语义上也自洽：没设该键 = 同一配方。
     vk = cfg.get("vllm_gen_kwargs") or {}
     vk_tag = "" if not vk else "-vk" + ",".join(f"{k}={vk[k]}" for k in sorted(vk))
+    # 【2026-09-17】系统提示偏离也进签名（提示是协议的一半：难度表是"模型×提示×
+    # 预算"的联合产物）。与 vk_tag 同一约定——**只在确实偏离 preset 时追加**，
+    # 默认档的签名串逐字不变（保 P1b 等历史 run 的对照口径与 ckpt 护栏）。
+    _sp = cfg.get("system_prompt")
+    if _sp != default_system_prompt(cfg.get("algo")):
+        sp_tag = "-sp" + hashlib.sha1(str(_sp).encode("utf-8")).hexdigest()[:6]
+    else:
+        sp_tag = ""
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -540,6 +549,10 @@ def main():
                     help="末段被轮长上限切断（trunc_final=1）的额外扣分权重（默认取 preset；"
                          "retool_math=0.5，其余算法=0）。这是 prose 轨迹唯一够得到的"
                          "长度反向信号——总长惩罚够不到 clen ≤ round_gen_tokens 的单轮轨迹")
+    ap.add_argument("--system_prompt_file", default=None,
+                    help="用文件内容整体替换系统提示（默认=preset 提示）。用途：提示层"
+                         "单变量 A/B 与 P1b 的原配方重现并行——file 只作用于本次 run，"
+                         "且提示指纹会进签名（-sp<hash6>），不会静默混进历史配方对照")
     ap.add_argument("--discard_abort", type=float, default=None,
                     help="窗口丢弃率熔断线（默认 0.90，0=关闭）：超过即 fail-fast，"
                          "防丢弃率爬升到采样空转、训练端无限 waiting for batch 的事故")
@@ -613,6 +626,9 @@ def main():
     if args.beta is not None: overrides["beta"] = args.beta
     if args.overlong_shaping: overrides["overlong_shaping"] = True
     if args.trunc_shaping is not None: overrides["trunc_shaping"] = args.trunc_shaping
+    if args.system_prompt_file:
+        with open(args.system_prompt_file, encoding="utf-8") as f:
+            overrides["system_prompt"] = f.read().strip()
     if args.discard_abort is not None: overrides["discard_abort"] = args.discard_abort
     if args.grad_clip is not None: overrides["gradient_clipping"] = args.grad_clip
     if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk

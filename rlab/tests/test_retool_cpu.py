@@ -1708,6 +1708,19 @@ def test_eval_thinking_switch():
     check("eval_vllm_one.py 有 enable_thinking 未生效的 fail-fast 告警",
           "模板未响应 enable_thinking=False" in src)
 
+    # 【2026-09-17】--system_prompt_file：让"提示层单变量 A/B"与"P1b 原配方重现"
+    # 能并行（file 只作用于本次 run，且提示指纹进签名 -sp<hash6>）。这几行在真机才会
+    # 执行，CPU 测不到 → 按项目既有做法查接线（pyflakes 只抓未定义名，抓不到漏接线）。
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _tr_src = open(os.path.join(_root, "rlab", "train.py"), encoding="utf-8").read()
+    _pb_src = open(os.path.join(_root, "rlab", "probe_difficulty.py"), encoding="utf-8").read()
+    check("train.py: --system_prompt_file 读文件后覆盖 system_prompt",
+          '"--system_prompt_file"' in _tr_src
+          and 'overrides["system_prompt"] = f.read().strip()' in _tr_src)
+    check("probe_difficulty.py: 同样支持（表是『模型×提示×预算』的联合产物，缺口径即另一张表）",
+          '"--system_prompt_file"' in _pb_src
+          and 'cfg["system_prompt"] = f.read().strip()' in _pb_src)
+
 
 def test_overlong_ref_and_opt_cli():
     print("[X] overlong 参考系修复 + 优化超参 CLI：retool 多轮总预算 ≠ 单轮 max_gen_tokens")

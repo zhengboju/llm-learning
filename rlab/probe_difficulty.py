@@ -134,6 +134,9 @@ def main():
                     help="覆盖采样温度（默认与训练一致 = retool_math 1.0）")
     ap.add_argument("--gpu_mem", type=float, default=0.85, help="vLLM 显存占比")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--system_prompt_file", default=None,
+                    help="用文件内容整体替换系统提示（**必须与训练同源**：难度表是"
+                         "『模型×提示×预算』三者的联合产物，提示不同就是另一张表）")
     ap.add_argument("--chat_template_kwargs", default=None,
                     help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
                          '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
@@ -180,6 +183,16 @@ def main():
         cfg["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None:
         cfg["max_context_tokens"] = args.max_context_tokens
+    if args.system_prompt_file:
+        # 提示是协议的一半：本探针出的表只对"同提示 + 同预算 + 同模型"的训练有效。
+        # 打印指纹，便于与训练启动行的 `signature=...-sp<hash6>` 逐字对上。
+        import hashlib
+        with open(args.system_prompt_file, encoding="utf-8") as f:
+            cfg["system_prompt"] = f.read().strip()
+        _sp_sha = hashlib.sha1(cfg["system_prompt"].encode("utf-8")).hexdigest()[:6]
+        print(f"[probe] 系统提示替换为 {args.system_prompt_file}"
+              f"（{len(cfg['system_prompt'])} 字符，sp{_sp_sha}）"
+              f"—— 训练必须传同一个 --system_prompt_file，签名里应出现 -sp{_sp_sha}")
     # 【2026-09-12】CLI 覆盖后必须重跑预算校验：探针的价值就在于"描述训练时的
     # 采样分布"，若探针预算几何与训练不一致（或不自洽），整张难度表都是另一个
     # 分布下的产物。get_config 里的校验发生在 override 之前，拦不住这里。

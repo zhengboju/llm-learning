@@ -393,6 +393,20 @@ _RETOOL_MATH_SYSTEM = (
 system_prompt_retool_math = _RETOOL_MATH_SYSTEM
 
 
+def default_system_prompt(algo: str) -> str:
+    """该算法 preset 的**默认**系统提示（供 run_signature 判定"提示被改过"）。
+
+    【2026-09-17 为什么需要它】提示是探针/训练/评测的单一来源，也是难度表的
+    协议的一半——表是"模型×提示×预算"三者的联合产物。改了提示却不进签名，
+    就会把"新提示下探的表"和"旧提示下的 run"当成同一配方对照（与
+    `vllm_gen_kwargs` 不进签名同属一类静默偏离）。"""
+    if algo == "retool_math":
+        return system_prompt_retool_math
+    if algo == "retool":
+        return system_prompt_retool
+    return BASE["system_prompt"]
+
+
 def validate_retool_budget(cfg: dict) -> int:
     """多轮预算自洽校验（纯函数，CPU 可测）。返回工具段预留 token 数。
 
