@@ -25,6 +25,18 @@ avg_clen, avg_code_ok}。训练时 `--difficulty_path <该文件>` 即启用过�
 
     bash rlab/run_gsm8k.sh retool_math /root/Qwen2.5-3B \
         --difficulty_path rlab_out/difficulty_probe.jsonl
+
+【2026-09-17 档位铁律】探针必须与训练的**采样档**一致，否则表描述的是另一个分布：
+  · 预算/提示/温度：默认自动取 retool_math preset；**训练时用 CLI 覆盖过
+    --round_gen_tokens/--max_rounds/--max_context_tokens，探针必须传同一组值**
+    （CLI 覆盖后 validate_retool_budget 会重跑校验，不自洽直接 raise）。
+  · thinking 开关：preset 已内置 enable_thinking=False，探针自动继承。
+  · 引擎档：默认取 preset 的 {"gdn_prefill_backend":"triton"}（不传 = 掉回 FlashInfer
+    GDN JIT，本 pod 会无 traceback 被 SIGKILL）。训练若开了确定性档，探针要同开：
+        --vllm_batch_invariant --vllm_attention_backend FLASH_ATTN
+    环境里若**遗留**了 VLLM_BATCH_INVARIANT=1（训练 run 的 export），探针会自动按
+    确定性档对齐并在缺 backend 时于引擎构造前 fail-fast；不想开就 `unset` 它。
+  · 模型：必须与训练起点同权重（换基座/换 ckpt 要重探；旧表不自动失效）。
 """
 import argparse
 import json
@@ -136,6 +148,21 @@ def main():
     ap.add_argument("--dump_samples", type=int, default=0,
                     help="额外把前 N 条截断轨迹 + 前 3 条正常轨迹的原文落盘到 "
                          "<out>.samples.jsonl（截断率高时定位 token 去向用）")
+    # 【2026-09-17 真机】档位三件套必须与训练一致（"探针与训练同口径"铁律）：
+    # 旧版探针既不传 cfg 的 vllm_gen_kwargs（连 preset 的 gdn_prefill_backend=triton
+    # 都没生效 → 会落回 FlashInfer GDN JIT → 本 pod 两次实锤的无 traceback SIGKILL），
+    # 也没有 attention backend 入口 —— 环境里遗留的 VLLM_BATCH_INVARIANT=1 会让引擎
+    # 启动即 RuntimeError（真机实锤）。
+    ap.add_argument("--vllm_gen_kwargs", default=None,
+                    help='JSON dict **整体替换** 引擎参数（与 train.py 同语义；默认取 '
+                         'preset 的 {"gdn_prefill_backend": "triton"}）。注意整体替换：'
+                         "只想加键时要把 triton 一并写回")
+    ap.add_argument("--vllm_batch_invariant", action="store_true",
+                    help="与训练同档：开 VLLM_BATCH_INVARIANT=1（**必须同时给 "
+                         "--vllm_attention_backend**，否则引擎启动即失败）。"
+                         "环境里若已继承该变量，探针会自动按确定性档对齐")
+    ap.add_argument("--vllm_attention_backend", default=None,
+                    help="显式 attention backend（如 FLASH_ATTN）；确定性档必需")
     args = ap.parse_args()
 
     from rlab.config import get_config, validate_retool_budget
@@ -183,8 +210,38 @@ def main():
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
+    from rlab.rollout import (attention_backend_kwargs, batch_invariant_guard,
+                              gdn_backend_missing)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
-    vllm_gen = LLM(model=cfg["model_path"], gpu_memory_utilization=args.gpu_mem)
+    # ---- 档位对齐（与 train/rollout 同一套 helper，不另写一份判定）----
+    _gk = dict(cfg.get("vllm_gen_kwargs") or {})
+    if args.vllm_gen_kwargs:
+        _gk = json.loads(args.vllm_gen_kwargs)
+        if not isinstance(_gk, dict):
+            raise SystemExit("[probe] --vllm_gen_kwargs 必须是 JSON dict（整体替换语义）")
+    _env_bi = str(os.environ.get("VLLM_BATCH_INVARIANT", "")).strip().lower() not in (
+        "", "0", "false")
+    _bi = bool(args.vllm_batch_invariant) or _env_bi
+    if _env_bi and not args.vllm_batch_invariant:
+        print(f"[probe] 检测到环境里继承的 VLLM_BATCH_INVARIANT="
+              f"{os.environ.get('VLLM_BATCH_INVARIANT')!r}（多半是训练 run 留下的 export）"
+              f"——探针按**确定性档**对齐（与训练同档是铁律）。不想开就先 "
+              f"`unset VLLM_BATCH_INVARIANT` 再跑。", flush=True)
+    batch_invariant_guard(_bi, args.vllm_attention_backend)   # 缺 backend 在引擎构造前拦下
+    if _bi:
+        os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    if args.vllm_attention_backend:
+        _gk.update(attention_backend_kwargs(args.vllm_attention_backend))
+    _vllm_path = cfg.get("vllm_model_path") or cfg["model_path"]
+    if gdn_backend_missing(_vllm_path, _gk):
+        print("[probe][警告] 引擎参数里没有 gdn_prefill_backend → Qwen3.5 的 GDN prefill "
+              "会落到 FlashInfer JIT 现场编译（本 pod 两次实锤：ninja 打爆宿主 RAM → "
+              "进程被 SIGKILL、**无 traceback**）。preset 默认已含 triton；"
+              "`--vllm_gen_kwargs` 是整体替换，别把 triton 写丢。", flush=True)
+    print(f"[probe] vLLM 引擎参数: {_gk}"
+          f"{'｜确定性档 VLLM_BATCH_INVARIANT=1' if _bi else ''}"
+          f"｜model={_vllm_path}", flush=True)
+    vllm_gen = LLM(model=_vllm_path, gpu_memory_utilization=args.gpu_mem, **_gk)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fout = open(args.out, "a", encoding="utf-8")

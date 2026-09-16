@@ -948,6 +948,23 @@ def test_difficulty_filter():
     check("train.py 暴露 --difficulty_band 并接线（含 0<=lo<hi<=1 校验）",
           '"--difficulty_band"' in _tsrcb
           and 'overrides["difficulty_band"] = (_lo, _hi)' in _tsrcb)
+    # 【2026-09-17 真机】探针此前不带引擎档：连 preset 的 gdn_prefill_backend=triton
+    # 都没传（会落回 FlashInfer GDN JIT → 无 traceback 的 SIGKILL），环境里遗留的
+    # VLLM_BATCH_INVARIANT=1 又让引擎启动即 RuntimeError。探针与训练同档是铁律。
+    import rlab.probe_difficulty as _PD
+    _psrc = _insb.getsource(_PD.main)
+    check("probe 把 preset 的 vllm_gen_kwargs 传进 LLM（否则掉回 FlashInfer JIT 档）",
+          'dict(cfg.get("vllm_gen_kwargs") or {})' in _psrc
+          and "LLM(model=_vllm_path, gpu_memory_utilization=args.gpu_mem, **_gk)" in _psrc)
+    check("probe 有一致性档入口 + 缺 backend 时引擎构造前 fail-fast",
+          '"--vllm_batch_invariant"' in _psrc
+          and "batch_invariant_guard(_bi, args.vllm_attention_backend)" in _psrc
+          and "attention_backend_kwargs(args.vllm_attention_backend)" in _psrc)
+    check("probe 识别继承的 VLLM_BATCH_INVARIANT（真机就是被它撞死的）",
+          'os.environ.get("VLLM_BATCH_INVARIANT"' in _psrc
+          and 'os.environ["VLLM_BATCH_INVARIANT"] = "1"' in _psrc)
+    check("probe 用 vllm_model_path（分裂加载）而非硬编码 model_path 起引擎",
+          '_vllm_path = cfg.get("vllm_model_path") or cfg["model_path"]' in _psrc)
 
     # 表加载：坏行/非法行静默跳过（探针逐题追加写，崩溃可能留截断行）
     with tempfile.TemporaryDirectory() as td:
