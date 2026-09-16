@@ -423,6 +423,23 @@ def test_eval_stats_and_signature():
           "共 12 个会话" in _rtbl and "会话A(#0)" in _rtbl and "会话L(#11)" in _rtbl)
     check("多会话提示把『同签名重跑会覆盖 step_N』写进表头（防评到上一轮的 ckpt）",
           "run_info.json" in _rtbl)
+    # 【2026-09-17 真机】纯时间判据把 bg1 的**一次** run（每 4 步一次 optimizer step
+    # 造成 >120s 空档）切成 31 个"会话"，逐会话表因此失去意义。硬判据 =
+    # gen_version 回退（新 run 从 0 重新计数）。
+    check("曲线新增 trunc率/code_ok率 两列（崩坏形态：格式在、正确性死、长度掉）",
+          "trunc率" in _rtbl and "code_ok率" in _rtbl)
+    _rec2 = os.path.join(_dir, "record_gv.jsonl")
+    with open(_rec2, "w", encoding="utf-8") as f:
+        for i, gv in enumerate([0, 16, 32, 0, 16, 32]):        # 中间一次回退 = 换 run
+            f.write(_json.dumps({
+                "t": 5000.0 + i * 5.0,                     # 间隔 5s：时间判据不切
+                "acc": [1.0] * 8, "fmt": [1.0] * 8, "clen": [1000] * 8,
+                "code_used": [1] * 8, "code_ok": [1] * 8, "trunc_final": [0] * 8,
+                "gen_version": gv, "phase": "cold",
+            }, ensure_ascii=False) + "\n")
+    _rtbl2 = summarize_record(_rec2)
+    check("gen_version 回退切出新会话（时间间隔不切时也能分开两次 run）",
+          "共 2 个会话" in _rtbl2 and "gen_ver=0..32" in _rtbl2)
 
 
 if __name__ == "__main__":

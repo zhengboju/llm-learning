@@ -538,6 +538,16 @@ def main():
                     help="gen_logps 改用逐轮 vLLM 采样 logprobs（省 GPU0 ~8G 的 torch "
                          "副本与每步一次全序列前向；数学同义但 kernel 口径变化，"
                          "首次启用请配 --verify_gen_logps 对拍）")
+    # 【2026-09-17 补 CLI 缺口】docs/07 §2/§3 实锤 "logprobs=0（只报被采样 token）"
+    # 这条形态在本环境**报的数与分布不符**（同一位置同一 token：N=0 报 -0.602，
+    # N=20(raw)/torch 都报 -7.40），并明确建议 vllm_gen_logps 档用 N≥1——但本文件
+    # 一直没暴露该开关，于是每个 --vllm_gen_logps 的 run 都被钉死在默认 N=0 上
+    # （bg1 真机 run 就是 N=0：cfg 里 vllm_logprobs_n=0 且无从覆盖）。
+    # 默认值仍取 config（0）以保 A/B 与旧 run 可复现；要跑修复档显式传 1。
+    ap.add_argument("--vllm_logprobs_n", type=int, default=None,
+                    help="vllm_gen_logps 档的 logprobs=N（默认取 config=0=旧行为；"
+                         "**修复档建议 1**：N≥1 时 vLLM 从 top-K 里挑被采样 token，"
+                         "与 torch 的差回落到 mean 0.02/max 0.23，见 docs/07 §2）")
     ap.add_argument("--verify_gen_logps", type=int, default=None,
                     help="前 N 组同时算两路 gen_logps 并打印最大差，验完释放 torch 副本")
     ap.add_argument("--vllm_batch_invariant", action="store_true",
@@ -591,6 +601,8 @@ def main():
     if args.grad_clip is not None: overrides["gradient_clipping"] = args.grad_clip
     if args.fwd_batch_chunk is not None: overrides["fwd_batch_chunk"] = args.fwd_batch_chunk
     if args.vllm_gen_logps: overrides["vllm_gen_logps"] = True
+    if args.vllm_logprobs_n is not None:
+        overrides["vllm_logprobs_n"] = int(args.vllm_logprobs_n)
     if args.verify_gen_logps is not None: overrides["verify_gen_logps"] = args.verify_gen_logps
     if args.vllm_batch_invariant: overrides["vllm_batch_invariant"] = True
     if args.vllm_attention_backend: overrides["vllm_attention_backend"] = args.vllm_attention_backend

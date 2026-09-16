@@ -198,22 +198,30 @@ def _sess_label(sess: int) -> str:
     return f"S{sess}"
 
 
-def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
-    """按 upload 批次滑动平均 acc/fmt/code 率与完成长度（retool 诊断用）。
+def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
+    """按 upload 批次滑动平均 acc/fmt(code/code_ok/trunc) 率与完成长度（retool 诊断用）。
 
     clen_cap ≈ max_context_tokens(2200) - 典型 prompt(~400) = 1800：接近上限
     说明轨迹在撞上下文预算（会被整组丢弃或标签被截断）——2026-09-08 第四轮
     "格式学到 75-95% 后崩回 0"的嫌疑机制，需 clen/code 趋势佐证。
 
-    【会话拆分 2026-09-08】record.jsonl 以追加模式写入，多次训练（重启/新 run）
-    会写进同一文件，且每次会话 pushes 计数归零 → 阶段(phase)列会来回振荡
-    （pushes 单调递增，单会话内 phase 只能冷→热切一次）。因此用时间戳间隔
-    >120s 切会话，逐会话聚合 stats——"崩盘点在哪个会话、各会话的冷热阶段"
-    一眼可辨，避免把跨会话曲线误读成单次训练的动力学。"""
-    accs, fmts, codes, clens, phases, sess_ids = [], [], [], [], [], []
+    window 以**样本**计（1 条 record = num_pre_Q=8 样本 = 1 组 = 1 micro-step）。
+    【2026-09-17 改默认 20→160】旧默认 20 样本 = 2.5 组，20 样本的二项噪声就有
+    ±11pp：真机 bg1 的相邻窗口在 10% 与 70% 之间跳，趋势被噪声完全淹没（且极易
+    被读成"崩了又好了"）。160 样本 = 20 组，与 docs/05 的"200 组窗口"同一量级。
+
+    【会话拆分 2026-09-08 / 2026-09-17 加固】record.jsonl 以追加模式写入，多次
+    训练（重启/新 run）会写进同一文件，且每次会话 pushes 计数归零。切会话判据：
+      ① 时间戳间隔 > SESS_GAP_S；
+      ② **gen_version 回退**（新 run 从 0 重新计数）——这一条才是硬判据：真机
+         bg1 每 ~4 步一次 optimizer step 会让同一 run 内出现 >120s 的空档，
+         纯时间判据把 106 组的一次 run 切成 31 个"会话"（每 1-4 组一个），
+         逐会话表因此失去意义。gen_version 回退只会在真正换 run 时发生。"""
+    accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
     sess_span = {}   # sess -> [first_t, last_t]（墙钟，便于对 Shell 历史核对是哪次 run）
+    sess_gv = {}     # sess -> [first_genver, last_genver]
     with open(path, encoding="utf-8") as f:
-        prev_t, sess = None, 0
+        prev_t, prev_gv, sess = None, None, 0
         for line in f:
             try:
                 rec = json.loads(line)
@@ -223,14 +231,23 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
             if n == 0:
                 continue
             t = rec.get("t")
-            if prev_t is not None and t is not None and t - prev_t > SESS_GAP_S:
+            gv = rec.get("gen_version")
+            _new = (prev_t is not None and t is not None and t - prev_t > SESS_GAP_S)
+            if not _new and isinstance(gv, int) and isinstance(prev_gv, int) and gv < prev_gv:
+                _new = True   # 权重推送计数回退 = 新 run（时间判据在这种 run 里会误切）
+            if _new:
                 sess += 1
             if t is not None:
                 prev_t = t
                 sess_span.setdefault(sess, [t, t])[1] = t
+            if isinstance(gv, int):
+                prev_gv = gv
+                sess_gv.setdefault(sess, [gv, gv])[1] = gv
             accs.extend(a > 0 for a in rec["acc"])
             fmts.extend(v > 0 for v in rec["fmt"])
             codes.extend(u > 0 for u in rec.get("code_used", []))
+            oks.extend(k > 0 for k in rec.get("code_ok", []))
+            trs.extend(int(x) for x in rec.get("trunc_final", []))
             clens.extend(rec.get("clen", []))
             ph = rec.get("phase")
             if ph:
@@ -242,45 +259,52 @@ def summarize_record(path: str, window: int = 20, clen_cap: int = 1800) -> str:
             idx = [i for i, v in enumerate(sess_ids) if v == s]
             a = sum(accs[i] for i in idx) / len(idx) * 100
             ff = sum(fmts[i] for i in idx) / len(idx) * 100
-            c = (sum(codes[i] for i in idx) / len(idx) * 100
-                 if codes else float("nan"))
+            k = (sum(oks[i] for i in idx) / len(idx) * 100 if oks else float("nan"))
+            tr = (sum(trs[i] for i in idx) / len(idx) * 100 if trs else float("nan"))
             lo, hi = idx[0], idx[-1] + 1
             span = sess_span.get(s)
             when = ""
             if span:
                 fmt_t = lambda x: time.strftime("%m-%d %H:%M:%S", time.localtime(x))
                 when = f" [{fmt_t(span[0])} ~ {fmt_t(span[1])}]"
+            gvr = sess_gv.get(s)
+            gv_col = f" gen_ver={gvr[0]}..{gvr[1]}" if gvr else ""
             sess_lines.append(
-                f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/16:.0f}步）"
-                f" acc={a:.1f}% fmt={ff:.1f}% code={c:.1f}%{when}")
-    out = [f"| 批次窗口 | acc率 | fmt率 | code率 | avg_clen | ≥90%cap | 阶段 | 会话 |",
-           "|---|---|---|---|---|---|---|---|"]
+                f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/8:.0f}组）"
+                f" acc={a:.1f}% fmt={ff:.1f}% code_ok={k:.1f}% trunc={tr:.1f}%"
+                f"{gv_col}{when}")
+    out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | code率 | code_ok率 | trunc率 | avg_clen | 阶段 | 会话 |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
-        out.insert(0, f"> record 共 {len(sess_span)} 个会话（间隔>{SESS_GAP_S:.0f}s 切分）"
-                      f"——追加写文件，多会话 = 同一 out_dir 被重启/多 run 混用；"
-                      f"末尾会话才是最近一次 run，且同签名重跑会覆盖 step_N，"
-                      f"评测前先核 `step_N/run_info.json` 的 started。")
+        out.insert(0, f"> record 共 {len(sess_span)} 个会话（间隔>{SESS_GAP_S:.0f}s 或 "
+                      f"gen_version 回退切分）——追加写文件，多会话 = 同一 out_dir 被"
+                      f"重启/多 run 混用；末尾会话才是最近一次 run，且同签名重跑会覆盖 "
+                      f"step_N，评测前先核 `step_N/run_info.json` 的 started。")
         out.insert(1, "")
     for i in range(0, len(accs), window):
-        chunk_a, chunk_f, chunk_c = accs[i:i + window], fmts[i:i + window], codes[i:i + window]
-        chunk_l = clens[i:i + window]
+        j = i + window
+        chunk_a, chunk_f, chunk_c = accs[i:j], fmts[i:j], codes[i:j]
+        chunk_k, chunk_t, chunk_l = oks[i:j], trs[i:j], clens[i:j]
         if not chunk_a:
             continue
         code_col = f"{sum(chunk_c) / len(chunk_c) * 100:.1f}%" if chunk_c else "—"
+        ok_col = f"{sum(chunk_k) / len(chunk_k) * 100:.1f}%" if chunk_k else "—"
+        tr_col = f"{sum(chunk_t) / len(chunk_t) * 100:.1f}%" if chunk_t else "—"
         if chunk_l:
             avg_l = sum(chunk_l) / len(chunk_l)
             near = sum(1 for l in chunk_l if l >= 0.9 * clen_cap) / len(chunk_l)
-            len_col = f"{avg_l:.0f} | {near * 100:.0f}%"
+            len_col = f"{avg_l:.0f}（{near * 100:.0f}%≥{int(0.9 * clen_cap)}）"
         else:
-            len_col = "— | —"
+            len_col = "—"
         ph_col = phases[i] if i < len(phases) else "—"
         sess_col = _sess_label(sess_ids[i]) if i < len(sess_ids) else "—"
-        out.append(f"| {i}~{i + len(chunk_a)} | {sum(chunk_a) / len(chunk_a) * 100:.1f}% "
+        out.append(f"| {i}~{j} | {i // 8}~{j // 8} "
+                   f"| {sum(chunk_a) / len(chunk_a) * 100:.1f}% "
                    f"| {sum(chunk_f) / len(chunk_f) * 100:.1f}% | {code_col} "
-                   f"| {len_col} | {ph_col} | {sess_col} |")
+                   f"| {ok_col} | {tr_col} | {len_col} | {ph_col} | {sess_col} |")
     if sess_lines:
         out.append("")
-        out.append(f"== 会话拆分（时间戳间隔>{SESS_GAP_S:.0f}s = 新会话）==")
+        out.append(f"== 会话拆分（间隔>{SESS_GAP_S:.0f}s 或 gen_version 回退 = 新会话）==")
         out.extend(sess_lines)
     return "\n".join(out)
 
@@ -289,6 +313,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval-json", default=None)
     ap.add_argument("--record", default=None)
+    ap.add_argument("--window", type=int, default=160,
+                    help="record 曲线的窗口（单位=样本；8 样本=1 组=1 micro-step。"
+                         "默认 160=20 组；调小看细节但噪声按 1/√n 放大）")
     ap.add_argument("--base", default="BASE")
     # 跨 json 两两配对（模型本体可以已灭失，只要有 per-item json）
     ap.add_argument("--pair-json", default=None,
@@ -307,7 +334,7 @@ if __name__ == "__main__":
     if args.eval_json:
         print(summarize_eval(args.eval_json, args.base))
     if args.record:
-        print(summarize_record(args.record))
+        print(summarize_record(args.record, window=args.window))
     if not args.eval_json and not args.record and not args.pair_json:
         cands = sorted(glob.glob("eval_vllm_all*.json"))
         if cands:

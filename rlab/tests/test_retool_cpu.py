@@ -2742,6 +2742,14 @@ def test_logprobs_n_fix_path():
     for algo in ("retool", "retool_math"):
         check(f"{algo} preset 未偷偷覆盖 N（档位由 CLI 决定）",
               "vllm_logprobs_n" not in ALGO_DEFAULTS.get(algo, {}))
+    # 【2026-09-17】修复档建议 N≥1，但 train.py 此前没有该 CLI —— 每个
+    # --vllm_gen_logps 的 run 都被钉死在 N=0（bg1 真机 run 即如此）。
+    import inspect as _ins
+    import rlab.train as _T
+    _tsrc = _ins.getsource(_T.main)
+    check("train.py 暴露 --vllm_logprobs_n 并接线到 overrides（否则 N=0 无法覆盖）",
+          '"--vllm_logprobs_n"' in _tsrc
+          and 'overrides["vllm_logprobs_n"] = int(args.vllm_logprobs_n)' in _tsrc)
 
     # N≥1 时 vLLM 必须仍把被采样 token 放进返回字典 —— 缺了就 fail-fast 且提示别退回 N=0
     class _LP(dict):
