@@ -269,6 +269,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
             ff = sum(fmts[i] for i in idx) / len(idx) * 100
             k = (sum(oks[i] for i in idx) / len(idx) * 100 if oks else float("nan"))
             tr = (sum(trs[i] for i in idx) / len(idx) * 100 if trs else float("nan"))
+            cond = f"{a / ff * 100:.1f}%" if ff > 0 else "—"
             lo, hi = idx[0], idx[-1] + 1
             span = sess_span.get(s)
             when = ""
@@ -279,10 +280,10 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
             gv_col = f" gen_ver={gvr[0]}..{gvr[1]}" if gvr else ""
             sess_lines.append(
                 f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/8:.0f}组）"
-                f" acc={a:.1f}% fmt={ff:.1f}% code_ok={k:.1f}% trunc={tr:.1f}%"
+                f" acc={a:.1f}% fmt={ff:.1f}% 条件精度={cond} code_ok={k:.1f}% trunc={tr:.1f}%"
                 f"{gv_col}{when}")
-    out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | code率 | code_ok率 | trunc率 | avg_clen | 阶段 | 会话 |",
-           "|---|---|---|---|---|---|---|---|---|---|"]
+    out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | avg_clen | 阶段 | 会话 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
         out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
                       f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
@@ -307,9 +308,16 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
             len_col = "—"
         ph_col = phases[i] if i < len(phases) else "—"
         sess_col = _sess_label(sess_ids[i]) if i < len(sess_ids) else "—"
+        # 【2026-09-17】条件精度 = acc率/fmt率 = "抽到 boxed 的轨迹里真做对的比例"。
+        # 这是区分"学到数学"与"学会收尾"的唯一干净指标（health 的 surface 签名同口径）：
+        # base 在预算充足时恒定 90%+，bg1 崩盘时掉到 25~38%——fmt 在涨而 acc 在掉。
+        # fmt 率为 0 时给 "—"（格式死亡事件里 fmt 恒 0，除法会崩）。
+        _a_rate = sum(chunk_a) / len(chunk_a)
+        _f_rate = sum(chunk_f) / len(chunk_f)
+        cond_col = f"{_a_rate / _f_rate * 100:.1f}%" if _f_rate > 0 else "—"
         out.append(f"| {i}~{j} | {i // 8}~{j // 8} "
-                   f"| {sum(chunk_a) / len(chunk_a) * 100:.1f}% "
-                   f"| {sum(chunk_f) / len(chunk_f) * 100:.1f}% | {code_col} "
+                   f"| {_a_rate * 100:.1f}% "
+                   f"| {_f_rate * 100:.1f}% | {cond_col} | {code_col} "
                    f"| {ok_col} | {tr_col} | {len_col} | {ph_col} | {sess_col} |")
     if sess_lines:
         out.append("")

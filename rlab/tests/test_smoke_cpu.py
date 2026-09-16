@@ -428,6 +428,20 @@ def test_eval_stats_and_signature():
     # 间隔 ~3min。新协议（有 gen_version）必须忽略这种 3 分钟级空档。
     check("曲线新增 trunc率/code_ok率 两列（崩坏形态：格式在、正确性死、长度掉）",
           "trunc率" in _rtbl and "code_ok率" in _rtbl)
+    # 【2026-09-17】条件精度列 = "抽到 boxed 的轨迹里真做对的比例"——区分"学到数学"与
+    # "学会收尾"的唯一干净指标（base 预算充足时 90%+，bg1 崩盘掉到 25~38%）。
+    check("曲线新增条件精度列（acc 50% / fmt 100% → 50.0%）",
+          "条件精度" in _rtbl and "| 50.0% | 100.0% | 50.0% |" in _rtbl)
+    _rec_nofmt = os.path.join(_dir, "record_nofmt.jsonl")
+    with open(_rec_nofmt, "w", encoding="utf-8") as f:
+        for _ in range(4):                       # 格式死亡事件：fmt 恒 0 → 除法必须不崩
+            f.write(_json.dumps({
+                "t": 900.0, "acc": [0.0] * 8, "fmt": [0.0] * 8, "clen": [900] * 8,
+                "code_used": [0] * 8, "code_ok": [0] * 8, "trunc_final": [0] * 8,
+            }, ensure_ascii=False) + "\n")
+    _rtbl_nf = summarize_record(_rec_nofmt)
+    check("fmt 率 0 时条件精度列给 —（不 ZeroDivisionError）",
+          "条件精度" in _rtbl_nf and "| 0.0% | 0.0% | — |" in _rtbl_nf)
     _rec_burst = os.path.join(_dir, "record_burst.jsonl")
     with open(_rec_burst, "w", encoding="utf-8") as f:
         for i in range(24):                      # 6 次 attempt × 4 条，间隔 180s>120s
