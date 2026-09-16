@@ -7,7 +7,9 @@ vLLM：v0.19.1 V1 引擎，`gdn_prefill_backend=triton`
 
 ## 一句话结论
 
-在这套环境上，**同一命令跑两次，vLLM 采样出来的 token 只有 2.91% 逐位置相同，对应 logp 最大差 14.5 nat**。因此 vLLM 报告的 `logprobs` 不能作为训练 gen_logps 的来源；`retool_math` 4B 训练必须回退到 torch 副本重算（`vllm_gen_logps=False`），接受约 8–9G 的额外显存开销。
+在这套环境上，**不开 batch-invariant 时**同一命令跑两次，vLLM 采样出来的 token 只有 2.91% 逐位置相同，对应 logp 最大差 14.5 nat。这一档下 vLLM 报告的 `logprobs` 不能作为训练 gen_logps 的来源，必须回退 torch 副本重算（`vllm_gen_logps=False`），接受约 8–9G 额外显存。
+
+**2026-09-16 更新（§9）：加 `VLLM_BATCH_INVARIANT=1` + 显式 attention backend 后两条都被修好** —— 跨进程 token 一致率 **100.00%**、`|Δlogp|` 全 0；且与 torch 副本的跨引擎残差降到 **max 0.123 nat**（>1 nat 占比 0%），比不开档时同引擎自身的噪声地板（max 0.54）还小。是否把训练档切到 vLLM logps，取决于**验收门**（step 1 `clip_frac`）与**吞吐代价**（§10）——**尚未切换，训练仍走 torch 副本**。
 
 ## 证据链
 
@@ -88,7 +90,7 @@ token 唯一数=1/3；top-K 字典唯一数=3/3；top-1 logp 极差=0.19
 
 机制推断：前向的**归约顺序**不固定（split-K / atomic 累加、按批量选择的 kernel），bf16 下表现为 ~0.2 nat 的 logit 抖动；头部抖 0.2 nat 已足以让近并列 token 互换 → 轨迹分叉（这是 2.91% 的来源）。tail token 因为 softmax 分母被 argmax 主导，抖动直接落在 logp 上（lpmode 实测交集 max|Δ| 5.98）。
 
-### 6. batch-invariant 这一步尚未完成
+### 6. batch-invariant：先启动失败，后完全修好
 
 `VLLM_BATCH_INVARIANT` 在 v0.19.1 里**确实存在**（`vllm/envs.py:78` 注册），但直接开会启动即失败：
 
@@ -97,18 +99,17 @@ RuntimeError: VLLM batch_invariant mode requires an attention backend in
 ['FLASH_ATTN', 'TRITON_ATTN', 'FLASH_ATTN_MLA', 'TRITON_MLA'], but got 'None'
 ```
 
-原因是 batch-invariant 的检查跑在 attention backend 解析**之前**，必须显式指定。工具已支持：
+原因是 batch-invariant 的检查跑在 attention backend 解析**之前**，必须显式指定。补上 `--attention_backend FLASH_ATTN` 后，`--measure det`（同一进程、背靠背、同参同 seed、重复 3 次）：
 
-```bash
-CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_BATCH_INVARIANT=1 PYTHONHASHSEED=0 \
-  python -m rlab.diag_logps --build_traj --model_path /root/Qwen3.5-4B --providers vllm \
-  --vllm_backend triton --attention_backend FLASH_ATTN --measure det --det_repeat 3 \
-  --out rlab_out/diag2/det_batchinv.jsonl
+```text
+token 唯一数=1/3；**top-K 字典唯一数=1/3**；top-1 logp=-0.0274 ×3；极差=0
 ```
 
-判据：若 `top-K 字典唯一数=1/3` 且 top-1 logp 极差≈0 → 可复现性被修好，那时才值得重新评估 vLLM logps 路线（但还需过 torch 对拍这一关）；若仍 3/3 → 此路不通，torch 副本是终局。
+对照第 5 节不开档的 `token 1/3 但字典 3/3、极差 0.19`：**字典也唯一了**。这反向坐实了机制——非确定性来自归约/批量相关的 kernel，与 RNG 无关。
 
-代价提示：batch-invariant 会关掉 custom all-reduce、改用确定性 kernel（失败运行的 config 里已可见 `disable_custom_all_reduce=True`），吞吐会掉。所以即使它能修好可复现性，也是一个 **VRAM（torch 副本 8–9G）vs 吞吐** 的取舍。
+（顺带确认本 pod 的 GDN 走 triton：引擎日志 `[gdn_linear_attn.py:147] Using Triton/FLA GDN prefill kernel`，FlashInfer JIT 全程未启用、无 SIGKILL。）
+
+代价提示：batch-invariant 会关掉 custom all-reduce、改用确定性 kernel（失败运行的 config 里已可见 `disable_custom_all_reduce=True`），吞吐会掉。所以即使可复现性修好，仍是一个 **VRAM（torch 副本 8–9G）vs 吞吐** 的取舍，见 §10。
 
 ### 7. 训练端 verify 复现同一结论（2026-09-15 19:xx，第 2 次真机）
 
@@ -144,23 +145,89 @@ CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_BATCH_INVARIANT=1 P
 - 看到 `[rollout][verify] vLLM vs torch` ⇒ **该 run 一定开着 `--vllm_gen_logps`**；
 - 换成 torch 副本档时，`--vllm_gen_logps` **和** `--verify_gen_logps` 都应去掉——只留 verify 会把副本白加载 ~8G 却没有任何对拍对象。
 
+### 9. batch-invariant 档过关：跨进程可复现 + 跨引擎残差压到口径地板（2026-09-16）
+
+命令（两次独立进程，除输出目录外完全相同；`--build_traj` 用的正是训练形态 `logprobs=0` + `max_tokens=3072`）：
+
+```bash
+export VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_BATCH_INVARIANT=1 PYTHONHASHSEED=0
+COMMON=(--build_traj --model_path /root/Qwen3.5-4B \
+  --chat_template_kwargs '{"enable_thinking": false}' \
+  --providers vllm --vllm_backend triton --attention_backend FLASH_ATTN)
+
+time CUDA_VISIBLE_DEVICES=0 python -m rlab.diag_logps "${COMMON[@]}" \
+  --traj_out rlab_out/bi1/traj.jsonl --out rlab_out/bi1/vllm.jsonl
+time CUDA_VISIBLE_DEVICES=0 python -m rlab.diag_logps "${COMMON[@]}" \
+  --traj_out rlab_out/bi2/traj.jsonl --out rlab_out/bi2/vllm.jsonl
+python -m rlab.diag_logps --diff_traj rlab_out/bi1/traj.jsonl rlab_out/bi2/traj.jsonl
+
+CUDA_VISIBLE_DEVICES=1 python -m rlab.diag_logps --traj_in rlab_out/bi1/traj.jsonl \
+  --model_path /root/Qwen3.5-4B --providers torch --torch_path fallback \
+  --out rlab_out/bi1/torch.jsonl
+python -m rlab.diag_logps --merge rlab_out/bi1/vllm.jsonl rlab_out/bi1/torch.jsonl
+```
+
+**A. 跨进程（两次独立进程）——通过**，与第 4 节的 2.91% 直接对照：
+
+| | 不开档（§4） | batch-invariant（本次） |
+|---|---|---|
+| token 逐位置一致率 | 2.91% | **100.00%**（n=19952） |
+| \|Δlogp\| mean / p50 / p99 / max | 0.675 / 0.136 / 5.79 / **14.5** | **0 / 0 / 0 / 0** |
+| >0.1 / >1nat | 53.35% / 21.29% | 0.00% / 0.00% |
+
+两次 `traj_id` 相同（`65681137d466`），逐点差值严格为 0 —— 不是"接近"，是逐位相同。
+
+**B. 跨引擎（vLLM:triton vs torch:torch_ref）——通过**，与第 2 节的训练形态 max 6.798 直接对照：
+
+| | 不开档训练形态（§2） | batch-invariant（本次，同形态） |
+|---|---|---|
+| target\|Δ\| mean | 0.055 | **0.0138** |
+| target\|Δ\| p99 / max | — / **6.798** | 0.123 / **0.123** |
+| >1.0 nat | 有 | **0.00%（0 点）** |
+| top-1 一致 / overlap@20 | 36/36 / 0.968 | **36/36 / 0.976** |
+| confident 分歧 | — | **0** |
+
+`max|Δ|_common=0.687`（top-K 交集上）是两套 bf16 实现的口径地板；**关键量是目标 token 自身的 |Δ| ≤ 0.123**，且它小于不开档时同引擎重采自身的噪声地板（lpmode B vs B2：mean 0.0735 / max 0.54）。即：跨引擎残差已经**小于**本环境原本的自噪声。
+
+最直观的一条：§1 那个 `vLLM=-0.946 / torch=-13.750` 的签名位置，本次同形态同量级位置 `q=6 L=0` 是 `vLLM=-0.942 / torch=-0.956（Δ=0.014）`。
+
+**C. 对验收门的定量预测**：`retool_math` 的 `clip_low/high=0.2/0.28` ⇒ 记为 clip 需要 `Δlogp > log1.28 = +0.247` 或 `Δlogp < log0.8 = -0.223`。本次观测的目标 |Δ| 最大值 **0.123**，**没有任何一点跨过阈值** ⇒ step 1 的 `clip_frac` 预期落在 0 ~ 1e-3（不开档 0.0087，torch 副本基线 0.0007）。这是待真机验收的可证伪预测。
+
+### 10. 代价与切换决定（未完成）
+
+- **吞吐未测**：本次两次 `--build_traj` 墙钟 7m43s / 7m38s（差 0.9%，跨进程一致性顺带得到稳定复现）。这个数**不能**当作 batch-invariant 的开销，因为它含 ~47s 引擎初始化 + 36 点前缀重算，且没有同命令的不开档对照。要测就测**同一命令去掉 `VLLM_BATCH_INVARIANT` 的墙钟**，或者更直接：验收门那一跑的 `per-step gen 墙钟` vs torch 副本档的同一数字。
+- **取舍的实质**：省下的是 GPU0 的 ~8–9G 显存 + 每步一次全序列前向；付出的是确定性 kernel 的生成开销。当前 GPU0 占用约 70G/96G，**显存并不紧张**，所以这笔账**只能靠吞吐来定**。
+- **顺带观察（待训练日志确认）**：本次引擎 config dump 里是 `enable_prefix_caching=False`。若训练端同样如此，则多轮 rollout 的"续写复用前轮 KV"这条设计假设不成立——每一轮都会从头 re-prefill（retool_math 每 attempt 4 题 × 8 条 × 3 轮，代价可观）。零成本核实：
+
+  ```bash
+  grep -o "enable_prefix_caching=[A-Za-z]*" train_log*.txt | sort | uniq -c
+  # 若确为 False，则 --vllm_gen_kwargs 整体替换（注意必须带上原有键）：
+  #   '{"gdn_prefill_backend": "triton", "enable_prefix_caching": true}'
+  ```
+
+- **纪律**：切换训练档之前，训练一律保持 `--vllm_gen_logps=False`（且不带 `--verify_gen_logps`）。batch-invariant 档会改变采样数值（token 序列本身与不开档不同），**跨档比较不是单变量**——任何前后对比都必须同一档内进行。
+
 ## 结论与处置
 
-1. **vLLM 的采样 logprobs 在本环境不可复现**——不是某个参数没调对，而是同一请求两次运行就会给出不同分布的 tail / 不同 token / 不同 logp。尾部（rank≥2）数值基本随机。
-2. **因此 `--vllm_gen_logps` 不能作为 retool_math 4B 的 gen_logps 来源**。用它训练会把一个随机量塞进 importance ratio，导致 clip_frac/approx_kl 被人为抬高，并偶尔爆出 10+ nat 的伪尖峰。
-3. **唯一同源且可复现的路是 torch 副本重算**（`vllm_gen_logps=False`）。它会：
+1. **不开 batch-invariant 时，vLLM 的采样 logprobs 在本环境不可复现**——不是某个参数没调对，而是同一请求两次运行就会给出不同分布的 tail / 不同 token / 不同 logp。尾部（rank≥2）数值基本随机。
+2. **该档下 `--vllm_gen_logps` 不能作为 retool_math 4B 的 gen_logps 来源**。用它训练会把一个随机量塞进 importance ratio，导致 clip_frac/approx_kl 被人为抬高，并偶尔爆出 10+ nat 的伪尖峰。
+3. **该档下唯一同源且可复现的路是 torch 副本重算**（`vllm_gen_logps=False`）。它会：
    - 在 GPU0 多占约 8–9G（与 ref 模型共享时总占用需按 docs/04 重排）；
    - 每步做一次全序列前向；
    - 保证 gen_logps 与训练前向使用**同一个 kernel、同一个 bf16 舍入、同一个确定性路径**。
-4. **训练命令应去掉 `--vllm_gen_logps`**，并恢复 `--verify_gen_logps N` 对拍。期望地板回到 doc 基线量级：clip_frac ~0.0007，approx_kl ~5e-4。
+4. **训练命令去掉 `--vllm_gen_logps`，且 `--verify_gen_logps` 也一并去掉**（§8：verify 的对拍对象是 vLLM logps，没有它只会白加载 ~8G 副本）。期望地板回到 doc 基线量级：clip_frac ~0.0007，approx_kl ~5e-4。
+5. **batch-invariant 档改写了这个结论的适用域**（§9）：可复现性与跨引擎口径都过关，代价只剩吞吐未测（§10）。切换与否等验收门 + 吞吐数据，**在此之前第 1–4 条就是当前纪律**。
 
 ## 仍开放的验证
 
+- **切换档的验收门 + 吞吐**（§9C/§10）：`--vllm_gen_logps --vllm_batch_invariant --vllm_attention_backend FLASH_ATTN --verify_gen_logps 5` 跑训练，看 step 1 的 `clip_frac` 是否落到 0~1e-3、per-step gen 墙钟相对 torch 副本档贵多少。
 - **FlashInfer 档**：由于该 pod 上 FlashInfer GDN prefill JIT 会 OOM-kill（两次实锤，零成功），无法验证它是否也有同样的非确定性。理论上 FlashInfer 与 Triton 是不同 kernel 实现，不能外推。
 - **其他模型 / 其他 vLLM 版本**：本结论仅限 Qwen3.5-4B + vLLM v0.19.1 + triton GDN prefill。3B 模型、非 GDN 模型、新版 vLLM 需单独验证。
-- **训练是否真的走 triton**：`grep -n "GDN prefill kernel" train_log*.txt` 仍建议跑，以确认训练日志与诊断数据属于同一档。
+- **训练端是否与诊断同档**：`grep -n "GDN prefill kernel" train_log*.txt`（应为 Triton/FLA）与 `grep -o "enable_prefix_caching=[A-Za-z]*" train_log*.txt`（§10 的顺带观察）仍建议跑一次，把训练日志与诊断数据的档位对齐。
+- **batch-invariant 的其他 attention backend**：本次只验了 `FLASH_ATTN`；`TRITON_ATTN` 档未验（vLLM 的白名单允许，但"允许"不等于"同样确定"）。
 
 ## 纪律记录
 
 - 2026-09-15 18:43 `--diff_traj` 给出 token 一致率 2.91% / max Δ=14.5 nat → 禁用 `--vllm_gen_logps` 成为显式决策。
+- 2026-09-16 `VLLM_BATCH_INVARIANT=1` + `--attention_backend FLASH_ATTN`：det 字典 1/3、跨进程 token 100.00% / Δ=0、跨引擎 target max 0.123 nat（§9）。**决策未变**——切换要过验收门与吞吐关，训练仍走 torch 副本。
 - 相关代码/工具保留（`vllm_logprobs_n`、`--measure lpmode`、`--diff_traj`、`--build_logprobs_n`），用于未来其他模型/backend 的复现性普查，不删除。
