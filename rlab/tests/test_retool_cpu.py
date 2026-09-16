@@ -682,6 +682,33 @@ def test_retool_math_fixes():
     check("池子证据：空池不炸", "空池" in pool_report_line(
         {"n_in": 0, "n_out": 0, "n_dup": 0, "n_unique_q": 0, "n_conflict_q": 0,
          "dup_min": 0, "dup_max": 0}, "x"))
+
+    # 【2026-09-16 事故·held-out 100% 污染】源数据每题 100~400 份重复（HF 侧
+    # 1,791,200 行 / ~16.7k 唯一题面）。旧版 prepare 按**位置**切 dev/train，
+    # 实测 train.jsonl 含 52,700 条 dev 题（500 题 × ~105 份）——dev 每一题都被训过。
+    from rlab.prepare_dapo_math import split_train_dev
+
+    dup_pool = [{"Q": f"q{i}", "A": "1"} for i in range(10) for _ in range(100)]
+    tr, dv = split_train_dev(dup_pool, 3, 42)
+    check("prepare 切分：以题面为单位抽满 dev（整组归 dev，行数随之超目标）、两侧不相交",
+          len(dv) == 100 and len(tr) == 900
+          and not ({r["Q"] for r in dv} & {r["Q"] for r in tr}))
+    check("prepare 切分：同一题面的所有副本整体归一侧（不会一半 dev 一半 train）",
+          all(sum(1 for r in dv if r["Q"] == q) in (0, 100)
+              for q in {r["Q"] for r in dup_pool}))
+    tr2, dv2 = split_train_dev([{"Q": "q1", "A": "1"}, {"Q": "q1", "A": "2"},
+                                {"Q": "q2", "A": "3"}], 1, 42)
+    check("prepare 切分：同题多解整体归一侧（不给'答案一半在 dev'留口子）",
+          not ({r["Q"] for r in dv2} & {r["Q"] for r in tr2})
+          and len(dv2) + len(tr2) == 3)
+    # 反证：旧的位置切法在同一份重复池上**必然**相交——这条锁住"为什么必须按题面切"
+    _old_dv, _old_tr = dup_pool[:3], dup_pool[3:]
+    check("反证：旧的位置切法在重复池上必然泄漏（本次事故的机制）",
+          bool({r["Q"] for r in _old_dv} & {r["Q"] for r in _old_tr}))
+    psrc = open("rlab/prepare_dapo_math.py", encoding="utf-8").read()
+    check("prepare 脚本三步齐备：去重 → 按题面切 → 落盘复读断言（缺一即回到事故）",
+          "dedup_questions(records)" in psrc and "split_train_dev(records" in psrc
+          and "_read_qa_jsonl(args.output_dir" in psrc)
     dsrc2 = open("rlab/data.py", encoding="utf-8").read()
     check("load_dapo_math_train 两条加载路都接上去重（不是只定义了纯函数）",
           dsrc2.count("return _finalize_train_pool(rows") == 3
