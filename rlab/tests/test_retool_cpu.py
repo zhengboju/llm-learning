@@ -528,6 +528,23 @@ def test_health_monitor():
     codes = {c for c, _ in window_check(hist, retool=True)}
     check("代码信号未出现 → no_code", "no_code" in codes)
 
+    # 签名⑥：表面收尾（收尾率↑ 且 正确率↓ 同时成立）—— bg1 崩溃的早期签名
+    def acc_drop(i):
+        return -0.40 if i < 64 else (-0.80 + (0.02 if i % 2 else -0.02))
+    def fmt_gain(i):
+        return 0.14 if i < 64 else (0.60 + (0.02 if i % 2 else -0.02))
+    codes = {c for c, _ in window_check(mk(128, acc_drop, fmt_gain))}
+    check("收尾率↑+正确率↓ → surface", "surface" in codes)
+    codes = {c for c, _ in window_check(
+        mk(128, lambda i: -0.40 + (0.02 if i % 2 else -0.02), fmt_gain))}
+    check("对照：只涨收尾率不报 surface", "surface" not in codes)
+    codes = {c for c, _ in window_check(
+        mk(128, acc_drop, lambda i: 0.14 + (0.02 if i % 2 else -0.02)))}
+    check("对照：只掉正确率不报 surface（decline 负责）", "surface" not in codes)
+    codes = {c for c, _ in window_check(
+        mk(128, acc_drop, lambda i: -0.90 if i < 64 else 0.60))}
+    check("对照：fmt 从低位学起 → surface 守卫不启用", "surface" not in codes)
+
     # 健康 曲线：acc 上升 / fmt 从低位学到高位 → 无致命告警
     def acc_rise(i):
         return -0.2 + 1.0 * i / 300

@@ -92,6 +92,25 @@ def window_check(hist, *, retool=False, max_clen=None):
                        "（trunc_shaping/overlong_shaping 是否真可达）；②预算是否已自洽"
                        "（否则尾部会被整组丢弃，丢弃率随之攀升）"))
 
+    # --- 签名⑥：表面收尾（"只学格式"的最早期签名，2026-09-17 新增）
+    # 事故形态（run2/bg1 崩溃）：outcome-only 奖励里**没有格式分**，但
+    # trunc_shaping=-0.5 让"被截断"(-1.5) 比"答错"(-1) 更差 → 逃脱罚分的最短路径是
+    # "少写、快点收尾"，于是 fmt（有 boxed）率 32%→50% 与 acc 率 30%→8.3%
+    # **同时发生**：收尾率在涨、正确率在掉。既有 decline 要等 acc 掉过 5pp
+    # （±1 口径 0.10）才响，而这条信号在此之前就可辨。
+    # 判据必须两条同时成立（单看其一是正常波动）：fmt 率较开局涨 ≥10pp 且 acc 率
+    # 掉 ≥5pp。守卫 pf0≥0.2：fmt 从低位学起的"格式学习期"（GSM8K 系）不算；
+    # retool_math 的 base 有 boxed 率本就 ~57%，该守卫不屏蔽本协议。
+    _pf, _pf0 = (fmt_m + 1) / 2, (_wmean([h["fmt"] for h in hist[:k]]) + 1) / 2
+    _pa, _pa0 = (acc_m + 1) / 2, (_wmean([h["acc"] for h in hist[:k]]) + 1) / 2
+    if n >= 96 and _pf0 >= 0.2 and (_pf - _pf0) >= 0.10 and (_pa0 - _pa) >= 0.05:
+        alerts.append(("surface",
+                       f"收尾率在涨（{_pf0:.0%}→{_pf:.0%}）而正确率在掉（{_pa0:.0%}→{_pa:.0%}），"
+                       f"条件精度 {_pa0 / max(_pf0, 1e-9):.0%}→{_pa / max(_pf, 1e-9):.0%} "
+                       "→ 表面收尾签名（用'会收尾'换'真会做'）。查：①单轮预算是否仍压着"
+                       "截断率（截断比答错更差时，最快逃生路径就是少写早收，见 docs/05 §6.5）；"
+                       "②判分域是否只剩 boxed 形式而丢了正确性"))
+
     # --- 签名⑤：retool 代码信号未出现（提示性，非致命）
     if retool and n >= 128 and _wmean([h["code_rate"] for h in hist[-k:]]) == 0.0:
         alerts.append(("no_code",
