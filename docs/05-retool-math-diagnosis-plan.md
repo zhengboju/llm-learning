@@ -329,6 +329,30 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B-text \
 > 确诊命令（尚未回填）：`cat /sys/fs/cgroup/memory.events`（看 `oom_kill`）+
 > `cat /sys/fs/cgroup/memory.max`（**别信 `free -g`**，它报的是宿主内存）。
 
+> **⚠️ 09-15 起跑故障：训练端第一个 backward 被 fla 护栏拦下**
+>
+> ```
+> RuntimeError: Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect
+> results for gated chunk_bwd_dqkwg (see #640). Please upgrade Triton to
+> >= 3.7.1 or install tilelang: `pip install tilelang`
+> ```
+>
+> **这是护栏不是崩溃**：triton 坏区间 + Hopper 上 GDN 反向会算错梯度，fla 宁可
+> raise。前向不受影响（loss 能算出来），死在 `engine.backward`。
+> **修法 = 装 tilelang**（不动 triton 版本；该后端只接管这一个 kernel，前向与
+> 生成端数值路径不变）。**绝不要**改掉那句 raise 或设 `FLA_DISABLE_BACKEND_DISPATCH=1`
+> ——那是让坏 kernel 静默跑。
+>
+> 操作顺序（装包 → 验依赖 → 探针热身后再起跑）与三条判据见
+> **`06-gdn-backend-tilelang.md`**；探针 `rlab/probe_gdn_backend.py`。
+>
+> **对 P1b 的两点影响**：① 本坑**不改变任何 cfg**，run 签名不变（`retool_math-ts0.5-…`
+> 照旧），与 run2 的对照口径仍成立；② 但**必须先证实 run2 当时不在这个坑里**——
+> 护栏 commit 是 09-11 才进 fla 的，而 run2（09-13）跑完了，说明当时护栏未生效，
+> 究竟是"triton 当时不在坏区间"（run2 可信）还是"fla 当时无护栏"（run2 梯度被
+> 静默污染），要用 `probe_gdn_backend.py --check-bad-triton` 量偏离后判定，
+> 判定为后者则 §1.1「工程与数值：无异常」与后续全部结论都要加限定。
+
 评测（对齐 §7.1 路线：`materialize_mm_ckpt` 物化 → `eval_vllm.py` 调度 → `eval_vllm_all.json`，
 N=500 / greedy / seed=42），然后走 `pair_eval` 三方配对：
 
@@ -412,7 +436,8 @@ python -m rlab.analysis --eval-json eval_vllm_all.p1b.json \
 | P0-7 | `pair_eval` 跨 json 两两配对（对照已灭失模型） | `[x]` | m200 json 遗物 vs p1s200，见 §7.3 |
 | 习惯 | run 偏离签名三处冗余 | `[x]` | `train.py`：wandb name / `run_info.json` / 启动日志 |
 | P1 | `trunc_shaping 0.5 → 0.0`，300 步，存盘 50 | `[x]` | **已定案（§7.3.1）**：证伪且方向相反 —— 去掉惩罚丢掉 step200 全部增益（−6.4pp, p=0.002）、中段崩盘（p1s150 −7.4pp, p=0.001）。不延长 |
-| P1b | **run2 原配方（ts0.5）重跑** 300 步 / 存盘 50 / 新 out_dir | `[ ]` | 定标 m200 增益是配方还是 run 随机性 + 拿回活的最佳 ckpt（m200 已灭失，OOD 需要）。**优先于 P2**。**命令 + 判据见 §6 P1b**（注意 `--lr 5e-6` 必须显式传） |
+| P1b | **run2 原配方（ts0.5）重跑** 300 步 / 存盘 50 / 新 out_dir | `[ ]` | 定标 m200 增益是配方还是 run 随机性 + 拿回活的最佳 ckpt（m200 已灭失，OOD 需要）。**优先于 P2**。**命令 + 判据见 §6 P1b**（注意 `--lr 5e-6` 必须显式传）。**09-15 起跑前置**：装 tilelang 并跑 `rlab/probe_gdn_backend.py`（见 §6 ⚠️ 块 + `06-gdn-backend-tilelang.md`）；同时用 `--check-bad-triton` 判定 run2 是否跑在坏 triton 上 |
+| — | GDN 反向护栏（triton 坏区间 × Hopper）| `[x]` | 09-15 非 P 序列故障。`rlab/probe_gdn_backend.py`（三条判据 + 两条反证 + JIT 预热）+ `rlab/tests/test_gdn_backend_cpu.py`（25 项 CPU 判据自检）+ `docs/06-gdn-backend-tilelang.md`。**pod 侧动作**：`pip install tilelang --no-deps` → 验依赖未被动 → 探针热身后起跑 |
 | — | 抽取自检判据改口径（`max\|Δlogits\|>0.1` → 逐位相等主闸） | `[x]` | 2026-09-14，非 P 序列任务：0.1017 是**异路径对拍**在 bf16 下的正常累积，不是抽取有误。`rlab/extract_text_model.py` `_selfcheck` 重写为三层判据 + 反证控制；若重跑过抽取，本条是 P1b 的隐性前置 |
 | P2 | 原生 `<tool_call>` + rounds 6 / per_round 1024 | `[ ]` | 与 P1 分开跑 |
 | P3 | 步数 200–300 + 存盘 50 成为默认 | `[ ]` | |
