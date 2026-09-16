@@ -496,6 +496,27 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty --model_path /root/Qwen3.
 （`max_rounds=2` 最多 1 次执行 → ≈48% 轨迹成功跑过代码），concise 下 0.441——3072 时代
 观察到的 `code_ok≈0` 是**截断的产物**而非模型偏好，**TIR 路径在 4B 上是活的**。
 
+**全量表的执行方式（多卡分片，2026-09-17）**：定版预算下实测 **~11 s/题** → 16,756 题
+单卡 ≈**50h**（不是我早先估的 30h；预算抬高 + 多轮里沙箱/回卷期间引擎闲置是主因）。
+`probe_difficulty` 新增 `--shard_index/--shard_count`（纯函数 `shard_items`，不变量
+"各片互斥且并集 = 原集合"已锁进测试；切片在 `--max_questions` **之后**，要求各片共享
+同一份打乱顺序）。两卡各一片、最后 `cat` 合并（行序无关，`load_difficulty_table` 按题面建 dict）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty --model_path /root/Qwen3.5-4B \
+  --k 8 --max_rounds 2 --round_gen_tokens 6144 --max_context_tokens 14336 \
+  --system_prompt_file rlab/prompts/retool_math_concise.txt \
+  --shard_index 0 --shard_count 2 \
+  --out rlab_out/difficulty_probe_4b_v5_r6144_concise_s0.jsonl
+# GPU1：同一条命令改 --shard_index 1、--out ..._s1.jsonl
+cat rlab_out/difficulty_probe_4b_v5_r6144_concise_s{0,1}.jsonl \
+  > rlab_out/difficulty_probe_4b_v5_r6144_concise_full.jsonl
+wc -l rlab_out/difficulty_probe_4b_v5_r6144_concise_full.jsonl   # 应 ≈ 全池题数
+```
+
+**合并后必查**：行数 ≈ 16,756（缺 = 有片没跑完/崩溃）；训练启动日志的
+`[rollout] 难度过滤 … 表中缺失 m=0`。两片各自的 `--out` 都支持断点续跑（追加写 + 跳过已有题）。
+
 **提示不 promote 进 preset**（保持 file + flag 形态）：preset 一改，P1b 就不是 run2 原配方了。
 等 P1b 跑完，再作为一次显式的"协议版本升级"合并进 preset。**全量 30h 表必须用 concise
 提示探**（表 = 模型 × 提示 × 预算，旧表作废）。

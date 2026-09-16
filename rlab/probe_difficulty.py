@@ -93,6 +93,25 @@ def _fmt_pct(x: float) -> str:
     return f"{x * 100:.1f}%"
 
 
+def shard_items(items: list, index: int, count: int) -> list:
+    """把（已打乱、已按 --max_questions 截断的）题目列表切成 count 片，返回第 index 片。
+
+    【2026-09-17 多卡并行探针】全量表在定版预算（6144/14336）下实测 ~11 s/题 →
+    16.7k 题要 ~50h 单卡。两卡各跑一片可减半，而分片正确性的**不变量**是
+    "各片互斥 且 并集 = 原集合"——丢题（表有洞 → 训练池被静默缩小）与重题
+    （白烧算力）都是不报错的静默错误，所以这里做成纯函数并锁进测试。
+
+    为什么按 `items[index::count]` 切：两个进程用同一 seed 打乱同一全池 → 各自的
+    todo 逐元素相同 → 余数切片天然互斥、并集等于原集合，且顺序确定（与"连续切"
+    等价，但对 --max_questions/续跑造成的 todo 差异更鲁棒）。合并方式：`cat` 即可
+    （load_difficulty_table 按题面建 dict，行序无关）。"""
+    if count < 1:
+        raise ValueError(f"shard_count 必须 ≥1，收到 {count}")
+    if not (0 <= index < count):
+        raise ValueError(f"shard_index 必须落在 [0,{count})，收到 {index}")
+    return list(items)[index::count]
+
+
 def summarize(all_rows: list, per_q: list) -> str:
     """纯函数：全量判别统计 + 难度分布直方（probe 的结论输出）。"""
     n = len(all_rows)
@@ -133,6 +152,11 @@ def main():
     ap.add_argument("--temp", type=float, default=None,
                     help="覆盖采样温度（默认与训练一致 = retool_math 1.0）")
     ap.add_argument("--gpu_mem", type=float, default=0.85, help="vLLM 显存占比")
+    ap.add_argument("--shard_index", type=int, default=0,
+                    help="多卡并行的分片序号（0-based；默认 0 = 不分片）")
+    ap.add_argument("--shard_count", type=int, default=1,
+                    help="总分片数（两卡各跑一片：0/2 与 1/2，最后 `cat` 合并；"
+                         "各片 --out 必须不同，合并后才是完整表）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--system_prompt_file", default=None,
                     help="用文件内容整体替换系统提示（**必须与训练同源**：难度表是"
@@ -212,6 +236,12 @@ def main():
     rng.shuffle(todo)   # --max_questions 截断时取到的是随机前缀，不是数据集顺序
     if args.max_questions > 0:
         todo = todo[:args.max_questions]
+    if args.shard_count > 1:
+        # 切片放在"打乱 + max_questions"之后：各片要求同一份参考顺序（同 seed 打乱同一
+        # 集合），否则互斥/并集的不变量不成立。
+        todo = shard_items(todo, args.shard_index, args.shard_count)
+        print(f"[probe] 分片 {args.shard_index}/{args.shard_count}: 本片 {len(todo)} 题"
+              f"（各片 --out 不同，最后 cat 合并成完整表）")
     print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
           f"| 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
           f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")

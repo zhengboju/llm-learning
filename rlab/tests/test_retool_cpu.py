@@ -1783,6 +1783,29 @@ def test_overlong_ref_and_opt_cli():
                                     trunc_final=1, trunc_shaping=0.5)["reward"]
     check("trunc shaping 对答错：-1 → -1.5（仍为负，group_mean 语义不变）",
           abs(_neg - (-1.5)) < 1e-6)
+
+    # ---- 多卡分片探针（2026-09-17）：不变量 = 各片互斥 且 并集 = 原集合 ----
+    # 全量表在定版预算下 ~50h 单卡；两卡分片是唯一不动协议的减半手段。丢题（表有洞
+    # → 训练池被静默缩小）与重题（白烧算力）都不报错，故锁死纯函数不变量。
+    from rlab.probe_difficulty import shard_items
+    _pool = [f"q{i}" for i in range(1000)]
+    _parts = [shard_items(_pool, i, 5) for i in range(5)]
+    check("分片并集 = 原集合（不丢题）",
+          sorted(x for p in _parts for x in p) == sorted(_pool))
+    check("分片互斥（不重题）", len({x for p in _parts for x in p}) == len(_pool))
+    check("分片大小均衡（差 ≤1）", max(map(len, _parts)) - min(map(len, _parts)) <= 1)
+    check("shard_count=1 恒等（默认档零行为变化）", shard_items(_pool, 0, 1) == _pool)
+    check("分片边界 fail-fast（越界/非法 count 不静默跑全池）",
+          bool(_exc_msg(lambda: shard_items(_pool, 2, 2)))
+          and bool(_exc_msg(lambda: shard_items(_pool, 0, 0)))
+          and bool(_exc_msg(lambda: shard_items(_pool, -1, 2))))
+    _pb_shard = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), "rlab",
+        "probe_difficulty.py"), encoding="utf-8").read()
+    check("probe_difficulty 接线：分片切片在 max_questions 之后（各片要求同一参考顺序）",
+          "shard_items(todo, args.shard_index, args.shard_count)" in _pb_shard
+          and _pb_shard.index("todo = todo[:args.max_questions]")
+          < _pb_shard.index("shard_items(todo, args.shard_index, args.shard_count)"))
     check("trunc_shaping 默认关闭（total_reward_retool_math 不传 = 旧行为）",
           abs(total_reward_retool_math("72", _ans)["reward"] - 1.0) < 1e-6)
     # CLI 入口：新三件套被 train.py 接收并落到 overrides
