@@ -636,7 +636,7 @@ def test_retool_math_fixes():
     import io as _io
     from contextlib import redirect_stdout as _rso
 
-    from rlab.data import pool_dup_note, verify_train_pool_clean
+    from rlab.data import dedup_questions, pool_report_line, verify_train_pool_clean
 
     buf = _io.StringIO()
     with _rso(buf):
@@ -649,16 +649,43 @@ def test_retool_math_fixes():
         same = verify_train_pool_clean(pool, [])
     check("train.jsonl 核实：无 dev 可核时原样返回且不告警（不噪音）",
           same == pool and buf2.getvalue() == "")
-    check("池子规模证据：无重复 → 无附注（保持旧日志逐字可比）",
-          pool_dup_note(pool) == "")
-    dup_rows = pool + pool                      # 3 题 × 2 份
-    check("池子规模证据：重复池 → 打出 Q 去重后的真实题数与份数",
-          "3 题" in pool_dup_note(dup_rows) and "2.0 份/题" in pool_dup_note(dup_rows))
-    check("池子规模证据：空池不炸", pool_dup_note([]) == "")
+
+    # 题目去重（2026-09-16 真机池 1,791,200 = 17,912×100）：必须**无损**——
+    # 按 (Q,A) 对去重，多解题各自保留；且判据要能说清"去重改不改变题目分布"。
+    dup_rows = pool + pool                      # 3 题 × 2 份，答案一致
+    dd, st = dedup_questions(dup_rows)
+    check("去重：重复整行合并，保留首次出现顺序",
+          [r["Q"] for r in dd] == ["q1", "q2", "q3"] and st["n_dup"] == 3
+          and (st["n_in"], st["n_out"], st["n_unique_q"]) == (6, 3, 3))
+    check("去重：重复份数统计（均匀 2 份）", st["dup_min"] == 2 and st["dup_max"] == 2)
+    check("去重：题干相同但答案不同 → 两条都保留（不丢监督信号）",
+          [r["A"] for r in dedup_questions(
+              [{"Q": "q1", "A": "1"}, {"Q": "q1", "A": "2"},
+               {"Q": "q1", "A": "1"}])[0]] == ["1", "2"])
+    _, st_multi = dedup_questions([{"Q": "q1", "A": "1"}, {"Q": "q1", "A": "2"}])
+    check("去重统计：多解题面单独计数（n_conflict_q）",
+          st_multi["n_conflict_q"] == 1 and st_multi["n_out"] == 2)
+    check("去重：无重复池原样返回（旧 run 逐字可比）",
+          dedup_questions(pool)[0] == pool and dedup_questions(pool)[1]["n_dup"] == 0)
+
+    check("池子证据：无重复 → 无重复字样，仍报唯一题面数",
+          "无重复" in pool_report_line(dedup_questions(pool)[1], "本地 train.jsonl"))
+    line_u = pool_report_line(st, "本地 train.jsonl")          # 均匀 2 份、无多解
+    check("池子证据：均匀重复且无多解 → 明确写「与去重前可比」",
+          "6 -> 3" in line_u and "重复 2 份/题" in line_u and "可比" in line_u
+          and "不可比" not in line_u)
+    line_nu = pool_report_line(dedup_questions(
+        [{"Q": "q1", "A": "1"}, {"Q": "q1", "A": "1"}, {"Q": "q2", "A": "2"}])[1],
+        "本地 train.jsonl")
+    check("池子证据：重复不均匀 → 必须警告「与去重前不可比」（防两次 run 被当同一实验）",
+          "1~2 份/题" in line_nu and "不可比" in line_nu)
+    check("池子证据：空池不炸", "空池" in pool_report_line(
+        {"n_in": 0, "n_out": 0, "n_dup": 0, "n_unique_q": 0, "n_conflict_q": 0,
+         "dup_min": 0, "dup_max": 0}, "x"))
     dsrc2 = open("rlab/data.py", encoding="utf-8").read()
-    check("load_dapo_math_train 真的接上了核实与规模证据（不是只定义了纯函数）",
-          "verify_train_pool_clean(rows, dev_rows)" in dsrc2
-          and "pool_dup_note(rows)" in dsrc2)
+    check("load_dapo_math_train 两条加载路都接上去重（不是只定义了纯函数）",
+          dsrc2.count("return _finalize_train_pool(rows") == 3
+          and "dedup_questions(rows)" in dsrc2)
 
     # 题目级动态采样（丢弃率 81% 根因修复的契约锁）
     from rlab.rollout import filter_question_pool

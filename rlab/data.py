@@ -205,20 +205,77 @@ def verify_train_pool_clean(rows: list, dev_rows: list) -> list:
     return kept
 
 
-def pool_dup_note(rows: list) -> str:
-    """纯函数：池子规模的可核证据——按 Q 文本去重后的题数与重复份数。
+def dedup_questions(rows: list) -> tuple:
+    """纯函数：按 **(Q, A) 对**精确去重，返回 `(新池, 统计)`。
 
-    【2026-09-16 真机】训练池日志是 1,791,200 条 = 17,912×100，与 DAPO-Math-17k
-    的规模不符。**重复本身不破坏调度**（QuestionScheduler 的 streak/黑名单按题面
-    文本 keyed，同一题的重复条目会被一并跳过），但会白占宿主内存、并让"池子有多大"
-    的判断失真。故每次加载都把去重后的真实题数打出来（集合只存已存在字符串的引用，
-    1.79M 条约 20-30MB 瞬时开销，付得起）。"""
-    if not rows:
-        return ""
-    uni = len({r.get("Q") for r in rows})
-    if uni == len(rows):
-        return ""
-    return f"｜Q 文本去重后 {uni} 题（重复 {len(rows) / max(uni, 1):.1f} 份/题）"
+    【为什么不按 Q 单独去重】同一题面可能带多个不同答案（多解 / 答案格式变体）——
+    按 Q 去重会**静默丢监督信号**。按 (Q, A) 对去重是无损的：只有逐字相同的整行才
+    合并，多解各自保留一条。统计里单列 `n_conflict_q` 就是为了让"重复=纯冗余"这个
+    假设**可见**，而不是替用户认定。
+
+    【为什么值得做】2026-09-16 真机训练池 1,791,200 条 = 17,912×100（本仓库
+    prepare 脚本只 `open("w")` 直写，不可能产出这个形状）：白占宿主 ~0.7G、让
+    "池子有多大"失真——QuestionScheduler 的 floor/重置/黑名单统计都建立在这个数上。
+
+    【顺序】保持首次出现（文件本身已 shuffle，保序 = 保住原来的采样顺序语义）。
+    【内存】`seen` 只为**保留下来**的行建键 → 键数 = n_out（100× 重复时只有 1.79 万个），
+    而不是行数。统计里 dup_min/dup_max 是每个题面的原始重复份数，用来判断重复是否均匀
+    ——**不均匀重复下的去重会改变题目分布**，那种情况与去重前的 run 不可比。
+    """
+    q_count, q_ans, seen, out = {}, {}, set(), []
+    for r in rows:
+        q, a = r.get("Q"), r.get("A")
+        q_count[q] = q_count.get(q, 0) + 1
+        q_ans.setdefault(q, set()).add(a)
+        key = (q, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    counts = list(q_count.values())
+    stats = {
+        "n_in": len(rows), "n_out": len(out), "n_dup": len(rows) - len(out),
+        "n_unique_q": len(q_count),
+        "n_conflict_q": sum(1 for v in q_ans.values() if len(v) > 1),
+        "dup_min": min(counts) if counts else 0,
+        "dup_max": max(counts) if counts else 0,
+    }
+    return out, stats
+
+
+def pool_report_line(st: dict, source: str) -> str:
+    """纯函数：把池子规模/重复形态收成一行证据（日志与测试共用，避免两处漂移）。
+
+    判据写死在文案里：**均匀重复且无多解 ⇒ 去重不改变题目分布**（与去重前的 run
+    可比）；其余情况去重会改变分布，必须显式说出来，不能让两次 run 的数字被悄悄
+    当成同一实验。"""
+    if not st["n_in"]:
+        return f"[data] DAPO-Math 训练池（{source}）: 空池"
+    if st["n_in"] == st["n_out"]:
+        return (f"[data] DAPO-Math 训练池（{source}）: {st['n_in']} 条"
+                f"｜唯一题面 {st['n_unique_q']} 题，无重复")
+    dup = (f"重复 {st['dup_min']}~{st['dup_max']} 份/题"
+           if st["dup_min"] != st["dup_max"] else f"重复 {st['dup_min']} 份/题")
+    comparable = (st["dup_min"] == st["dup_max"]) and st["n_conflict_q"] == 0
+    verdict = ("（均匀且无多解：去重不改变题目分布，与去重前可比）" if comparable
+               else "（**去重改变题目分布：与去重前的 run 不可比**）")
+    conflict = (f"；{st['n_conflict_q']} 题带多个不同答案（按 (Q,A) 去重，多解全保留）"
+                if st["n_conflict_q"] else "")
+    return (f"[data] DAPO-Math 训练池（{source}）: {st['n_in']} -> {st['n_out']} 条"
+            f"｜唯一题面 {st['n_unique_q']} 题，{dup}{verdict}{conflict}")
+
+
+def _finalize_train_pool(rows: list, source: str) -> list:
+    """训练池加载收尾：核实 dev 契约（若 dev 可用）→ 按 (Q,A) 去重 → 打一行证据。"""
+    if source == "本地 train.jsonl":
+        dev_path = os.path.join(_DAPO_LOCAL_DIR, "dev.jsonl")
+        dev_rows = _read_qa_jsonl(dev_path) if os.path.exists(dev_path) else []
+        rows = verify_train_pool_clean(rows, dev_rows)
+    else:
+        rows = _dapo_strip_dev(rows)     # 全量加载路径：带"dev 缺失"大字警告
+    rows, st = dedup_questions(rows)
+    print(pool_report_line(st, source), flush=True)
+    return rows
 
 
 def load_dapo_math_train() -> list:
@@ -228,19 +285,15 @@ def load_dapo_math_train() -> list:
     【2026-09-09 审查修复】旧版直接返回全量 17k：即使跑了 prepare 脚本，dev 题
     依然在训练池里（prepare 只写文件、训练路径根本不读 train.jsonl），dev=50 题
     被完整训过还拿来当评测集。
-    【2026-09-16 补】读 train.jsonl 这条路以前"信任文件名"，现在当场核实
-    （verify_train_pool_clean）并打印池子真实规模（pool_dup_note）。"""
+    【2026-09-16 补】① 读 train.jsonl 这路以前"信任文件名"，现在当场核实
+    （verify_train_pool_clean）；② 两条加载路都过 (Q,A) 去重（dedup_questions）
+    并打印池子真实规模与重复形态。"""
     ms_err = None
     train_jsonl = os.path.join(_DAPO_LOCAL_DIR, "train.jsonl")
     if os.path.exists(train_jsonl):
         rows = _read_qa_jsonl(train_jsonl)
         if rows:
-            dev_path = os.path.join(_DAPO_LOCAL_DIR, "dev.jsonl")
-            dev_rows = _read_qa_jsonl(dev_path) if os.path.exists(dev_path) else []
-            rows = verify_train_pool_clean(rows, dev_rows)
-            print(f"[data] DAPO-Math 训练池 via 本地 train.jsonl（已剔除 dev）: "
-                  f"{len(rows)} 条{pool_dup_note(rows)}")
-            return rows
+            return _finalize_train_pool(rows, "本地 train.jsonl")
     # 1) 尝试 modelscope（训练机默认；HF 镜像也可能通）
     if DATA_SOURCE in ("ms", "auto"):
         try:
@@ -264,7 +317,7 @@ def load_dapo_math_train() -> list:
                             rows.append({"Q": q, "A": a})
                     if rows:
                         print(f"[data] DAPO-Math-17k via modelscope {ms_id}: {len(rows)} 条")
-                        return _dapo_strip_dev(rows)
+                        return _finalize_train_pool(rows, f"modelscope {ms_id}")
                 except Exception:
                     continue
             raise RuntimeError("modelscope DAPO-Math-17k 均未命中")
@@ -290,7 +343,7 @@ def load_dapo_math_train() -> list:
         if not rows:
             raise RuntimeError("HF DAPO-Math-17k 清洗后为空")
         print(f"[data] DAPO-Math-17k via HF: {len(rows)} 条")
-        return _dapo_strip_dev(rows)
+        return _finalize_train_pool(rows, "HF DAPO-Math-17k")
     except Exception as e:
         raise RuntimeError(f"[data] DAPO-Math-17k 加载失败：modelscope 错误={ms_err}，HF 错误={e}") from e
 
