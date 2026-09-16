@@ -411,23 +411,35 @@ def test_eval_stats_and_signature():
     _rec = os.path.join(_dir, "record.jsonl")
     with open(_rec, "w", encoding="utf-8") as f:
         for s in range(12):                      # 12 个会话，跨过旧的 8 上限
-            for _ in range(2):
+            for _ in range(2):                   # 旧协议：无 gen_version → 时间判据
                 f.write(_json.dumps({
                     "t": 1000.0 + s * 300.0, "algo": "retool_math",
                     "acc": [1.0] * 4 + [0.0] * 4, "fmt": [1.0] * 8,
                     "clen": [2000] * 8, "code_used": [1] * 8, "code_ok": [1] * 8,
-                    "trunc_final": [0] * 8, "gen_version": s * 16, "phase": "cold",
+                    "trunc_final": [0] * 8, "phase": "cold",
                 }, ensure_ascii=False) + "\n")
     _rtbl = summarize_record(_rec)
     check("≥9 个会话不再 IndexError，且逐会话汇总齐全",
           "共 12 个会话" in _rtbl and "会话A(#0)" in _rtbl and "会话L(#11)" in _rtbl)
     check("多会话提示把『同签名重跑会覆盖 step_N』写进表头（防评到上一轮的 ckpt）",
           "run_info.json" in _rtbl)
-    # 【2026-09-17 真机】纯时间判据把 bg1 的**一次** run（每 4 步一次 optimizer step
-    # 造成 >120s 空档）切成 31 个"会话"，逐会话表因此失去意义。硬判据 =
-    # gen_version 回退（新 run 从 0 重新计数）。
+    # 【2026-09-17 真机】纯时间判据把 bg1 的**一次** run 切成 31 个"会话"：真因是
+    # `gen_questions_per_attempt=4` 让一次 attempt 的 4 条记录时间戳完全相同、attempt
+    # 间隔 ~3min。新协议（有 gen_version）必须忽略这种 3 分钟级空档。
     check("曲线新增 trunc率/code_ok率 两列（崩坏形态：格式在、正确性死、长度掉）",
           "trunc率" in _rtbl and "code_ok率" in _rtbl)
+    _rec_burst = os.path.join(_dir, "record_burst.jsonl")
+    with open(_rec_burst, "w", encoding="utf-8") as f:
+        for i in range(24):                      # 6 次 attempt × 4 条，间隔 180s>120s
+            f.write(_json.dumps({
+                "t": 2000.0 + (i // 4) * 180.0, "acc": [1.0] * 8, "fmt": [1.0] * 8,
+                "clen": [1000] * 8, "code_used": [1] * 8, "code_ok": [1] * 8,
+                "trunc_final": [0] * 8,
+                "gen_version": 0 if i < 12 else 16, "phase": "cold",
+            }, ensure_ascii=False) + "\n")
+    _rtbl3 = summarize_record(_rec_burst)
+    check("有 gen_version 时忽略 3min 级空档（burst 上传不再被切成假会话）",
+          "共 1 个会话" in _rtbl3)
     _rec2 = os.path.join(_dir, "record_gv.jsonl")
     with open(_rec2, "w", encoding="utf-8") as f:
         for i, gv in enumerate([0, 16, 32, 0, 16, 32]):        # 中间一次回退 = 换 run

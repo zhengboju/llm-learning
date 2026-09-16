@@ -17,7 +17,8 @@ import os
 import time
 
 NOISE_FLOOR_PP = 2.0   # 【已降级】仅留作历史报告对照；判定改用 ci95()/McNemar，见下
-SESS_GAP_S = 120.0     # record 时间戳间隔 >120s = 新训练会话（进程重启/新 run 追加同文件）
+SESS_GAP_S = 120.0     # record 时间戳间隔 >120s = 新训练会话（旧协议：record 无 gen_version）
+SESS_GAP_GV_S = 1800.0  # 新协议（有 gen_version）下的时间兜底阈值：见 summarize_record
 
 
 # ---------------------------------------------- 统计口径（2026-09-12 新增）----
@@ -211,15 +212,20 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
     被读成"崩了又好了"）。160 样本 = 20 组，与 docs/05 的"200 组窗口"同一量级。
 
     【会话拆分 2026-09-08 / 2026-09-17 加固】record.jsonl 以追加模式写入，多次
-    训练（重启/新 run）会写进同一文件，且每次会话 pushes 计数归零。切会话判据：
-      ① 时间戳间隔 > SESS_GAP_S；
-      ② **gen_version 回退**（新 run 从 0 重新计数）——这一条才是硬判据：真机
-         bg1 每 ~4 步一次 optimizer step 会让同一 run 内出现 >120s 的空档，
-         纯时间判据把 106 组的一次 run 切成 31 个"会话"（每 1-4 组一个），
-         逐会话表因此失去意义。gen_version 回退只会在真正换 run 时发生。"""
+    训练（重启/新 run）会写进同一文件，且每次会话 pushes 计数归零。
+
+    **切会话判据分档**（2026-09-17 真机定案）：
+      · 有 `gen_version`（新协议）→ **只看 gen_version 回退**（新 run 从 0 重新
+        计数），时间阈值放宽到 SESS_GAP_GV_S(30min) 只兜"真重启"。
+        为什么不能沿用 120s：`gen_questions_per_attempt=4` 时**一次 attempt 的
+        4 条记录时间戳完全相同**（4 题一次性上传），attempt 之间隔 ~3min →
+        120s 判据把一次 106 组的 run 切成 **31 个"会话"**，逐会话表彻底失去意义
+        （真机 bg1 的原始读数就是这个形态）。
+      · 无 `gen_version`（旧协议）→ 沿用 120s 时间判据。"""
     accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
     sess_span = {}   # sess -> [first_t, last_t]（墙钟，便于对 Shell 历史核对是哪次 run）
     sess_gv = {}     # sess -> [first_genver, last_genver]
+    has_gv = False
     with open(path, encoding="utf-8") as f:
         prev_t, prev_gv, sess = None, None, 0
         for line in f:
@@ -232,7 +238,8 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
                 continue
             t = rec.get("t")
             gv = rec.get("gen_version")
-            _new = (prev_t is not None and t is not None and t - prev_t > SESS_GAP_S)
+            _gap = SESS_GAP_GV_S if has_gv else SESS_GAP_S
+            _new = (prev_t is not None and t is not None and t - prev_t > _gap)
             if not _new and isinstance(gv, int) and isinstance(prev_gv, int) and gv < prev_gv:
                 _new = True   # 权重推送计数回退 = 新 run（时间判据在这种 run 里会误切）
             if _new:
@@ -241,6 +248,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
                 prev_t = t
                 sess_span.setdefault(sess, [t, t])[1] = t
             if isinstance(gv, int):
+                has_gv = True
                 prev_gv = gv
                 sess_gv.setdefault(sess, [gv, gv])[1] = gv
             accs.extend(a > 0 for a in rec["acc"])
@@ -276,9 +284,10 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
     out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | code率 | code_ok率 | trunc率 | avg_clen | 阶段 | 会话 |",
            "|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
-        out.insert(0, f"> record 共 {len(sess_span)} 个会话（间隔>{SESS_GAP_S:.0f}s 或 "
-                      f"gen_version 回退切分）——追加写文件，多会话 = 同一 out_dir 被"
-                      f"重启/多 run 混用；末尾会话才是最近一次 run，且同签名重跑会覆盖 "
+        out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
+                      f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
+                      f"——追加写文件，多会话 = 同一 out_dir 被重启/多 run 混用；"
+                      f"末尾会话才是最近一次 run，且同签名重跑会覆盖 "
                       f"step_N，评测前先核 `step_N/run_info.json` 的 started。")
         out.insert(1, "")
     for i in range(0, len(accs), window):
@@ -304,7 +313,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
                    f"| {ok_col} | {tr_col} | {len_col} | {ph_col} | {sess_col} |")
     if sess_lines:
         out.append("")
-        out.append(f"== 会话拆分（间隔>{SESS_GAP_S:.0f}s 或 gen_version 回退 = 新会话）==")
+        out.append(f"== 会话拆分（新协议=gen_version 回退；旧协议=>{SESS_GAP_S:.0f}s 间隔）==")
         out.extend(sess_lines)
     return "\n".join(out)
 
