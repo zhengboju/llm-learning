@@ -1039,7 +1039,17 @@ def gen_worker(Q, cfg: dict):
     # scheduler 的黑名单只覆盖"在线观察到连续零方差"的题，base 从未做对过的题
     # （p≈0，丢弃率 81% 的主体）由静态过滤在训练开始前一次性出清。
     if cfg.get("difficulty_path"):
-        _table = load_difficulty_table(cfg["difficulty_path"])
+        # 【2026-09-18 M4】训练端当前协议指纹 → load_difficulty_table 校验表是否
+        # 同一『模型×提示×预算』下探的（换预算/提示/k 续跑同一 --out 会静默混表）。
+        import hashlib as _hl
+        _expected_meta = {
+            "model": os.path.basename(str(cfg["model_path"]).rstrip("/")),
+            "k": cfg.get("num_pre_Q"),
+            "rounds": cfg.get("max_rounds"), "round_tokens": cfg.get("round_gen_tokens"),
+            "ctx": cfg.get("max_context_tokens"), "temp": cfg.get("temperature"),
+            "sp": _hl.sha1(str(cfg.get("system_prompt", "")).encode("utf-8")).hexdigest()[:6],
+        }
+        _table = load_difficulty_table(cfg["difficulty_path"], expected_meta=_expected_meta)
         _lo, _hi = cfg.get("difficulty_band", (0.0, 1.0))
         QAs, _dstat = filter_qas_by_difficulty(QAs, _table, lo=_lo, hi=_hi)
         print(f"[rollout] 难度过滤 band=({_lo},{_hi}): {_dstat['total']} -> {_dstat['kept']} 题"

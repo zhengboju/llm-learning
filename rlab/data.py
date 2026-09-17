@@ -404,13 +404,19 @@ def _strip_dapo_template(q: str) -> str:
 # 静态过滤出清"base 从未做对过的题"，在线调度出清"当前学不动的题"。
 
 
-def load_difficulty_table(path: str) -> dict:
+def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
     """读 probe_difficulty.py 产出的 jsonl -> {Q: 行dict}（含 k/n_correct/fmt_rate…）。
 
     坏行静默跳过（探针是逐行追加写，崩溃可能留下截断行）；缺 k/n_correct 或
     k<=0 的行视为无效——过滤宁可保守（题进不了表 = 被丢弃，见 filter 的
-    missing 口径），不允许半行数据混进训练池。"""
+    missing 口径），不允许半行数据混进训练池。
+
+    expected_meta：训练端传入的当前协议指纹（model/k/rounds/round_tokens/ctx/
+    temp/sp）。表是"模型×提示×预算"的联合产物（M4，2026-09-18）——行自带的
+    probe_meta 若与当前协议不一致，说明这张表不是当前协议下探的（换预算/提示/k
+    续跑同一 --out 会静默混表），告警但不 fail-fast（旧表无 probe_meta 仍可用）。"""
     table = {}
+    warned = set()
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -424,6 +430,16 @@ def load_difficulty_table(path: str) -> dict:
             k, nc = r.get("k"), r.get("n_correct")
             if q and isinstance(k, int) and k > 0 and isinstance(nc, int) and 0 <= nc <= k:
                 table[str(q)] = r
+                if expected_meta and r.get("probe_meta"):
+                    for _fk in ("model", "k", "rounds", "round_tokens", "ctx", "temp", "sp"):
+                        _rv = r["probe_meta"].get(_fk)
+                        _ev = expected_meta.get(_fk)
+                        if _rv is not None and _rv != _ev and _fk not in warned:
+                            warned.add(_fk)
+                            print(f"[data][警告] 难度表 probe_meta[{_fk}] 与当前协议不符: "
+                                  f"表中 {_rv!r} ≠ 当前 {_ev!r} —— 这张表不是当前"
+                                  f"『模型×提示×预算』下探的（换协议续跑同一 --out 会静默"
+                                  f"混表）；核对 --difficulty_path 是否给错表。")
     return table
 
 

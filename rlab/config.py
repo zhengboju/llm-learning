@@ -487,6 +487,17 @@ def get_config(algo: str, **overrides) -> dict:
             "--vllm_gen_kwargs '{\"gdn_prefill_backend\": \"triton\"}'")
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
+    # 【2026-09-18 H2 护栏】vllm_gen_logps 档位：N=0 是 docs/07 实锤的坏路径
+    # （logprobs=0 只报被采样 token，在 vLLM v0.19.1 + Qwen3.5 GDN 上 prefill 位
+    # 单点差 6.8 nat、与 torch 独立重算不符），正确用法需 N≥1（top-K 里挑被采样
+    # token）+ batch_invariant + 显式 attention_backend 四件套。默认 False 的
+    # torch 副本路径是合法的（A/B、旧 run 复现），故这里 warn 不 fail-fast——
+    # 但开了 gen_logps 还停在 N=0，就是静默跑在已证伪路径上。
+    if cfg.get("vllm_gen_logps") and not cfg.get("vllm_logprobs_n"):
+        print("[config][警告] vllm_gen_logps=True 但 vllm_logprobs_n=0 —— docs/07 实锤的"
+              "坏路径（N=0 只报被采样 token，prefill 位单点差 6.8 nat）。"
+              "正确用法四件套: --vllm_gen_logps --vllm_logprobs_n 1 "
+              "--vllm_batch_invariant --vllm_attention_backend FLASH_ATTN")
     return cfg
 
 

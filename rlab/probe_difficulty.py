@@ -54,13 +54,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def aggregate_rows(rows: list) -> list:
+def aggregate_rows(rows: list, probe_meta: dict = None) -> list:
     """纯函数（CPU 可测）：逐轨迹记录 -> 逐题通过率统计。
 
     rows 每项：{Q, A, acc, fmt, trunc, clen}（acc=±1，fmt=±1 有无 boxed，
     trunc=末段是否被轮长切断，clen=轨迹全长 token）。
     返回每题 {Q, A, k, n_correct, pass_rate, fmt_rate, trunc_rate,
-    avg_clen, avg_code_ok}，顺序与 rows 中题首次出现顺序一致。"""
+    avg_clen, avg_code_ok}，顺序与 rows 中题首次出现顺序一致。
+    probe_meta：本次探测的协议指纹（模型/预算/温度/提示/k），落进每行——表是
+    "模型×提示×预算"的联合产物，行必须自证出处，续跑/混表才能被发现（M4）。"""
     order, by_q = [], {}
     for r in rows:
         q = str(r["Q"])
@@ -80,12 +82,15 @@ def aggregate_rows(rows: list) -> list:
         d = by_q[q]
         k = len(d["acc"])
         nc = sum(d["acc"])
-        out.append({"Q": q, "A": d["A"], "k": k, "n_correct": nc,
-                    "pass_rate": nc / k,
-                    "fmt_rate": sum(d["fmt"]) / k,
-                    "trunc_rate": sum(d["trunc"]) / k,
-                    "avg_clen": sum(d["clen"]) / k,
-                    "avg_code_ok": sum(d["code_ok"]) / k})
+        row = {"Q": q, "A": d["A"], "k": k, "n_correct": nc,
+               "pass_rate": nc / k,
+               "fmt_rate": sum(d["fmt"]) / k,
+               "trunc_rate": sum(d["trunc"]) / k,
+               "avg_clen": sum(d["clen"]) / k,
+               "avg_code_ok": sum(d["code_ok"]) / k}
+        if probe_meta:
+            row["probe_meta"] = probe_meta
+        out.append(row)
     return out
 
 
@@ -133,22 +138,39 @@ def probe_plan(QAs: list, done: dict, *, seed: int = 42, max_questions: int = 0,
     return order, todo
 
 
-def summarize(all_rows: list, per_q: list) -> str:
-    """纯函数：全量判别统计 + 难度分布直方（probe 的结论输出）。"""
-    n = len(all_rows)
-    no_boxed = sum(1 for r in all_rows if r["fmt"] <= 0) / max(1, n)
-    trunc = sum(1 for r in all_rows if r["trunc"]) / max(1, n)
-    p0 = sum(1 for r in per_q if r["n_correct"] == 0)
-    p1 = sum(1 for r in per_q if r["n_correct"] == r["k"])
-    mid = len(per_q) - p0 - p1
+def summarize(all_rows: list, per_q: list, disk_per_q: list = None) -> str:
+    """纯函数：全量判别统计 + 难度分布直方（probe 的结论输出）。
+
+    disk_per_q：磁盘全量表的逐题聚合（load_difficulty_table 的 values）。断点续跑
+    时 all_rows/per_q 只含**本轮新探**的片段，判读数字若只看它们会系统性失真
+    （M3，2026-09-18）——有磁盘全量时用它做难度分布；轨迹级比率（无 boxed/截断）
+    由磁盘行的 fmt_rate/trunc_rate 按 k 加权聚合（口径与逐轨迹一致）。"""
+    if disk_per_q:
+        # 磁盘全量：难度分布用全量，轨迹级比率按 k 加权
+        _n_tr = sum(r["k"] for r in disk_per_q)
+        no_boxed = sum(r["k"] * (1 - r.get("fmt_rate", 0.0)) for r in disk_per_q) / max(1, _n_tr)
+        trunc = sum(r["k"] * r.get("trunc_rate", 0.0) for r in disk_per_q) / max(1, _n_tr)
+        p0 = sum(1 for r in disk_per_q if r["n_correct"] == 0)
+        p1 = sum(1 for r in disk_per_q if r["n_correct"] == r["k"])
+        mid = len(disk_per_q) - p0 - p1
+        per_q_src, n_src = disk_per_q, _n_tr
+    else:
+        n = len(all_rows)
+        no_boxed = sum(1 for r in all_rows if r["fmt"] <= 0) / max(1, n)
+        trunc = sum(1 for r in all_rows if r["trunc"]) / max(1, n)
+        p0 = sum(1 for r in per_q if r["n_correct"] == 0)
+        p1 = sum(1 for r in per_q if r["n_correct"] == r["k"])
+        mid = len(per_q) - p0 - p1
+        per_q_src, n_src = per_q, n
     lines = [
-        f"[probe] 题数 {len(per_q)} × k={per_q[0]['k'] if per_q else 0} 轨迹 {n} 条",
+        f"[probe] 题数 {len(per_q_src)} × k={per_q_src[0]['k'] if per_q_src else 0} "
+        f"轨迹 {n_src} 条" + ("（磁盘全量）" if disk_per_q else "（本轮）"),
         f"[probe] 难度分布: 全错(0/4类) {p0} | 可学(0<rate<1) {mid} | 全对 {p1}",
         f"        -> 训练池预期 ≈{mid} 题（丢弃率主体 = 全错组 (1-p)^8，p≈0 题出清即切割）",
         f"[probe] 判别统计: 无 boxed {_fmt_pct(no_boxed)}（协议/prompt 失败签名，"
         f"高则先修生成层）/ 末段截断 {_fmt_pct(trunc)}",
     ]
-    if no_boxed < 0.2 and p0 > len(per_q) * 0.5:
+    if no_boxed < 0.2 and p0 > len(per_q_src) * 0.5:
         lines.append("[probe] 判读: 无 boxed 少 + 全错题多 → 能力失败主导，"
                      "prompt 层无杠杆，直接启用 --difficulty_path 过滤")
     elif no_boxed >= 0.2:
@@ -264,10 +286,21 @@ def main():
     print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
           f"| 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
           f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
+    # 【2026-09-18 M4】协议指纹落进每行：表是"模型×提示×预算"的联合产物，行必须
+    # 自证出处——换预算/提示/k 续跑同一 --out 会静默混两个分布的表，训练端无从
+    # 检测（训练签名已有 -t<sha6> 表指纹，闭环缺半边：表自己不含协议指纹）。
+    probe_meta = {
+        "model": os.path.basename(args.model_path.rstrip("/")),
+        "k": args.k,
+        "rounds": cfg["max_rounds"], "round_tokens": cfg["round_gen_tokens"],
+        "ctx": cfg["max_context_tokens"], "temp": cfg["temperature"],
+        "sp": _sp_sha,   # 提示指纹（-sp<hash6> 同源）
+        "seed": args.seed,
+    }
     if not todo:
         print("[probe] 无剩余题，直接输出统计")
-        per_q = list(load_difficulty_table(args.out).values())
-        print(summarize([], per_q))
+        _dk_per_q = list(load_difficulty_table(args.out).values())
+        print(summarize([], [], disk_per_q=_dk_per_q or None))
         return
 
     from transformers import AutoTokenizer
@@ -360,7 +393,7 @@ def main():
         if fout_samp is not None and n_dump_trunc >= args.dump_samples and n_dump_ok >= 3:
             fout_samp.close()
             fout_samp = None   # 额度收满即停写，防止全量落盘
-        per_q = aggregate_rows(rows)
+        per_q = aggregate_rows(rows, probe_meta)
         for r in per_q:
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
         fout.flush()
@@ -371,7 +404,13 @@ def main():
               f"累计 {w0 + len(wave)} 题 | {time.time() - t0:.0f}s", flush=True)
 
     fout.close()
-    print(summarize(all_rows, aggregate_rows(all_rows)))
+    # 【2026-09-18 M3】结束统计一律以**磁盘全量表**为准，不以进程内存为准：断点
+    # 续跑时 all_rows 只含本轮新探的片段，全量表在磁盘 jsonl 里（"无剩余题"路径
+    # 早就走磁盘，续跑路径却把判读数字按新探片段显示——系统性失真）。统一为：
+    # 最终判读 = load_difficulty_table(磁盘全量) 的逐题聚合。
+    _disk = load_difficulty_table(args.out) if os.path.exists(args.out) else {}
+    print(summarize(all_rows, aggregate_rows(all_rows, probe_meta),
+                    disk_per_q=list(_disk.values()) or None))
     print(f"[probe] 表已写出: {args.out}\n"
           f"[probe] 训练启用: bash rlab/run_gsm8k.sh retool_math <model> "
           f"--difficulty_path {args.out}")

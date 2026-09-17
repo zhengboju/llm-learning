@@ -269,6 +269,29 @@ def test_config_retool_math():
     check("BASE 隔离：grpo 仍是 0.7/top_k=50/4 条/group_std",
           g["temperature"] == 0.7 and g["top_k"] == 50
           and g["num_pre_Q"] == 4 and g["adv_mode"] == "group_std")
+    # 【2026-09-18 H2】vllm_gen_logps=True 但 vllm_logprobs_n=0 = docs/07 实锤坏路径
+    # （N=0 只报被采样 token，prefill 位单点差 6.8 nat）。config 层打警告（不
+    # fail-fast：torch 副本默认路径合法，A/B 与旧 run 复现需要保留）。
+    import io as _io, contextlib as _ctx
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        get_config("retool_math", use_wandb=False, vllm_gen_logps=True,
+                   vllm_logprobs_n=0)
+    check("H2: gen_logps=True + N=0 → config 层警告（坏路径不再静默）",
+          "vllm_logprobs_n=0" in _buf.getvalue()
+          and "6.8 nat" in _buf.getvalue())
+    _buf2 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf2):
+        get_config("retool_math", use_wandb=False, vllm_gen_logps=True,
+                   vllm_logprobs_n=1)
+    check("H2: gen_logps=True + N=1 → 无警告（正确档位）",
+          "vllm_logprobs_n=0" not in _buf2.getvalue())
+    _buf3 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf3):
+        get_config("retool_math", use_wandb=False)
+    check("H2: 默认 torch 副本路径（gen_logps=False）→ 无警告",
+          "vllm_logprobs_n=0" not in _buf3.getvalue())
+    print()
 
 
 # --------------------------------- G. tiny GPT2：logps 对齐 + mask 排除 ----
@@ -1007,6 +1030,32 @@ def test_difficulty_filter():
         tbl = load_difficulty_table(p)
     check("表加载：合法行收录、非法/截断行静默跳过",
           set(tbl) == {"q0", "q1"} and tbl["q1"]["k"] == 8)
+
+    # 【2026-09-18 M4】表协议指纹：表是"模型×提示×预算"的联合产物，行必须自证出处。
+    # 换预算/提示/k 续跑同一 --out 会静默混表，训练端无从检测——load 时校验。
+    from rlab.probe_difficulty import aggregate_rows
+    _meta = {"model": "Qwen3.5-4B", "k": 8, "rounds": 2, "round_tokens": 6144,
+             "ctx": 14336, "temp": 1.0, "sp": "8e0184"}
+    _mr = [{"Q": "a", "A": "7", "acc": 1, "fmt": 1, "trunc": 0, "clen": 100, "code_ok": 1},
+           {"Q": "a", "A": "7", "acc": -1, "fmt": 1, "trunc": 1, "clen": 200, "code_ok": 0}]
+    _r2 = aggregate_rows(_mr, _meta)
+    check("aggregate_rows 带 probe_meta：每行落协议指纹",
+          _r2 and _r2[0].get("probe_meta") == _meta)
+    _r3 = aggregate_rows(_mr[:2])
+    check("不带 probe_meta：行无该字段（旧调用方零变化）",
+          "probe_meta" not in _r3[0])
+    with tempfile.TemporaryDirectory() as td:
+        _p2 = os.path.join(td, "t2.jsonl")
+        with open(_p2, "w", encoding="utf-8") as f:
+            for r in _r2:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        _tbl2 = load_difficulty_table(_p2, expected_meta=_meta)
+        check("expected_meta 匹配 → 正常加载（不告警）", set(_tbl2) == {"a"})
+        _tbl3 = load_difficulty_table(_p2, expected_meta={**_meta, "sp": "deadbe"})
+        check("expected_meta 不匹配（换提示续跑同表）→ 仍加载（不 fail-fast，旧表兼容）"
+              "但触发告警", set(_tbl3) == {"a"})
+        _tbl4 = load_difficulty_table(_p2)   # 无 expected_meta（训练端不传）→ 零告警
+        check("无 expected_meta → 不校验（旧调用方零变化）", set(_tbl4) == {"a"})
     print()
 
 
@@ -1031,6 +1080,20 @@ def test_probe_aggregate():
     s = summarize(rows, per_q)
     check("summarize：含难度分布与判别统计（无 boxed 率 = 2/4 = 50%）",
           "难度分布" in s and "50.0%" in s and isinstance(s, str))
+    # 【2026-09-18 M3】断点续跑时 summarize 必须以磁盘全量表的聚合为准，否则判读
+    # 数字只覆盖"本轮新探片段"（系统性失真）。disk_per_q 传入时用它做难度分布 +
+    # 按 k 加权重算轨迹级比率。
+    _dk = [{"Q": "x", "A": "1", "k": 8, "n_correct": 0, "fmt_rate": 1.0, "trunc_rate": 0.0},
+           {"Q": "y", "A": "2", "k": 8, "n_correct": 8, "fmt_rate": 1.0, "trunc_rate": 0.0},
+           {"Q": "z", "A": "3", "k": 8, "n_correct": 4, "fmt_rate": 0.5, "trunc_rate": 0.25}]
+    _sd = summarize([], [], disk_per_q=_dk)
+    check("M3: 续跑判读用磁盘全量（题数=3、全错1/可学1/全对1、无 boxed 由 fmt_rate 加权）",
+          "题数 3" in _sd and "（磁盘全量）" in _sd
+          and "全错(0/4类) 1" in _sd and "可学(0<rate<1) 1" in _sd and "全对 1" in _sd)
+    check("M3: 轨迹级比率按 k 加权（z 的 fmt_rate 0.5 → 无 boxed = (8*0+8*0+8*0.5)/24 = 16.7%）",
+          "16.7%" in _sd and "末段截断" in _sd)
+    check("M3: 无 disk_per_q → 保持旧路径（本轮内存口径，无『磁盘全量』标记）",
+          "（磁盘全量）" not in summarize(rows, per_q))
     print()
 
 
