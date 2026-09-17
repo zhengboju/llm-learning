@@ -47,6 +47,10 @@ parser.add_argument("--dump_items", action=argparse.BooleanOptionalAction, defau
                     help="落盘 per-item 明细（默认开，供 analysis.py 做配对检验/分层）；--no-dump_items 关闭")
 parser.add_argument("--max_rounds", type=int, default=None, help="--retool 时最多代码-执行轮数；None=取训练配置")
 parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置")
+parser.add_argument("--proto_from", default=None,
+                    help="协议来源目录（含 run_info.json）；None=从 --model 自己的 run_info 回读。"
+                         "供 BASE 等无 run_info 的裸模型复用『被测 checkpoint 的训练协议』，"
+                         "保证 Δacc 同档（2026-09-17）。")
 args = parser.parse_args()
 
 # ---- 从 checkpoint 回读训练协议（run_info.json）----
@@ -69,8 +73,9 @@ def _load_run_cfg(model_path: str):
     except (OSError, ValueError):
         return None
 
-_run = _load_run_cfg(args.model)
+_run = _load_run_cfg(args.proto_from) if args.proto_from else _load_run_cfg(args.model)
 _run_cfg = (_run["config"] if _run else {}) or {}
+_proto_src = args.proto_from or args.model
 
 # ---- algo 推断（兼容旧 --retool） ----
 if args.algo is None:
@@ -147,7 +152,8 @@ if _sp_sig and _sp_sha != _sp_sig:
           f"  （eval 用 {_sp_src}；若训练是 --system_prompt_file 且文件已变，请核对）")
 
 # ---- 评测协议来源自证（预算/提示/采样）----
-print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认）'} | "
+print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认）'} "
+      f"(src={_proto_src}) | "
       f"algo={args.algo} eval_task={args.eval_task} | "
       f"round_tokens={args.round_tokens} max_len={args.max_len} max_rounds={args.max_rounds} | "
       f"system_prompt={_sp_src} sp_sha={_sp_sha}")

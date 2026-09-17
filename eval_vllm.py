@@ -111,6 +111,29 @@ def _assert_local_dir(p: str, what: str) -> bool:
     return True
 
 
+def _has_run_info(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "run_info.json"))
+
+
+# 【2026-09-17 同档修复】BASE 是裸模型（无 run_info.json），此前回落 preset 默认
+# （3072/默认提示），而被测 checkpoint 用 run_info 训练协议（6144/concise）——Δacc
+# 是两个不同协议下的差，不公平也无从自证。现在：BASE 复用『第一个有 run_info 的
+# tuned checkpoint』的训练协议（--proto_from），与被测模型严格同档。
+# 语义：BASE 作为基线必须跟"被测对象"的档，而不是 preset 默认。
+_tuned_proto = [p for _, p in models if _has_run_info(p)]
+_first_proto = _tuned_proto[0] if _tuned_proto else None
+BASE_PROTO = {}
+if not _has_run_info(base_path) and _first_proto:
+    BASE_PROTO["BASE"] = _first_proto
+    print(f"[同档] BASE({base_path}) 无 run_info → 复用 {_first_proto} 的训练协议"
+          f"（Δacc 与被测模型同档，2026-09-17）")
+elif _has_run_info(base_path):
+    print(f"[同档] BASE({base_path}) 自带 run_info → 用自身协议")
+elif not _first_proto:
+    print("[同档] 警告: BASE 无 run_info 且 tuned 里也没有带 run_info 的 ckpt → "
+          "全部回落 preset 默认（旧 ckpt 评测，Δacc 档位存疑）")
+
+
 def run_one(gpu, idx, name, path):
     if not _assert_local_dir(path, f"模型 {name}"):
         with lock:
@@ -131,6 +154,9 @@ def run_one(gpu, idx, name, path):
         cmd += ["--show", str(args.show)]
     if args.mm_base:
         cmd += ["--mm_base", args.mm_base]
+    _pf = BASE_PROTO.get(name)
+    if _pf:
+        cmd += ["--proto_from", _pf]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
     # 竞态兜底：同卡实例退出释放显存撞上另一实例的初始化剖析 → AssertionError。
     # 该失败只发生在启动窗口期，冷却后重试几乎必成，最多试3次。

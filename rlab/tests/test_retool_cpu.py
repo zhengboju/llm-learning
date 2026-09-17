@@ -1773,6 +1773,20 @@ def test_eval_thinking_switch():
     check("行为：无 run_info / 损坏 → None（旧 ckpt 回落 preset，不抛）",
           _load_run_cfg(os.path.join(os.path.dirname(_ck), "no_such_dir")) is None)
 
+    # 【2026-09-17 同档修复】BASE 无 run_info → 复用第一个 tuned ckpt 的训练协议。
+    # one 进程吃 --proto_from；调度器探测并给 BASE 传。
+    _ev2_src = open(os.path.join(_root, "eval_vllm.py"), encoding="utf-8").read()
+    check("调度器: BASE 无 run_info 时复用第一个带 run_info 的 tuned ckpt 协议",
+          "BASE_PROTO" in _ev2_src
+          and "if not _has_run_info(base_path) and _first_proto:" in _ev2_src
+          and "BASE_PROTO[\"BASE\"] = _first_proto" in _ev2_src)
+    check("调度器: run_one 给 BASE 进程传 --proto_from",
+          '"--proto_from", _pf' in _ev2_src)
+    check("one 进程: --proto_from 优先于 --model 自身 run_info",
+          "args.proto_from" in _ev_src
+          and "_load_run_cfg(args.proto_from) if args.proto_from else _load_run_cfg(args.model)"
+          in _ev_src)
+
 
 
 def test_overlong_ref_and_opt_cli():
