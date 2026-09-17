@@ -2100,7 +2100,8 @@ def test_fwd_batch_chunk():
     params = list(inspect.signature(run_server).parameters)
     check("run_server 前 6 个位置参数保持不变（e2e 位置传参契约）",
           params[:6] == ["model_path", "port", "mode", "beta", "grad_accum", "device"]
-          and params[-1] == "batch_chunk")
+          and params[-2] == "batch_chunk"
+          and params[-1] == "queue_max" and "queue_max" not in params[:6])
 
 
 def test_vllm_gen_logps():

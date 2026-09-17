@@ -71,6 +71,25 @@ def passthrough_repack(d, refs):
     return parts
 
 
+def bounded_lifo_put(q, item, maxsize: int):
+    """Lifo 背压：队列满时不阻塞、直接丢**本次要放**的项（=最新）并返回 False。
+
+    【2026-09-18 M2】passthrough 双 Lifo 无上限：生成快于训练（3B GSM8K 形态）时
+    result_queue 里 train 永远不消费的旧批滞留内存 + ref 前向白算。语义关键：
+    train 每次 `get()` 拿 Lifo 顶（最新）——满时丢本次，train 拿到的仍是"最近一次
+    成功放入的"批次，与无限队列时行为逐字一致，只是删掉了 train 永远不会拿的
+    中间批。raw_queue 同理（主循环拿顶）。rfpp 保序必须无限（maxsize<=0 恒不丢）。
+    返回 True=已放入 / False=队列满，本次被丢（ref 前向白算一次，可接受）。"""
+    if maxsize and maxsize > 0:
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            return False     # 满：丢本次（=最新），train 拿的还是顶上的最新已放入批
+    q.put_nowait(item)
+    return True
+
+
 def rfpp_process_macro(items, beta, pad_id):
     """RF++ macro-batch 数学（纯函数，可单测）。
 
@@ -110,7 +129,8 @@ def rfpp_process_macro(items, beta, pad_id):
 
 
 def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
-               device="cuda", attn_implementation="sdpa", batch_chunk=1):
+               device="cuda", attn_implementation="sdpa", batch_chunk=1,
+               queue_max=0):
     from bottle import Bottle, request
     from bottle import run as bottle_run
     from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
@@ -135,8 +155,12 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
     # 队列语义与各自原版逐字一致：
     # passthrough（simple_grpo_v1 原版）：双 Lifo ——训练端吃最新鲜的 batch，贴近 on-policy；
     # rfpp（simple-reinforce++ 原版）：双 FIFO ——macro batch 按上传顺序攒批、保序下发。
+    # 【2026-09-18 M2 背压】passthrough 双 Lifo 无上限：生成快于训练（3B GSM8K 形态）
+    # 时旧结果永久滞留 + 白算 ref。queue_max>0 时给两条队加 maxsize，满时丢最旧——
+    # 反正 train 只吃最新（Lifo），丢最旧不破坏 on-policy 语义。rfpp 保序必须无限。
     if mode == "passthrough":
-        raw_queue, result_queue = queue.LifoQueue(), queue.LifoQueue()
+        raw_queue = queue.LifoQueue(maxsize=max(0, queue_max))
+        result_queue = queue.LifoQueue(maxsize=max(0, queue_max))
     else:
         raw_queue, result_queue = queue.Queue(), queue.Queue()
     app = Bottle()
@@ -155,7 +179,7 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
         data["inputs"] = bytes_to_tensor(dd[1])
         data["rewards"] = bytes_to_tensor(dd[2])
         data["extras"] = [bytes_to_tensor(x) for x in dd[3:]]   # gen_logps, acc, fmt...
-        raw_queue.put(data)
+        bounded_lifo_put(raw_queue, data, queue_max)
         print(f"[ref_server] receive {data['inputs'].shape}", flush=True)
         return b"tensor"
 
@@ -176,7 +200,9 @@ def run_server(model_path, port, mode="passthrough", beta=0.04, grad_accum=4,
             with torch.inference_mode():
                 refs = get_per_token_logps(ref_model, d["inputs"].to(device),
                                            batch_chunk=batch_chunk)
-            result_queue.put(make_bytes_list(passthrough_repack(d, refs[:, plen - 1:].cpu())))
+            bounded_lifo_put(result_queue,
+                             make_bytes_list(passthrough_repack(d, refs[:, plen - 1:].cpu())),
+                             queue_max)
     elif mode == "rfpp":
         while True:
             items = []
@@ -211,7 +237,10 @@ if __name__ == "__main__":
     ap.add_argument("--batch_chunk", type=int, default=1,
                     help="分块前向每次过 backbone 的行数（默认 1=逐行=历史口径）。"
                          "run_gsm8k.sh 用 FWD_BATCH_CHUNK 环境变量与 train/gen 同步")
+    ap.add_argument("--queue_max", type=int, default=0,
+                    help="passthrough 双队列容量上限（0=无限=旧行为；>0 时满则丢最旧，"
+                         "防生成快于训练时旧结果滞留+白算。rfpp 保序恒用无限）")
     args = ap.parse_args()
     run_server(args.model_path, args.port, args.mode, args.beta, args.grad_accum,
                args.device, attn_implementation=args.attn_implementation,
-               batch_chunk=args.batch_chunk)
+               batch_chunk=args.batch_chunk, queue_max=args.queue_max)

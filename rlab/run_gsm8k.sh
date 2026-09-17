@@ -139,10 +139,19 @@ fi
 # rfpp 无 KL：config beta=0.0，但 ref_server 默认 --beta 0.04，不显式传会矛盾
 REF_BETA_ARGS=""
 if [ "$ALGO" = "rfpp" ]; then REF_BETA_ARGS="--beta 0.0"; fi
+# 【2026-09-18 M2 背压】passthrough 双队列上限：生成快于训练时旧结果滞留+白算。
+# 默认给 16（≈grad_accum 4 倍，够 ref_server 提前算几批又不无限堆积）；rfpp 保序
+# 必须无限（shell 不传 → server 默认 0 = 无限，这里只在 passthrough 且未覆盖时给）。
+REF_QUEUE_MAX_ARGS=""
+if [ "$MODE" = "passthrough" ] && [ -z "$REF_QUEUE_MAX" ]; then
+  REF_QUEUE_MAX_ARGS="--queue_max 16"
+elif [ -n "$REF_QUEUE_MAX" ]; then
+  REF_QUEUE_MAX_ARGS="--queue_max $REF_QUEUE_MAX"
+fi
 
 CUDA_VISIBLE_DEVICES=$REF_GPU python -m rlab.ref_server --model_path "$MODEL" \
     --port $PORT --mode $MODE $REF_BETA_ARGS --attn_implementation "$ATTN_IMPL" \
-    --batch_chunk "$FWD_BATCH_CHUNK" &
+    --batch_chunk "$FWD_BATCH_CHUNK" $REF_QUEUE_MAX_ARGS &
 REF_PID=$!
 
 # Pre-flight 2：等 /health 且模式匹配（替代盲等 15s；ref 模型加载可能 >15s）

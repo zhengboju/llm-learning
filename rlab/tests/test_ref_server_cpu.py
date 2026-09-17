@@ -76,6 +76,52 @@ def test_passthrough():
                               "acc_scores", "format_scores"} <= set(end2.keys()))
 
 
+def test_bounded_lifo_backpressure():
+    print("[B2] bounded_lifo_put 背压（M2，2026-09-18）：满时丢本次，保最新优先语义")
+    import queue as _q
+    from rlab.ref_server import bounded_lifo_put
+    q = _q.LifoQueue(maxsize=3)
+    for i in range(3):
+        bounded_lifo_put(q, i, 3)
+    check("队列满（3/3）", q.qsize() == 3)
+    dropped = bounded_lifo_put(q, 99, 3)   # 满：丢本次（99 不入队），队列不变
+    check("满时放新项返回 False（本次被背压丢弃）", dropped is False)
+    check("丢的是本次而非旧批（train 拿 Lifo 顶 = 已放入的最新）",
+          q.qsize() == 3 and q.get() == 2 and q.get() == 1 and q.get() == 0)
+    q2 = _q.LifoQueue(maxsize=3)
+    for i in range(3):
+        bounded_lifo_put(q2, i, 3)
+    check("maxsize 未满时正常放入返回 True", q2.qsize() == 3)
+    # 无限（maxsize<=0，rfpp 保序路径）：从不丢
+    q3 = _q.LifoQueue()
+    for i in range(10):
+        r = bounded_lifo_put(q3, i, 0)
+        assert r is True
+    check("maxsize=0（rfpp 保序）→ 从不丢，10/10 全在", q3.qsize() == 10)
+    # 满→丢一次后，队列仍保留全部已放入项，后续继续消费腾出空间后可再放入
+    q4 = _q.LifoQueue(maxsize=2)
+    bounded_lifo_put(q4, "a", 2); bounded_lifo_put(q4, "b", 2)
+    bounded_lifo_put(q4, "c", 2)             # 满：丢 "c"，a/b 保留
+    q4.get()                                  # train 消费一个 → 腾出空间
+    check("消费后腾出空间 → 再放成功", bounded_lifo_put(q4, "d", 2) is True
+          and q4.qsize() == 2)
+    # 并发安全冒烟：10 线程各放 100 项，maxsize=5，最终大小 ≤5 且无异常
+    import threading as _th
+    q5 = _q.LifoQueue(maxsize=5)
+    errs = []
+
+    def _worker():
+        try:
+            for i in range(100):
+                bounded_lifo_put(q5, i, 5)
+        except Exception as e:  # noqa
+            errs.append(e)
+    ts = [_th.Thread(target=_worker) for _ in range(10)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    check("并发冒烟：无异常且队列不超上限", not errs and q5.qsize() <= 5)
+
+
 def test_rfpp_math():
     print("[C] rfpp_process_macro")
     pad = 7
