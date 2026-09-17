@@ -63,6 +63,20 @@ def _git_head() -> str:
         return "unknown"
 
 
+def _difficulty_tag(path) -> str:
+    """难度表的内容指纹（sha1 前 6 位）。
+
+    【2026-09-17 为什么它必须进签名】表是**数据协议的一半**：同一个 `difficulty_band`
+    下换表（半表 → 补齐全表 → 换提示/预算重探）会直接改变训练池，而签名此前只记
+    band（`d0-1`）——于是"半表 run"与"全表 run"在两个不同 out_dir 里会长得**一模一样**，
+    横比表格时无法分辨。读不到文件时给 `NA`（不抛：签名必须永远能打印出来）。"""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:6]
+    except Exception:
+        return "NA"
+
+
 def run_signature(cfg: dict) -> str:
     """一行「偏离签名」：把最容易被静默改掉、事后只能靠考古发现的维度压成可读串。
 
@@ -74,7 +88,7 @@ def run_signature(cfg: dict) -> str:
     """
     if cfg.get("difficulty_path"):
         lo, hi = (cfg.get("difficulty_band") or (0.0, 1.0))
-        dtag = f"d{lo:g}-{hi:g}"
+        dtag = f"d{lo:g}-{hi:g}-t{_difficulty_tag(cfg['difficulty_path'])}"
     else:
         dtag = "nodiff"
     lr = cfg.get("lr")

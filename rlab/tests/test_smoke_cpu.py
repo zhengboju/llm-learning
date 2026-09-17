@@ -386,6 +386,24 @@ def test_eval_stats_and_signature():
     check("提示偏离 → 追加 -sp<hash6>", "-sp" in _sig_sp and len(_sig_sp.split("-sp")[1]) == 6)
     check("提示指纹对内容敏感（差一个字符即变）",
           run_signature({**_sp_default, "system_prompt": _sp_new + " "}) != _sig_sp)
+    # 【2026-09-17】难度表也要指纹：同 band 换表（半表→全表→换提示重探）会换训练池，
+    # 只记 `d0-1` 会让两次不同的数据实验在不同 out_dir 里长得一模一样。
+    _dt = os.path.join(_dir, "diff_table.jsonl")
+    with open(_dt, "w", encoding="utf-8") as f:
+        f.write('{"Q": "q1", "n_correct": 3, "k": 8}\n')
+    _sig_t1 = run_signature({**_sp_default, "difficulty_path": _dt})
+    _tag = _sig_t1.split("-d0-1-t")[-1][:6] if "-d0-1-t" in _sig_t1 else ""
+    check("难度表指纹进签名（d<band>-t<hash6>），且仍含 band 供人眼辨别",
+          len(_tag) == 6)
+    with open(_dt, "a", encoding="utf-8") as f:      # 表内容变（如补齐到全表）
+        f.write('{"Q": "q2", "n_correct": 0, "k": 8}\n')
+    check("表内容变 → 签名变（半表 run 与全表 run 不再同签名）",
+          run_signature({**_sp_default, "difficulty_path": _dt}) != _sig_t1)
+    check("表路径不存在 → 指纹 NA（签名必须永远能打印，不抛）",
+          "-tNA" in run_signature({**_sp_default, "difficulty_path": _dt + ".nope"}))
+    check("无表（nodiff）不带表指纹（注意 ts0.5 里就含 -t，只能查 d<band>-t 形态）",
+          "-nodiff-" in run_signature(_sp_default)
+          and "d0-1-t" not in run_signature(_sp_default))
     check("两个 -sp 标签不影响其它字段（前缀仍逐字一致）",
           _sig_sp.startswith(run_signature(_sp_default)))
     # 候选提示文件：只在显式 --system_prompt_file 时生效，默认档零影响
