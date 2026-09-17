@@ -112,6 +112,27 @@ def shard_items(items: list, index: int, count: int) -> list:
     return list(items)[index::count]
 
 
+def probe_plan(QAs: list, done: dict, *, seed: int = 42, max_questions: int = 0,
+               shard_index: int = 0, shard_count: int = 1):
+    """→ `(order, todo)`：本片的固定参考顺序（**与 done 无关**）+ 本片真正待探的题。
+
+    **顺序铁律：先打乱 → max_questions → 切片 → 最后才按 done 过滤。**
+    反过来（先按 done 过滤、再打乱切片）在**续跑**时会让 todo 变短 → 打乱后的切片
+    整体错位 → 本片跑去探另一片的题：分片的"互斥/并集 = 原集合"不变量在续跑路径上
+    失效（首跑完全正常，只有中断恢复才踩——最难发现的那类）。
+    【2026-09-17 真机】50h 全量表第一次分片跑到 ~60% 才发现这个顺序问题，
+    所以它必须是纯函数 + 有反证测试。"""
+    rng = random.Random(seed)
+    order = list(QAs)
+    rng.shuffle(order)          # --max_questions 截断时取到的是随机前缀，不是数据集顺序
+    if max_questions > 0:
+        order = order[:max_questions]
+    if shard_count > 1:
+        order = shard_items(order, shard_index, shard_count)
+    todo = [x for x in order if str(x["Q"]) not in done]
+    return order, todo
+
+
 def summarize(all_rows: list, per_q: list) -> str:
     """纯函数：全量判别统计 + 难度分布直方（probe 的结论输出）。"""
     n = len(all_rows)
@@ -227,21 +248,19 @@ def main():
     from rlab.rollout import build_prompt, multi_turn_rollout_group
 
     QAs = load_qas(cfg["data_task"])
-    # 断点续跑：已探过的题跳过（表逐题追加写，崩溃/中断不丢进度）
+    # 断点续跑：已探过的题跳过（表逐题追加写，崩溃/中断不丢进度）。
+    # 【2026-09-17】分片 × 续跑的顺序交给 probe_plan 纯函数（切片与 done 无关），
+    # 否则续跑时切片错位 → 两片互相探对方的题（重叠浪费 + 不变量失效）。
     done = load_difficulty_table(args.out) if os.path.exists(args.out) else {}
-    todo = [x for x in QAs if str(x["Q"]) not in done]
-    if done:
-        print(f"[probe] 续跑: 表中已有 {len(done)} 题，剩余 {len(todo)} 题")
-    rng = random.Random(args.seed)
-    rng.shuffle(todo)   # --max_questions 截断时取到的是随机前缀，不是数据集顺序
-    if args.max_questions > 0:
-        todo = todo[:args.max_questions]
+    order, todo = probe_plan(QAs, done, seed=args.seed,
+                             max_questions=args.max_questions,
+                             shard_index=args.shard_index,
+                             shard_count=args.shard_count)
     if args.shard_count > 1:
-        # 切片放在"打乱 + max_questions"之后：各片要求同一份参考顺序（同 seed 打乱同一
-        # 集合），否则互斥/并集的不变量不成立。
-        todo = shard_items(todo, args.shard_index, args.shard_count)
-        print(f"[probe] 分片 {args.shard_index}/{args.shard_count}: 本片 {len(todo)} 题"
+        print(f"[probe] 分片 {args.shard_index}/{args.shard_count}: 本片 {len(order)} 题"
               f"（各片 --out 不同，最后 cat 合并成完整表）")
+    if done:
+        print(f"[probe] 续跑: 本片表中已有 {len(done)} 题，本片剩余 {len(todo)} 题")
     print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
           f"| 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
           f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")

@@ -1803,9 +1803,35 @@ def test_overlong_ref_and_opt_cli():
         os.path.dirname(os.path.abspath(__file__)))), "rlab",
         "probe_difficulty.py"), encoding="utf-8").read()
     check("probe_difficulty 接线：分片切片在 max_questions 之后（各片要求同一参考顺序）",
-          "shard_items(todo, args.shard_index, args.shard_count)" in _pb_shard
-          and _pb_shard.index("todo = todo[:args.max_questions]")
-          < _pb_shard.index("shard_items(todo, args.shard_index, args.shard_count)"))
+          "shard_items(order, shard_index, shard_count)" in _pb_shard
+          and _pb_shard.index("order = order[:max_questions]")
+          < _pb_shard.index("shard_items(order, shard_index, shard_count)"))
+
+    # ---- 分片 × 续跑：切片必须与 done 无关（否则续跑时切片错位 → 两片互相探对方的题）
+    # 【2026-09-17 真机】50h 分片表跑到 ~60% 才发现：旧顺序"先按 done 过滤再打乱切片"
+    # 首跑正常、只有中断恢复才踩。下面既锁新不变量，也用反证把旧顺序的错法钉住。
+    from rlab.probe_difficulty import probe_plan
+    _pool = [{"Q": f"q{i}", "A": "1"} for i in range(100)]
+    _o0, _t0 = probe_plan(_pool, {}, seed=42, shard_index=0, shard_count=2)
+    _o1, _t1 = probe_plan(_pool, {}, seed=42, shard_index=1, shard_count=2)
+    _q0, _q1 = {x["Q"] for x in _t0}, {x["Q"] for x in _t1}
+    check("首跑：两片互斥且并集 = 全池",
+          not (_q0 & _q1) and (_q0 | _q1) == {x["Q"] for x in _pool})
+    _done0 = {x["Q"]: {"n_correct": 1} for x in _t0[:10]}          # 片0 已完成 10 题
+    _o0b, _t0b = probe_plan(_pool, _done0, seed=42, shard_index=0, shard_count=2)
+    check("续跑：本片参考顺序不变（切片与 done 无关）",
+          [x["Q"] for x in _o0b] == [x["Q"] for x in _o0])
+    check("续跑：待探 = 本片切片 − done（不会越界探另一片的题）",
+          {x["Q"] for x in _t0b} == _q0 - set(_done0) and len(_t0b) == len(_o0) - 10)
+    import random as _random
+
+    def _old_plan(pool, done, idx, cnt):     # 旧顺序（先 done 过滤再打乱切片）
+        todo = [x for x in pool if x["Q"] not in done]
+        _random.Random(42).shuffle(todo)
+        return todo[idx::cnt]
+    _old0 = {x["Q"] for x in _old_plan(_pool, _done0, 0, 2)}
+    check("反证：旧顺序在续跑时越界（片0 会探到片1 的题 → 重叠浪费）",
+          len(_old0 & _q1) > 0)
     check("trunc_shaping 默认关闭（total_reward_retool_math 不传 = 旧行为）",
           abs(total_reward_retool_math("72", _ans)["reward"] - 1.0) < 1e-6)
     # CLI 入口：新三件套被 train.py 接收并落到 overrides
