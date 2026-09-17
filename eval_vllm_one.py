@@ -49,6 +49,29 @@ parser.add_argument("--max_rounds", type=int, default=None, help="--retool 时�
 parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置")
 args = parser.parse_args()
 
+# ---- 从 checkpoint 回读训练协议（run_info.json）----
+# 【2026-09-17 对齐缺口】此前 eval 的预算/提示一律取 preset 默认：训练用
+# `--system_prompt_file`/`--round_gen_tokens 6144` 等 CLI 覆盖时，eval 会静默落到
+# 默认 3072/默认提示——"评测一个 checkpoint"实际测的是第三种协议，Δacc 无法自证。
+# 现在：CLI 显式传参 > run_info.json 的训练 config > preset 默认，并在偏离时醒目告警。
+def _load_run_cfg(model_path: str):
+    """读 ckpt 的 run_info.json['config']（训练时的完整 cfg）；缺失/损坏 → None。
+
+    注意顶层另有 signature/git_head 等身份字段，但协议本体在 config 里（write_run_info
+    落盘的是 cfg 全量）。None 视为"出处不明的旧 ckpt"，回落 preset 默认。"""
+    try:
+        with open(os.path.join(model_path, "run_info.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        cfg = info.get("config") or {}
+        if not isinstance(cfg, dict):
+            return None
+        return {"signature": info.get("signature"), "config": cfg}
+    except (OSError, ValueError):
+        return None
+
+_run = _load_run_cfg(args.model)
+_run_cfg = (_run["config"] if _run else {}) or {}
+
 # ---- algo 推断（兼容旧 --retool） ----
 if args.algo is None:
     args.algo = "retool" if args.retool else "grpo"
@@ -67,6 +90,9 @@ try:
 except KeyError:
     # 未知 algo（如直接传 base_path），回落 BASE
     _rcfg = dict(_BASE_CFG)
+# 【2026-09-17】run_info 的训练 config 优先于 preset：CLI 显式传参仍覆盖（见下）。
+if _run_cfg:
+    _rcfg = {**_rcfg, **_run_cfg}
 
 if is_retool_family:
     if args.round_tokens is None:
@@ -89,15 +115,42 @@ name = args.name or "_".join(args.model.rstrip("/").split("/")[-2:])
 out_path = args.out or f"eval_vllm_{name}.json"
 
 # ---- system_prompt 对齐训练 ----
+from rlab.config import default_system_prompt as _default_system_prompt
+# 【2026-09-17】训练用 --system_prompt_file 时，run_info.config.system_prompt 是文件内容；
+# eval 端回读同一内容，并用 run_info 的 signature 里的 `-sp<hash>` 校验哈希。
+_sp_run = _run_cfg.get("system_prompt")
 if args.algo == "retool_math":
     from rlab.config import system_prompt_retool_math
-    system_prompt = system_prompt_retool_math
+    _sp_preset = system_prompt_retool_math
 elif args.algo == "retool":
     from rlab.config import system_prompt_retool
-    system_prompt = system_prompt_retool
+    _sp_preset = system_prompt_retool
 else:
-    system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
+    _sp_preset = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
  The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
+if _sp_run and _sp_run != _default_system_prompt(args.algo):
+    system_prompt = _sp_run
+    _sp_src = "run_info(config.system_prompt)"
+else:
+    system_prompt = _sp_preset
+    _sp_src = "preset 默认"
+_sp_sha = hashlib.sha1(system_prompt.encode("utf-8")).hexdigest()[:6]
+_sp_sig = ""
+if _run and _run.get("signature"):
+    import re as _re
+    _m = _re.search(r"-sp([0-9a-f]{6})", _run["signature"])
+    if _m:
+        _sp_sig = _m.group(1)
+if _sp_sig and _sp_sha != _sp_sig:
+    print(f"[eval][警告] system_prompt 与训练签名不符：训练 -sp{_sp_sig} ≠ eval -sp{_sp_sha}\n"
+          f"  （eval 用 {_sp_src}；若训练是 --system_prompt_file 且文件已变，请核对）")
+
+# ---- 评测协议来源自证（预算/提示/采样）----
+print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认）'} | "
+      f"algo={args.algo} eval_task={args.eval_task} | "
+      f"round_tokens={args.round_tokens} max_len={args.max_len} max_rounds={args.max_rounds} | "
+      f"system_prompt={_sp_src} sp_sha={_sp_sha}")
 
 # ---- 奖励口径复用 rlab.reward（单点真相，不再 дублировать） ----
 from rlab.reward import (

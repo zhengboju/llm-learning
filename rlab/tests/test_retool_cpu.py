@@ -1731,6 +1731,49 @@ def test_eval_thinking_switch():
           '"--system_prompt_file"' in _pb_src
           and 'cfg["system_prompt"] = f.read().strip()' in _pb_src)
 
+    # 【2026-09-17 对齐缺口】eval 此前一律取 preset 默认预算/提示：训练用
+    # --system_prompt_file/--round_gen_tokens 6144 覆盖时，eval 静默测第三种协议。
+    # 现在 eval_vllm_one.py 从 ckpt 的 run_info.json 回读训练 config（CLI 显式传参仍覆盖）。
+    _ev_src = open(os.path.join(_root, "eval_vllm_one.py"), encoding="utf-8").read()
+    check("eval_vllm_one.py 回读 run_info.json 的训练 config（协议本体，非仅顶层签名）",
+          "def _load_run_cfg(" in _ev_src
+          and 'info.get("config")' in _ev_src)
+    check("优先级：CLI 显式 > run_info 训练 config > preset 默认",
+          _ev_src.index("_rcfg = {**_rcfg, **_run_cfg}")
+          < _ev_src.index("if args.round_tokens is None:"))
+    check("回读顺序在系统提示装配之前（system_prompt 也吃 run_info）",
+          _ev_src.index("_run_cfg = (_run[\"config\"] if _run else {}) or {}")
+          < _ev_src.index("# ---- system_prompt 对齐训练 ----"))
+    check("system_prompt 来源 run_info.config.system_prompt，且与训练签名 -sp<hash> 对拍告警",
+          "_sp_run = _run_cfg.get(\"system_prompt\")" in _ev_src
+          and "训练 -sp{_sp_sig}" in _ev_src)
+    check("chat_template_kwargs 也吃 _rcfg（已 merge run_info，thinking 开关不丢）",
+          "_ctkw = _rcfg.get(\"chat_template_kwargs\")" in _ev_src)
+    # 行为级：_load_run_cfg 纯函数真跑（AST exec，脚本顶层要 --model 起 vLLM 不可 import）
+    import ast as _ast2
+    _fn2 = next(n for n in _ast2.parse(_ev_src).body
+                if isinstance(n, _ast2.FunctionDef) and n.name == "_load_run_cfg")
+    _ns2 = {"os": os, "json": json}
+    exec(compile(_ast2.Module(body=[_fn2], type_ignores=[]), "<runcfg>", "exec"), _ns2)
+    _load_run_cfg = _ns2["_load_run_cfg"]
+    _ck = os.path.join(tempfile.mkdtemp(), "ckpt_runinfo")
+    os.makedirs(_ck, exist_ok=True)
+    with open(os.path.join(_ck, "run_info.json"), "w", encoding="utf-8") as f:
+        json.dump({"signature": "retool_math-ts0.5-ol1-r2x6144-s300x50-lr1e-06-d0-1-tabc123-sp8e0184-vkgdn_prefill_backend=triton",
+                   "config": {"round_gen_tokens": 6144, "max_context_tokens": 14336,
+                              "max_rounds": 2, "system_prompt": "你是一个简洁的解题助手。\n",
+                              "chat_template_kwargs": {"enable_thinking": False}}}, f)
+    _r = _load_run_cfg(_ck)
+    check("行为：回读到训练 config（预算三件套 + system_prompt + thinking 开关）",
+          _r and _r["config"]["round_gen_tokens"] == 6144
+          and _r["config"]["max_context_tokens"] == 14336
+          and _r["config"]["max_rounds"] == 2
+          and _r["config"]["system_prompt"] == "你是一个简洁的解题助手。\n"
+          and _r["config"]["chat_template_kwargs"] == {"enable_thinking": False})
+    check("行为：无 run_info / 损坏 → None（旧 ckpt 回落 preset，不抛）",
+          _load_run_cfg(os.path.join(os.path.dirname(_ck), "no_such_dir")) is None)
+
+
 
 def test_overlong_ref_and_opt_cli():
     print("[X] overlong 参考系修复 + 优化超参 CLI：retool 多轮总预算 ≠ 单轮 max_gen_tokens")
