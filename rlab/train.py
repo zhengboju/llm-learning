@@ -307,6 +307,19 @@ def run_training(cfg, args):
             batch = get_batch(cfg["ref_server"])
         _ensure_gen_alive()
 
+        # 【2026-09-18 max staleness】off-policy 兜底：吃太旧策略的批直接丢弃
+        # （框架建议"更早的数据直接丢弃"）。staleness 口径与 [train][口径] 行一致：
+        # opt-step 差 = floor((step-1)/GAS) − floor(gen_version/GAS)。0/None=不启用。
+        _max_stale = int(cfg.get("max_stale_opt_steps") or 0)
+        if _max_stale > 0 and isinstance(batch.get("gen_version"), int):
+            _gas = max(1, int(cfg.get("gradient_accumulation_steps", 1)))
+            _upd = (step - 1) // _gas - batch["gen_version"] // _gas
+            if _upd > _max_stale:
+                print(f"[train][staleness] 丢弃批次: staleness={_upd} opt-step > "
+                      f"max_stale_opt_steps={_max_stale}（gen_version="
+                      f"{batch['gen_version']} @ step {step}）——off-policy 兜底，"
+                      f"继续等下一批", flush=True)
+                continue
         plen = batch["plen"]
         inputs = batch["inputs"].to(engine.device)
         advantages = batch["advantages"].to(engine.device)
@@ -507,6 +520,12 @@ def main():
                          "（默认 0.0 1.0 = DAPO 口径：去掉全错/全对；要同时去掉 "
                          "lopsided 组就传 0.25 0.75）。注意表中缺失的题一律丢弃"
                          "——探针没覆盖到的题不会进训练池")
+    # 【2026-09-18 max staleness】off-policy 兜底：吃太旧策略的批直接丢弃。
+    # 与 gen_update_steps 的关系见 config.py 注释。默认 0 = 不启用（历史行为）。
+    ap.add_argument("--max_stale_opt_steps", type=int, default=None,
+                    help="丢弃 staleness 超过该 opt-step 数的批（0/None=不启用）。"
+                         "合理下限 = gen_update_steps（推送周期内都够新）；"
+                         "设更大是容忍队列堆积。见 docs/05 staleness 讨论")
     ap.add_argument("--seed", type=int, default=None,
                     help="固定训练种子（抽题顺序+生成采样），阶段1 起对比实验必带")
     ap.add_argument("--chat_template_kwargs", default=None,
@@ -625,6 +644,8 @@ def main():
         if not (0.0 <= _lo < _hi <= 1.0):
             raise SystemExit(f"--difficulty_band 需满足 0<=lo<hi<=1，收到 {_lo},{_hi}")
         overrides["difficulty_band"] = (_lo, _hi)
+    if args.max_stale_opt_steps is not None:
+        overrides["max_stale_opt_steps"] = args.max_stale_opt_steps
     if args.seed is not None: overrides["seed"] = args.seed
     if args.chat_template_kwargs:
         overrides["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)

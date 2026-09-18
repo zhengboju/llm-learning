@@ -211,6 +211,11 @@ BASE = dict(
     all_steps=300,
     save_steps=100,
     gen_update_steps=16,     # 每 N 个 optimizer step 推送权重给生成端
+    # 【2026-09-18 max staleness】训练端丢弃"吃太旧策略"的批（off-policy 兜底）。
+    # 0 = 不启用（历史行为）。>0 时：batch 的 gen_version 与当前 opt-step 差 >
+    # 该值 → 丢弃该批（continue 等下一批）。合理下限 = gen_update_steps（推送周期
+    # 内的批都"够新"）；设更大是容忍双队列堆积造成的额外陈旧。见 docs/05 §P3 关联。
+    max_stale_opt_steps=0,
     train_micro_batch_size_per_gpu=4,   # = Q_batch_size*num_pre_Q
     gradient_accumulation_steps=4,
     lr=1e-6,

@@ -515,6 +515,25 @@ def test_eval_stats_and_signature():
     _rtbl2 = summarize_record(_rec2)
     check("gen_version 回退切出新会话（时间间隔不切时也能分开两次 run）",
           "共 2 个会话" in _rtbl2 and "gen_ver=0..32" in _rtbl2)
+    # 【2026-09-18 staleness 列】off-policy 可观测：窗口内吃多旧的策略（opt-step）。
+    # 单条 gv=0 的 record（样本 0..7，micro-step 0，floor(0/4)=0）→ staleness=0。
+    _rec_st = os.path.join(_dir, "record_stale.jsonl")
+    with open(_rec_st, "w", encoding="utf-8") as f:
+        f.write(_json.dumps({
+            "t": 9000.0, "acc": [1.0] * 8, "fmt": [1.0] * 8, "clen": [1000] * 8,
+            "code_used": [1] * 8, "code_ok": [1] * 8, "trunc_final": [0] * 8,
+            "gen_version": 0, "phase": "cold",
+        }, ensure_ascii=False) + "\n")
+        # gv=32：样本 8..15 = micro-step 1 → floor(1/4)=0 − floor(32/4)=8 = −8（超前）
+        f.write(_json.dumps({
+            "t": 9001.0, "acc": [0.0] * 8, "fmt": [1.0] * 8, "clen": [1000] * 8,
+            "code_used": [1] * 8, "code_ok": [1] * 8, "trunc_final": [0] * 8,
+            "gen_version": 32, "phase": "cold",
+        }, ensure_ascii=False) + "\n")
+    _rtbl_st = summarize_record(_rec_st, window=8)
+    check("staleness 列存在且数值正确（gv=0 首条=0；gv=32 超前=-8）",
+          "staleness" in _rtbl_st and "0.0（max 0）" in _rtbl_st
+          and "-8.0（max -8）" in _rtbl_st)
 
 
 if __name__ == "__main__":

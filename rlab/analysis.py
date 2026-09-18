@@ -223,6 +223,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
         （真机 bg1 的原始读数就是这个形态）。
       · 无 `gen_version`（旧协议）→ 沿用 120s 时间判据。"""
     accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
+    stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
     sess_span = {}   # sess -> [first_t, last_t]（墙钟，便于对 Shell 历史核对是哪次 run）
     sess_gv = {}     # sess -> [first_genver, last_genver]
     has_gv = False
@@ -251,6 +252,16 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
                 has_gv = True
                 prev_gv = gv
                 sess_gv.setdefault(sess, [gv, gv])[1] = gv
+            # 【2026-09-18 staleness 可观测】每样本的陈旧度（opt-step 口径，与
+            # train.py [train][口径] 行同公式）。1 record = 8 样本 = 1 micro-step；
+            # 本批第 i 个样本的 micro-step = (累计样本数 + i)//8。gen_version 是
+            # 生成该批时权重对应的 micro-step。staleness 过高 = 训练在吃太旧的
+            # 策略数据（off-policy，框架监控建议②）。
+            if isinstance(gv, int):
+                _gas = 4                                    # 与 config 一致（见函数尾注释）
+                for _i in range(n):
+                    _m = (len(accs) + _i) // 8              # 本样本的 micro-step
+                    stales.append((_m // _gas) - (gv // _gas))
             accs.extend(a > 0 for a in rec["acc"])
             fmts.extend(v > 0 for v in rec["fmt"])
             codes.extend(u > 0 for u in rec.get("code_used", []))
@@ -278,12 +289,17 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
                 when = f" [{fmt_t(span[0])} ~ {fmt_t(span[1])}]"
             gvr = sess_gv.get(s)
             gv_col = f" gen_ver={gvr[0]}..{gvr[1]}" if gvr else ""
+            st_col = ""
+            if stales:
+                _ss = [stales[i] for i in idx if i < len(stales)]
+                if _ss:
+                    st_col = f" staleness均值={sum(_ss) / len(_ss):.1f}(max {max(_ss)})"
             sess_lines.append(
                 f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/8:.0f}组）"
                 f" acc={a:.1f}% fmt={ff:.1f}% 条件精度={cond} code_ok={k:.1f}% trunc={tr:.1f}%"
-                f"{gv_col}{when}")
-    out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | avg_clen | 阶段 | 会话 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|"]
+                f"{gv_col}{st_col}{when}")
+    out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | avg_clen | staleness | 阶段 | 会话 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
         out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
                       f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
@@ -306,6 +322,14 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
             len_col = f"{avg_l:.0f}（{near * 100:.0f}%≥{int(0.9 * clen_cap)}）"
         else:
             len_col = "—"
+        # 【2026-09-18 staleness 列】窗口内样本陈旧度的均值/最大（opt-step 口径）。
+        # >0 表示窗口内有样本吃到比推送周期更旧的策略（off-policy）；无 gen_version
+        # 的旧 record 显示 "—"。均值反映"典型吃多旧"，最大反映"最坏吃多旧"。
+        if stales and i < len(stales):
+            _ch_s = stales[i:j]
+            stal_col = f"{sum(_ch_s) / len(_ch_s):.1f}（max {max(_ch_s)}）" if _ch_s else "—"
+        else:
+            stal_col = "—"
         ph_col = phases[i] if i < len(phases) else "—"
         sess_col = _sess_label(sess_ids[i]) if i < len(sess_ids) else "—"
         # 【2026-09-17】条件精度 = acc率/fmt率 = "抽到 boxed 的轨迹里真做对的比例"。
@@ -318,7 +342,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
         out.append(f"| {i}~{j} | {i // 8}~{j // 8} "
                    f"| {_a_rate * 100:.1f}% "
                    f"| {_f_rate * 100:.1f}% | {cond_col} | {code_col} "
-                   f"| {ok_col} | {tr_col} | {len_col} | {ph_col} | {sess_col} |")
+                   f"| {ok_col} | {tr_col} | {len_col} | {stal_col} | {ph_col} | {sess_col} |")
     if sess_lines:
         out.append("")
         out.append(f"== 会话拆分（新协议=gen_version 回退；旧协议=>{SESS_GAP_S:.0f}s 间隔）==")

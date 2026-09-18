@@ -2104,6 +2104,40 @@ def test_fwd_batch_chunk():
           and params[-1] == "queue_max" and "queue_max" not in params[:6])
 
 
+def test_max_stale_discard():
+    print("[Z2] max_stale_opt_steps：off-policy 兜底——训练端丢弃超陈旧批（2026-09-18）")
+    # config 默认 0 = 不启用（历史行为零变化）
+    check("config 默认 max_stale_opt_steps=0（不启用）",
+          get_config("retool_math", use_wandb=False)["max_stale_opt_steps"] == 0)
+    # CLI 透传进 overrides
+    import inspect as _ins
+    import rlab.train as _TB
+    _tsrc = _ins.getsource(_TB.main)
+    check("train.py 暴露 --max_stale_opt_steps 并接线",
+          '"--max_stale_opt_steps"' in _tsrc
+          and 'overrides["max_stale_opt_steps"] = args.max_stale_opt_steps' in _tsrc)
+    # 丢弃逻辑（真机运行时路径）：staleness = floor((step-1)/GAS) − floor(gv/GAS)
+    _tr_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    check("训练循环有 max staleness 丢弃块（读 gen_version、超限 continue）",
+          "max_stale_opt_steps" in _tr_src
+          and "off-policy 兜底" in _tr_src
+          and _tr_src.index("staleness] 丢弃批次")
+          < _tr_src.index("continue", _tr_src.index("staleness] 丢弃批次"))
+          < _tr_src.index('plen = batch["plen"]'))
+    # 口径纯函数级验证：模拟训练端算 staleness 并判丢弃
+    _gas = 4
+    for _step, _gv, _max_s, _expect in [
+        (17, 0, 16, False),     # floor(16/4)=4 − 0 = 4 ≤ 16 不丢
+        (65, 0, 16, False),     # floor(64/4)=16 − 0 = 16，严格 > 判定 → 恰好=16 不丢
+        (81, 0, 16, True),      # floor(80/4)=20 − 0 = 20 > 16 丢
+        (81, 64, 16, False),    # floor(80/4)=20 − floor(64/4)=16 = 4 不丢（生成端已跟进）
+    ]:
+        _upd = (_step - 1) // _gas - _gv // _gas
+        check(f"staleness 口径 step={_step} gv={_gv}: {_upd} > {_max_s} → {'丢' if _expect else '不丢'}",
+              (_upd > _max_s) == _expect)
+
+
 def test_vllm_gen_logps():
     print("[AA] 减法①：gen_logps 改走 vLLM 逐轮采样 logprobs（提取/拼接/对拍闸门）")
     from rlab.rollout import (LogpsVerifier, collect_retool_group, gen_logps_from_segs,
