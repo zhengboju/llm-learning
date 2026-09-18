@@ -228,11 +228,38 @@ elif args.eval_task == "dapo_math":
     # 【2026-09-09 审查修复·split 强制生效】test=dev.jsonl(held-out)，train=训练池。
     # 旧版两个 split 都回落全量 17k train pool（训练/评测同池污染）且 dev 缺失时
     # 静默用训练池充当 held-out——现在 dev 缺失直接报错。
-    from rlab.data import load_dapo_math_dev, load_dapo_math_train
+    from rlab.data import (load_dapo_math_dev, load_dapo_math_train,
+                           load_difficulty_table, filter_qas_by_difficulty)
     if args.split == "test":
         test_data = load_dapo_math_dev()   # 缺失时 FileNotFoundError 带指引
     else:
         test_data = load_dapo_math_train()
+        # 【2026-09-18 分布内对照缺口】训练端跑 `filter_qas_by_difficulty`（band +
+        # 难度表）把全量池缩到 ~2 万题；旧版 --split train 直接抽全量池——抽到的题
+        # 绝大多数训练**没见过**，不是真正的"分布内"。现在从 run_info 回读训练端
+        # 同一套过滤（difficulty_path/band 单点同源），让 eval 的 train split 与
+        # 训练分布严格一致。
+        _dp = (_run_cfg.get("difficulty_path") or "")
+        if _dp:
+            _lo, _hi = _run_cfg.get("difficulty_band", (0.0, 1.0))
+            if not isinstance(_lo, (int, float)) or not isinstance(_hi, (int, float)):
+                _lo, _hi = 0.0, 1.0
+            try:
+                _tbl = load_difficulty_table(_dp)
+            except OSError:
+                _tbl = {}
+            if _tbl:
+                test_data, _dstat = filter_qas_by_difficulty(test_data, _tbl, lo=_lo, hi=_hi)
+                print(f"  [eval][train] 复用训练端难度过滤 band=({_lo},{_hi}): "
+                      f"{_dstat['total']} -> {_dstat['kept']} 题"
+                      f"（p_zero {_dstat['p_zero']} / p_one {_dstat['p_one']} / "
+                      f"band_out {_dstat['band_out']} / missing {_dstat['missing']}）")
+            else:
+                print(f"  [eval][警告] --split train 但难度表读不到（{_dp}）→ "
+                      f"按全量池抽，不是训练分布内")
+        else:
+            print("  [eval][警告] --split train 但训练 run_info 无 difficulty_path → "
+                  "按全量池抽，不是训练分布内")
     print(f"  dapo_math [{args.split}]: {len(test_data)} 题")
 else:
     raise ValueError(f"未知 eval_task {args.eval_task}")

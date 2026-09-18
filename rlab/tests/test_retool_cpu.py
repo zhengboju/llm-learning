@@ -1850,6 +1850,19 @@ def test_eval_thinking_switch():
           and "_load_run_cfg(args.proto_from) if args.proto_from else _load_run_cfg(args.model)"
           in _ev_src)
 
+    # 【2026-09-18 分布内对照缺口】--split train 此前直接抽全量池（训练端难度过滤
+    # 后 ~2 万题之外的题大多数训练没见过），不是真正的"分布内"。修复：eval 的
+    # train split 复用 run_info 回读的训练端同一套过滤（difficulty_path/band 单点同源）。
+    check("--split train 复用训练端难度过滤（difficulty_path 从 run_info 回读）",
+          'from rlab.data import (load_dapo_math_dev, load_dapo_math_train,' in _ev_src
+          and "load_difficulty_table" in _ev_src
+          and "filter_qas_by_difficulty(test_data, _tbl, lo=_lo, hi=_hi)" in _ev_src)
+    check("train split 的过滤与训练同源（_run_cfg 的 difficulty_path，非 CLI 新参数）",
+          '_dp = (_run_cfg.get("difficulty_path") or "")' in _ev_src
+          and "_run_cfg.get(\"difficulty_band\", (0.0, 1.0))" in _ev_src)
+    check("难度表读不到/无 difficulty_path 时大字告警（不静默按全量池抽）",
+          "按全量池抽，不是训练分布内" in _ev_src)
+
 
 
 def test_overlong_ref_and_opt_cli():
