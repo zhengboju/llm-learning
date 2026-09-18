@@ -462,6 +462,34 @@ def test_eval_stats_and_signature():
     check("同层配对出现在表里（step200 vs BASE 的用码层）", "同题配对" in _cltbl
           and "p=" in _cltbl)
 
+    print("[G] 分层迁移分析（code_migration）")
+    # 【2026-09-18】--code-layer 只回答"每个存档点自己分层 acc"，回答不了
+    # "BASE 用码的题到 step300 转纯推理后答得怎么样"——H1 判据的最后一块证据。
+    from rlab.analysis import summarize_code_migration
+    # BASE: q1/q2 用码（q1 对 q2 错），q3/q4/q5 纯推理（q3/q5 对 q4 错）
+    # step200: q1/q2 仍用码（全对），q3/q4/q5 仍纯推理（q3/q5 对 q4 错），q6 新增
+    _jcm = os.path.join(_dir, "eval_code_mig.json")
+    _json.dump({
+        "BASE": {"acc": 0.4, "n": 5, "items": [
+            {"qk": "q1", "acc": 1.0, "code_used": 1}, {"qk": "q2", "acc": 0.0, "code_used": 1},
+            {"qk": "q3", "acc": 1.0, "code_used": 0}, {"qk": "q4", "acc": 0.0, "code_used": 0},
+            {"qk": "q5", "acc": 1.0, "code_used": 0}]},
+        "step300": {"acc": 0.6, "n": 6, "items": [
+            {"qk": "q1", "acc": 1.0, "code_used": 0},  # BASE 用码 → 转纯推理，对
+            {"qk": "q2", "acc": 0.0, "code_used": 0},  # BASE 用码 → 转纯推理，错
+            {"qk": "q3", "acc": 1.0, "code_used": 0},  # BASE 纯推理 → 仍纯推理
+            {"qk": "q4", "acc": 0.0, "code_used": 0},
+            {"qk": "q5", "acc": 1.0, "code_used": 0},
+            {"qk": "q6", "acc": 1.0, "code_used": 0}]},
+        "_meta": {}},
+        open(_jcm, "w", encoding="utf-8"), ensure_ascii=False)
+    _cm = summarize_code_migration(_jcm)
+    check("迁移表以 BASE 分层为锚（两行层名 + 目标列）", "以 BASE 分层为锚" in _cm
+          and "| 用码 |" in _cm and "| 纯推理 |" in _cm)
+    check("BASE 用码题转纯推理格标 ◆（放弃代码的归宿）", "◆" in _cm)
+    check("迁移计数正确：用码层 q1/q2 转纯推理(1对)；纯推理层 q3/q4/q5 仍同层(2对)",
+          "50.0% (1/2)◆" in _cm and "66.7% (2/3)" in _cm)
+
     print("[G] pair_eval 跨 json 配对（模型已灭失也可对照）")
     # 【2026-09-13】run2 的 m200 权重灭失（raw 被 P1 覆盖 + _mm 副本被删），
     # per-item json 是唯一遗物 —— 跨 json 同题配对让它仍能进对照表。

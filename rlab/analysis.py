@@ -230,6 +230,65 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
     return "\n".join(lines)
 
 
+def summarize_code_migration(path: str, ref_name: str = "BASE") -> str:
+    """分层迁移分析：以 ref_name（通常 BASE）的分层为锚，追踪各层题在
+    其他存档点里的**去向**。
+
+    【2026-09-18 由来】--code-layer 只回答"每个存档点自己分层的 acc"，无法回答
+    "BASE 里用码的那些题，到 step300 去哪了、转纯推理后答得怎么样"——这正是
+    H1 判据的最后一块证据：压灭代码是否伤害了原本用码的题。
+
+    对 ref 的每个 item 按 code_used 分层，再在目标模型的 items 里同题查找：
+      · 用码层 → 目标也用码 / 目标转纯推理 / 目标缺题
+      · 纯推理层 → 目标也纯推理 / 目标转用码 / 目标缺题
+    每格输出 (题数, acc 率)，"目标也纯推理"格标 ◆ 提示这是 BASE 用码题放弃代码后
+    的归宿。转层列的 McNemar 判定回答"放弃代码/改用代码是否显著改变 acc"。"""
+    with open(path, encoding="utf-8") as f:
+        results = json.load(f)
+    models = {k: v for k, v in results.items() if not k.startswith("_")}
+    ref = models.get(ref_name)
+    if not ref or not ref.get("items"):
+        return f"（{ref_name} 无 items，无法作迁移锚）"
+    ref_items = {it.get("qk"): it for it in ref["items"] if it.get("qk")}
+    lines = ["**分层迁移（以 %s 分层为锚）**" % ref_name,
+             "| 目标 | BASE层 | 目标同层 | 目标转另一层 | 目标缺题 |",
+             "|---|---|---|---:|---:|"]
+    for name, r in models.items():
+        if name == ref_name:
+            continue
+        items = {it.get("qk"): it for it in (r.get("items") or []) if it.get("qk")}
+        cells = {}
+        for layer, keep_used in (("用码", True), ("纯推理", False)):
+            same = trans = missing = same_ok = trans_ok = 0
+            for qk, it in ref_items.items():
+                # 只按锚层（ref）的 code_used 分组；目标只看同题 acc。
+                # 【2026-09-18】链式比较陷阱：`(code or 0) > 0 == keep_used` 会被
+                # Python 解析成 `(code>0) and (0 == keep_used)`（共享中间值 0），
+                # 恒假/恒真——必须显式括号 `((code or 0) > 0) == keep_used`。
+                if ((it.get("code_used") or 0) > 0) != keep_used:
+                    continue
+                t = items.get(qk)
+                if t is None:
+                    missing += 1
+                elif (((t.get("code_used") or 0) > 0) == keep_used):
+                    same += 1
+                    same_ok += 1 if t.get("acc", 0) == 1.0 else 0
+                else:
+                    trans += 1
+                    trans_ok += 1 if t.get("acc", 0) == 1.0 else 0
+            cells[layer] = (same, same_ok, trans, trans_ok, missing)
+        for layer, key in (("用码", "用码"), ("纯推理", "纯推理")):
+            same, same_ok, trans, trans_ok, missing = cells[key]
+            same_col = _acc_col(same_ok, same)
+            trans_col = _acc_col(trans_ok, trans)
+            if layer == "用码":
+                # BASE 用码题 → 目标也用码 / 转纯推理（◆ 放弃代码的归宿）
+                lines.append(f"| {name} | {layer} | {same_col} | {trans_col}◆ | {missing} |")
+            else:
+                lines.append(f"| {name} | {layer} | {same_col} | {trans_col} | {missing} |")
+    return "\n".join(lines)
+
+
 def pair_eval(path_a: str, path_b: str, name_a: str, name_b: str) -> str:
     """跨 json 两两同题配对（McNemar）。
 
@@ -459,6 +518,9 @@ if __name__ == "__main__":
     ap.add_argument("--record", default=None)
     ap.add_argument("--code-layer", default=None,
                     help="代码分层分析：跨存档点按 code_used 分层 acc + 与 BASE 同层配对")
+    ap.add_argument("--code-migration", default=None,
+                    help="分层迁移分析：以 BASE 分层为锚，追踪各层题在后续存档点里的去向"
+                         "（放弃代码后答得怎么样）")
     ap.add_argument("--window", type=int, default=160,
                     help="record 曲线的窗口（单位=样本；8 样本=1 组=1 micro-step。"
                          "默认 160=20 组；调小看细节但噪声按 1/√n 放大）")
@@ -481,6 +543,8 @@ if __name__ == "__main__":
         print(summarize_eval(args.eval_json, args.base))
     if args.code_layer:
         print(summarize_code_layer(args.code_layer, args.base))
+    if args.code_migration:
+        print(summarize_code_migration(args.code_migration, args.base))
     if args.record:
         print(summarize_record(args.record, window=args.window))
     if not args.eval_json and not args.record and not args.code_layer and not args.pair_json:
