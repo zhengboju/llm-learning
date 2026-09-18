@@ -47,6 +47,8 @@ def main():
                     help="算法名：grpo/retool/retool_math；指定后自动决定 prompt/预算/奖励口径与数据集")
     ap.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"],
                     help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
+    ap.add_argument("--val_n", type=int, default=1,
+                    help="每题采样数（>1=Average@N 采样评测，参考项目口径；retool_math 建议 8-12）")
     args = ap.parse_args()
 
     # 兼容旧 --retool
@@ -59,6 +61,8 @@ def main():
            "--tuned", models, "--n", str(args.n), "--seed", str(args.seed),
            "--gpus", args.gpus, "--per_gpu", str(args.per_gpu), "--split", args.split,
            "--base_path", args.base_path]
+    if args.val_n > 1:
+        cmd += ["--val_n", str(args.val_n)]
     if args.skip_base:
         cmd.append("--skip_base")
     if args.gpu_mem is not None:

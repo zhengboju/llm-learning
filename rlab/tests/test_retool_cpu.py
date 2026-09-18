@@ -2477,18 +2477,22 @@ def test_budget_guard_and_drift_stats():
     from rlab.losses import compute_loss, _finalize
 
     # ---- ① 旧的事故配置必须被硬拦 ----
+    # 【2026-09-18 方案B】preset 已改 4×2048+14336（合法）；旧事故复现需显式 8192 ctx。
     _raised = False
     try:
-        get_config("retool_math", use_wandb=False, max_rounds=3, round_gen_tokens=3072)
+        get_config("retool_math", use_wandb=False, max_rounds=3, round_gen_tokens=3072,
+                   max_context_tokens=8192)
     except ValueError as e:
         _raised = "预算不自洽" in str(e)
     check("旧事故配置 3×3072+1024 > 8192 → get_config 直接 ValueError（防静默上线）", _raised)
     check("错误信息含可执行改法（给出 round_gen_tokens 上限）",
           "round_gen_tokens ≤" in str(_exc_msg(lambda: get_config(
-              "retool_math", use_wandb=False, max_rounds=3, round_gen_tokens=3072))))
-    check("预算自洽的 preset 不报错（retool 与 retool_math 都要过）",
+              "retool_math", use_wandb=False, max_rounds=3, round_gen_tokens=3072,
+              max_context_tokens=8192))))
+    check("方案B preset（4×2048+14336）预算自洽且不报错",
           validate_retool_budget(get_config("retool_math", use_wandb=False)) >= 0
-          and validate_retool_budget(get_config("retool", use_wandb=False)) > 0)
+          and get_config("retool_math", use_wandb=False)["max_rounds"] == 4
+          and get_config("retool_math", use_wandb=False)["round_gen_tokens"] == 2048)
     check("非 retool 算法不参与预算校验（返回值 0）",
           validate_retool_budget(get_config("grpo", use_wandb=False)) == 0)
 

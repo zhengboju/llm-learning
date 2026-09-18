@@ -47,6 +47,16 @@ parser.add_argument("--dump_items", action=argparse.BooleanOptionalAction, defau
                     help="落盘 per-item 明细（默认开，供 analysis.py 做配对检验/分层）；--no-dump_items 关闭")
 parser.add_argument("--max_rounds", type=int, default=None, help="--retool 时最多代码-执行轮数；None=取训练配置")
 parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置")
+# 【2026-09-18 采样评测】参考项目（agentic-rl-lab/05-retool）的增益全在采样下显现
+# （Average@N，temp 1.0 / top_p 0.7）；greedy 会把多轮代码行为测成灭绝（docs §7.5.2
+# mode vs mixture 已记录）。--val_n>1 时每题采样 val_n 条（per-item 记首条，
+# 聚合 acc=Average@N），采样参数默认对齐参考（temp 1.0 / top_p 0.7）。
+parser.add_argument("--val_n", type=int, default=1,
+                    help="每题采样数（>1 启用 Average@N 采样评测，参考项目口径）；默认 1=greedy")
+parser.add_argument("--temperature", type=float, default=None,
+                    help="采样温度；None=val_n>1 时取 1.0（参考项目），否则 0（greedy）")
+parser.add_argument("--top_p", type=float, default=None,
+                    help="采样 top_p；None=val_n>1 时取 0.7（参考项目），否则 1.0")
 parser.add_argument("--proto_from", default=None,
                     help="协议来源目录（含 run_info.json）；None=从 --model 自己的 run_info 回读。"
                          "供 BASE 等无 run_info 的裸模型复用『被测 checkpoint 的训练协议』，"
@@ -433,59 +443,91 @@ llm = LLM(model=_model_for_vllm, gpu_memory_utilization=args.gpu_mem,
           max_model_len=args.max_len, dtype="bfloat16", **_vllm_kwargs)
 
 code_used = code_ok = None
+# 【2026-09-18 采样评测】--val_n>1 时每题采样 val_n 条（Average@N，参考项目口径）。
+# greedy（val_n=1）保持历史行为逐位不变：retool 家族贪心（temp=0）→ 多轮生成；
+# 非 retool 贪心 → 单轮生成。采样档（val_n>1）：
+#   · 非 retool：直接 llm.generate(n=val_n)，聚合 acc = 平均正确率（Average@N）
+#   · retool：多轮生成每样本独立 seed（参考项目逐条独立采样），聚合同理
+_sampling = args.val_n > 1
+if _sampling:
+    _temp = args.temperature if args.temperature is not None else 1.0
+    _topp = args.top_p if args.top_p is not None else 0.7
+    print(f"  [采样评测] val_n={args.val_n} temperature={_temp} top_p={_topp}（Average@N，参考项目口径）")
+else:
+    _temp = 0.0
+    _topp = 1.0
 if is_retool_family:
     from rlab.rollout import multi_turn_rollout_group
-    sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens)
+    if _sampling:
+        # 每条轨迹独立请求 + 独立 seed（与训练同形态；vLLM 同 seed 会生成相同轨迹）
+        import random as _rnd
+        _base = _rnd.randrange(1 << 30)
+        sp_mt = [SamplingParams(temperature=_temp, top_p=_topp,
+                                max_tokens=args.round_tokens, seed=_base + k)
+                 for k in range(len(prompts) * args.val_n)]
+    else:
+        sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens)
     mt_cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
               "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
+    _probe_prompts = [p for p in prompts for _ in range(args.val_n)] if _sampling else prompts
     _segs, _full, code_stats = multi_turn_rollout_group(
-        llm, sp_mt, tokenizer, prompts, mt_cfg)
+        llm, sp_mt, tokenizer, _probe_prompts, mt_cfg)
     answers = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                for segs_i in _segs]
-    # 打分域：retool 去代码块后再判，retool_math 直接 boxed（代码块不影响 boxed 提取，但为一致仍可剥离）
-    if args.algo == "retool_math":
-        # boxed 提取已只看末300字符，代码块残留不干扰；为与训练一致不剥离也行，但剥离更干净
-        answers = [_strip_code_blocks(a) for a in answers]
-    else:
-        answers = [_strip_code_blocks(a) for a in answers]
+    # 打分域：retool_math 剥离代码块（与训练端 total_reward_retool_math 同口径）
+    answers = [_strip_code_blocks(a) for a in answers]
     code_used = [s["code_used"] for s in code_stats]
     code_ok = [s["code_ok"] for s in code_stats]
 else:
-    outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=args.max_tokens))
-    answers = [o.outputs[0].text for o in outs]
-    code_used = code_ok = [0] * len(answers)
+    if _sampling:
+        outs = llm.generate(prompts, SamplingParams(temperature=_temp, top_p=_topp,
+                                                    max_tokens=args.max_tokens,
+                                                    n=args.val_n))
+        answers = [o.text for out in outs for o in out.outputs]
+        code_used = code_ok = [0] * len(answers)
+    else:
+        outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=args.max_tokens))
+        answers = [o.outputs[0].text for o in outs]
+        code_used = code_ok = [0] * len(answers)
 
 # ---------- 评分 ----------
 # 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
 # 把"只写代码没写答案/输出为空"的样本剔出分母，模型退化时反而美化 acc。
+# 【2026-09-18 采样口径】--val_n>1 时 answers 是 [题][采样] 平铺（每题 val_n 条）：
+# 聚合 acc = Average@N（每题 val_n 条平均），per-item 记每题平均 acc/fmt。
 acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
 items = []      # per-item 明细（--dump_items，默认开）：供 analysis.py 配对检验/分层
-for i, (item, ans) in enumerate(zip(sample, answers)):
+for i, item in enumerate(sample):
     n_valid += 1
-    a = f = 0.0     # 空答案计入分母记 0 分（见上方审查修复注释）
-    if len(ans.strip()) > 0:
-        # ground_truth 归一：gsm8k 带 ####，dapo 直接答案
-        if args.eval_task == "gsm8k":
-            gt = item["A"].split("####")[-1].strip()
-            a = reward_correct_gsm8k(ans, gt)
-            f = reward_format_gsm8k(ans)
-        else:
-            gt = str(item["A"]).strip()
-            a = reward_correct_boxed_eval(ans, gt)
-            f = reward_format_boxed(ans)
-    acc += a; fmt += f; both += (a == 1.0 and f == 1.0)
+    a_avg = f_avg = 0.0
+    for k in range(args.val_n):
+        ans = answers[i * args.val_n + k] if _sampling else answers[i]
+        a = f = 0.0     # 空答案计入分母记 0 分（见上方审查修复注释）
+        if len(ans.strip()) > 0:
+            # ground_truth 归一：gsm8k 带 ####，dapo 直接答案
+            if args.eval_task == "gsm8k":
+                gt = item["A"].split("####")[-1].strip()
+                a = reward_correct_gsm8k(ans, gt)
+                f = reward_format_gsm8k(ans)
+            else:
+                gt = str(item["A"]).strip()
+                a = reward_correct_boxed_eval(ans, gt)
+                f = reward_format_boxed(ans)
+        a_avg += a / args.val_n
+        f_avg += f / args.val_n
+    acc += a_avg; fmt += f_avg; both += (a_avg == 1.0 and f_avg == 1.0)
     if args.dump_items:
         items.append({
             # 题面指纹：跨模型对齐用（同 seed/split 下同题同 key）——McNemar 的配对键。
             # run2 缺的正是这个键，导致 +5.0pp 只能做未配对检验（p≈0.11）。
             "qk": hashlib.sha1(str(item["Q"]).encode("utf-8")).hexdigest()[:12],
-            "acc": a, "fmt": f,
+            "acc": a_avg, "fmt": f_avg,
             "code_used": int(code_used[i]) if code_used and i < len(code_used) else 0,
             "code_ok": int(code_ok[i]) if code_ok and i < len(code_ok) else 0,
-            "ans_len": len(ans), "empty": 0 if ans.strip() else 1,
+            "ans_len": 0, "empty": 0,
         })
     if i < args.show:
-        print(f"  [a={a:.0f} f={f:.0f}] {ans[:500]}")
+        print(f"  [a={a_avg:.2f} f={f_avg:.2f}]")
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid,
@@ -494,7 +536,8 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
           # 【2026-09-12 审计缺口补齐】旧版不记 model_path：多模型同表时事后无法核对
           # "这一行评的到底是哪个 checkpoint"（本文件 docstring 自己就在警告同名覆盖）。
           "model_path": args.model,
-          "eval_protocol": {"temperature": 0, "greedy": True, "seed": args.seed,
+          "eval_protocol": {"temperature": _temp, "top_p": _topp, "greedy": not _sampling,
+                            "val_n": args.val_n, "seed": args.seed,
                             "max_rounds": args.max_rounds, "round_tokens": args.round_tokens,
                             "max_tokens": args.max_tokens, "max_len": args.max_len}}
 if args.dump_items:

@@ -37,6 +37,8 @@ parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果jso
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math；自动决定 prompt/预算/奖励口径")
 parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"], help="评测数据集；None=自动")
+# 【2026-09-18 采样评测】透传给 eval_vllm_one.py：--val_n>1 启用 Average@N（参考项目口径）
+parser.add_argument("--val_n", type=int, default=1, help="每题采样数（>1=Average@N 采样评测）")
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -144,6 +146,8 @@ def run_one(gpu, idx, name, path):
     cmd = [sys.executable, one_py, "--model", path, "--name", name,
            "--n", str(args.n), "--seed", str(args.seed), "--split", args.split,
            "--gpu_mem", str(GPU_MEM), "--out", out_json]
+    if args.val_n > 1:
+        cmd += ["--val_n", str(args.val_n)]
     if args.retool:
         cmd += ["--retool"]
     if args.algo is not None:

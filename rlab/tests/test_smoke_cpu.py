@@ -356,8 +356,8 @@ def test_eval_stats_and_signature():
     cfg = get_config("retool_math", use_wandb=False, trunc_shaping=0.0,
                      all_steps=300, save_steps=50, lr=5e-6)
     sig = run_signature(cfg)
-    check("签名含 algo/trunc/轮次/步数存盘/lr",
-          sig.startswith("retool_math-ts0-ol1-r2x3072-s300x50-lr5e-06"))
+    check("签名含 algo/trunc/轮次/步数存盘/lr（方案B：r4x2048）",
+          sig.startswith("retool_math-ts0-ol1-r4x2048-s300x50-lr5e-06"))
     check("trunc_shaping 变化会改变签名（P1 消融可直接比对）",
           run_signature({**cfg, "trunc_shaping": 0.5}) != sig)
     check("lr=0.0 不被 falsy 吞掉（显式 0 仍进签名）", "-lr0-" in run_signature({**cfg, "lr": 0.0}))
@@ -367,7 +367,7 @@ def test_eval_stats_and_signature():
     info = _json.load(open(_p, encoding="utf-8"))
     check("run_info 顶层带 signature + 消融维度（trunc/rounds/save_steps）",
           info["signature"] == sig and info["trunc_shaping"] == 0.0
-          and info["max_rounds"] == 2 and info["save_steps"] == 50)
+          and info["max_rounds"] == 4 and info["save_steps"] == 50)
     check("run_info 仍保留完整 cfg（2026-09-11 provenance 契约不破）", len(info["config"]) > 50)
 
     # 【2026-09-17】系统提示偏离进签名：提示是协议的一半（难度表 = 模型×提示×预算），

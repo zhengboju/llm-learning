@@ -58,23 +58,27 @@ ALGO_DEFAULTS = {
     # config.validate_retool_budget() 强制（不满足直接 raise，防再次静默上线）：
     #     max_rounds × round_gen_tokens + max_prompt_length + 工具段预留
     #         ≤ max_context_tokens
-    # 本 preset 代入：2×3072 + 1024 + 1×266 = 7434 ≤ 8192 ✅（余量 758）
-    # 为什么是 max_rounds 2 而不是 round_gen_tokens 2048：
-    #   ① 精度杀手是 trunc_final（末段被**单轮**上限切断），它只跟 round_gen_tokens
-    #      有关；降到 2048 会让 trunc 更糟（探针已实测 1024 下截断 85%）。
-    #   ② max_rounds 对本模型是"虚假预算"（docs/03 v4 探针：无代码即终局，
-    #      有效单轨迹预算 = round_gen_tokens）——砍掉一轮不损失 prose 路径，
-    #      换来的 3072 token 余量让"合法轨迹永不被 overlong 丢"。
-    #   ③ 保留 TIR 最小闭环：round1 写代码 → 沙箱执行 → round2 出 final 答案。
-    #   想恢复 2 次代码执行（3 轮）请改 max_rounds=3 + round_gen_tokens=2048，
-    #   并接受 trunc_final 上升（本轮已有健康签名会报警）。
+    # 【2026-09-18 方案B·轮次预算重定，为何从 2×6144 改 4×2048】三次 run（run2 /
+    # p5 两版）代码路径都被 RL 压灭（code% 45→3、code_ok 56%→10%），而分层迁移
+    # 分析实锤代码有真实价值（BASE 用码题 74.1% vs 纯推理 47.4% = +26.7pp）。
+    # 根因不是参数（lr 1e-6 / reward ±1 / clip 0.2-0.28 已对齐官方与
+    # agentic-rl-lab/05-retool），是协议结构：max_rounds=2 只有 1 次代码机会，
+    # 代码写错一次整条轨迹就废、无补救空间 → RL 算出"写代码期望净收益为负"→
+    # 理性压灭。参考项目（同 Qwen3.5-4B）用 max_code_calls=4/turns=6 让代码
+    # "可分步改进"：turns 2.0→2.8 在学"多试几次"、code_calls 1.24→1.98 单调升、
+    # Average@12 23.6→47.5、sandbox success 0.68→0.80（代码越练越能跑）。
+    # 方案 B = max_rounds 4（3 次代码机会）+ round_gen_tokens 2048（不赌 4B 在
+    # 1024 下的截断风险，docs/03 探针 1024 截断 85%）+ max_context_tokens 14336
+    # （p5 实测档，need=4×2048+1024+798=10014 ≤ 14336 ✅，余量充足）。
+    # 仍保留的差异（报告须注明）：loss_norm sample_mean、KL β=0.04、
+    # Q_batch_size=1、trunc_shaping 0.5（p5 已证伪其是增益来源，保留不影响）。
     "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
                         loss_norm="sample_mean", data_task="dapo_math",
                         num_pre_Q=8, train_micro_batch_size_per_gpu=8,
                         temperature=1.0, top_k=-1,
                         gen_questions_per_attempt=4, sandbox_workers=8,
-                        max_context_tokens=8192, round_gen_tokens=3072,
-                        max_rounds=2,
+                        max_context_tokens=14336, round_gen_tokens=2048,
+                        max_rounds=4,
                         max_gen_tokens=8192, max_prompt_length=1024,
                         # 长度控制：overlong 现在可达（预算自洽）→ 打开；再叠一个
                         # 靶向 trunc_final 的项（prose 路径唯一够得到的反向信号）。
