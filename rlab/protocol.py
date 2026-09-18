@@ -40,6 +40,19 @@ _PY_FENCE_RE = re.compile(r"```python\s*(.*?)```", re.DOTALL)
 # 特殊 token 字面量（<|im_end|> / <|endoftext|> 等，Qwen 系通用形态）
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
 
+# 【2026-09-18 stop 机制·工具调用节奏的核心修复】模型写到**代码块闭合围栏**立即
+# 停止生成，沙箱结果紧跟代码回填——修复"代码→自己瞎猜→[真结果]"的错位。
+# 无 stop 时（p5/p6 三轮 run）：一段生成写满 max_tokens 才结束，代码块被事后正则
+# 提取、TOOL_RESULT 拼在**整段末尾**——模型先猜了结果才看到真结果，"调用工具获取
+# 信息"的因果链断裂；同时每段烧满预算 → 末段 finish_reason=length → trunc 42~55%
+# → 无 boxed → reward -1，代码路径结构性负 advantage 被 RL 压灭（code% 50→3）。
+# 参考实现（Auto_Program/hjy_grpo_program.py:151）同款机制：stop 句 + include_stop。
+# stop 串选 "```\n"（闭围栏+换行）而非 "```"：经 chr 验证 "```python\n" **不含**
+# "```\n" 子串（"```" 后面跟的是 "python"），开围栏不会误停；闭围栏 "```\n" 命中后
+# include_stop_str_in_output=True 保留围栏字节，extract_python_blocks 仍能拿到完整
+# ```python...``` 块。附带收益：每段最多一个代码块（blocks[-1] 白写问题自然消解）。
+RETOOL_STOP_KWARGS = {"stop": ["```\n"], "include_stop_str_in_output": True}
+
 
 def sanitize_tool_text(text: str) -> str:
     """沙箱输出拼回模型上下文前的无害化消毒（对齐 agentic-rl-lab/05-retool 教训：

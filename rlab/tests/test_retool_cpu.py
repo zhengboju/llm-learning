@@ -269,6 +269,42 @@ def test_config_retool_math():
     check("BASE 隔离：grpo 仍是 0.7/top_k=50/4 条/group_std",
           g["temperature"] == 0.7 and g["top_k"] == 50
           and g["num_pre_Q"] == 4 and g["adv_mode"] == "group_std")
+
+    print("[F3] stop 机制（工具调用节奏修复，2026-09-18）")
+    # 【三轮 run 代码压灭的根因】无 stop 时一段生成写满 max_tokens：代码被事后提取、
+    # TOOL_RESULT 拼在整段末尾——模型先瞎猜结果才看到真结果，且末段高截断（42~55%）
+    # → 无 boxed → -1，代码路径结构性负 advantage。修复 = stop 在闭围栏立即停。
+    from rlab.protocol import RETOOL_STOP_KWARGS as _STOP
+    _bt = chr(96) * 3
+    check("stop 串 = 闭围栏+换行（含 include_stop 保留围栏字节）",
+          _STOP == {"stop": [_bt + "\n"], "include_stop_str_in_output": True})
+    check("开围栏不误停：'```python\\n' 不含 stop 串（chr 验证过的语义）",
+          (_bt + "\n") not in (_bt + "python\n"))
+    from rlab.protocol import extract_python_blocks as _epb
+    check("stop 截断形态下完整块仍可提取（include_stop 保留闭围栏）",
+          _epb("reasoning " + _bt + "python\nprint(1)\n" + _bt + "\n") == ["print(1)"])
+    check("未闭合围栏（无 stop 触发、段被切）不产块（行为与旧协议一致）",
+          _epb("x " + _bt + "python\nprint(1)\n") == [])
+    _ro_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "rollout.py"), encoding="utf-8").read()
+    check("gen_worker 的 make_retool_sps 接线 stop（cfg.retool_stop 条件化）",
+          "if cfg.get(\"retool_stop\"):" in _ro_src
+          and "kw.update(_RETOOL_STOP_KWARGS)" in _ro_src)
+    _ev_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "eval_vllm_one.py"), encoding="utf-8").read()
+    check("eval 的 sp_mt 接线 stop（从训练 config 回读，新旧 ckpt 不混测）",
+          "RETOOL_STOP_KWARGS as _STOP_KW" in _ev_src
+          and "_rcfg.get(\"retool_stop\")" in _ev_src
+          and "**_stop" in _ev_src)
+    check("retool_math/retool preset 默认开 retool_stop；grpo 无此键（家族隔离）",
+          cfg["retool_stop"] is True
+          and get_config("retool", use_wandb=False)["retool_stop"] is True
+          and "retool_stop" not in get_config("grpo", use_wandb=False))
+    from rlab.train import run_signature as _rsig
+    _sig_stop = _rsig(cfg)
+    _sig_nostop = _rsig({**cfg, "retool_stop": False})
+    check("stop 进签名（-stop1 后缀；关闭或缺键 → 历史签名逐字不变）",
+          _sig_stop.endswith("-stop1") and _sig_nostop == _sig_stop[:-len("-stop1")])
     # 【2026-09-18 H2】vllm_gen_logps=True 但 vllm_logprobs_n=0 = docs/07 实锤坏路径
     # （N=0 只报被采样 token，prefill 位单点差 6.8 nat）。config 层打警告（不
     # fail-fast：torch 副本默认路径合法，A/B 与旧 run 复现需要保留）。
@@ -1351,19 +1387,25 @@ def test_vllm_gen_kwargs():
     # 签名可见性：kernel 换了（triton vs flashinfer）不能算同配方——默认档现在就是
     # triton，故新 run 必然带 -vk 段；只有**显式关掉该键**（vllm_gen_kwargs=None）时
     # 历史签名串逐字不变，旧 ckpt 仍算同签名（刻意的：不传档 = 同一配方）。
+    # 【2026-09-18 stop 机制】retool_math preset 默认 retool_stop=True → 签名尾部
+    # 追加 -stop1（在 -vk 段之后），vk 断言相应从 endswith 改为含 -stop1 后缀。
     sig0 = run_signature(cfg)
     check("默认档带 triton：签名含 -vkgdn_prefill_backend=triton（不静默换档）",
-          sig0.endswith("-vkgdn_prefill_backend=triton"))
+          "-vkgdn_prefill_backend=triton" in sig0 and sig0.endswith("-stop1"))
     sig_none = run_signature({**cfg, "vllm_gen_kwargs": None})
-    check("显式关掉该键：签名无 vk 段（历史串逐字不变 -> 旧 ckpt 仍算同签名）",
-          "-vk" not in sig_none and sig0.startswith(sig_none))
+    # 【2026-09-18】stop 段（-stop1）排在 vk 段之后：vk 开关会移动其后所有段，
+    # 原"全串 startswith"语义失效——改为比较去掉 -stop1 尾巴后的前缀关系
+    # （验证力不变：vk 关闭 = 其段整体消失、其余逐字不变）。
+    _s0, _sn = sig0[:-len("-stop1")], sig_none[:-len("-stop1")]
+    check("显式关掉该键：签名无 vk 段（去掉 -stop1 后历史串逐字不变 -> 旧 ckpt 同签名）",
+          "-vk" not in sig_none and _s0.startswith(_sn) and sig_none.endswith("-stop1"))
     sig_vk = run_signature({**cfg, "vllm_gen_kwargs": {"gdn_prefill_backend": "flashinfer"}})
     check("换档 -> 签名尾部追加 -vk<键=值>（纯追加，前缀不变）",
-          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer")
-          and sig_vk.startswith(sig_none))
+          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer-stop1")
+          and sig_vk[:-len("-stop1")].startswith(_sn))
     check("多个键按 key 排序（同配方两次 run 签名逐字可比）",
           run_signature({**cfg, "vllm_gen_kwargs": {"b": 1, "a": 2}})
-          .endswith("-vka=2,b=1"))
+          .endswith("-vka=2,b=1-stop1"))
 
     # 接线（无 GPU 的机器上唯一能验的部分：真机构造路径由源码断言兜住）
     rollout_src = open("rlab/rollout.py", encoding="utf-8").read()

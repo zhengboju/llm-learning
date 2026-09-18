@@ -36,7 +36,10 @@ ALGO_DEFAULTS = {
     # 阶段2 ReTool：多轮代码交织（loss 与 grpo 同——group_std/sample_mean，
     # 差异全在 rollout：分段轨迹 + 沙箱 + 工具段 mask 置0，见 docs/02-retool.md）
     "retool":  dict(beta=0.04, clip_low=0.2, clip_high=0.2, adv_mode="group_std",
-                    loss_norm="sample_mean"),
+                    loss_norm="sample_mean",
+                    # stop 机制与 retool_math 同家族（围栏协议一致；GSM8K 历史协议
+                    # 的 code_rate≈0 下 stop 无受力面，开启无行为差异风险）
+                    retool_stop=True),
     # 方案1：retool-math（借鉴 agentic-rl-lab/05-retool）—— DAPO-Math-17k + outcome-only
     # boxed + clip-higher（0.2/0.28）+ 参考实现的采样与组配置：
     # temperature=1.0、无 top_k（vLLM top_k=-1=全词表）、组 8 条、adv 不除 std。
@@ -80,6 +83,11 @@ ALGO_DEFAULTS = {
                         max_context_tokens=14336, round_gen_tokens=2048,
                         max_rounds=4,
                         max_gen_tokens=8192, max_prompt_length=1024,
+                        # 【2026-09-18 stop 机制】写到代码块闭合围栏立即停（protocol.
+                        # RETOOL_STOP_KWARGS）——工具结果紧跟代码回填，修复"代码→瞎猜
+                        # →结果"错位与 42~55% 高截断（三轮 run 代码压灭的根因）。
+                        # 关闭 = 回到 p6 旧协议（A/B 对照位）。
+                        retool_stop=True,
                         # 长度控制：overlong 现在可达（预算自洽）→ 打开；再叠一个
                         # 靶向 trunc_final 的项（prose 路径唯一够得到的反向信号）。
                         overlong_shaping=True, overlong_buffer=256,

@@ -110,10 +110,14 @@ def run_signature(cfg: dict) -> str:
         sp_tag = "-sp" + hashlib.sha1(str(_sp).encode("utf-8")).hexdigest()[:6]
     else:
         sp_tag = ""
+    # 【2026-09-18 stop 机制进签名】工具调用节奏是 rollout 协议的一半（带 stop 的
+    # p7 与无 stop 的 p6 同预算参数但行为完全不同，不进签名就无法区分）。与
+    # vk_tag/sp_tag 同一约定：键缺失或关闭 → 一个字符都不加，历史签名逐字不变。
+    stop_tag = "-stop1" if cfg.get("retool_stop") else ""
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -539,6 +543,10 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    ap.add_argument("--retool_stop", action=argparse.BooleanOptionalAction, default=None,
+                    help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
+                         "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
+                         "--no-retool_stop 关闭 = p6 旧协议（A/B 对照位）")
     ap.add_argument("--gen_gpu_mem", type=float, default=None,
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
@@ -652,6 +660,7 @@ def main():
     if args.round_gen_tokens is not None: overrides["round_gen_tokens"] = args.round_gen_tokens
     if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
+    if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows

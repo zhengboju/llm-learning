@@ -458,15 +458,21 @@ else:
     _topp = 1.0
 if is_retool_family:
     from rlab.rollout import multi_turn_rollout_group
+    from rlab.protocol import RETOOL_STOP_KWARGS as _STOP_KW
+    # 【2026-09-18 stop 机制】评测与训练同节奏铁律：stop 从训练 config 回读
+    # （_rcfg 即 --proto_from 对齐的那份），旧 ckpt（无 retool_stop 键）不带 stop
+    # → 评测行为与训练严格一致，新旧协议不混测。
+    _stop = dict(_STOP_KW) if _rcfg.get("retool_stop") else {}
     if _sampling:
         # 每条轨迹独立请求 + 独立 seed（与训练同形态；vLLM 同 seed 会生成相同轨迹）
         import random as _rnd
         _base = _rnd.randrange(1 << 30)
         sp_mt = [SamplingParams(temperature=_temp, top_p=_topp,
-                                max_tokens=args.round_tokens, seed=_base + k)
+                                max_tokens=args.round_tokens, seed=_base + k,
+                                **_stop)
                  for k in range(len(prompts) * args.val_n)]
     else:
-        sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens)
+        sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens, **_stop)
     mt_cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
               "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
     _probe_prompts = [p for p in prompts for _ in range(args.val_n)] if _sampling else prompts

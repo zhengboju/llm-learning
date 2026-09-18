@@ -45,7 +45,8 @@ from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.model_loading import load_causal_lm, resolve_load_config
-from rlab.protocol import (TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
+from rlab.protocol import (RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
+                           TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
                            make_bytes_list, sanitize_tool_text,
                            segment_mask_from_spans, tensor_to_bytes)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
@@ -1202,11 +1203,18 @@ def gen_worker(Q, cfg: dict):
     def make_retool_sps(n_req, seed_salt):
         """retool 家族每轨迹独立 SamplingParams（每条一个请求且 seed 各不相同
         ——共用 seed 会让同题各条生成完全相同的轨迹，组内零方差 → group_ok
-        永假无限重采）。seed_salt：随重采/轮次递增的盐，防同 seed 复采同轨迹。"""
+        永假无限重采）。seed_salt：随重采/轮次递增的盐，防同 seed 复采同轨迹。
+
+        【2026-09-18 stop 机制】cfg.retool_stop=True 时带上 protocol.
+        RETOOL_STOP_KWARGS：模型写到代码块闭合围栏立即停（include_stop 保留围栏
+        字节，extract_python_blocks 拿到完整块），沙箱结果紧跟代码回填——修复
+        "代码→瞎猜→[结果]"错位与高截断（p5/p6 三轮 run 代码压灭的根因）。"""
         seed0 = cfg.get("seed")
         kw = dict(n=1, temperature=cfg["temperature"],
                   max_tokens=cfg.get("round_gen_tokens", 400),
                   top_p=cfg["top_p"], top_k=cfg.get("top_k", 50))
+        if cfg.get("retool_stop"):
+            kw.update(_RETOOL_STOP_KWARGS)
         if _use_vllm_logps:
             # 被采样 token 的 logprob（= log π(tok|完整前文)），逐轮收集即 gen_logps。
             # logprobs_mode=raw_logprobs：显式要"后处理前"的 logprob，防某些 vLLM
