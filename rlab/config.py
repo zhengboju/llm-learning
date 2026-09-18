@@ -386,19 +386,24 @@ _RETOOL_EXTRA = (
     "fenced block like: "
     "```python\n<your code>\n```\n"
     "The environment executes your code automatically and inserts the result "
-    "between [TOOL RESULT] and [/TOOL RESULT]. Read the result and continue "
-    "reasoning in the thinking section, then finish with the final answer "
+    "between [TOOL RESULT] and [/TOOL RESULT]. After you close the code block "
+    "with ```, stop immediately and wait for the execution result; read it, then "
+    "continue reasoning in the thinking section, then finish with the final answer "
     "inside the required answer tags. Always finish your code block before continuing."
 )
 system_prompt_retool = BASE["system_prompt"] + _RETOOL_EXTRA
 
 # 方案1：retool-math 系统提示（借鉴 agentic-rl-lab/05-retool）—— outcome-only \boxed{}
+# 【2026-09-18 stop 配套】与 protocol.RETOOL_STOP_KWARGS 咬合：模型写完代码块
+# 闭合围栏 ``` 立即被截停（stop=["```\n"]），故必须告诉它"写完代码就停、等执行
+# 结果、读完再继续"——否则模型会把"被截停"理解成失败，反而抑制写代码。
 _RETOOL_MATH_SYSTEM = (
     "You solve math problems step by step with help from a Python code interpreter.\n"
     "Use the code_interpreter tool when calculation, symbolic manipulation, or enumeration helps you solve the problem accurately and quickly.\n\n"
     "How to use the code_interpreter tool:\n"
     "- Call it with Python code inside a fenced block like: ```python\n<your code>\n```\n"
     "  The environment executes your code automatically and inserts the result between [TOOL RESULT] and [/TOOL RESULT].\n"
+    "- After you close the code block with ```, stop immediately and wait for the execution result. It will be inserted between [TOOL RESULT] and [/TOOL RESULT]; read it, then continue reasoning from there.\n"
     "- Results are captured from what your code prints with print(). Always print the values you want to see.\n"
     "- Each execution is independent: no variables, files, or state carry over between calls. Redefine everything you need in each piece of code.\n"
     "- Code must finish within a few seconds and use little memory. Do not read or write files. If you enumerate or brute-force, keep the search space small.\n"

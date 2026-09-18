@@ -305,6 +305,24 @@ def test_config_retool_math():
     _sig_nostop = _rsig({**cfg, "retool_stop": False})
     check("stop 进签名（-stop1 后缀；关闭或缺键 → 历史签名逐字不变）",
           _sig_stop.endswith("-stop1") and _sig_nostop == _sig_stop[:-len("-stop1")])
+    # 【2026-09-18 prompt 配套】stop 与 prompt 是同一机制的两半：必须告诉模型
+    # "写完代码块就停、等结果"——否则被截停会被理解成失败，抑制写代码。
+    # （对照参考 Auto_Program：prompt 教"写完代码说固定停句" ↔ stop 句同串咬合）
+    from rlab.config import default_system_prompt, system_prompt_retool_math
+    _math_sp = default_system_prompt("retool_math")
+    check("retool_math 默认提示含 stop 配套句（写完代码块就停等结果）",
+          "stop immediately and wait for the execution result" in _math_sp)
+    _pf = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "prompts", "retool_math_concise.txt")
+    _psp = open(_pf, encoding="utf-8").read()
+    check("concise 提示文件同步补 stop 配套句（p7 用这份）",
+          "stop immediately and wait for the execution result" in _psp)
+    check("retool（GSM8K 家族）提示也补了（一致性，低风险）",
+          "stop immediately and wait for the execution result"
+          in default_system_prompt("retool"))
+    _sig_sp2 = _rsig({**cfg, "system_prompt": _math_sp + " "})
+    check("提示改动会更新 -sp hash（p7 与 p5/p6 的 -sp8e0184 不同 = 提示确实是新协议一部分）",
+          "-sp" in _sig_sp2 and _sig_sp2.split("-sp")[1][:6] not in ("8e0184",))
     # 【2026-09-18 H2】vllm_gen_logps=True 但 vllm_logprobs_n=0 = docs/07 实锤坏路径
     # （N=0 只报被采样 token，prefill 位单点差 6.8 nat）。config 层打警告（不
     # fail-fast：torch 副本默认路径合法，A/B 与旧 run 复现需要保留）。

@@ -7,6 +7,7 @@ How to use the code_interpreter tool:
 <your code>
 ```
   The environment executes your code automatically and inserts the result between [TOOL RESULT] and [/TOOL RESULT].
+- After you close the code block with ```, stop immediately and wait for the execution result. It will be inserted between [TOOL RESULT] and [/TOOL RESULT]; read it, then continue reasoning from there.
 - Keep each code block short: no comments, and print only the final value(s) you need.
 - Results are captured from what your code prints with print(). Always print the values you want to see.
 - Each execution is independent: no variables, files, or state carry over between calls. Redefine everything you need in each piece of code.
