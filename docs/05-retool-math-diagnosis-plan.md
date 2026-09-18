@@ -932,6 +932,74 @@ eval per-item 里 code_used=1 的 acc vs code_used=0 的 acc——用码样本 a
 
 - **①（零成本，已落地工具）**：`python -m rlab.analysis --code-layer eval_vllm_all.json`
   分层分析，钉死 H1/H2。
+
+#### 7.5.6 分层/迁移/双 split 定案 + 方案 B 落地（2026-09-18）
+
+**代码分层分析（--code-layer，dev per-item）**：增益 100% 来自纯推理层（step100 +14.4pp
+p=0.001 / step200 +13.2pp p=0.000 显著），用码层相对 BASE 无增益（-3.4pp 噪声内，n=90
+配对够大）。**代码压灭是理性的（H1 方向）**——但方向与 §7.5.5 的 H2 预判相反。
+
+**分层迁移分析（--code-migration，同题双 acc）**：以 BASE 分层为锚，500 题全量对账：
+
+| 存档点 | 用码层 Δ（228题） | 纯推理层 Δ（272题） | 整体 |
+|---|---:|---:|---:|
+| step100 | -3.9pp | +11.6pp | +4.6pp |
+| step200 | -10.9pp | +11.3pp | +1.2pp |
+| step300 | **-12.7pp** | **+4.6pp** | **-3.4pp** |
+
+BASE 用码题 acc 74.1% vs 纯推理题 47.4% = **代码有真实价值 +26.7pp**；训练把用码
+228→8 题、放弃代码的题 acc 从 74.1% 掉到 62.3%。**净效果 -3.4pp = 丢代码（-12.7pp×228）
+远超涨推理（+4.6pp×272）。**
+
+**双 split 对照（--split train 修复后带难度过滤；dev 为 held-out）**：
+
+| 模型 | train acc | Δtrain | dev acc | Δdev |
+|---|---:|---:|---:|---:|
+| BASE | 69.0 | — | 59.6 | — |
+| step100 | 71.8 | +2.8 (p=0.272) | 64.2 | +4.6 (p=0.033) |
+| step200 | 72.0 | +3.0 (p=0.248) | 60.8 | +1.2 (p=0.634) |
+| step300 | 67.0 | **-2.0** (p=0.463) | 56.2 | **-3.4** (p=0.145) |
+
+**五条定案**：
+
+1. **代码压灭跨分布一致**：train/dev 两个独立抽样里 code% 都 ~50%→2.6-3.0%。不是评测
+   集假象，是训练真的在杀代码。
+2. **训练退化跨分布一致**：step300 在 train（-2.0）和 dev（-3.4）都负向。不是分布外
+   泛化问题，是模型后期整体变差。
+3. **step100/200 是真实的、小的增益**（train +2.8/+3.0、dev +4.6/+1.2，方向全正，幅度
+   在噪声边缘）。**有效果但小，且被后期退化吃掉。**
+4. **根因收敛到协议结构，不是参数**：lr 1e-6 / reward ±1 / clip 0.2-0.28 全对齐官方与
+   参考；`max_rounds=2` 只有 1 次代码机会——代码写错一次整条轨迹就废、无补救空间 →
+   RL 算出"写代码期望净收益为负"→ 理性压灭（与 §4.2 预判一致）。
+5. **参考项目（agentic-rl-lab/05-retool，同 Qwen3.5-4B）证明多轮能保代码**：
+   `max_code_calls=4/turns=6` 让代码可分步改进——code_calls 1.24→1.98 单调升、
+   Average@12 23.6→47.5（+23.89pp，正好是用户要的理想状态）、sandbox success
+   0.68→0.80（代码越练越能跑）。它预算：6 轮×1024、轨迹≤8192、LoRA r32 lr 4e-5、
+   原生 `<tool_call>` 协议（base 工具调用率 87.5% 起点高）。
+
+**方案 B 落地（commit 1e186c1，2026-09-18）**：preset `max_rounds 2→4`（3 次代码机会）、
+`round_gen_tokens 3072→2048`（不赌 4B 在 1024 下的截断风险，docs/03 探针 1024 截断 85%）、
+`max_context_tokens 8192→14336`（need=4×2048+1024+798=10014≤14336 ✅，p5 实测档）。
+lr/reward/clip 全不动（单变量）。配套 eval 加 `--val_n` 采样评测（Average@N，
+temp 1.0/top_p 0.7 参考口径）——greedy 会把多轮代码测成灭绝（docs §7.5.2 mode vs
+mixture），参考的增益全在采样下显现。
+
+**运行**（新 out_dir，撞名护栏强制）：
+```bash
+bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
+  --all_steps 300 --save_steps 50 --gen_update_steps 8 \
+  --difficulty_path rlab_out/difficulty_probe_4b_v5_r6144_concise_full.jsonl \
+  --out_dir rlab_out/retool_math_p6
+# 评测（采样档，BASE 经 --proto_from 同档）：
+python -m rlab.eval --algo retool_math --n 200 --seed 42 --val_n 8 \
+  --models "step100=./rlab_out/retool_math_p6/step_100,step200=./rlab_out/retool_math_p6/step_200,step300=./rlab_out/retool_math_p6/step_300" \
+  --out eval_vllm_all_p6.json
+```
+
+**判据（跑之前定死）**：① code% 不再单调灭绝（≥30% 保持）→ 方案 B 止住压灭；
+② code_calls（avg_rounds）>1 且不降 → 模型在学"多试几次"；③ Average@8 acc 单调升或
+step200 显著 > BASE → 多轮让代码 advantage 转正。任一不满足 → 方案 B 证伪，转 A
+（6×1024 完全对齐参考）或接受 §7.5 适用域结论。
 - **②（一次评测）**：`--split train` 分布内对照——区分"分布内增益被基准掩盖" vs
   "分布外就是没增益"。
 - **③**：若 H2 → 尝试级 shaping（code_used>0 给小分，不依赖 code_ok）或 cold code 权重
