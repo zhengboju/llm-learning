@@ -87,6 +87,109 @@ def _verdict(diff_pp: float, half_pp: float, p=None) -> str:
     return "显著" if (diff_pp - half_pp > 0 or diff_pp + half_pp < 0) else "噪声内"
 
 
+# ---------------------------------------------- 代码分层分析（2026-09-18）----
+# 【为什么】p5 的 step300 增益被抹平（§7.5 判据对照），且 record 的 code_ok 率
+# 56% → 10% 单调崩——需要区分两种机制：
+#   H1「理性压灭」：写代码的样本 acc 不高于纯推理 → 工具路径在 4B/GSM8K 上无真实
+#      优势，崩塌是 RL 的最优解（无调参解，诚实结论，参照 §7.5.4 的 H2 分支）；
+#   H2「激励/可行性不足」：写代码的样本 acc 更高 → 是信号问题（可救）。
+# 判据 = eval per-item 里 code_used=1 vs code_used=0 两组的 acc 差（同题配对更好）。
+# 数据源是 eval json 的 per-item（eval_vllm_one.py --dump_items，默认开），零训练成本。
+
+def code_layer(items, key: str = "qk"):
+    """按 code_used 分层一份 per-item 结果 → ((n_on, n_on_acc), (n_off, n_off_acc))。
+
+    code_used>0 记"用码"（与 eval 的 code_rate 口径一致）。任一臂无 items 返回
+    None。跨存档点的**同层**配对（如 model 用码层 vs BASE 用码层）由
+    summarize_code_layer 单独做——单份 items 内同一题不可能既用码又不用码，
+    code_layer 自身不做配对。"""
+    _parts = _code_layer_items(items, key)
+    if _parts is None:
+        return None
+    on, off = _parts
+    return ((len(on), sum(1 for it in on if it.get("acc", 0) == 1.0)),
+            (len(off), sum(1 for it in off if it.get("acc", 0) == 1.0)))
+
+
+def _code_layer_items(items, key: str = "qk"):
+    """分层后返回 (用码 item 列表, 纯推理 item 列表)；无可用 items 返回 None。"""
+    if not items:
+        return None
+    on, off = [], []
+    for it in items:
+        if not it.get(key):
+            continue
+        (on if (it.get("code_used") or 0) > 0 else off).append(it)
+    if not on and not off:
+        return None
+    return on, off
+
+
+def _acc_col(n_acc: int, n: int) -> str:
+    if not n:
+        return "—"
+    return f"{n_acc / n * 100:.1f}% ({n_acc}/{n})"
+
+
+def summarize_code_layer(path: str, base_name: str = "BASE") -> str:
+    """跨存档点输出「用码 vs 纯推理」分层 acc 表。
+
+    读 eval json（per-item），对每个模型按 code_used 分层出 acc；再对每个模型
+    与 BASE 的**同题**做 code 层配对 McNemar，回答「增益集中在哪一层」——
+    code_on 层显著而 code_off 层噪声内 ⇒ 增益来自工具路径（健康）；反之
+    增益全在 code_off ⇒ 工具是噪声（崩塌机制 H1 实锤，§7.5.4 判据）。"""
+    with open(path, encoding="utf-8") as f:
+        results = json.load(f)
+    models = {k: v for k, v in results.items() if not k.startswith("_")}
+    base = models.get(base_name)
+    lines = ["| 模型 | 用码题 | 用码 acc | 纯推理题 | 纯推理 acc |",
+             "|---|---|---:|---:|---:|"]
+    for name, r in models.items():
+        items = r.get("items")
+        cl = code_layer(items) if items else None
+        if cl is None:
+            lines.append(f"| {name} | — | — | — | — |")
+            continue
+        (n_on, a_on), (n_off, a_off) = cl
+        lines.append(f"| {name} | {n_on} | {_acc_col(a_on, n_on)} | {n_off} | "
+                     f"{_acc_col(a_off, n_off)} |")
+    if not base:
+        return "\n".join(lines)
+    lines += ["", "**同题配对（code 层 vs BASE 同层）：**",
+              "| 模型 | 层 | Δacc vs BASE | McNemar | 判定 |",
+              "|---|---|---:|---|---|"]
+    for name, r in models.items():
+        if name == base_name:
+            continue
+        items, bitems = r.get("items"), base.get("items")
+        if not items or not bitems:
+            continue
+        a_parts = _code_layer_items(items)
+        b_parts = _code_layer_items(bitems)
+        if not a_parts or not b_parts:
+            continue
+        for layer, (a_items, b_items) in (("用码", (a_parts[0], b_parts[0])),
+                                          ("纯推理", (a_parts[1], b_parts[1]))):
+            _b = _c = _m = 0
+            bm = {it.get("qk"): it for it in a_items if it.get("qk")}
+            bb = {it.get("qk"): it for it in b_items if it.get("qk")}
+            for k in bm.keys() & bb.keys():
+                am, ab = bm[k].get("acc", 0) == 1.0, bb[k].get("acc", 0) == 1.0
+                if am and not ab:
+                    _b += 1
+                elif ab and not am:
+                    _c += 1
+                _m += 1
+            if _m:
+                p = mcnemar_exact(_b, _c)
+                _n1, _na1 = len(a_items), sum(1 for it in a_items if it.get("acc", 0) == 1.0)
+                _n2, _na2 = len(b_items), sum(1 for it in b_items if it.get("acc", 0) == 1.0)
+                _d, _ = diff_ci95(_na1 / _n1, _n1, _na2 / _n2, _n2)
+                lines.append(f"| {name} | {layer} | {_d:+.1f}pp | "
+                             f"p={p:.3f} (b={_b}/c={_c}, n={_m}) | {_verdict(_d, 0, p)} |")
+    return "\n".join(lines)
+
+
 def summarize_eval(path: str, base_name: str = "BASE") -> str:
     with open(path, encoding="utf-8") as f:
         results = json.load(f)
@@ -354,6 +457,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval-json", default=None)
     ap.add_argument("--record", default=None)
+    ap.add_argument("--code-layer", default=None,
+                    help="代码分层分析：跨存档点按 code_used 分层 acc + 与 BASE 同层配对")
     ap.add_argument("--window", type=int, default=160,
                     help="record 曲线的窗口（单位=样本；8 样本=1 组=1 micro-step。"
                          "默认 160=20 组；调小看细节但噪声按 1/√n 放大）")
@@ -374,9 +479,11 @@ if __name__ == "__main__":
         print(pair_eval(_primary, args.pair_json, args.pair_a, args.pair_b))
     if args.eval_json:
         print(summarize_eval(args.eval_json, args.base))
+    if args.code_layer:
+        print(summarize_code_layer(args.code_layer, args.base))
     if args.record:
         print(summarize_record(args.record, window=args.window))
-    if not args.eval_json and not args.record and not args.pair_json:
+    if not args.eval_json and not args.record and not args.code_layer and not args.pair_json:
         cands = sorted(glob.glob("eval_vllm_all*.json"))
         if cands:
             print(summarize_eval(cands[-1], args.base))

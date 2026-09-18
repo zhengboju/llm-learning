@@ -432,6 +432,36 @@ def test_eval_stats_and_signature():
     check("无 per-item 时明确标注是两比例检验（不冒充满配检验）",
           "两比例（无 per-item）" in tbl)
 
+    print("[G] 代码分层分析（code_layer / summarize_code_layer）")
+    # 【2026-09-18】p5 的 step300 增益被抹平 + record code_ok 56%→10% 崩——需区分
+    # H1「理性压灭」（用码样本 acc 不高 ⇒ 工具路径无优势，无解）vs H2「激励不足」
+    # （用码样本 acc 更高 ⇒ 可救）。数据源 = eval per-item 的 code_used，零训练成本。
+    from rlab.analysis import code_layer, summarize_code_layer
+    _cl_items = [
+        {"qk": "q1", "acc": 1.0, "code_used": 1}, {"qk": "q2", "acc": 0.0, "code_used": 1},
+        {"qk": "q3", "acc": 1.0, "code_used": 0}, {"qk": "q4", "acc": 0.0, "code_used": 0},
+        {"qk": "q5", "acc": 1.0, "code_used": 0},
+    ]
+    _cl = code_layer(_cl_items)
+    check("code_layer 分层 (n,acc) 正确（用码 2 题对 1 / 纯推理 3 题对 2）",
+          _cl == ((2, 1), (3, 2)))
+    check("code_layer 无 items → None（不把缺数据当 0）", code_layer([]) is None
+          and code_layer(None) is None)
+    _jcl = os.path.join(_dir, "eval_code_layer.json")
+    _json.dump({
+        "BASE": {"acc": 0.4, "n": 5, "items": _cl_items},
+        "step200": {"acc": 0.6, "n": 5, "items": [
+            {"qk": "q1", "acc": 1.0, "code_used": 1}, {"qk": "q2", "acc": 1.0, "code_used": 1},
+            {"qk": "q3", "acc": 0.0, "code_used": 0}, {"qk": "q4", "acc": 0.0, "code_used": 0},
+            {"qk": "q5", "acc": 1.0, "code_used": 0}]},
+        "_meta": {"base_path": "/root/Qwen3.5-4B"}},
+        open(_jcl, "w", encoding="utf-8"), ensure_ascii=False)
+    _cltbl = summarize_code_layer(_jcl)
+    check("分层表给出用码/纯推理两层的 n 与 acc", "用码题" in _cltbl
+          and "纯推理题" in _cltbl and "50.0% (1/2)" in _cltbl)
+    check("同层配对出现在表里（step200 vs BASE 的用码层）", "同题配对" in _cltbl
+          and "p=" in _cltbl)
+
     print("[G] pair_eval 跨 json 配对（模型已灭失也可对照）")
     # 【2026-09-13】run2 的 m200 权重灭失（raw 被 P1 覆盖 + _mm 副本被删），
     # per-item json 是唯一遗物 —— 跨 json 同题配对让它仍能进对照表。
