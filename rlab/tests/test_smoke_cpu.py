@@ -488,7 +488,9 @@ def test_eval_stats_and_signature():
           and "| 用码 |" in _cm and "| 纯推理 |" in _cm)
     check("BASE 用码题转纯推理格标 ◆（放弃代码的归宿）", "◆" in _cm)
     check("迁移计数正确：用码层 q1/q2 转纯推理(1对)；纯推理层 q3/q4/q5 仍同层(2对)",
-          "50.0% (1/2)◆" in _cm and "66.7% (2/3)" in _cm)
+          "50.0% (1/2) vs B 50.0% (1/2)" in _cm and "66.7% (2/3) vs B 66.7% (2/3)" in _cm)
+    check("同题集上给出 target vs BASE 双 acc（放弃代码的代价可读）",
+          "vs B" in _cm)
 
     print("[G] pair_eval 跨 json 配对（模型已灭失也可对照）")
     # 【2026-09-13】run2 的 m200 权重灭失（raw 被 P1 覆盖 + _mm 副本被删），
