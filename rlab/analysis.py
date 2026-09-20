@@ -60,7 +60,13 @@ def paired_counts(items_model, items_base, key: str = "qk"):
     约定 model 为被测臂、base 为基线臂：
       b = model 对 & base 错（提升方向的 discordant pair）
       c = model 错 & base 对（回退方向）
-    任一臂缺 items / 无 key / 无可对齐题时返回 None（调用方回落两比例检验）。"""
+    任一臂缺 items / 无 key / 无可对齐题时返回 None（调用方回落两比例检验）。
+
+    【口径警告·2026-09-19】本函数按 acc==1.0 二值化，**只对 greedy（val_n=1）
+    有效**。采样档（--val_n>1）的 per-item acc 是 Average@N ∈ [0,1]，acc==1.0
+    退化成"N 条全对"——检验的是 all-N-correct 率而不是 acc（p8 实测：step100
+    的"-4.6pp p=0.003 显著"是全对率之差，真实 acc 差仅 -1.5pp）。连续档一律走
+    paired_mean_test，分派由 items_are_binary 判定。"""
     if not items_model or not items_base:
         return None
     bm = {it.get(key): it for it in items_model if it.get(key)}
@@ -76,6 +82,72 @@ def paired_counts(items_model, items_base, key: str = "qk"):
         elif ab and not am:
             c += 1
     return (b, c, matched) if matched else None
+
+
+def items_are_binary(*item_lists) -> bool:
+    """per-item 的 acc 是否全为 0/1（greedy 档）。任一值落在开区间 → 采样档。
+
+    分派依据：McNemar 要求二值配对结果；Average@N 的小数 acc 必须走连续配对
+    检验，否则"显著"回答的是另一个问题（见 paired_counts 口径警告）。
+    显式 val_n>1 标记也直接判为连续档（即使本次抽样恰好全 0/1）。"""
+    for items in item_lists:
+        for it in items or []:
+            if int(it.get("val_n", 1) or 1) > 1:
+                return False
+            a = it.get("acc", 0)
+            if a != 0 and a != 1:
+                return False
+    return True
+
+
+def _norm_two_sided_p(z: float) -> float:
+    """标准正态双侧 p（erfc 实现，无 scipy 依赖）。"""
+    return math.erfc(abs(z) / math.sqrt(2.0))
+
+
+def paired_mean_test(items_model, items_base, key: str = "qk"):
+    """连续 per-item（Average@N）的同题配对均值检验 → (diff_pp, p, matched)。
+
+    对每道题取 d_i = acc_model,i − acc_base,i（配对，消除题目难度方差），检验
+    E[d]=0。用 z = mean(d)/SE 的正态近似（n≥30 足够；本项目 N=200/500 远超）。
+    这是采样档 McNemar 的正确替代：McNemar 只能吃二值，而 Average@N 的信息
+    （8 条里对几条）恰恰在小数部分，二值化会把它全部丢掉。"""
+    if not items_model or not items_base:
+        return None
+    bm = {it.get(key): it for it in items_model if it.get(key)}
+    bb = {it.get(key): it for it in items_base if it.get(key)}
+    if not bm or not bb:
+        return None
+    diffs = [float(bm[k].get("acc", 0)) - float(bb[k].get("acc", 0))
+             for k in bm.keys() & bb.keys()]
+    n = len(diffs)
+    if n < 2:
+        return None
+    mean = sum(diffs) / n
+    var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+    if var <= 0.0:
+        # 所有题的差完全相同：非零差即确定性差异，零差即完全无变化
+        return (mean * 100.0, (0.0 if mean != 0.0 else 1.0), n)
+    se = math.sqrt(var / n)
+    return (mean * 100.0, _norm_two_sided_p(mean / se), n)
+
+
+def paired_test_auto(items_model, items_base, key: str = "qk"):
+    """统一入口：按 items 口径自动选 McNemar（二值）或配对均值检验（连续）。
+
+    返回 (delta_pp, p, matched, test_label)；无法配对时 None。"""
+    if items_are_binary(items_model, items_base):
+        pc = paired_counts(items_model, items_base, key)
+        if pc is None:
+            return None
+        b, c, matched = pc
+        p = mcnemar_exact(b, c)
+        return (None, p, matched, f"McNemar p={p:.3f} (b={b}/c={c}, n={matched})")
+    pm = paired_mean_test(items_model, items_base, key)
+    if pm is None:
+        return None
+    d, p, matched = pm
+    return (d, p, matched, f"配对均值 z 检验 p={p:.3f} (Δ={d:+.2f}pp, n={matched})")
 
 
 def _verdict(diff_pp: float, half_pp: float, p=None) -> str:
@@ -102,13 +174,16 @@ def code_layer(items, key: str = "qk"):
     code_used>0 记"用码"（与 eval 的 code_rate 口径一致）。任一臂无 items 返回
     None。跨存档点的**同层**配对（如 model 用码层 vs BASE 用码层）由
     summarize_code_layer 单独做——单份 items 内同一题不可能既用码又不用码，
-    code_layer 自身不做配对。"""
+    code_layer 自身不做配对。
+
+    【2026-09-19】采样档下 acc/code_used 都是每题 Average@N 小数：acc 用求和
+    （= 期望答对题数）而非 ==1.0 计数，否则"全 N 条对"才计分会系统性低估。"""
     _parts = _code_layer_items(items, key)
     if _parts is None:
         return None
     on, off = _parts
-    return ((len(on), sum(1 for it in on if it.get("acc", 0) == 1.0)),
-            (len(off), sum(1 for it in off if it.get("acc", 0) == 1.0)))
+    return ((len(on), sum(float(it.get("acc", 0)) for it in on)),
+            (len(off), sum(float(it.get("acc", 0)) for it in off)))
 
 
 def _code_layer_items(items, key: str = "qk"):
@@ -125,10 +200,10 @@ def _code_layer_items(items, key: str = "qk"):
     return on, off
 
 
-def _acc_col(n_acc: int, n: int) -> str:
+def _acc_col(n_acc: float, n: int) -> str:
     if not n:
         return "—"
-    return f"{n_acc / n * 100:.1f}% ({n_acc}/{n})"
+    return f"{n_acc / n * 100:.1f}% ({n_acc:g}/{n})"
 
 
 def summarize_code_layer(path: str, base_name: str = "BASE") -> str:
@@ -170,24 +245,44 @@ def summarize_code_layer(path: str, base_name: str = "BASE") -> str:
             continue
         for layer, (a_items, b_items) in (("用码", (a_parts[0], b_parts[0])),
                                           ("纯推理", (a_parts[1], b_parts[1]))):
-            _b = _c = _m = 0
-            bm = {it.get("qk"): it for it in a_items if it.get("qk")}
-            bb = {it.get("qk"): it for it in b_items if it.get("qk")}
-            for k in bm.keys() & bb.keys():
-                am, ab = bm[k].get("acc", 0) == 1.0, bb[k].get("acc", 0) == 1.0
-                if am and not ab:
-                    _b += 1
-                elif ab and not am:
-                    _c += 1
-                _m += 1
-            if _m:
-                p = mcnemar_exact(_b, _c)
-                _n1, _na1 = len(a_items), sum(1 for it in a_items if it.get("acc", 0) == 1.0)
-                _n2, _na2 = len(b_items), sum(1 for it in b_items if it.get("acc", 0) == 1.0)
-                _d, _ = diff_ci95(_na1 / _n1, _n1, _na2 / _n2, _n2)
-                lines.append(f"| {name} | {layer} | {_d:+.1f}pp | "
-                             f"p={p:.3f} (b={_b}/c={_c}, n={_m}) | {_verdict(_d, 0, p)} |")
+            # 【2026-09-19】同层配对也按口径分派（采样档走配对均值 z 检验）
+            pt = paired_test_auto(a_items, b_items)
+            if pt is None:
+                continue
+            _d_paired, p, _m, test = pt
+            _n1 = len(a_items)
+            _n2 = len(b_items)
+            if not _n1 or not _n2:
+                continue
+            _na1 = sum(float(it.get("acc", 0)) for it in a_items)
+            _na2 = sum(float(it.get("acc", 0)) for it in b_items)
+            _d, _ = diff_ci95(_na1 / _n1, _n1, _na2 / _n2, _n2)
+            if _d_paired is not None:
+                _d = _d_paired
+            lines.append(f"| {name} | {layer} | {_d:+.1f}pp | "
+                         f"{test} | {_verdict(_d, 0, p)} |")
     return "\n".join(lines)
+
+
+def legacy_code_rate(r: dict):
+    """旧 json（metrics_version 缺失/=1）的 code 率回修 → (值, 是否回修过)。
+
+    【2026-09-19 p8 事故】旧 eval 把 code_rate/code_ok_rate/avg_rounds 除以
+    **题数** n_valid，而 code_used 是 [题][采样] 平铺（长度 n×val_n）→ 采样档
+    显示值虚高 val_n 倍（真机 p8：401.5% 实为 50.2%）。
+
+    回修判据**只认 metrics_version + eval_protocol.val_n**，不靠"值 >1 才像坏的"
+    猜：真实 5% 的率在 val_n=8 下显示 40%，完全像个正常率却同样是错的。
+    新 json（version≥2）原样返回，绝不二次缩放。"""
+    if "code_rate" not in r:
+        return None, False
+    v = r.get("code_rate")
+    if int(r.get("metrics_version", 1) or 1) >= 2:
+        return v, False
+    val_n = int((r.get("eval_protocol") or {}).get("val_n", 1) or 1)
+    if val_n > 1:
+        return v / val_n, True
+    return v, False
 
 
 def summarize_eval(path: str, base_name: str = "BASE") -> str:
@@ -202,6 +297,8 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
         lines.append(f"> N={n_base} · 单臂 95%CI 最坏 ≈±{hw:.1f}pp · 两臂差 ≈±{hw * math.sqrt(2):.1f}pp "
                      f"· 判定 = CI 不跨 0（有 per-item 时改用 McNemar p<0.05）")
         lines.append("")
+    # 旧 json 回修提示（一次性，表下方给出）
+    _repaired = [k for k, v in models.items() if legacy_code_rate(v)[1]]
     lines += [f"| 模型 | acc%(±95%CI) | fmt% | code% | Δacc vs {base_name} | 检验 | 判定 |",
               "|---|---|---|---|---|---|---|"]
     for name, r in models.items():
@@ -210,23 +307,37 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
         hw = ci95(r.get("acc", 0.0), n)
         acc_col = f"{acc:.1f}±{hw:.1f}" if hw == hw else f"{acc:.1f}"
         fmt_col = f"{r.get('fmt', 0.0) * 100:.1f}"
-        code_col = f"{r['code_rate'] * 100:.1f}" if "code_rate" in r else "—"
+        _cr, _fixed = legacy_code_rate(r)
+        code_col = f"{_cr * 100:.1f}{'*' if _fixed else ''}" if _cr is not None else "—"
         if name == base_name or not base or not n or not n_base:
             delta, test, verdict = "—", "—", "—"
         else:
             d, h = diff_ci95(r.get("acc", 0.0), n, base.get("acc", 0.0), n_base)
-            pc = paired_counts(r.get("items"), base.get("items"))
-            if pc is not None:
-                b, c, matched = pc
-                p = mcnemar_exact(b, c)
+            # 【2026-09-19】按 items 口径自动分派：greedy→McNemar，采样档
+            # （Average@N 小数 acc）→配对均值 z 检验。旧版无条件 McNemar 会把
+            # "N 条全对率之差"报成 acc 之差（p8 step100 -4.6pp p=0.003 实为全对率）。
+            pt = paired_test_auto(r.get("items"), base.get("items"))
+            if pt is not None:
+                d_paired, p, matched, test = pt
+                # 配对均值检验直接给出配对 Δ（比未配对两比例差更准），优先采用
+                if d_paired is not None:
+                    d = d_paired
                 delta = f"{d:+.1f}pp"
-                test = f"McNemar p={p:.3f} (b={b}/c={c}, n={matched})"
                 verdict = _verdict(d, h, p)
             else:
                 delta = f"{d:+.1f}±{h:.1f}pp"
                 test = "两比例（无 per-item）"
                 verdict = _verdict(d, h)
         lines.append(f"| {name} | {acc_col} | {fmt_col} | {code_col} | {delta} | {test} | {verdict} |")
+    if _repaired:
+        _vn = int((models[_repaired[0]].get("eval_protocol") or {}).get("val_n", 1) or 1)
+        lines += ["",
+                  f"> `*` code% 已按旧口径回修（原值除以 val_n={_vn}）："
+                  f"旧 eval 把代码率除以题数而非轨迹数（n×val_n），采样档虚高 {_vn} 倍。"
+                  f"受影响模型：{', '.join(_repaired)}。",
+                  "> ⚠️ 这些旧 json 的 **per-item `code_used` 无法回修**"
+                  "（当年只写入了前 N 条轨迹，题 N/val_n.. 全缺）→ "
+                  "`--code-layer` / `--code-migration` 需用新代码重跑 eval 才可信。"]
     return "\n".join(lines)
 
 
@@ -234,14 +345,17 @@ def _pair_col(pairs):
     """pairs = [(ref_item, target_item), ...] 同题对 → 'target acc / ref acc' 字符串。
 
     同题集上两个模型的 acc 直接可读：如 '62.3% (137/220) vs B 73.2% (161/220)' 表示
-    这 220 题上 target 62.3%、BASE 73.2%——放弃代码的代价一目了然。"""
+    这 220 题上 target 62.3%、BASE 73.2%——放弃代码的代价一目了然。
+
+    【2026-09-19】acc 用求和而非 ==1.0 计数：采样档 per-item 是 Average@N 小数，
+    二值化会把"8 条里对 7 条"记成 0（系统性低估两臂 acc）。"""
     if not pairs:
         return "—"
     n = len(pairs)
-    t_ok = sum(1 for _, t in pairs if t.get("acc", 0) == 1.0)
-    r_ok = sum(1 for r, _ in pairs if r.get("acc", 0) == 1.0)
-    return (f"{t_ok / n * 100:.1f}% ({t_ok}/{n})"
-            f" vs B {r_ok / n * 100:.1f}% ({r_ok}/{n})")
+    t_ok = sum(float(t.get("acc", 0)) for _, t in pairs)
+    r_ok = sum(float(r.get("acc", 0)) for r, _ in pairs)
+    return (f"{t_ok / n * 100:.1f}% ({t_ok:g}/{n})"
+            f" vs B {r_ok / n * 100:.1f}% ({r_ok:g}/{n})")
 
 
 def summarize_code_migration(path: str, ref_name: str = "BASE") -> str:
@@ -338,11 +452,12 @@ def pair_eval(path_a: str, path_b: str, name_a: str, name_b: str) -> str:
     na, nb = ma.get("n") or 0, mb.get("n") or 0
     if na and nb:
         d, h = diff_ci95(ma.get("acc", 0.0), na, mb.get("acc", 0.0), nb)
-        pc = paired_counts(ma.get("items"), mb.get("items"))
-        if pc is not None:
-            b, c, matched = pc
-            p = mcnemar_exact(b, c)
-            test = f"McNemar p={p:.3f} (b={b}/c={c}, n={matched})"
+        # 【2026-09-19】同 summarize_eval：按口径分派 McNemar / 配对均值 z 检验
+        pt = paired_test_auto(ma.get("items"), mb.get("items"))
+        if pt is not None:
+            _d_paired, p, _matched, test = pt
+            if _d_paired is not None:
+                d = _d_paired
             verdict = _verdict(d, h, p)
         else:
             test = "两比例（无 per-item 可配对）"

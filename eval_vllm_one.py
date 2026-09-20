@@ -523,13 +523,25 @@ for i, item in enumerate(sample):
         f_avg += f / args.val_n
     acc += a_avg; fmt += f_avg; both += (a_avg == 1.0 and f_avg == 1.0)
     if args.dump_items:
+        # 【2026-09-19 修复·采样档索引错位】code_used/code_ok 是 [题][采样] 平铺
+        # （长度 n*val_n），旧版直接取 code_used[i] 只覆盖前 200 条轨迹 = 题 0..24
+        # 的全部采样，题 25.. 全部缺失 → 代码分层/迁移分析口径全错。
+        # 现按题聚合 val_n 条（与 acc/fmt 的 Average@N 同口径）。
+        if _sampling:
+            _sl = slice(i * args.val_n, (i + 1) * args.val_n)
+            _cu = sum(code_used[_sl]) / args.val_n if code_used else 0.0
+            _ck = sum(code_ok[_sl]) / args.val_n if code_ok else 0.0
+        else:
+            _cu = float(code_used[i]) if code_used and i < len(code_used) else 0.0
+            _ck = float(code_ok[i]) if code_ok and i < len(code_ok) else 0.0
         items.append({
             # 题面指纹：跨模型对齐用（同 seed/split 下同题同 key）——McNemar 的配对键。
             # run2 缺的正是这个键，导致 +5.0pp 只能做未配对检验（p≈0.11）。
             "qk": hashlib.sha1(str(item["Q"]).encode("utf-8")).hexdigest()[:12],
             "acc": a_avg, "fmt": f_avg,
-            "code_used": int(code_used[i]) if code_used and i < len(code_used) else 0,
-            "code_ok": int(code_ok[i]) if code_ok and i < len(code_ok) else 0,
+            # 采样档为每题均值（float）；greedy 档为 0/1 计数（int 语义不变）
+            "code_used": _cu, "code_ok": _ck,
+            "val_n": args.val_n,
             "ans_len": 0, "empty": 0,
         })
     if i < args.show:
@@ -537,6 +549,11 @@ for i, item in enumerate(sample):
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid,
+          # 【2026-09-19】指标口径版本：2 = code_rate/code_ok_rate/avg_rounds 以
+          # **轨迹数**（n×val_n）为除数、per-item 的 code_used 按题聚合。
+          # 缺此键或 =1 的旧 json 是 p8 事故档（除数=题数 → 采样档虚高 val_n 倍），
+          # analysis.py 按本键决定是否做 legacy 回修，绝不靠"看起来像不像率"猜。
+          "metrics_version": 2,
           "n_requested": args.n, "n_dropped_long": _dropped_long,
           "algo": args.algo, "eval_task": args.eval_task, "split": args.split,
           # 【2026-09-12 审计缺口补齐】旧版不记 model_path：多模型同表时事后无法核对
@@ -549,9 +566,12 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
 if args.dump_items:
     result["items"] = items
 if is_retool_family and n_valid:
-    result["code_rate"] = sum(1 for u in code_used if u > 0) / n_valid
-    result["code_ok_rate"] = sum(1 for k in code_ok if k > 0) / n_valid
-    result["avg_rounds"] = sum(code_used) / n_valid
+    # 【2026-09-19 修复·采样档除数】code_used 长度 = n_valid*val_n（每题 val_n 条轨迹）
+    # 旧版除以 n_valid 导致 val_n=8 时显示值是真实值的 8 倍（p8: 401.5% 实为 50.2%）
+    _denom = len(code_used) if code_used else 1
+    result["code_rate"] = sum(1 for u in code_used if u > 0) / _denom
+    result["code_ok_rate"] = sum(1 for k in code_ok if k > 0) / _denom
+    result["avg_rounds"] = sum(code_used) / _denom
 print(f"\n[3/3] {name}（{args.eval_task} {args.split}，N={len(sample)} algo={args.algo}）")
 print(f"{name:<16}{result['acc']*100:>9.1f}%{result['fmt']*100:>9.1f}%{result['both']*100:>9.1f}%{result['n']:>10}")
 if is_retool_family and n_valid:

@@ -3334,6 +3334,102 @@ def test_logprobs_n_fix_path():
           and "--vllm_batch_invariant --vllm_attention_backend FLASH_ATTN" in rollout_src2)
 
 
+# ---- AI. 采样评测（--val_n）口径三连修：除数 / per-item 索引 / 检验二值化 ----
+def test_val_n_metric_fixes():
+    """[AI] p8「训练一直没效果」的真因是**评测层三个 bug**，不是训练（2026-09-19）。
+
+    真机 p8 报表签名：`code% = 401.5 / 406.5 / 417.0 / 366.0`（>100% 不可能是率）
+    + `step100 -4.6pp McNemar p=0.003 显著`。三个连环 bug：
+      ① code_rate/code_ok_rate/avg_rounds 除以 n_valid（题数 200），而 code_used
+         长度是 n_valid×val_n（1600）→ 显示值是真实值的 val_n=8 倍（401.5%→50.2%）。
+         **代码从未被灭绝**，各存档点都保持 ~46-52%，先前"code 压灭"的叙事在 p8 不成立。
+      ② per-item 的 code_used 取 code_used[i]（i=题号 0..199），而该列表是
+         [题][采样] 平铺 → 只覆盖题 0..24 的全部采样，题 25.. 全缺 → 代码分层/
+         迁移分析口径全错。
+      ③ McNemar 按 `acc == 1.0` 二值化，而采样档 per-item acc 是 Average@N 小数
+         → 检验的是"N 条全对率"而非 acc。**"显著"回答了另一个问题。**
+    """
+    print("[AI] 采样评测 --val_n 口径三连修（p8 假阴性事故）")
+    import inspect
+
+    from rlab.analysis import (code_layer, items_are_binary, paired_counts,
+                               paired_mean_test, paired_test_auto)
+
+    # ---- ① 除数：真机数字精确复现 ----
+    esrc = open("eval_vllm_one.py", encoding="utf-8").read()
+    check("code 指标除数改为 len(code_used)（= n_valid×val_n），不再用 n_valid",
+          "_denom = len(code_used) if code_used else 1" in esrc
+          and "result[\"avg_rounds\"] = sum(code_used) / _denom" in esrc)
+    check("旧除数写法（/ n_valid）已从 code 指标里消失（反证：防回归）",
+          "if u > 0) / n_valid" not in esrc and "sum(code_used) / n_valid" not in esrc)
+    # p8 报表 401.5% 的来源与修复后的真值
+    n_valid, val_n = 200, 8
+    code_used = [0] * (n_valid * val_n)
+    for i in range(803):          # sum(code_used)=803 → 旧口径 401.5%
+        code_used[i] = 1
+    old_rate = sum(1 for u in code_used if u > 0) / n_valid
+    new_rate = sum(1 for u in code_used if u > 0) / len(code_used)
+    check("旧口径精确复现真机 401.5%，新口径给出真值 50.2%（差 val_n=8 倍）",
+          abs(old_rate * 100 - 401.5) < 1e-6 and abs(new_rate * 100 - 50.19) < 0.01
+          and abs(old_rate / new_rate - val_n) < 1e-9)
+
+    # ---- ② per-item 索引：按题聚合 val_n 条，而不是取第 i 条轨迹 ----
+    check("per-item 采样档按题切片聚合 code_used/code_ok（不再用 code_used[i]）",
+          "_sl = slice(i * args.val_n, (i + 1) * args.val_n)" in esrc
+          and "sum(code_used[_sl]) / args.val_n" in esrc)
+    check("per-item 落 val_n 标记（供下游判定连续/二值口径）",
+          '"val_n": args.val_n,' in esrc)
+    check("旧索引写法已消失（反证）",
+          "int(code_used[i]) if code_used and i < len(code_used)" not in esrc)
+
+    # ---- ③ 检验分派：二值 → McNemar；连续 → 配对均值 z ----
+    greedy_a = [{"qk": "a", "acc": 1.0, "val_n": 1}, {"qk": "b", "acc": 0.0, "val_n": 1}]
+    greedy_b = [{"qk": "a", "acc": 0.0, "val_n": 1}, {"qk": "b", "acc": 0.0, "val_n": 1}]
+    samp_a = [{"qk": "a", "acc": 0.875, "val_n": 8}, {"qk": "b", "acc": 0.25, "val_n": 8}]
+    check("greedy（全 0/1 且 val_n=1）判为二值 → 仍走 McNemar（历史口径不变）",
+          items_are_binary(greedy_a, greedy_b)
+          and "McNemar" in paired_test_auto(greedy_a, greedy_b)[3])
+    check("采样档小数 acc 判为连续 → 走配对均值 z 检验",
+          not items_are_binary(samp_a)
+          and "配对均值" in paired_test_auto(samp_a, greedy_a)[3])
+    # 采样档即使本次抽样恰好全 0/1，也必须靠 val_n 标记判连续（否则口径随数据漂移）
+    edge = [{"qk": "a", "acc": 1.0, "val_n": 8}, {"qk": "b", "acc": 0.0, "val_n": 8}]
+    check("采样档恰好全 0/1 仍判连续（val_n 标记优先，口径不随抽样漂移）",
+          not items_are_binary(edge))
+
+    # 二值化失真的定量反证：真实 acc 差 vs 全对率差是两个不同的量
+    base = [{"qk": f"q{i}", "acc": k / 8, "val_n": 8}
+            for i, k in enumerate([8, 8, 7, 6, 5, 4, 3, 2, 1, 0])]
+    model = [{"qk": f"q{i}", "acc": k / 8, "val_n": 8}
+             for i, k in enumerate([7, 7, 7, 7, 7, 5, 4, 3, 2, 1])]
+    real_d = (sum(x["acc"] for x in model) - sum(x["acc"] for x in base)) / 10 * 100
+    pc = paired_counts(model, base)      # 旧路径：全对率口径
+    pm = paired_mean_test(model, base)   # 新路径：真实 acc 配对差
+    check("旧 McNemar 在此例上只看到'全对率 2→0'（b=0/c=2），丢掉全部小数信息",
+          pc[0] == 0 and pc[1] == 2)
+    check("配对均值检验给出真实 acc 差（+7.5pp，与逐题均值一致）且方向为正",
+          abs(pm[0] - real_d) < 1e-9 and pm[0] > 0)
+    check("两个口径在此例上**方向相反**——这正是 p8 '显著变差' 的成因",
+          pm[0] > 0 and pc[1] > pc[0])
+
+    # ---- 分层/迁移的 acc 也必须求和而非 ==1.0 计数 ----
+    asrc = open("rlab/analysis.py", encoding="utf-8").read()
+    layer = code_layer([{"qk": "a", "acc": 0.875, "code_used": 1.0},
+                        {"qk": "b", "acc": 0.25, "code_used": 0.0}])
+    check("code_layer 采样档用 acc 求和（0.875 不再被 ==1.0 归零）",
+          layer == ((1, 0.875), (1, 0.25)))
+    check("_pair_col 同题双 acc 也改求和（迁移分析不再系统性低估两臂）",
+          'float(t.get("acc", 0)) for _, t in pairs' in asrc)
+    check("paired_counts 留下口径警告（只对 greedy 有效，连续档走 paired_mean_test）",
+          "口径警告" in (paired_counts.__doc__ or "")
+          and "paired_mean_test" in (paired_counts.__doc__ or ""))
+    # 所有配对检验入口都必须走自动分派，不许残留裸 McNemar 调用
+    for fn in ("summarize_eval", "pair_eval", "summarize_code_layer"):
+        src = inspect.getsource(getattr(__import__("rlab.analysis", fromlist=[fn]), fn))
+        check(f"{fn} 走 paired_test_auto（不再裸调 paired_counts+mcnemar）",
+              "paired_test_auto" in src and "mcnemar_exact(" not in src)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -3376,6 +3472,7 @@ if __name__ == "__main__":
     test_diag_impl_label_and_mode()
     test_diag_counter_and_trajid()
     test_logprobs_n_fix_path()
+    test_val_n_metric_fixes()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
