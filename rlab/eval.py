@@ -49,6 +49,9 @@ def main():
                     help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
     ap.add_argument("--val_n", type=int, default=1,
                     help="每题采样数（>1=Average@N 采样评测，参考项目口径；retool_math 建议 8-12）")
+    ap.add_argument("--out", default=None,
+                    help="合并结果json路径（透传给底层 eval_vllm.py；None=其默认 eval_vllm_all.json。"
+                         "2026-09-20 缺口修复：此前 rlab.eval 不认 --out，多模型异名结果只能用默认名覆盖）")
     args = ap.parse_args()
 
     # 兼容旧 --retool
@@ -69,6 +72,8 @@ def main():
         cmd += ["--gpu_mem", str(args.gpu_mem)]
     if args.mm_base:
         cmd += ["--mm_base", args.mm_base]
+    if args.out:
+        cmd += ["--out", args.out]
     if args.retool:
         cmd.append("--retool")
     if algo is not None:
