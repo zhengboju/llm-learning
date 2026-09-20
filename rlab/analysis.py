@@ -479,12 +479,41 @@ def _sess_label(sess: int) -> str:
     return f"S{sess}"
 
 
-def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
+def record_clen_cap(path: str, default: int = 1800) -> tuple:
+    """record.jsonl 同目录的 run_info.json 推导 clen 上限（纯函数，CPU 可测）。
+
+    返回 (clen_cap, 来源说明)。clen 的语义是**整条轨迹 completion 全长**
+    （rollout.py 的 per_sample_ids = 各段 ids 拼接，含工具段），它的物理上限是
+    `max_context_tokens − max_prompt_length`（retool_context_overlong 的丢弃线
+    减去 prompt 占用），而不是任何单轮预算。
+
+    【2026-09-20 为什么必须读 run_info】旧版把 clen_cap 硬编码成 1800（2200−400
+    的 3B 时代值），而 p8 的真实上限是 26400−1024 = 25376 —— 差 14 倍。后果：
+    "≥0.9×cap" 那一列按 1620 判，p8 报表里显示 68%~98% 的样本"接近上限"，
+    **全部是饱和噪声**，且极易被读成"长度顶满预算"。而 ts0/ts0.5 单变量对照的
+    核心判据正是长度/截断轴，这一列不可信就等于判据不可信。
+    docs/05 §7.5.3 声称过这个修法，但代码里一直没有落地（调用点也不传该参数）。
+    """
+    info_path = os.path.join(os.path.dirname(os.path.abspath(path)), "run_info.json")
+    try:
+        with open(info_path, encoding="utf-8") as f:
+            cfg = (json.load(f) or {}).get("config") or {}
+        ctx = int(cfg.get("max_context_tokens") or 0)
+        plen = int(cfg.get("max_prompt_length") or 0)
+        if ctx > 0 and ctx - plen > 0:
+            return ctx - plen, f"run_info({ctx}−{plen})"
+    except (OSError, ValueError, TypeError):
+        pass
+    return default, f"默认{default}（无 run_info，口径存疑）"
+
+
+def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
     """按 upload 批次滑动平均 acc/fmt(code/code_ok/trunc) 率与完成长度（retool 诊断用）。
 
-    clen_cap ≈ max_context_tokens(2200) - 典型 prompt(~400) = 1800：接近上限
-    说明轨迹在撞上下文预算（会被整组丢弃或标签被截断）——2026-09-08 第四轮
-    "格式学到 75-95% 后崩回 0"的嫌疑机制，需 clen/code 趋势佐证。
+    clen_cap: None = 从 record 同目录的 run_info.json 推导（见 record_clen_cap，
+    = max_context_tokens − max_prompt_length）；显式传值则覆盖。接近上限说明轨迹
+    在撞上下文预算（会被整组丢弃或标签被截断）。**注意这条线是"全轨迹预算"，
+    末段被单轮上限切断是另一回事，看 trunc 列（retool_trunc 签名）。**
 
     window 以**样本**计（1 条 record = num_pre_Q=8 样本 = 1 组 = 1 micro-step）。
     【2026-09-17 改默认 20→160】旧默认 20 样本 = 2.5 组，20 样本的二项噪声就有
@@ -502,7 +531,12 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
         120s 判据把一次 106 组的 run 切成 **31 个"会话"**，逐会话表彻底失去意义
         （真机 bg1 的原始读数就是这个形态）。
       · 无 `gen_version`（旧协议）→ 沿用 120s 时间判据。"""
+    if clen_cap is None:
+        clen_cap, _cap_src = record_clen_cap(path)
+    else:
+        _cap_src = f"显式传入{clen_cap}"
     accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
+    cws = []             # 每样本末轮浪费的代码调用次数（2026-09-20）
     stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
     sess_span = {}   # sess -> [first_t, last_t]（墙钟，便于对 Shell 历史核对是哪次 run）
     sess_gv = {}     # sess -> [first_genver, last_genver]
@@ -547,6 +581,12 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
             codes.extend(u > 0 for u in rec.get("code_used", []))
             oks.extend(k > 0 for k in rec.get("code_ok", []))
             trs.extend(int(x) for x in rec.get("trunc_final", []))
+            # 末轮写代码 = 结构性无 boxed 且 trunc_final 记不到（2026-09-20）；
+            # 旧 record 无该键 → 补 0，列会显示 0.0% 而不是崩
+            _cw = rec.get("code_wasted") or []
+            cws.extend(int(x) for x in _cw)
+            if len(_cw) < n:
+                cws.extend([0] * (n - len(_cw)))
             clens.extend(rec.get("clen", []))
             ph = rec.get("phase")
             if ph:
@@ -578,8 +618,12 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
                 f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/8:.0f}组）"
                 f" acc={a:.1f}% fmt={ff:.1f}% 条件精度={cond} code_ok={k:.1f}% trunc={tr:.1f}%"
                 f"{gv_col}{st_col}{when}")
-    out = ["| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | avg_clen | staleness | 阶段 | 会话 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    out = [f"> clen 上限口径: {_cap_src} → cap={clen_cap}，"
+           f"「≥{int(0.9 * clen_cap)}」列 = 接近**全轨迹**预算（撞它会被整组丢弃）；"
+           f"末段被单轮上限切断请看 trunc 列。",
+           "",
+           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | 末轮废码率 | avg_clen | staleness | 阶段 | 会话 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
         out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
                       f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
@@ -591,11 +635,15 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
         j = i + window
         chunk_a, chunk_f, chunk_c = accs[i:j], fmts[i:j], codes[i:j]
         chunk_k, chunk_t, chunk_l = oks[i:j], trs[i:j], clens[i:j]
+        chunk_w = cws[i:j]
         if not chunk_a:
             continue
         code_col = f"{sum(chunk_c) / len(chunk_c) * 100:.1f}%" if chunk_c else "—"
         ok_col = f"{sum(chunk_k) / len(chunk_k) * 100:.1f}%" if chunk_k else "—"
         tr_col = f"{sum(chunk_t) / len(chunk_t) * 100:.1f}%" if chunk_t else "—"
+        # 末轮浪费代码率：与 trunc 互补，两者相加≈"没产出 boxed"的可归因部分
+        wst_col = (f"{sum(1 for x in chunk_w if x > 0) / len(chunk_w) * 100:.1f}%"
+                   if chunk_w else "—")
         if chunk_l:
             avg_l = sum(chunk_l) / len(chunk_l)
             near = sum(1 for l in chunk_l if l >= 0.9 * clen_cap) / len(chunk_l)
@@ -622,7 +670,8 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = 1800) -> str:
         out.append(f"| {i}~{j} | {i // 8}~{j // 8} "
                    f"| {_a_rate * 100:.1f}% "
                    f"| {_f_rate * 100:.1f}% | {cond_col} | {code_col} "
-                   f"| {ok_col} | {tr_col} | {len_col} | {stal_col} | {ph_col} | {sess_col} |")
+                   f"| {ok_col} | {tr_col} | {wst_col} | {len_col} | {stal_col} "
+                   f"| {ph_col} | {sess_col} |")
     if sess_lines:
         out.append("")
         out.append(f"== 会话拆分（新协议=gen_version 回退；旧协议=>{SESS_GAP_S:.0f}s 间隔）==")

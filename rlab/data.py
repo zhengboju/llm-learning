@@ -411,10 +411,17 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
     k<=0 的行视为无效——过滤宁可保守（题进不了表 = 被丢弃，见 filter 的
     missing 口径），不允许半行数据混进训练池。
 
-    expected_meta：训练端传入的当前协议指纹（model/k/rounds/round_tokens/ctx/
+    expected_meta：训练端传入的当前协议指纹（model/rounds/round_tokens/ctx/
     temp/sp）。表是"模型×提示×预算"的联合产物（M4，2026-09-18）——行自带的
-    probe_meta 若与当前协议不一致，说明这张表不是当前协议下探的（换预算/提示/k
-    续跑同一 --out 会静默混表），告警但不 fail-fast（旧表无 probe_meta 仍可用）。"""
+    probe_meta 若与当前协议不一致，说明这张表不是当前协议下探的（换预算/提示
+    续跑同一 --out 会静默混表），告警但不 fail-fast（旧表无 probe_meta 仍可用）。
+
+    【2026-09-20 修复·k 不参与比对】`k` 在两端语义不同：探针端是"每题探测几条"
+    （probe_difficulty 的 --k，默认 4），训练端曾传 `num_pre_Q`（=8）——两个数
+    本就不该相等，于是**每次训练启动必然误报一次** meta 不符。检测器对已知正常
+    状态叫狼来了，真正的混表信号（换预算/换提示）就被训练出的"忽略习惯"淹掉
+    （与 health.py 的 retool_trunc 阈值教训同类）。k 只影响通过率估计的噪声，
+    不改变"这张表描述的是哪个协议"，故从指纹里剔除。"""
     table = {}
     warned = set()
     with open(path, encoding="utf-8") as f:
@@ -431,7 +438,8 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
             if q and isinstance(k, int) and k > 0 and isinstance(nc, int) and 0 <= nc <= k:
                 table[str(q)] = r
                 if expected_meta and r.get("probe_meta"):
-                    for _fk in ("model", "k", "rounds", "round_tokens", "ctx", "temp", "sp"):
+                    # k 刻意不在比对清单里（两端语义不同，见 docstring）
+                    for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

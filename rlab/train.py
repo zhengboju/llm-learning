@@ -114,10 +114,31 @@ def run_signature(cfg: dict) -> str:
     # p7 与无 stop 的 p6 同预算参数但行为完全不同，不进签名就无法区分）。与
     # vk_tag/sp_tag 同一约定：键缺失或关闭 → 一个字符都不加，历史签名逐字不变。
     stop_tag = "-stop1" if cfg.get("retool_stop") else ""
+    # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
+    # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
+    # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
+    # guard_ckpt_collision 对这些维度完全失效：不同配方的 step_N 会互相覆盖
+    # （P1 事故的同类盲区）。`seed` 尤其危险 —— 双 seed 复跑本该是两次独立实验，
+    # 却会撞同一个 out_dir。
+    # 约定与 vk_tag/sp_tag/stop_tag 一致：**只在偏离 preset 默认时追加字符**，
+    # 等于默认值时一个字符都不加 —— 历史签名串逐字不变，旧 ckpt 不会突然变成
+    # "外来签名"，正在跑的 run 中途重启也不会被自己的护栏拦死。
+    _opt_tag = ""
+    _preset = ALGO_DEFAULTS.get(cfg.get("algo"), {})
+    for _key, _pfx in (("beta", "b"), ("gradient_accumulation_steps", "g"),
+                       ("num_pre_Q", "n"), ("gen_update_steps", "u"),
+                       ("temperature", "T"), ("adv_mode", "a"),
+                       ("max_context_tokens", "c"), ("seed", "sd")):
+        _cur = cfg.get(_key)
+        _dflt = _preset.get(_key, BASE.get(_key))
+        if _cur != _dflt:
+            _v = f"{_cur:g}" if isinstance(_cur, (int, float)) and not isinstance(_cur, bool) \
+                else str(_cur)
+            _opt_tag += f"-{_pfx}{_v}"
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:

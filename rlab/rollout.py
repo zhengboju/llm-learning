@@ -385,14 +385,17 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                  {"kind": "assistant"|"tool", "text": str, "ids": list[int]}
                  （ids = 该段真实 token 序列，assistant 段即 vLLM 采样 token）
       full_text: list[str] —— 每个样本的完整轨迹文本（prompt+全部段，日志用）
-      code_stats: list[{"code_used": int, "code_ok": int, "trunc_final": int}]
-                  （trunc_final=1 表示末个 assistant 段被轮长上限切断）
+      code_stats: list[{"code_used": int, "code_ok": int, "trunc_final": int,
+                        "code_wasted": int}]
+                  （trunc_final=1 表示末个 assistant 段被轮长上限切断；
+                   code_wasted = 末轮写了代码但不会被执行的次数——该轨迹
+                   结构性无 boxed，且 retool_stop 下 trunc_final 也记不到它）
     """
     n = len(prompts_text)
     # 每条请求的无 pad prompt token（与批量左 pad prompt_ids 同源：去 pad 即得）
     ctx_ids = [tokenizer(p, add_special_tokens=False)["input_ids"] for p in prompts_text]
     segs = [[] for _ in range(n)]
-    code_stats = [{"code_used": 0, "code_ok": 0} for _ in range(n)]
+    code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0} for _ in range(n)]
     active = list(range(n))            # 还在"代码-执行-续写"循环里的样本
     n_rounds = int(cfg.get("max_rounds", 3))
     for _rnd in range(n_rounds):
@@ -423,11 +426,19 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
             blocks = extract_python_blocks(new_text)
             if not blocks:
                 continue              # 本轮无代码块 → 样本结束，等待最终答案
+            # 【2026-09-20 可观测性修复】计数移到 is_final_round 判断**之前**：
+            # 旧版自增在 continue 之后，末轮写的代码在 code_used/code_ok/trunc_final
+            # 三个统计量里**同时为 0**（retool_stop 让末段 finish_reason="stop"
+            # 而非 "length"）——一条"末轮以代码收尾"的轨迹 reward=-1（无 boxed）
+            # 却在数据里显示"既没写代码也没被截断"，与"啰嗦跑飞"无法区分。
+            code_stats[i]["code_used"] += 1
             if is_final_round:
-                continue              # 最后一轮：不执行代码（结果无人消费，见 docstring）
+                # 末轮代码不执行（结果无人消费，见 docstring）→ 这次调用是纯浪费，
+                # 且该轨迹结构性地不会产出 boxed。单列计数供 record/analysis 观察。
+                code_stats[i]["code_wasted"] += 1
+                continue
             code = blocks[-1]          # 执行最后一个完整代码块（最新计算意图；
                                         # Auto_Program 原版取第一个——并非一致，是有意改进）
-            code_stats[i]["code_used"] += 1
             exec_jobs.append((i, code))
 
         # 沙箱并行执行（2026-09-09 提速）：run_code 是 subprocess，线程池并发安全。
@@ -675,6 +686,10 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         "clen": clen_i,
                         "trunc": [int(s["trunc_final"])
                                   for s in code_stats[i * n:(i + 1) * n]],
+                        # 末轮写了代码却不会被执行的次数（该轨迹结构性无 boxed，
+                        # 且 retool_stop 下 trunc_final 记不到它）
+                        "cw": [int(s.get("code_wasted", 0))
+                               for s in code_stats[i * n:(i + 1) * n]],
                         "plen": plen_i})
     return results
 
@@ -1045,7 +1060,9 @@ def gen_worker(Q, cfg: dict):
         import hashlib as _hl
         _expected_meta = {
             "model": os.path.basename(str(cfg["model_path"]).rstrip("/")),
-            "k": cfg.get("num_pre_Q"),
+            # 【2026-09-20】不再传 k：探针的 k（每题探几条）与训练的 num_pre_Q
+            # （每题采几条）语义不同、本就不相等，传了会让 load_difficulty_table
+            # 每次启动必误报一次（真混表信号被"忽略习惯"淹掉）。见 data.py docstring。
             "rounds": cfg.get("max_rounds"), "round_tokens": cfg.get("round_gen_tokens"),
             "ctx": cfg.get("max_context_tokens"), "temp": cfg.get("temperature"),
             "sp": _hl.sha1(str(cfg.get("system_prompt", "")).encode("utf-8")).hexdigest()[:6],
@@ -1315,7 +1332,18 @@ def gen_worker(Q, cfg: dict):
                               f"各题真实 {min(_trues)}~{max(_trues)}"
                               "（打分序列与 vLLM 生成序列逐 token/逐位置同源）",
                               flush=True)
-                rollout_seq[0] += 1   # 盐递增：uniform/超长题重试时不会复采同轨迹
+                # 【2026-09-20 修复·盐步长必须等于本次消耗的 seed 数】
+                # make_retool_sps 占用 [salt, salt+n_req)，n_req = 题数×num_pre_Q
+                # （retool_math = 4×8 = 32）。旧版每次 attempt 只 +=1 → 相邻 attempt
+                # 的 seed 区间**重叠 31/32 = 97%**，要 32 次 attempt 才走出重叠区。
+                # 后果（与 vllm_batch_invariant=True 叠加最狠）：同题 uniform 被插回
+                # 队首重采时，8 条里 7-8 条 seed 上次已用过，而相邻 attempt 之间多数
+                # 没有权重推送（gen_update_steps=8）→ 同 seed+同 prompt+同权重 =
+                # 同轨迹 → "重采"复现上次结果 → 再次 uniform → q_skip_streak=2 达标
+                # 拉黑。**题目被拉黑的真实原因是 seed 复用，不是"当前学不动"**，
+                # QuestionScheduler 的判据因此失真（p8 丢弃率 25~31% 零方差主导且
+                # 不随时间下降）。组内 8 条 seed 一直是互不相同的（零方差与此无关）。
+                rollout_seq[0] += len(inputs) * cfg["num_pre_Q"]
                 for q, res in zip(inputs, results):
                     if res["status"] == "uniform":
                         samp_stats["uniform"] += 1
@@ -1372,6 +1400,7 @@ def gen_worker(Q, cfg: dict):
                     "acc": r["acc"].tolist(), "fmt": r["fmt"].tolist(),
                     "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
                     "trunc_final": r["trunc"],
+                    "code_wasted": r["cw"],
                     "gen_version": policy_version[0],
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
                 health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"],
