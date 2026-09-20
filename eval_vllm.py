@@ -39,6 +39,13 @@ parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/ret
 parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"], help="评测数据集；None=自动")
 # 【2026-09-18 采样评测】透传给 eval_vllm_one.py：--val_n>1 启用 Average@N（参考项目口径）
 parser.add_argument("--val_n", type=int, default=1, help="每题采样数（>1=Average@N 采样评测）")
+# 【2026-09-20 采样档可复现性】确定性档统一覆盖（None=各子进程随自己的 run_info）
+parser.add_argument("--vllm_batch_invariant", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="确定性档（VLLM_BATCH_INVARIANT=1）统一覆盖所有模型；"
+                         "None=随各自训练 run_info。采样评测建议开")
+parser.add_argument("--vllm_attention_backend", default=None,
+                    help="显式 attention backend（FLASH_ATTN 等），与上一项成对")
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -161,6 +168,14 @@ def run_one(gpu, idx, name, path):
     _pf = BASE_PROTO.get(name)
     if _pf:
         cmd += ["--proto_from", _pf]
+    # 【2026-09-20 确定性档透传】不透传 = 每个子进程各自从 run_info 回读，BASE
+    # （无 run_info，走 --proto_from）与 tuned 可能落到不同档 → Δacc 混进 kernel
+    # 变量。显式传时对所有模型统一覆盖，档位在一次 eval 内严格一致。
+    if args.vllm_batch_invariant is not None:
+        cmd += ["--vllm_batch_invariant"] if args.vllm_batch_invariant \
+            else ["--no-vllm_batch_invariant"]
+    if args.vllm_attention_backend:
+        cmd += ["--vllm_attention_backend", args.vllm_attention_backend]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
     # 竞态兜底：同卡实例退出释放显存撞上另一实例的初始化剖析 → AssertionError。
     # 该失败只发生在启动窗口期，冷却后重试几乎必成，最多试3次。

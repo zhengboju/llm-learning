@@ -61,6 +61,16 @@ parser.add_argument("--proto_from", default=None,
                     help="协议来源目录（含 run_info.json）；None=从 --model 自己的 run_info 回读。"
                          "供 BASE 等无 run_info 的裸模型复用『被测 checkpoint 的训练协议』，"
                          "保证 Δacc 同档（2026-09-17）。")
+# 【2026-09-20 采样档可复现性】确定性档开关：默认 None=从 run_info 回读训练档
+# （采样评测不开则同权重重跑漂移 ~2pp，实测 BASE 63.1→61.1）。两个键必须成对，
+# 只开 batch_invariant 不给 backend 会在引擎构造时 RuntimeError（已 fail-fast 前拦）。
+parser.add_argument("--vllm_batch_invariant", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="确定性档（VLLM_BATCH_INVARIANT=1）；None=随训练 run_info。"
+                         "采样评测（--val_n>1）强烈建议开，否则跨 run 不可比")
+parser.add_argument("--vllm_attention_backend", default=None,
+                    help="显式 attention backend（FLASH_ATTN/TRITON_ATTN）；"
+                         "None=随训练 run_info。确定性档必需（与上一项成对）")
 args = parser.parse_args()
 
 # ---- 从 checkpoint 回读训练协议（run_info.json）----
@@ -438,6 +448,33 @@ from vllm import LLM, SamplingParams
 _vllm_kwargs = dict(_rcfg.get("vllm_gen_kwargs") or {})
 if _vllm_kwargs:
     print(f"  vLLM 引擎参数（与训练同一份配置）: {_vllm_kwargs}")
+# 【2026-09-20 采样档可复现性】确定性档必须与训练同步接线——否则采样评测不可复现：
+# 实测同权重/同 --seed/同 --n 重跑 BASE 漂移 63.1→61.1（-2.0pp），而 3pp 级效应正
+# 埋在这个地板里。抽题与轨迹 seed 本来就是确定的（random.seed(--seed) 之后
+# random.sample 与 randrange 同属一条流，已实测同 seed/同 n 逐位复现），真正的
+# 抖动源是 vLLM 侧：批调度 + bf16 归约顺序（docs/07 已定案）。训练端 gen_worker
+# 走的正是 VLLM_BATCH_INVARIANT=1 + 显式 attention backend 这一对（缺一即失效，
+# batch_invariant_guard 会 fail-fast），eval 此前只取 vllm_gen_kwargs、把这两个
+# 键静默丢掉 = 评测与训练不同档。CLI 可显式覆盖，默认从 run_info 回读训练档。
+from rlab.rollout import attention_backend_kwargs as _attn_kw
+from rlab.rollout import batch_invariant_guard as _bi_guard
+
+_bi = _rcfg.get("vllm_batch_invariant") if args.vllm_batch_invariant is None \
+    else args.vllm_batch_invariant
+_attn_be = args.vllm_attention_backend or _rcfg.get("vllm_attention_backend")
+_bi_guard(bool(_bi), _attn_be)      # 开了确定性档却缺 backend → 构造前 raise
+if _bi:
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    print("  [确定性档] VLLM_BATCH_INVARIANT=1（与训练同档；关 custom all-reduce、"
+          "改用确定性 kernel，吞吐有代价）")
+if _attn_be:
+    _vllm_kwargs.update(_attn_kw(_attn_be))
+    print(f"  [确定性档] attention backend={_attn_be} → {_vllm_kwargs}")
+if not _bi and args.val_n > 1:
+    print("  [警告] 采样评测（--val_n>1）未开确定性档：同权重重跑会有 ~2pp 漂移"
+          "（实测 BASE 63.1→61.1），3pp 级效应无法与噪声区分。"
+          "训练档若已开，请确认 run_info 可读；或显式传 "
+          "--vllm_batch_invariant --vllm_attention_backend FLASH_ATTN")
 _gpu_mem_preflight(args.gpu_mem)
 llm = LLM(model=_model_for_vllm, gpu_memory_utilization=args.gpu_mem,
           max_model_len=args.max_len, dtype="bfloat16", **_vllm_kwargs)
@@ -562,7 +599,12 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
           "eval_protocol": {"temperature": _temp, "top_p": _topp, "greedy": not _sampling,
                             "val_n": args.val_n, "seed": args.seed,
                             "max_rounds": args.max_rounds, "round_tokens": args.round_tokens,
-                            "max_tokens": args.max_tokens, "max_len": args.max_len}}
+                            "max_tokens": args.max_tokens, "max_len": args.max_len,
+                            # 【2026-09-20】确定性档落盘：采样评测的跨 run 可比性前提。
+                            # 缺这两项的旧 json（或 batch_invariant=false）不可与新
+                            # json 直接比 Δacc——同权重漂移可达 2pp。
+                            "vllm_batch_invariant": bool(_bi),
+                            "vllm_attention_backend": _attn_be}}
 if args.dump_items:
     result["items"] = items
 if is_retool_family and n_valid:

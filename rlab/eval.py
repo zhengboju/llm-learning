@@ -49,6 +49,16 @@ def main():
                     help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
     ap.add_argument("--val_n", type=int, default=1,
                     help="每题采样数（>1=Average@N 采样评测，参考项目口径；retool_math 建议 8-12）")
+    # 【2026-09-20 采样档可复现性】确定性档透传（None=各模型随自己的训练 run_info）。
+    # 采样评测不开确定性档时，同权重/同 seed 重跑 BASE 实测漂移 2.0pp（63.1→61.1），
+    # 3pp 级效应无法与噪声区分 —— 跨 run 对比前必须对齐本档。
+    ap.add_argument("--vllm_batch_invariant", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="确定性档（VLLM_BATCH_INVARIANT=1）统一覆盖所有模型；"
+                         "None=随各自训练 run_info。采样评测（--val_n>1）建议开")
+    ap.add_argument("--vllm_attention_backend", default=None,
+                    help="显式 attention backend（FLASH_ATTN/TRITON_ATTN），与上一项成对；"
+                         "确定性档缺它会在引擎构造时 RuntimeError（已前拦）")
     ap.add_argument("--out", default=None,
                     help="合并结果json路径（透传给底层 eval_vllm.py；None=其默认 eval_vllm_all.json。"
                          "2026-09-20 缺口修复：此前 rlab.eval 不认 --out，多模型异名结果只能用默认名覆盖）")
@@ -80,6 +90,11 @@ def main():
         cmd += ["--algo", algo]
     if args.eval_task is not None:
         cmd += ["--eval_task", args.eval_task]
+    if args.vllm_batch_invariant is not None:
+        cmd.append("--vllm_batch_invariant" if args.vllm_batch_invariant
+                   else "--no-vllm_batch_invariant")
+    if args.vllm_attention_backend:
+        cmd += ["--vllm_attention_backend", args.vllm_attention_backend]
     print("[eval]", " ".join(cmd))
     raise SystemExit(subprocess.call(cmd))
 

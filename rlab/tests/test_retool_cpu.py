@@ -2510,6 +2510,8 @@ def test_pyflakes_undefined():
              "rlab/model_loading.py", "rlab/materialize_mm_ckpt.py",
              "rlab/ref_server.py",
              "rlab/data.py", "rlab/prepare_dapo_math.py", "rlab/diag_logps.py",
+             # 【2026-09-20】rlab/eval.py 此前漏在清单外（改它时无静态防线）
+             "rlab/eval.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
@@ -3430,6 +3432,75 @@ def test_val_n_metric_fixes():
               "paired_test_auto" in src and "mcnemar_exact(" not in src)
 
 
+# ---- AJ. eval 采样档确定性接线（跨 run 可比性前提） ----
+def test_eval_determinism_wiring():
+    """[AJ] 采样评测的可复现性缺口（2026-09-20）：确定性档没接到 eval。
+
+    实测：同权重、同 `--seed 42`、同 `--n 200` 重跑 BASE，acc 63.1 → **61.1**
+    （−2.0pp）。而本轮要判定的效应只有 3pp 级 —— 噪声地板吃掉结论。
+
+    **自我纠正记录**：先前曾断言"轨迹 seed 不受 --seed 约束"（指
+    `_base = _rnd.randrange(1<<30)`），**该判断错误**：`import random as _rnd`
+    绑定的是同一个已被 `random.seed(args.seed)` 播种的模块对象，实测同
+    seed/同 n 下 `_base` 逐位复现（993486218）。真正的抖动源是 vLLM 侧
+    （批调度 + bf16 归约顺序，docs/07 已定案），修法 = 训练端那对
+    `VLLM_BATCH_INVARIANT=1` + 显式 attention backend。
+
+    教训：**"不可复现"要先定位到层**——同一条 random 流里的确定性可以直接
+    实测验证，不能靠读一眼 `randrange` 就下结论。
+    """
+    print("[AJ] eval 采样档确定性接线（同权重漂移 2pp 的修法）")
+    import random
+
+    # 先把"轨迹 seed 本来就确定"这条实测锁进测试（防再次误判）
+    def _seq(seed, n):
+        random.seed(seed)
+        s = random.sample(list(range(17000)), n)
+        return s[:3], random.randrange(1 << 30)
+    a, b = _seq(42, 200), _seq(42, 200)
+    check("抽题+轨迹 base seed 在同 seed/同 n 下逐位复现（纠正旧误判）", a == b)
+    check("换 seed 则 base seed 改变（确实受 --seed 约束）",
+          _seq(43, 200)[1] != _seq(42, 200)[1])
+    # n 改变会移动 random 状态 → 轨迹 seed 也变（跨 n 的 run 不可逐条比对）
+    check("换 n 会移动 random 流 → base seed 改变（跨 n 不可逐条比）",
+          _seq(42, 500)[1] != _seq(42, 200)[1])
+
+    one = open("eval_vllm_one.py", encoding="utf-8").read()
+    sched = open("eval_vllm.py", encoding="utf-8").read()
+    uni = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "eval.py"), encoding="utf-8").read()
+
+    check("eval_one: 确定性档 CLI 存在且默认 None（=随 run_info，不改历史默认行为）",
+          '"--vllm_batch_invariant"' in one and '"--vllm_attention_backend"' in one
+          and "if args.vllm_batch_invariant is None" in one)
+    check("eval_one: 复用训练端 batch_invariant_guard（成对校验单点同源，不另写一份）",
+          "batch_invariant_guard as _bi_guard" in one
+          and "_bi_guard(bool(_bi), _attn_be)" in one)
+    check("eval_one: 复用训练端 attention_backend_kwargs（键名从 vLLM 注册表取）",
+          "attention_backend_kwargs as _attn_kw" in one
+          and "_vllm_kwargs.update(_attn_kw(_attn_be))" in one)
+    check("eval_one: env 在 LLM() 构造之前设置（vLLM envs 惰性读取，晚设无效）",
+          one.index('os.environ["VLLM_BATCH_INVARIANT"] = "1"') < one.index("llm = LLM("))
+    check("eval_one: 采样档未开确定性档时告警（把 2pp 地板写在脸上）",
+          "未开确定性档" in one and "63.1" in one)
+    check("eval_one: 档位落进 eval_protocol（旧 json 不可与新 json 直接比 Δacc）",
+          '"vllm_batch_invariant": bool(_bi)' in one
+          and '"vllm_attention_backend": _attn_be' in one)
+    # 透传链：断一环则多模型 eval 里 BASE 与 tuned 可能落不同档
+    check("调度器 eval_vllm.py 透传两个 flag（含 --no- 关档形态）",
+          '["--vllm_batch_invariant"]' in sched
+          and '["--no-vllm_batch_invariant"]' in sched
+          and '"--vllm_attention_backend", args.vllm_attention_backend' in sched)
+    check("统一入口 rlab/eval.py 透传两个 flag（含 --no- 关档形态）",
+          '"--vllm_batch_invariant" if args.vllm_batch_invariant' in uni
+          and '"--no-vllm_batch_invariant"' in uni
+          and '"--vllm_attention_backend", args.vllm_attention_backend' in uni)
+    # 三处都用 BooleanOptionalAction：None/True/False 三态（None 才能"随 run_info"）
+    for tag, src in (("eval_one", one), ("调度器", sched), ("统一入口", uni)):
+        check(f"{tag}: 用 BooleanOptionalAction 三态（None=随训练档，非 store_true 两态）",
+              "action=argparse.BooleanOptionalAction" in src)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -3473,6 +3544,7 @@ if __name__ == "__main__":
     test_diag_counter_and_trajid()
     test_logprobs_n_fix_path()
     test_val_n_metric_fixes()
+    test_eval_determinism_wiring()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
