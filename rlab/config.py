@@ -74,7 +74,7 @@ ALGO_DEFAULTS = {
     # 1024 下的截断风险，docs/03 探针 1024 截断 85%）+ max_context_tokens 14336
     # （p5 实测档，need=4×2048+1024+798=10014 ≤ 14336 ✅，余量充足）。
     # 仍保留的差异（报告须注明）：loss_norm sample_mean、KL β=0.04、
-    # Q_batch_size=1、trunc_shaping 0.5（p5 已证伪其是增益来源，保留不影响）。
+    # Q_batch_size=1、trunc_shaping 0.0（overlong_filter 接管，硬罚归零）。
     "retool_math": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
                         loss_norm="sample_mean", data_task="dapo_math",
                         num_pre_Q=8, train_micro_batch_size_per_gpu=8,
@@ -88,10 +88,13 @@ ALGO_DEFAULTS = {
                         # →结果"错位与 42~55% 高截断（三轮 run 代码压灭的根因）。
                         # 关闭 = 回到 p6 旧协议（A/B 对照位）。
                         retool_stop=True,
-                        # 长度控制：overlong 现在可达（预算自洽）→ 打开；再叠一个
-                        # 靶向 trunc_final 的项（prose 路径唯一够得到的反向信号）。
+                        # 长度控制：overlong 现在可达（预算自洽）→ 打开。
+                        # 【2026-09-21 trunc_shaping 归零】overlong_filter=True 时
+                        # 截断样本 adv=0（从 advantage/组统计中移除），trunc_shaping
+                        # 只改截断样本的 reward 值但该值被 mask 跳过 → 零影响。
+                        # DAPO 消融：硬截断罚（无论 0 还是 0.5）都是 reward noise。
                         overlong_shaping=True, overlong_buffer=256,
-                        trunc_shaping=0.5,
+                        trunc_shaping=0.0,
                         # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage
                         # 和组统计中移除（消融 +6 分，最稳定的长度控制组件）。
                         # 杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再

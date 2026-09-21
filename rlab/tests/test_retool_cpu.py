@@ -3642,8 +3642,10 @@ def test_preflight_audit_fixes():
         check("④ 迁移兼容：老签名是新签名前缀且新增段全是优化器段 → 放行"
               "（否则正在跑的 run 崩溃后无法续跑）", True)
         # 反向与真换配方都必须继续拦
+        # 【2026-09-21】preset trunc_shaping 从 0.5 改 0.0，所以"不同配方"
+        # 的构造方向也反过来：把 -ts0- 改成 -ts0.5-（而非旧的 -ts0.5→-ts0）
         with open(os.path.join(_ck, "run_info.json"), "w", encoding="utf-8") as f:
-            json.dump({"signature": _old.replace("-ts0.5", "-ts0")}, f)
+            json.dump({"signature": _old.replace("-ts0-", "-ts0.5-")}, f)
         try:
             guard_ckpt_collision(_tmp3, _cfg)
             _ok = False
