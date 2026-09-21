@@ -253,10 +253,13 @@ def main():
     if args.system_prompt_file:
         # 提示是协议的一半：本探针出的表只对"同提示 + 同预算 + 同模型"的训练有效。
         # 打印指纹，便于与训练启动行的 `signature=...-sp<hash6>` 逐字对上。
-        import hashlib
         with open(args.system_prompt_file, encoding="utf-8") as f:
             cfg["system_prompt"] = f.read().strip()
-        _sp_sha = hashlib.sha1(cfg["system_prompt"].encode("utf-8")).hexdigest()[:6]
+    # 提示指纹始终计算（probe_meta 要写入每行；不传 --system_prompt_file 时
+    # 用 preset 默认提示的指纹）
+    import hashlib
+    _sp_sha = hashlib.sha1(cfg["system_prompt"].encode("utf-8")).hexdigest()[:6]
+    if args.system_prompt_file:
         print(f"[probe] 系统提示替换为 {args.system_prompt_file}"
               f"（{len(cfg['system_prompt'])} 字符，sp{_sp_sha}）"
               f"—— 训练必须传同一个 --system_prompt_file，签名里应出现 -sp{_sp_sha}")
