@@ -1921,18 +1921,18 @@ def test_eval_thinking_switch():
           and "_load_run_cfg(args.proto_from) if args.proto_from else _load_run_cfg(args.model)"
           in _ev_src)
 
-    # 【2026-09-18 分布内对照缺口】--split train 此前直接抽全量池（训练端难度过滤
-    # 后 ~2 万题之外的题大多数训练没见过），不是真正的"分布内"。修复：eval 的
-    # train split 复用 run_info 回读的训练端同一套过滤（difficulty_path/band 单点同源）。
-    check("--split train 复用训练端难度过滤（difficulty_path 从 run_info 回读）",
-          'from rlab.data import (load_dapo_math_dev, load_dapo_math_train,' in _ev_src
+    # 【2026-09-22 分布对齐修复】eval 的 train 和 test split 都用训练端同一套
+    # 难度过滤。此前只过滤 train split → 两个 split 难度分布不同 → train eval
+    # 偏高（p9 假信号）。现在 probe 覆盖训练池+dev 集，eval 两端同表同 band 过滤。
+    check("eval 两端 split 都用难度过滤（同表同 band）",
+          'from rlab.data import (load_dapo_math_dev, load_dapo_math_train,'
+          in _ev_src
           and "load_difficulty_table" in _ev_src
           and "filter_qas_by_difficulty(test_data, _tbl, lo=_lo, hi=_hi)" in _ev_src)
-    check("train split 的过滤与训练同源（_run_cfg 的 difficulty_path，非 CLI 新参数）",
-          '_dp = (_run_cfg.get("difficulty_path") or "")' in _ev_src
-          and "_run_cfg.get(\"difficulty_band\", (0.0, 1.0))" in _ev_src)
-    check("难度表读不到/无 difficulty_path 时大字告警（不静默按全量池抽）",
-          "按全量池抽，不是训练分布内" in _ev_src)
+    check("难度过滤对 test 和 train split 都生效（不分流）",
+          '[eval][{args.split}] 难度过滤' in _ev_src)
+    check("无 difficulty_path 时两端都告警（含 p≈0 稀释）",
+          "含 p≈0 题，效果被稀释" in _ev_src)
 
 
 

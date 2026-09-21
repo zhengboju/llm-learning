@@ -270,6 +270,17 @@ def main():
     from rlab.rollout import build_prompt, multi_turn_rollout_group
 
     QAs = load_qas(cfg["data_task"])
+    # 【2026-09-22 分布对齐】同时探 dev 集，让 eval 的 test split 能用同一张表
+    # 过滤到同一 difficulty_band → 训练/评测同分布 → 不被 p≈0 题稀释。
+    # dev 是 held-out：探针只用 base 估计难度，不参与训练，不泄露。
+    if cfg["data_task"] in ("dapo_math", "dapo-math-17k", "math_dapo"):
+        from rlab.data import load_dapo_math_dev
+        _dev = load_dapo_math_dev()
+        _train_qs = {q["Q"] for q in QAs}
+        _dev_new = [q for q in _dev if q["Q"] not in _train_qs]
+        QAs = QAs + _dev_new
+        print(f"[probe] 训练池 {len(QAs) - len(_dev_new)} 题 + dev {len(_dev_new)} 题"
+              f" = {len(QAs)} 题联合探针")
     # 断点续跑：已探过的题跳过（表逐题追加写，崩溃/中断不丢进度）。
     # 【2026-09-17】分片 × 续跑的顺序交给 probe_plan 纯函数（切片与 done 无关），
     # 否则续跑时切片错位 → 两片互相探对方的题（重叠浪费 + 不变量失效）。
