@@ -82,25 +82,56 @@ def forward_per_token_logps(model, input_ids: torch.Tensor,
 
 
 def compute_advantages(rewards: torch.Tensor, group_size: int, mode: str,
-                       eps: float = 1e-4) -> torch.Tensor:
+                       eps: float = 1e-4,
+                       sample_mask: torch.Tensor = None) -> torch.Tensor:
     """奖励 -> advantage（生成端调用，上传前完成）。
 
     rewards: (G,) 展平的每条样本原始奖励，G = Q_batch_size * num_pre_Q
+    sample_mask: (G,) 1=有效, 0=过滤（DAPO overlong filtering）。有效样本参与
+        组统计（均值/std）；过滤样本 adv=0（不贡献 pg_term）。None=全部有效（旧行为）。
       group_std  : 组内 (r-mean)/std          —— GRPO/DAPO/CISPO/GSPO
       group_mean : 组内 r-mean（不除 std）     —— Dr.GRPO（去 1/std 偏差）
       global_mean: 全局 r-mean（基线不分组）    —— RF++（组内对比仍在，但基线跨组共享）
+
+    【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除：
+    - 组均值/std 只算非截断样本 → 截断样本不污染基线
+    - 截断样本 adv=0 → pg_term=0（不贡献策略梯度）
+    - 全错组+混合截断不再因 trunc_shaping 产生假方差通过 group_ok（NeMo-RL bug）
+    DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
     """
     G = rewards.numel()
     assert G % group_size == 0, f"奖励数 {G} 不是组大小 {group_size} 的整数倍"
     r = rewards.float()
+    if sample_mask is None:
+        sample_mask = torch.ones(G, dtype=r.dtype, device=r.device)
+    else:
+        sample_mask = sample_mask.to(dtype=r.dtype, device=r.device)
+
     if mode == "global_mean":
-        return r - r.mean()
+        valid_sum = (r * sample_mask).sum()
+        valid_count = sample_mask.sum().clamp(min=1)
+        global_mean = valid_sum / valid_count
+        return ((r - global_mean) * sample_mask)
+
     groups = r.view(G // group_size, group_size)
+    mask = sample_mask.view(G // group_size, group_size)
+
     if mode == "group_mean":
-        return (groups - groups.mean(dim=1, keepdim=True)).view(-1)
+        group_sum = (groups * mask).sum(dim=1, keepdim=True)
+        group_count = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        group_mean = group_sum / group_count
+        return ((groups - group_mean) * mask).view(-1)
+
     if mode == "group_std":
-        return ((groups - groups.mean(dim=1, keepdim=True))
-                / (groups.std(dim=1, keepdim=True) + eps)).view(-1)
+        group_sum = (groups * mask).sum(dim=1, keepdim=True)
+        group_count = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        group_mean = group_sum / group_count
+        # 无偏 std（与旧版 torch.std(unbiased=True) 对齐）：除 (N-1)
+        diff_sq = ((groups - group_mean) ** 2) * mask
+        var = diff_sq.sum(dim=1, keepdim=True) / (group_count - 1).clamp(min=1)
+        std = var.sqrt() + eps
+        return (((groups - group_mean) / std) * mask).view(-1)
+
     raise KeyError(f"未知 adv_mode {mode!r}")
 
 

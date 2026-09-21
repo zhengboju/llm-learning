@@ -115,6 +115,11 @@ def run_signature(cfg: dict) -> str:
     # p7 与无 stop 的 p6 同预算参数但行为完全不同，不进签名就无法区分）。与
     # vk_tag/sp_tag 同一约定：键缺失或关闭 → 一个字符都不加，历史签名逐字不变。
     stop_tag = "-stop1" if cfg.get("retool_stop") else ""
+    # 【2026-09-21 overlong filtering 进签名】截断样本从 advantage 移除是行为级
+    # 变化（同 trunc_shaping/预算下梯度流向不同），必须进签名否则新旧 run 撞名。
+    # 约定同 stop_tag：只在开启时追加，历史签名逐字不变（前缀兼容由 _is_opt_suffix
+    # 识别 "of" 段 → guard_ckpt_collision 放行）。
+    of_tag = "-of1" if cfg.get("overlong_filter") else ""
     # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
     # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
     # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
@@ -139,7 +144,7 @@ def run_signature(cfg: dict) -> str:
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{_opt_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{of_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -156,6 +161,7 @@ def write_run_info(path: str, cfg: dict) -> None:
             "max_rounds": cfg.get("max_rounds"),
             "trunc_shaping": cfg.get("trunc_shaping"),
             "overlong_shaping": cfg.get("overlong_shaping"),
+            "overlong_filter": cfg.get("overlong_filter"),
             "difficulty_path": cfg.get("difficulty_path"),
             "difficulty_band": cfg.get("difficulty_band"),
             "lr": cfg.get("lr"),
@@ -179,7 +185,7 @@ def _ckpt_signature(ckpt_dir: str):
 
 
 # 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
-_OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd")
+_OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -647,6 +653,12 @@ def main():
                     help="末段被轮长上限切断（trunc_final=1）的额外扣分权重（默认取 preset；"
                          "retool_math=0.5，其余算法=0）。这是 prose 轨迹唯一够得到的"
                          "长度反向信号——总长惩罚够不到 clen ≤ round_gen_tokens 的单轮轨迹")
+    ap.add_argument("--overlong_filter", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="DAPO overlong filtering：截断样本从 advantage 和组统计中移除"
+                         "（adv=0，不贡献 pg_term）。DAPO 消融 +6 分，杀 NeMo-RL bug"
+                         "（trunc_shaping>0 时全错组+混合截断产生假方差）。"
+                         "retool_math preset 默认开；--no-overlong_filter 关闭做 A/B")
     ap.add_argument("--system_prompt_file", default=None,
                     help="用文件内容整体替换系统提示（默认=preset 提示）。用途：提示层"
                          "单变量 A/B 与 P1b 的原配方重现并行——file 只作用于本次 run，"
@@ -727,6 +739,7 @@ def main():
     if args.beta is not None: overrides["beta"] = args.beta
     if args.overlong_shaping: overrides["overlong_shaping"] = True
     if args.trunc_shaping is not None: overrides["trunc_shaping"] = args.trunc_shaping
+    if args.overlong_filter is not None: overrides["overlong_filter"] = args.overlong_filter
     if args.system_prompt_file:
         with open(args.system_prompt_file, encoding="utf-8") as f:
             overrides["system_prompt"] = f.read().strip()

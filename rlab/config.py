@@ -92,6 +92,11 @@ ALGO_DEFAULTS = {
                         # 靶向 trunc_final 的项（prose 路径唯一够得到的反向信号）。
                         overlong_shaping=True, overlong_buffer=256,
                         trunc_shaping=0.5,
+                        # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage
+                        # 和组统计中移除（消融 +6 分，最稳定的长度控制组件）。
+                        # 杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再
+                        # 产生假方差通过 group_ok（p9 step100 -8.5pp 的根因）。
+                        overlong_filter=True,
                         code_w=0.0, reward_switch_step=1000000000,
                         # 【2026-09-11 eval 全灭事故】思考开关收进 preset 单点同源：
                         # Qwen3.5 默认 enable_thinking=True，eval 端 prompt 构造从
@@ -282,6 +287,11 @@ BASE = dict(
     # 合法轨迹再也不会被丢，shaping 成为**唯一**的长度控制 → 打开它。
     overlong_shaping=False,
     overlong_buffer=64,      # DAPO 软悬崖缓冲区宽度
+    # 【2026-09-21 DAPO overlong filtering】截断样本（末段被轮长上限切断）从
+    # advantage 和组统计中移除：组均值只算非截断、截断样本 adv=0。
+    # DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
+    # 同时杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再产生假方差。
+    overlong_filter=False,
     # 【2026-09-12 靶向 shaping·长度膨胀的真正出口】末段被轮长上限切断
     # （trunc_final=1）的额外扣分。为什么不能只靠 overlong_shaping：completion
     # 总长惩罚够不到"单轮就结束"的 prose 轨迹（clen ≤ round_gen_tokens < trigger）。

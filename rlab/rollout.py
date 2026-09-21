@@ -574,6 +574,7 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     返回 (adv, acc_s, fmt_s, code_used, code_ok, phase)。"""
     phase = reward_phase(steps_elapsed, cfg["reward_switch_step"])
     rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
+    trunc_finals = []  # overlong filtering: 1=末段被截断 → 从 advantage/组统计中移除
     n = cfg["num_pre_Q"]
     assert len(asst_texts) == len(inputs) * n, \
         f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
@@ -584,9 +585,11 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # （两代 bug 都记录在 reward.overlong_ref_tokens 的 docstring 里）
     _ol_ref = overlong_ref_tokens(cfg)
     _trunc_w = float(cfg.get("trunc_shaping", 0.0) or 0.0)
+    _do_filter = bool(cfg.get("overlong_filter", False))
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
+            _tf = code_stats[idx].get("trunc_final", 0)
             if is_math:
                 sc = total_reward_retool_math(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
@@ -595,7 +598,7 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     overlong_buffer=cfg["overlong_buffer"],
                     overlong_shaping=cfg.get("overlong_shaping", False),
                     # 末段被轮长上限切断 → 额外扣分（prose 路径唯一够得到的长度反向信号）
-                    trunc_final=code_stats[idx].get("trunc_final", 0),
+                    trunc_final=_tf,
                     trunc_shaping=_trunc_w)
             else:
                 sc = total_reward_retool(
@@ -609,8 +612,17 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
             rewards.append(sc["reward"]); acc_s.append(sc["acc"])
             fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])
             ck.append(code_stats[idx]["code_ok"])
+            trunc_finals.append(_tf)
     rewards = torch.tensor(rewards, dtype=torch.float32)
-    adv = compute_advantages(rewards, n, cfg["adv_mode"])
+    # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除：
+    # 组均值只算非截断 → 截断样本 adv=0 → 不贡献 pg_term。
+    # 杀 NeMo-RL bug：全错组+混合截断不再因 trunc_shaping 产生假方差通过 group_ok。
+    if _do_filter and any(trunc_finals):
+        sample_mask = torch.tensor([0 if tf else 1 for tf in trunc_finals],
+                                   dtype=torch.float32)
+        adv = compute_advantages(rewards, n, cfg["adv_mode"], sample_mask=sample_mask)
+    else:
+        adv = compute_advantages(rewards, n, cfg["adv_mode"])
     return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 

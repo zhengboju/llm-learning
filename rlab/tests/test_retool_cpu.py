@@ -303,8 +303,8 @@ def test_config_retool_math():
     from rlab.train import run_signature as _rsig
     _sig_stop = _rsig(cfg)
     _sig_nostop = _rsig({**cfg, "retool_stop": False})
-    check("stop 进签名（-stop1 后缀；关闭或缺键 → 历史签名逐字不变）",
-          _sig_stop.endswith("-stop1") and _sig_nostop == _sig_stop[:-len("-stop1")])
+    check("stop 进签名（-stop1 存在；关闭或缺键 → 不含 -stop1）",
+          "-stop1" in _sig_stop and "-stop1" not in _sig_nostop)
     # 【2026-09-18 prompt 配套】stop 与 prompt 是同一机制的两半：必须告诉模型
     # "写完代码块就停、等结果"——否则被截停会被理解成失败，抑制写代码。
     # （对照参考 Auto_Program：prompt 教"写完代码说固定停句" ↔ stop 句同串咬合）
@@ -1415,24 +1415,26 @@ def test_vllm_gen_kwargs():
     # triton，故新 run 必然带 -vk 段；只有**显式关掉该键**（vllm_gen_kwargs=None）时
     # 历史签名串逐字不变，旧 ckpt 仍算同签名（刻意的：不传档 = 同一配方）。
     # 【2026-09-18 stop 机制】retool_math preset 默认 retool_stop=True → 签名尾部
-    # 追加 -stop1（在 -vk 段之后），vk 断言相应从 endswith 改为含 -stop1 后缀。
+    # 追加 -stop1（在 -vk 段之后）。
+    # 【2026-09-21 overlong filtering】retool_math preset 默认 overlong_filter=True
+    # → -stop1 之后再追加 -of1。vk 断言相应改为含 -stop1-of1 后缀。
     sig0 = run_signature(cfg)
     check("默认档带 triton：签名含 -vkgdn_prefill_backend=triton（不静默换档）",
-          "-vkgdn_prefill_backend=triton" in sig0 and sig0.endswith("-stop1"))
+          "-vkgdn_prefill_backend=triton" in sig0 and sig0.endswith("-stop1-of1"))
     sig_none = run_signature({**cfg, "vllm_gen_kwargs": None})
-    # 【2026-09-18】stop 段（-stop1）排在 vk 段之后：vk 开关会移动其后所有段，
-    # 原"全串 startswith"语义失效——改为比较去掉 -stop1 尾巴后的前缀关系
-    # （验证力不变：vk 关闭 = 其段整体消失、其余逐字不变）。
-    _s0, _sn = sig0[:-len("-stop1")], sig_none[:-len("-stop1")]
-    check("显式关掉该键：签名无 vk 段（去掉 -stop1 后历史串逐字不变 -> 旧 ckpt 同签名）",
-          "-vk" not in sig_none and _s0.startswith(_sn) and sig_none.endswith("-stop1"))
+    # vk 段排在 stop/of 段之前：vk 开关会移动其后所有段，原"全串 startswith"
+    # 语义失效——改为比较去掉 -stop1-of1 尾巴后的前缀关系（验证力不变）。
+    _tail = "-stop1-of1"
+    _s0, _sn = sig0[:-len(_tail)], sig_none[:-len(_tail)]
+    check("显式关掉该键：签名无 vk 段（去掉 -stop1-of1 后历史串逐字不变 -> 旧 ckpt 同签名）",
+          "-vk" not in sig_none and _s0.startswith(_sn) and sig_none.endswith("-stop1-of1"))
     sig_vk = run_signature({**cfg, "vllm_gen_kwargs": {"gdn_prefill_backend": "flashinfer"}})
     check("换档 -> 签名尾部追加 -vk<键=值>（纯追加，前缀不变）",
-          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer-stop1")
-          and sig_vk[:-len("-stop1")].startswith(_sn))
+          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer-stop1-of1")
+          and sig_vk[:-len(_tail)].startswith(_sn))
     check("多个键按 key 排序（同配方两次 run 签名逐字可比）",
           run_signature({**cfg, "vllm_gen_kwargs": {"b": 1, "a": 2}})
-          .endswith("-vka=2,b=1-stop1"))
+          .endswith("-vka=2,b=1-stop1-of1"))
 
     # 接线（无 GPU 的机器上唯一能验的部分：真机构造路径由源码断言兜住）
     rollout_src = open("rlab/rollout.py", encoding="utf-8").read()
@@ -3709,6 +3711,165 @@ def test_preflight_audit_fixes():
     check("⑧ 逐存档点列出真实更新数（step_50=12upd 这类）", "upd" in _tr)
 
 
+def test_overlong_filter():
+    """【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除。
+
+    核心机制：
+    - 组均值只算非截断样本 → 截断样本不污染基线
+    - 截断样本 adv=0 → pg_term=0（不贡献策略梯度）
+    - 杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再产生假方差通过 group_ok
+
+    DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
+    """
+    print("[T] DAPO overlong filtering（截断样本从 advantage 移除）")
+    from rlab.losses import compute_advantages
+    from rlab.rollout import group_ok, retool_score_flat
+    from rlab.config import get_config
+
+    cfg = get_config("retool_math", use_wandb=False)
+
+    # ---- 1. compute_advantages 带 sample_mask 的正确性 ----
+    # 8 条组：4 对（reward=+1）、2 错（reward=-1）、2 截断（reward=-1.5, mask=0）
+    r = torch.tensor([1, 1, 1, 1, -1, -1, -1.5, -1.5], dtype=torch.float32)
+    mask = torch.tensor([1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.float32)
+
+    adv_filtered = compute_advantages(r, 8, "group_mean", sample_mask=mask)
+    adv_plain = compute_advantages(r, 8, "group_mean")
+
+    # 截断样本 adv=0
+    check("截断样本 adv=0（不贡献 pg_term）",
+          adv_filtered[6].item() == 0 and adv_filtered[7].item() == 0)
+
+    # 非截断样本的组均值只算非截断：mean = (4*1 + 2*(-1)) / 6 = 2/6 = 0.333
+    _mean_nontrunc = (4 * 1 + 2 * (-1)) / 6
+    check("组均值只算非截断样本",
+          abs(adv_filtered[0].item() - (1 - _mean_nontrunc)) < 1e-5)
+
+    # 不带 mask 时（旧行为）：组均值算全部 8 条
+    _mean_all = r.mean().item()
+    check("无 mask 时组均值算全部（旧行为不变）",
+          abs(adv_plain[0].item() - (1 - _mean_all)) < 1e-5)
+
+    # 无 mask = 全 1 mask（等价）
+    check("sample_mask=None 等价于全 1（旧行为）",
+          bool(((compute_advantages(r, 8, "group_mean", sample_mask=None)
+                 - compute_advantages(r, 8, "group_mean")).abs() < 1e-6).all()))
+
+    # ---- 2. NeMo-RL bug 杀死：全错组+混合截断 → group_ok 失败 ----
+    # 8 条全错：4 截断（reward=-1.5, mask=0）、4 非截断（reward=-1, mask=1）
+    r_allwrong = torch.tensor([-1.5, -1.5, -1.5, -1.5, -1, -1, -1, -1], dtype=torch.float32)
+    mask_allwrong = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.float32)
+
+    adv_nemo = compute_advantages(r_allwrong, 8, "group_mean", sample_mask=mask_allwrong)
+    # 非截断全错：mean=-1, adv = -1-(-1) = 0；截断 adv=0 → 全 0
+    check("NeMo bug 杀死：全错组+混合截断 → 全 adv=0",
+          bool((adv_nemo.abs() < 1e-6).all()))
+    check("NeMo bug 杀死：全错组+混合截断 → group_ok 失败（被过滤）",
+          not bool(group_ok(adv_nemo)))
+
+    # 对比：不带 mask 时（旧行为，NeMo bug 存在）
+    adv_nemo_bug = compute_advantages(r_allwrong, 8, "group_mean")
+    # 截断 reward=-1.5, 非截断 reward=-1, mean=-1.25
+    # 非截断 adv = -1-(-1.25) = +0.25 → 正优势！
+    check("NeMo bug 确认：无 mask 时全错组非截断拿正优势",
+          adv_nemo_bug[4].item() > 0)
+    check("NeMo bug 确认：无 mask 时全错组通过 group_ok（假方差）",
+          bool(group_ok(adv_nemo_bug)))
+
+    # ---- 3. 全截断组 → 全 adv=0 → group_ok 失败 ----
+    r_alltrunc = torch.full((8,), -1.5, dtype=torch.float32)
+    mask_alltrunc = torch.zeros(8, dtype=torch.float32)
+    adv_alltrunc = compute_advantages(r_alltrunc, 8, "group_mean", sample_mask=mask_alltrunc)
+    check("全截断组 → 全 adv=0 → group_ok 失败",
+          bool((adv_alltrunc.abs() < 1e-6).all()) and not bool(group_ok(adv_alltrunc)))
+
+    # ---- 4. 混合组（对+错+截断）→ 截断 adv=0，非截断正常 ----
+    r_mixed = torch.tensor([1, -1, 1, -1, -1.5, 1, -1, -1.5], dtype=torch.float32)
+    mask_mixed = torch.tensor([1, 1, 1, 1, 0, 1, 1, 0], dtype=torch.float32)
+    adv_mixed = compute_advantages(r_mixed, 8, "group_mean", sample_mask=mask_mixed)
+    # 非截断: [1,-1,1,-1,1,-1], mean=0, adv=[1,-1,1,-1,1,-1]
+    check("混合组：截断 adv=0", adv_mixed[4].item() == 0 and adv_mixed[7].item() == 0)
+    check("混合组：非截断 adv 正常（=r-mean）",
+          abs(adv_mixed[0].item() - 1.0) < 1e-5 and abs(adv_mixed[1].item() + 1.0) < 1e-5)
+    check("混合组：group_ok 通过（有方差）", bool(group_ok(adv_mixed)))
+
+    # ---- 5. group_std 也正确处理 sample_mask ----
+    r_std = torch.tensor([1, -1, 1, -1, -1.5, 1, -1, -1.5], dtype=torch.float32)
+    mask_std = torch.tensor([1, 1, 1, 1, 0, 1, 1, 0], dtype=torch.float32)
+    adv_std = compute_advantages(r_std, 8, "group_std", sample_mask=mask_std)
+    check("group_std：截断 adv=0", adv_std[4].item() == 0 and adv_std[7].item() == 0)
+    check("group_std：非截断 adv≠0（有梯度）",
+          adv_std[0].item() != 0 and adv_std[1].item() != 0)
+    # group_std 无 mask 时与旧版一致
+    adv_std_old = compute_advantages(r_std, 8, "group_std")
+    check("group_std：无 mask 时与旧版一致",
+          bool(((adv_std_old - compute_advantages(r_std, 8, "group_std", sample_mask=None)).abs() < 1e-6).all()))
+
+    # ---- 6. retool_score_flat 集成：overlong_filter=True 时截断样本被 mask ----
+    # 构造 1 题 × 8 条轨迹，其中 2 条截断
+    inputs = [{"Q": "q", "A": "42"}]
+    asst_texts = ["\\boxed{42}"] * 6 + ["no answer"] * 2  # 6 对、2 错
+    code_stats = [{"code_used": 0, "code_ok": 0, "trunc_final": 0} for _ in range(6)] \
+        + [{"code_used": 0, "code_ok": 0, "trunc_final": 1} for _ in range(2)]
+    cfg_test = {**cfg, "overlong_filter": True, "trunc_shaping": 0.5}
+    adv, acc, fmt, cu, ck, phase = retool_score_flat(
+        inputs, asst_texts, code_stats, cfg_test, steps_elapsed=0)
+    # 截断样本（idx 6,7）adv=0
+    check("retool_score_flat：overlong_filter=True 时截断样本 adv=0",
+          adv[6].item() == 0 and adv[7].item() == 0)
+    # 非截断样本 adv≠0（6 对 vs 0 错 → mean=1 → adv=0... 全对组零方差）
+    # 改成 4 对 2 错（非截断）+ 2 截断
+    asst_texts2 = ["\\boxed{42}"] * 4 + ["wrong"] * 2 + ["no answer"] * 2
+    code_stats2 = [{"code_used": 0, "code_ok": 0, "trunc_final": 0} for _ in range(4)] \
+        + [{"code_used": 0, "code_ok": 0, "trunc_final": 0} for _ in range(2)] \
+        + [{"code_used": 0, "code_ok": 0, "trunc_final": 1} for _ in range(2)]
+    adv2, _, _, _, _, _ = retool_score_flat(
+        inputs, asst_texts2, code_stats2, cfg_test, steps_elapsed=0)
+    check("retool_score_flat：混合组截断 adv=0，非截断 adv≠0",
+          adv2[6].item() == 0 and adv2[7].item() == 0
+          and adv2[0].item() != 0 and adv2[4].item() != 0)
+
+    # overlong_filter=False 时截断样本参与组统计（旧行为）
+    cfg_nofilter = {**cfg, "overlong_filter": False, "trunc_shaping": 0.5}
+    adv3, _, _, _, _, _ = retool_score_flat(
+        inputs, asst_texts2, code_stats2, cfg_nofilter, steps_elapsed=0)
+    # 截断样本 reward=-1.5, 非截断 mean = (4*1+2*(-1))/6 = 0.333
+    # 截断 adv = -1.5 - 0.333 = -1.833 ≠ 0
+    check("retool_score_flat：overlong_filter=False 时截断样本参与组统计（旧行为）",
+          adv3[6].item() != 0)
+
+    # ---- 7. config preset 锁 ----
+    check("retool_math preset: overlong_filter=True",
+          get_config("retool_math", use_wandb=False)["overlong_filter"] is True)
+    check("BASE: overlong_filter=False（其他算法不受影响）",
+          get_config("grpo", use_wandb=False)["overlong_filter"] is False)
+
+    # ---- 8. 签名 + 迁移兼容 ----
+    from rlab.train import run_signature, _is_opt_suffix
+    sig = run_signature(cfg)
+    check("签名含 -of1（retool_math preset 开 overlong_filter）", "-of1" in sig)
+    cfg_off = {**cfg, "overlong_filter": False}
+    sig_off = run_signature(cfg_off)
+    check("签名无 -of（关闭 overlong_filter）", "-of" not in sig_off)
+    # 迁移兼容：旧签名（无 -of1）是新签名的前缀，且新增段是 opt-tag
+    check("_is_opt_suffix 识别 -of1 段（迁移兼容）",
+          _is_opt_suffix("-of1"))
+    check("迁移兼容：旧签名是新签名前缀 + of 段 → 放行",
+          sig.startswith(sig_off) and _is_opt_suffix(sig[len(sig_off):]))
+
+    # ---- 9. CLI 透传 ----
+    _tr = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
+    check("CLI: --overlong_filter BooleanOptionalAction（支持 --no-）",
+          'add_argument("--overlong_filter"' in _tr
+          and "BooleanOptionalAction" in _tr
+          and '"--no-overlong_filter"' in _tr or "--no-overlong_filter" in _tr)
+    check("CLI: overlong_filter 透传到 overrides",
+          'overrides["overlong_filter"]' in _tr)
+    check("run_info: overlong_filter 落盘",
+          '"overlong_filter": cfg.get("overlong_filter")' in _tr)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -3754,6 +3915,7 @@ if __name__ == "__main__":
     test_val_n_metric_fixes()
     test_eval_determinism_wiring()
     test_preflight_audit_fixes()
+    test_overlong_filter()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

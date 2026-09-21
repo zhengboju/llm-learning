@@ -383,11 +383,12 @@ def test_eval_stats_and_signature():
           "-sp" not in run_signature(_sp_default))
     _sp_new = default_system_prompt("retool_math") + "\nBe concise."
     _sig_sp = run_signature({**_sp_default, "system_prompt": _sp_new})
-    # 【2026-09-18】-sp<hash6> 后可能还跟着 -stop1 尾巴（stop 段在 sp 段之后），
+    # 【2026-09-18】-sp<hash6> 后可能还跟着 -stop1/-of1 尾巴（stop/of 段在 sp 段之后），
     # 断言改为取 split 后首 6 位（hash 本体）。
     check("提示偏离 → 追加 -sp<hash6>",
           "-sp" in _sig_sp and len(_sig_sp.split("-sp")[1][:6]) == 6
-          and len(_sig_sp.split("-sp")[1]) in (6, 6 + len("-stop1")))
+          and len(_sig_sp.split("-sp")[1]) in (6, 6 + len("-stop1"),
+                                               6 + len("-stop1-of1")))
     check("提示指纹对内容敏感（差一个字符即变）",
           run_signature({**_sp_default, "system_prompt": _sp_new + " "}) != _sig_sp)
     # 【2026-09-17】难度表也要指纹：同 band 换表（半表→全表→换提示重探）会换训练池，
@@ -409,8 +410,8 @@ def test_eval_stats_and_signature():
           "-nodiff-" in run_signature(_sp_default)
           and "d0-1-t" not in run_signature(_sp_default))
     check("两个 -sp 标签不影响其它字段（前缀仍逐字一致）",
-          _sig_sp[:-len("-stop1")].startswith(
-              run_signature(_sp_default)[:-len("-stop1")]))
+          _sig_sp[:-len("-stop1-of1")].startswith(
+              run_signature(_sp_default)[:-len("-stop1-of1")]))
     # 候选提示文件：只在显式 --system_prompt_file 时生效，默认档零影响
     _spf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "prompts", "retool_math_concise.txt")
