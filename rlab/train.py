@@ -281,6 +281,68 @@ def save_checkpoint(cfg, engine, tokenizer, save_name, sd) -> str:
     return "文本格式（非复合模型，历史口径）"
 
 
+def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
+                     eval_n=500):
+    """checkpoint 保存后自动跑评测（test + train split），结果落进 step_N/eval_*.json。
+
+    【2026-09-21 为什么需要它】p9 训练完 11 小时才发现 step100 测试集 -8.5pp（NeMo
+    bug）。如果每个 checkpoint 都自动评测，step50 就能看到深坑并决定是否继续。
+    训练集 vs 测试集的 Δacc 差异也能实时看到（过拟合/分布不一致的早期信号）。
+
+    GPU 显存：训练 vLLM 占 GPU0 的 gen_gpu_mem（默认 0.6≈57G），eval 子进程用
+    eval_gpu_mem=0.20（≈19G）在**同一 GPU0** 上共存——4B bf16 权重 8.6G + KV 池
+    10G = 18.6G < 19G。checkpoint 保存时训练暂停、vLLM 空闲，无并发竞争。
+    """
+    import subprocess as _sp
+    import sys as _sys
+    _one = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "eval_vllm_one.py")
+    _mp = cfg.get("vllm_model_path") or cfg.get("model_path", "")
+    _algo = cfg.get("algo", "grpo")
+    _env = dict(os.environ, CUDA_VISIBLE_DEVICES=eval_gpu)
+    summary = {}
+    for _split in ("test", "train"):
+        _out = os.path.join(ckpt_dir, f"eval_{_split}.json")
+        _cmd = [_sys.executable, _one,
+                "--model", ckpt_dir, "--name", f"step{step}_{_split}",
+                "--n", str(eval_n), "--seed", "42",
+                "--split", _split, "--algo", _algo,
+                "--gpu_mem", str(eval_gpu_mem),
+                "--proto_from", ckpt_dir, "--out", _out]
+        if _mp:
+            _cmd += ["--mm_base", _mp]
+        # 确定性档：从 run_info 回读（eval_vllm_one.py 自动处理）
+        print(f"[eval] step {step} {_split} ...", flush=True)
+        try:
+            _proc = _sp.run(_cmd, env=_env, capture_output=True, text=True,
+                            timeout=900)
+        except _sp.TimeoutExpired:
+            print(f"[eval] step {step} {_split} TIMEOUT (>15min)", flush=True)
+            continue
+        if _proc.returncode == 0 and os.path.exists(_out):
+            with open(_out, encoding="utf-8") as f:
+                _r = json.load(f)
+            _acc = _r.get("acc", 0)
+            _fmt = _r.get("fmt", 0)
+            _code = _r.get("code_rate", 0)
+            summary[_split] = {"acc": _acc, "fmt": _fmt, "code": _code, "n": _r.get("n", 0)}
+            print(f"[eval] step {step} {_split}: acc={_acc*100:.1f}% "
+                  f"fmt={_fmt*100:.1f}% code={_code*100:.1f}% (n={_r.get('n', 0)})",
+                  flush=True)
+        else:
+            print(f"[eval] step {step} {_split} FAILED (exit={_proc.returncode})"
+                  f"\n  stderr: {(_proc.stderr or '')[:300]}", flush=True)
+    # 汇总行（grep 友好）
+    if summary:
+        _t = summary.get("test", {})
+        _r = summary.get("train", {})
+        print(f"[eval] step {step} 汇总: test acc={_t.get('acc', 0)*100:.1f}% "
+              f"fmt={_t.get('fmt', 0)*100:.1f}% | train acc={_r.get('acc', 0)*100:.1f}% "
+              f"fmt={_r.get('fmt', 0)*100:.1f}% | gap={(_r.get('acc', 0) - _t.get('acc', 0))*100:+.1f}pp",
+              flush=True)
+    return summary
+
+
 def run_training(cfg, args):
     import deepspeed
     from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
@@ -549,6 +611,17 @@ def run_training(cfg, args):
                 _fmt = save_checkpoint(cfg, engine, tokenizer, save_name, sd)
                 write_run_info(os.path.join(save_name, "run_info.json"), cfg)
                 print(f"[train] saved -> {save_name}（{_fmt}）")
+                # 【2026-09-21 训练内嵌评测】每个 checkpoint 自动跑 test+train
+                # 评测，结果落进 step_N/eval_*.json + 训练日志 [eval] 行。
+                # 训练完不用再手动评测；训练中就能看到 step100 深坑（NeMo bug）
+                # 或 train/test gap 扩大（过拟合）。
+                if cfg.get("eval_during_training", False):
+                    _eval_gpu = str(cfg.get("eval_gpu", "0"))
+                    _eval_mem = float(cfg.get("eval_gpu_mem", 0.20))
+                    _eval_n = int(cfg.get("eval_n", 500))
+                    _run_inline_eval(cfg, save_name, step,
+                                     eval_gpu=_eval_gpu, eval_gpu_mem=_eval_mem,
+                                     eval_n=_eval_n)
             dist.barrier()
 
 
@@ -702,6 +775,21 @@ def main():
                          "head_dim 256 消除 T² math 回退，配合放开 --micro_rows；"
                          "需 pip install flash-attn，ref_server 同步降 bf16）")
     ap.add_argument("--local_rank", type=int, default=0)  # deepspeed 传入
+    # 【2026-09-21 训练内嵌评测】每个 checkpoint 自动跑 test+train 评测，
+    # 结果落进 step_N/eval_*.json + 训练日志 [eval] 行。训练完不用再手动评测；
+    # 训练中就能看到 step100 深坑（NeMo bug）或 train/test gap 扩大（过拟合）。
+    ap.add_argument("--eval_during_training", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="checkpoint 保存后自动跑评测（test+train split）。"
+                         "retool_math preset 默认开；--no-eval_during_training 关闭")
+    ap.add_argument("--eval_n", type=int, default=None,
+                    help="内嵌评测的题数（默认 500；减到 200 可省时间做快速筛查）")
+    ap.add_argument("--eval_gpu", default=None,
+                    help="内嵌评测用哪张卡（默认 0 = 与生成端 vLLM 共卡，"
+                         "checkpoint 保存时训练暂停无竞争）")
+    ap.add_argument("--eval_gpu_mem", type=float, default=None,
+                    help="内嵌评测 vLLM 显存占比（默认 0.20；4B 权重 8.6G+KV 池 "
+                         "10G=18.6G < 0.20×96G=19.2G，与训练 vLLM 共存）")
     args = ap.parse_args()
 
     overrides = {}
@@ -756,6 +844,14 @@ def main():
         overrides["vllm_gen_kwargs"] = json.loads(args.vllm_gen_kwargs)
     if args.save_mm_checkpoint is not None:
         overrides["save_mm_checkpoint"] = args.save_mm_checkpoint
+    if args.eval_during_training is not None:
+        overrides["eval_during_training"] = args.eval_during_training
+    if args.eval_n is not None:
+        overrides["eval_n"] = args.eval_n
+    if args.eval_gpu is not None:
+        overrides["eval_gpu"] = args.eval_gpu
+    if args.eval_gpu_mem is not None:
+        overrides["eval_gpu_mem"] = args.eval_gpu_mem
 
     cfg = get_config(args.algo, **overrides)
     # 【2026-09-12】偏离签名先算好再打印/落盘：wandb run name 与 run_info.json 同源，

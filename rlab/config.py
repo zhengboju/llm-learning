@@ -100,6 +100,8 @@ ALGO_DEFAULTS = {
                         # 杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再
                         # 产生假方差通过 group_ok（p9 step100 -8.5pp 的根因）。
                         overlong_filter=True,
+                        # 训练内嵌评测：每个 checkpoint 自动跑 test+train
+                        eval_during_training=True,
                         code_w=0.0, reward_switch_step=1000000000,
                         # 【2026-09-11 eval 全灭事故】思考开关收进 preset 单点同源：
                         # Qwen3.5 默认 enable_thinking=True，eval 端 prompt 构造从
@@ -295,6 +297,16 @@ BASE = dict(
     # DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
     # 同时杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再产生假方差。
     overlong_filter=False,
+
+    # ---- 训练内嵌评测（2026-09-21）----
+    # 每个 checkpoint 保存后自动跑 test+train 评测，结果落进 step_N/eval_*.json。
+    # 训练完不用再手动评测；训练中就能看到 step100 深坑或 train/test gap。
+    # eval_gpu_mem=0.20 与训练 vLLM（gen_gpu_mem=0.6）共卡 GPU0，checkpoint 保存时
+    # 训练暂停无竞争。retool_math preset 默认开；BASE 默认 False（GSM8K 家族不需要）。
+    eval_during_training=False,
+    eval_n=500,
+    eval_gpu="0",
+    eval_gpu_mem=0.20,
     # 【2026-09-12 靶向 shaping·长度膨胀的真正出口】末段被轮长上限切断
     # （trunc_final=1）的额外扣分。为什么不能只靠 overlong_shaping：completion
     # 总长惩罚够不到"单轮就结束"的 prose 轨迹（clen ≤ round_gen_tokens < trigger）。
