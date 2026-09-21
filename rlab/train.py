@@ -36,7 +36,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from rlab.config import default_system_prompt, ds_config, get_config
+from rlab.config import (ALGO_DEFAULTS, BASE, default_system_prompt, ds_config,
+                         get_config)
 from rlab.losses import ALGOS, compute_loss, forward_per_token_logps
 from rlab.model_loading import load_causal_lm
 from rlab.protocol import decode_batch
@@ -177,6 +178,29 @@ def _ckpt_signature(ckpt_dir: str):
         return None
 
 
+# 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
+_OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd")
+
+
+def _is_opt_suffix(suffix: str) -> bool:
+    """纯函数：suffix 是否**只**由 run_signature 的优化器段构成（迁移兼容用）。
+
+    形如 "-u8-c26400-sd42" → True；"-ts0.5" / "" / "-zzz1" → False。
+    注意 "sd" 必须先于 "s" 之类的单字母前缀匹配（这里没有 "s"，但保持最长优先
+    的写法以防后续加段时踩坑）。"""
+    if not suffix:
+        return False
+    for part in suffix.split("-"):
+        if not part:
+            continue
+        for pfx in sorted(_OPT_TAG_PREFIXES, key=len, reverse=True):
+            if part.startswith(pfx) and len(part) > len(pfx):
+                break
+        else:
+            return False
+    return True
+
+
 def guard_ckpt_collision(out_dir: str, cfg: dict) -> None:
     """【2026-09-13 P1 事故】out_dir 按 algo 共享 + save_steps 撞名 → 新 run 静默
     覆盖旧 run 的 step_* 原始 ckpt：P1（ts0）的 step_200 覆掉了 run2（ts0.5）的
@@ -190,6 +214,18 @@ def guard_ckpt_collision(out_dir: str, cfg: dict) -> None:
             continue
         old = _ckpt_signature(ckpt)
         if old == sig:
+            continue
+        # 【2026-09-20 迁移兼容】签名新增了优化器段（-b/-g/-n/-u/-T/-a/-c/-sd，
+        # 只在偏离 preset 时出现）。老 ckpt 是在**没有该段**的版本下存的，于是
+        # 同一个 run 中途重启会算出"更长但同前缀"的签名，被本护栏拦死自己的
+        # checkpoint（正在跑的 run 崩溃后无法续跑 = 本护栏帮倒忙）。
+        # 判据：老签名是新签名的**前缀**且新增部分只由已知优化器段构成 → 同配方，
+        # 放行并提示。反向（老的更长）不放行——那是真的换了配方。
+        if old and sig.startswith(old) and _is_opt_suffix(sig[len(old):]):
+            print(f"[train][兼容] {ckpt} 的签名是本次签名的前缀："
+                  f"\n  旧 {old}\n  新 {sig}\n"
+                  f"  新增段 {sig[len(old):]!r} 全部是优化器段（签名扩展于 2026-09-20）"
+                  f"——判为同配方，放行。若你确实换了配方，请改 --out_dir。", flush=True)
             continue
         raise RuntimeError(
             f"[train] out_dir={out_dir} 已有别的 run 的 checkpoint，拒绝启动：\n"
@@ -714,6 +750,23 @@ def main():
     cfg["run_signature"] = run_signature(cfg)
     print(f"[train] 偏离签名 signature={cfg['run_signature']}"
           f"（对比参考 agentic-rl-lab/05-retool 与上轮 run 时先看这一行）")
+    # 【2026-09-20 剂量口径自证】`all_steps` 计的是 **micro-batch 拉取次数**，不是
+    # optimizer 更新数 —— 每步拉一个上传批（=num_pre_Q 行），GAS 步才更新一次。
+    # 旧注释/文档把 300 说成 "300 optimizer steps"，实际只有 75 次，差 4 倍，
+    # 于是"再多跑就会涨"这类剂量判断一直建立在放大 4 倍的错觉上。这里把三个
+    # 口径同时打出来，存档点对应的真实更新数也逐个列清。
+    _gas = max(1, int(cfg.get("gradient_accumulation_steps", 1) or 1))
+    _rows = int(cfg.get("train_micro_batch_size_per_gpu", 0) or 0)
+    _steps = int(cfg.get("all_steps", 0) or 0)
+    _save = int(cfg.get("save_steps", 0) or 0)
+    _marks = ""
+    if _save > 0:
+        _marks = "；存档点 " + " / ".join(
+            f"step_{s}={s // _gas}upd" for s in range(_save, _steps + 1, _save))
+    print(f"[train] 剂量口径: all_steps={_steps} 是 micro-step（每步 1 批 ×{_rows} 行）"
+          f" → optimizer 更新 = {_steps}/GAS{_gas} = **{_steps // _gas} 次**"
+          f"，轨迹总数 ≈ {_steps * _rows} 条，有效 batch = {_rows}×{_gas} = "
+          f"{_rows * _gas} 条/更新{_marks}")
     print("[train] config:", json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
     run_training(cfg, args)
 

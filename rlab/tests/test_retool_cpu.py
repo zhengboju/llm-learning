@@ -492,10 +492,19 @@ def test_multi_rollout_and_scoring():
     check("s1/s3 无代码即结束 [a]",
           [s["kind"] for s in segs[1]] == ["assistant"]
           and [s["kind"] for s in segs[3]] == ["assistant"])
-    check("code_used/ok 统计正确（末轮代码不计入）",
-          code_stats[0] == {"code_used": 2, "code_ok": 2, "trunc_final": 0}
-          and code_stats[1] == {"code_used": 0, "code_ok": 0, "trunc_final": 0}
-          and code_stats[2] == {"code_used": 1, "code_ok": 1, "trunc_final": 0})
+    # 【2026-09-20 契约扩展】新增 code_wasted（末轮写了代码但不执行的次数）。
+    # code_used/code_ok 的口径**刻意不变**（末轮仍不计入）——它们是跨 run 比较的
+    # code% 列，改语义会让 p8 的 48~70% 与后续 run 不可比。末轮废码单列一个字段，
+    # 既补上可观测性又不动历史口径。
+    check("code_used/ok 统计正确（末轮代码仍不计入——跨 run 口径不变）",
+          code_stats[0] == {"code_used": 2, "code_ok": 2, "code_wasted": 1,
+                            "trunc_final": 0}
+          and code_stats[1] == {"code_used": 0, "code_ok": 0, "code_wasted": 0,
+                                "trunc_final": 0}
+          and code_stats[2] == {"code_used": 1, "code_ok": 1, "code_wasted": 0,
+                                "trunc_final": 0})
+    check("末轮写代码 → code_wasted=1（旧版三个统计量同时为 0，与'啰嗦跑飞'无法区分）",
+          code_stats[0]["code_wasted"] == 1 and code_stats[0]["trunc_final"] == 0)
     check("工具段内容 = 沙箱 stdout",
           "42" in segs[0][1]["text"] and "5" in segs[2][1]["text"])
     check("每段带 ids（assistant 段 ids = 生成 token）",
@@ -3501,6 +3510,205 @@ def test_eval_determinism_wiring():
               "action=argparse.BooleanOptionalAction" in src)
 
 
+def test_preflight_audit_fixes():
+    """【2026-09-20 pre-flight 审查八项修复】每项都锁"旧行为会怎么错"。
+
+    ①analysis clen_cap 从 run_info 推导（旧：硬编码 1800 → p8 那列 68~98% 是纯
+      饱和噪声，而 ts 实验的核心判据正是长度轴）
+    ②seed 盐步长 = 本次消耗的 seed 数（旧：+=1 → 相邻 attempt 重叠 97%，丢组重采
+      复采同轨迹 → 题目被"seed 复用"而非"学不动"拉黑）
+    ③probe_meta 指纹剔除 k（训练传 num_pre_Q=8 vs 探针 args.k=4，口径不同 → 必然误报）
+    ④run_signature 覆盖优化器层 + 迁移兼容（旧：18 个生效超参改了签名一字不变）
+    ⑤micro_batch 由 Q×num_pre_Q 推导（旧：硬编码成对 → --num_pre_Q 4 静默腰斩等效 lr）
+    ⑥eval 协议回落告警 + 剔题阈值与训练对齐（baseA/baseB 事故：静默落到 preset 2048/14336）
+    ⑦末轮废码可观测（旧：code_used/code_ok/trunc_final 同时为 0，完全隐形）
+    ⑧启动行打印真实更新预算（旧：300 micro-step 被当成 300 次 optimizer 更新，差 4 倍）
+    """
+    print("[S] pre-flight 审查八项修复")
+    import re as _re
+    import shutil
+    from rlab.analysis import summarize_record
+    from rlab.data import load_difficulty_table
+    from rlab.train import _is_opt_suffix, guard_ckpt_collision
+    from rlab.train import run_signature as _rs
+
+    _roll = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
+    _ana = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "analysis.py"), encoding="utf-8").read()
+    _tr = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
+    _ev = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "eval_vllm_one.py"), encoding="utf-8").read()
+
+    # ---- ① clen_cap 从 run_info 推导 ----
+    _tmp = tempfile.mkdtemp()
+    try:
+        _rp = os.path.join(_tmp, "record.jsonl")
+        with open(_rp, "w", encoding="utf-8") as f:
+            for _ in range(3):
+                f.write(json.dumps({
+                    "t": 1.0, "algo": "retool_math", "acc": [1] * 8, "fmt": [1] * 8,
+                    "clen": [2000] * 8, "code_used": [1] * 8, "code_ok": [1] * 8,
+                    "trunc_final": [0] * 8, "gen_version": 0, "phase": "cold"}) + "\n")
+        _no_ri = summarize_record(_rp, window=8)
+        check("① 无 run_info → 回落 1800 且显式声明口径存疑",
+              "cap=1800" in _no_ri and "口径存疑" in _no_ri)
+        with open(os.path.join(_tmp, "run_info.json"), "w", encoding="utf-8") as f:
+            json.dump({"config": {"max_context_tokens": 26400,
+                                  "max_prompt_length": 1024}}, f)
+        _with_ri = summarize_record(_rp, window=8)
+        check("① 有 run_info → cap = ctx − max_prompt_length（26400−1024=25376）",
+              "cap=25376" in _with_ri and "run_info(26400−1024)" in _with_ri)
+        # 这才是真正的回归点：clen=2000 在旧 cap 下被标成"接近上限"(≥1620)，
+        # 在真实 cap 下根本不接近（≥22838）——p8 报表那列噪声的由来。
+        check("① 回归：clen=2000 旧 cap 判 100%≥1620，真实 cap 判 0%≥22838",
+              "100%≥1620" in _no_ri and "0%≥22838" in _with_ri)
+        check("① 显式传参仍优先（调用方可覆盖）",
+              "cap=999" in summarize_record(_rp, window=8, clen_cap=999))
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
+
+    # ---- ② seed 盐步长 ----
+    check("② 盐按本次消耗的 seed 数递增（不是 +=1）",
+          _re.search(r"rollout_seq\[0\]\s*\+=\s*len\(inputs\)\s*\*\s*cfg\[.num_pre_Q.\]",
+                     _roll) is not None)
+    check("② 旧的 `rollout_seq[0] += 1` 已不存在",
+          _re.search(r"rollout_seq\[0\]\s*\+=\s*1\b", _roll) is None)
+    # 数值对拍：4 题 × 8 条 = 32 个 seed/attempt，相邻 attempt 必须零重叠
+    def _seeds(salt, n_req=32, seed0=42):
+        return {seed0 + salt + k for k in range(n_req)}
+    check("② 步长=32 时相邻 attempt seed 零重叠（旧步长 1 重叠 31/32=97%）",
+          not (_seeds(0) & _seeds(32)) and len(_seeds(0) & _seeds(1)) == 31)
+
+    # ---- ③ probe_meta 指纹剔除 k ----
+    _tmp2 = tempfile.mkdtemp()
+    try:
+        _dp = os.path.join(_tmp2, "d.jsonl")
+        _meta_disk = {"model": "Qwen3.5-4B", "k": 4, "rounds": 4,
+                      "round_tokens": 6144, "ctx": 26400, "temp": 1.0, "sp": "3aac5d"}
+        with open(_dp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"Q": "q1", "k": 4, "n_correct": 2,
+                                "probe_meta": _meta_disk}) + "\n")
+        import io as _io
+        from contextlib import redirect_stdout as _rso
+        # 训练端指纹：k=num_pre_Q=8（与探针 args.k=4 口径不同），其余全同
+        _exp = {**_meta_disk, "k": 8}
+        _buf = _io.StringIO()
+        with _rso(_buf):
+            _t = load_difficulty_table(_dp, expected_meta=_exp)
+        check("③ 仅 k 不同 → 不告警（口径不同，旧版必然误报）",
+              len(_t) == 1 and "警告" not in _buf.getvalue())
+        # 真偏离（换预算）仍必须报，否则护栏就废了
+        _buf2 = _io.StringIO()
+        with _rso(_buf2):
+            load_difficulty_table(_dp, expected_meta={**_exp, "round_tokens": 2048})
+        check("③ 真偏离（round_tokens 变）仍告警（护栏未被削弱）",
+              "round_tokens" in _buf2.getvalue() and "警告" in _buf2.getvalue())
+    finally:
+        shutil.rmtree(_tmp2, ignore_errors=True)
+    check("③ 训练端注释说明 k 为何被排除",
+          "num_pre_Q" in _roll and "语义不同" in _roll)
+
+    # ---- ④ 签名覆盖优化器层 + 迁移兼容 ----
+    _c = get_config("retool_math", use_wandb=False)
+    check("④ 默认配方（无偏离）签名不含优化器段——历史签名逐字不变",
+          "-b" not in _rs(_c).split("-stop1")[-1]
+          and _rs(_c) == _rs(get_config("retool_math", use_wandb=False)))
+    for _k, _v, _tag in (("beta", 0.01, "-b0.01"), ("num_pre_Q", 4, "-n4"),
+                         ("gen_update_steps", 8, "-u8"), ("seed", 42, "-sd42"),
+                         ("temperature", 0.7, "-T0.7"),
+                         ("max_context_tokens", 26400, "-c26400")):
+        check(f"④ {_k} 偏离 preset → 签名出现 {_tag}",
+              _tag in _rs(get_config("retool_math", use_wandb=False, **{_k: _v})))
+    check("④ _is_opt_suffix 只认优化器段",
+          _is_opt_suffix("-u8-c26400-sd42") and _is_opt_suffix("-sd42")
+          and not _is_opt_suffix("-ts0.5") and not _is_opt_suffix("")
+          and not _is_opt_suffix("-zzz1"))
+    _tmp3 = tempfile.mkdtemp()
+    try:
+        _cfg = get_config("retool_math", use_wandb=False, seed=42,
+                          gen_update_steps=8, max_context_tokens=26400)
+        _cfg["run_signature"] = _rs(_cfg)
+        _ck = os.path.join(_tmp3, "step_50")
+        os.makedirs(_ck)
+        # 老 ckpt 的签名 = 新签名去掉优化器段（正在跑的 run 中途重启的真实形态）
+        _old = _cfg["run_signature"].split("-u8")[0]
+        with open(os.path.join(_ck, "run_info.json"), "w", encoding="utf-8") as f:
+            json.dump({"signature": _old}, f)
+        guard_ckpt_collision(_tmp3, _cfg)   # 不抛 = 放行
+        check("④ 迁移兼容：老签名是新签名前缀且新增段全是优化器段 → 放行"
+              "（否则正在跑的 run 崩溃后无法续跑）", True)
+        # 反向与真换配方都必须继续拦
+        with open(os.path.join(_ck, "run_info.json"), "w", encoding="utf-8") as f:
+            json.dump({"signature": _old.replace("-ts0.5", "-ts0")}, f)
+        try:
+            guard_ckpt_collision(_tmp3, _cfg)
+            _ok = False
+        except RuntimeError:
+            _ok = True
+        check("④ 真换配方（ts0 vs ts0.5）仍拒绝——护栏未被削弱", _ok)
+    finally:
+        shutil.rmtree(_tmp3, ignore_errors=True)
+
+    # ---- ⑤ micro_batch 推导 ----
+    check("⑤ 默认 retool_math: micro_batch = 1×8 = 8",
+          get_config("retool_math", use_wandb=False)[
+              "train_micro_batch_size_per_gpu"] == 8)
+    check("⑤ --num_pre_Q 4 → micro_batch 随之变 4（旧版仍是 8 = 等效 lr 腰斩）",
+          get_config("retool_math", use_wandb=False, num_pre_Q=4)[
+              "train_micro_batch_size_per_gpu"] == 4)
+    check("⑤ grpo 默认 1×4 = 4（其他算法未被带歪）",
+          get_config("grpo", use_wandb=False)[
+              "train_micro_batch_size_per_gpu"] == 4)
+    try:
+        get_config("retool_math", use_wandb=False, num_pre_Q=4,
+                   train_micro_batch_size_per_gpu=8)
+        _ok = False
+    except (ValueError, RuntimeError):
+        _ok = True
+    check("⑤ 显式传矛盾值 → fail-fast（不静默改语义）", _ok)
+
+    # ---- ⑥ eval 协议回落告警 + 剔题阈值 ----
+    check("⑥ 无 run_info → 醒目告警（baseA/baseB 静默落 preset 的事故）",
+          "回落 preset 默认" in _ev
+          and _re.search(r"if not _run:\s*\n\s*print\(f?\"\\n\[eval\]\[警告\]", _ev)
+          is not None)
+    check("⑥ 告警给出旁路（--proto_from）与可疑后果（fmt 掉一半）",
+          "--proto_from <某个带 run_info" in _ev and "fmt" in _ev)
+    check("⑥ 剔题阈值与训练对齐（plen > max_prompt_length，同源回读 _rcfg）",
+          '_max_plen = int(_rcfg.get("max_prompt_length")' in _ev
+          and "if _max_plen and _pl > _max_plen:" in _ev)
+    check("⑥ 两条线并存：训练同规则 + max_len 兜底（防撞 max_model_len）",
+          "_dropped_plen" in _ev and "_dropped_long" in _ev)
+    check("⑥ 协议出处落进结果 json（事后可判定这次评的是哪个协议）",
+          '"proto_from_run_info": bool(_run)' in _ev
+          and '"n_dropped_plen"' in _ev)
+
+    # ---- ⑦ 末轮废码可观测 ----
+    # 【设计决定，2026-09-20】**不**把末轮代码计入 code_used。
+    # 第一版改动曾把自增提到 is_final_round 之前，结果 code% 这一列的语义变了：
+    # p8 的 48~70% 是"末轮不计入"口径，p9 若计入就凭空抬高一截（≈末轮废码率），
+    # 而 code% 正是要跨 run 比较的轴之一 —— 修可观测性不该以牺牲可比性为代价。
+    # 现在：code_used 逐位不变，末轮废码走独立的 code_wasted 计数。
+    check("⑦ code_used 仍在 is_final_round 之后自增（口径与 p8 逐位可比）",
+          _roll.index("if is_final_round:")
+          < _roll.index('code_stats[i]["code_used"] += 1'))
+    check("⑦ 末轮代码单独记 code_wasted（新增信号，不动既有列）",
+          'code_stats[i]["code_wasted"] += 1' in _roll)
+    check("⑦ code_wasted 在 code_stats 初始化时就有（无缺键 KeyError 风险）",
+          '"code_wasted": 0' in _roll)
+    check("⑦ code_wasted 进 record 落盘", '"code_wasted"' in _roll)
+    check("⑦ analysis 展示末轮废码率列", "末轮废码率" in _ana)
+
+    # ---- ⑧ 剂量口径打印 ----
+    check("⑧ 启动行打印 optimizer 更新数而非 micro-step",
+          "剂量口径" in _tr and "optimizer 更新" in _tr)
+    check("⑧ 同时打印轨迹总数与有效 batch",
+          "轨迹总数" in _tr and "有效 batch" in _tr)
+    check("⑧ 逐存档点列出真实更新数（step_50=12upd 这类）", "upd" in _tr)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -3545,6 +3753,7 @@ if __name__ == "__main__":
     test_logprobs_n_fix_path()
     test_val_n_metric_fixes()
     test_eval_determinism_wiring()
+    test_preflight_audit_fixes()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

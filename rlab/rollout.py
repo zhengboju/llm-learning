@@ -426,17 +426,21 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
             blocks = extract_python_blocks(new_text)
             if not blocks:
                 continue              # 本轮无代码块 → 样本结束，等待最终答案
-            # 【2026-09-20 可观测性修复】计数移到 is_final_round 判断**之前**：
-            # 旧版自增在 continue 之后，末轮写的代码在 code_used/code_ok/trunc_final
-            # 三个统计量里**同时为 0**（retool_stop 让末段 finish_reason="stop"
-            # 而非 "length"）——一条"末轮以代码收尾"的轨迹 reward=-1（无 boxed）
-            # 却在数据里显示"既没写代码也没被截断"，与"啰嗦跑飞"无法区分。
-            code_stats[i]["code_used"] += 1
             if is_final_round:
-                # 末轮代码不执行（结果无人消费，见 docstring）→ 这次调用是纯浪费，
-                # 且该轨迹结构性地不会产出 boxed。单列计数供 record/analysis 观察。
+                # 【2026-09-20 可观测性修复】末轮代码不执行（结果无人消费，见
+                # docstring）→ 这次调用是纯浪费，且该轨迹结构性地不会产出 boxed。
+                # 旧版在此直接 continue，于是这类轨迹在 code_used/code_ok/
+                # trunc_final 三个统计量里**同时为 0**（retool_stop 让末段
+                # finish_reason="stop" 而非 "length"）——reward=-1（无 boxed）却
+                # 显示"既没写代码也没被截断"，与"啰嗦跑飞"在数据里完全同形。
+                # 【为什么不计入 code_used】code_used 的既有语义是"真正执行过的
+                # 代码调用次数"，它是 analysis 的 code% 列与跨 run 对照（p8 的
+                # 48~70%）的口径。把末轮废码并进去会静默抬高该列、破坏可比性，
+                # 而 code% 正是长度/代码轴的判据之一。故**单列新计数**：既有口径
+                # 逐位不变，末轮废码从此可见。
                 code_stats[i]["code_wasted"] += 1
                 continue
+            code_stats[i]["code_used"] += 1
             code = blocks[-1]          # 执行最后一个完整代码块（最新计算意图；
                                         # Auto_Program 原版取第一个——并非一致，是有意改进）
             exec_jobs.append((i, code))

@@ -177,6 +177,22 @@ print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认�
       f"algo={args.algo} eval_task={args.eval_task} | "
       f"round_tokens={args.round_tokens} max_len={args.max_len} max_rounds={args.max_rounds} | "
       f"system_prompt={_sp_src} sp_sha={_sp_sha}")
+# 【2026-09-20 回落告警】任何模型读不到 run_info 就会**静默**用 preset 默认协议跑。
+# 事故形态（本次实测）：`--skip_base --models "baseA=/root/Qwen3.5-4B,baseB=..."`
+# —— 裸模型目录没有 run_info，而调度器的同档兜底（eval_vllm.py 的 BASE_PROTO）
+# 只认名字恰好是 "BASE" 的那一项，于是两个 base 双双回落 preset：
+# round_tokens 6144→2048、ctx 26400→14336、sp 3aac5d→72078f。
+# 结果 fmt 从 ~70% 掉到 34.4%、acc 31.3% —— 看起来像"模型很差"，实际是**测了
+# 另一个协议**。此前只有 BASE 缺 run_info 且 tuned 里也没有时才告警（那条分支
+# 在"根本没有名为 BASE 的项"时压根不进），所以这次全程没有任何提示。
+# 现在：只要回落 preset 就醒目告警，并直接给出旁路（--proto_from）。
+if not _run:
+    print(f"\n[eval][警告] {args.model} 读不到 run_info.json → 协议**回落 preset 默认**：\n"
+          f"    round_tokens={args.round_tokens} max_rounds={args.max_rounds} "
+          f"max_len={args.max_len} sp_sha={_sp_sha}\n"
+          f"  若被测对象是用别的预算/提示训出来的，这些数与它不同档，Δacc 无意义\n"
+          f"  （典型签名：fmt 相对同档基线掉一半 = 轮预算装不下推理）。\n"
+          f"  → 显式指定协议来源: --proto_from <某个带 run_info 的 step_N 目录>\n", flush=True)
 
 # ---- 奖励口径复用 rlab.reward（单点真相，不再 дублировать） ----
 from rlab.reward import (
@@ -319,15 +335,27 @@ if _ctkw and _ctkw.get("enable_thinking") is False \
 # 旧版没有任何防线：长题多轮 ctx 增长后撞 vLLM max_model_len → 整个 eval 进程崩溃。
 # 规则与训练对齐：prompt + 生成预算 + 工具段余量 > max_len 的题剔除（训练端同规则
 # 根本采不到这些题，剔除后口径反而更一致），剔除数进结果 json。
+# 【2026-09-20 口径对齐】旧版只有 max_len 这一道线，实际阈值 = max_len − 生成预算
+# = 27424 − (4×6144+512) = 2336，而训练端是 `plen > max_prompt_length` = 1024：
+# 1024 < plen ≤ 2336 的题**训练端永远采不到、eval 端照评**，Δacc 混进了分布外题。
+# 现在两条线都判：先按训练端的 max_prompt_length（同源回读），再保留 max_len 兜底
+# （防撞 vLLM max_model_len 崩进程）。
+_max_plen = int(_rcfg.get("max_prompt_length") or 0)
 _gen_budget = (args.max_rounds * args.round_tokens + 512) if is_retool_family \
     else (args.max_tokens + 64)
-_kept, _dropped_long = [], 0
+_kept, _dropped_long, _dropped_plen = [], 0, 0
 for _item, _p in zip(sample, prompts):
     _pl = len(tokenizer(_p, add_special_tokens=False)["input_ids"])
+    if _max_plen and _pl > _max_plen:
+        _dropped_plen += 1          # 训练端同规则跳组 → 分布内一致性
+        continue
     if _pl + _gen_budget > args.max_len:
-        _dropped_long += 1
+        _dropped_long += 1          # 兜底：防多轮 ctx 撞 max_model_len
         continue
     _kept.append((_item, _p))
+if _dropped_plen:
+    print(f"  [对齐] {_dropped_plen} 题 prompt>{_max_plen}(max_prompt_length)，已剔除"
+          f"（训练端同规则跳组，这些题不在训练分布内）")
 if _dropped_long:
     print(f"  [警告] {_dropped_long} 题 prompt+生成预算超 max_len={args.max_len}，已剔除"
           "（与训练端跳组规则对齐）")
@@ -591,7 +619,7 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
           # 缺此键或 =1 的旧 json 是 p8 事故档（除数=题数 → 采样档虚高 val_n 倍），
           # analysis.py 按本键决定是否做 legacy 回修，绝不靠"看起来像不像率"猜。
           "metrics_version": 2,
-          "n_requested": args.n, "n_dropped_long": _dropped_long,
+          "n_requested": args.n, "n_dropped_long": _dropped_long, "n_dropped_plen": _dropped_plen,
           "algo": args.algo, "eval_task": args.eval_task, "split": args.split,
           # 【2026-09-12 审计缺口补齐】旧版不记 model_path：多模型同表时事后无法核对
           # "这一行评的到底是哪个 checkpoint"（本文件 docstring 自己就在警告同名覆盖）。
@@ -604,7 +632,14 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
                             # 缺这两项的旧 json（或 batch_invariant=false）不可与新
                             # json 直接比 Δacc——同权重漂移可达 2pp。
                             "vllm_batch_invariant": bool(_bi),
-                            "vllm_attention_backend": _attn_be}}
+                            "vllm_attention_backend": _attn_be,
+                            # 【2026-09-20】协议出处落盘：False = 回落 preset 默认
+                            # （读不到 run_info）。事后核对"这一行测的是哪个协议"
+                            # 的唯一凭据——本次 baseA/baseB 事故正是因为回落不留痕。
+                            "proto_from_run_info": bool(_run),
+                            "proto_src": _proto_src,
+                            "max_prompt_length": _max_plen,
+                            "system_prompt_sha": _sp_sha}}
 if args.dump_items:
     result["items"] = items
 if is_retool_family and n_valid:

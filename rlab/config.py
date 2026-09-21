@@ -507,6 +507,24 @@ def get_config(algo: str, **overrides) -> dict:
             f"[config] vllm_gen_kwargs 必须是 dict 或 None，收到 "
             f"{type(_vk).__name__}（{_vk!r}）；CLI 形态："
             "--vllm_gen_kwargs '{\"gdn_prefill_backend\": \"triton\"}'")
+    # 【2026-09-20 micro-batch 契约推导】train_micro_batch_size_per_gpu 必须等于
+    # 一个上传批的行数 = Q_batch_size × num_pre_Q（生成端按题构造 num_pre_Q 行批）。
+    # 旧版把两者在 preset 里**硬编码成对**（retool_math: 8/8）却没有任何推导或
+    # 校验 —— 于是 `--num_pre_Q 4`（记录在案的 OOM 回退位）只改前者，DS 仍声明
+    # micro_batch=8：梯度缩放分母按 8 算而实际只有 4 行，**等效 lr 被静默腰斩**，
+    # 有效 batch 也从声明的 32 变成 16。这类"配置自相矛盾但不报错"最难排查。
+    _implied_mb = int(cfg.get("Q_batch_size", 1) or 1) * int(cfg.get("num_pre_Q", 1) or 1)
+    if "train_micro_batch_size_per_gpu" not in overrides:
+        cfg["train_micro_batch_size_per_gpu"] = _implied_mb
+    elif cfg["train_micro_batch_size_per_gpu"] != _implied_mb:
+        raise ValueError(
+            f"[config] micro-batch 契约不符：train_micro_batch_size_per_gpu="
+            f"{cfg['train_micro_batch_size_per_gpu']} 但 Q_batch_size×num_pre_Q="
+            f"{cfg.get('Q_batch_size')}×{cfg.get('num_pre_Q')}={_implied_mb}。\n"
+            f"  后果：DeepSpeed 按声明值缩放梯度，与实际上传行数不符 → 等效 lr 被"
+            f"静默改变（--num_pre_Q 4 这类回退位最易踩）。\n"
+            f"  改法：不要显式传 train_micro_batch_size_per_gpu，让它由 "
+            f"Q_batch_size×num_pre_Q 推导。")
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
     # 【2026-09-18 H2 护栏】vllm_gen_logps 档位：N=0 是 docs/07 实锤的坏路径
