@@ -681,10 +681,15 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             [inputs[i]], asst_texts[i * n:(i + 1) * n],
             code_stats[i * n:(i + 1) * n], cfg, steps_elapsed=steps_elapsed,
             completion_lens=clen_i)
+        _trunc_i = [int(s["trunc_final"]) for s in code_stats[i * n:(i + 1) * n]]
         # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
         # 与超长分流；2026-09-10 起不再连坐同批其他题）
         if not group_ok(adv_i):
-            results.append({"status": "uniform"})
+            # 【2026-09-21 健康检查选择偏差修复】丢弃组也带诊断数据（acc/fmt/clen/
+            # trunc），让 health.observe 能观测到被过滤组的截断率——否则高截断组
+            # 被 overlong_filter 判为 uniform 后健康检查只看存活组 → trunc_rate 被低估。
+            results.append({"status": "uniform", "acc": acc_i, "fmt": fmt_i,
+                            "clen": clen_i, "cu": cu_i, "trunc": _trunc_i})
             continue
         if use_vllm_logps:
             gen_logps_i = gen_logps_from_segs(segs_i)
@@ -706,6 +711,14 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         # 且 retool_stop 下 trunc_final 记不到它）
                         "cw": [int(s.get("code_wasted", 0))
                                for s in code_stats[i * n:(i + 1) * n]],
+                        # 【2026-09-21 overlong_filter】截断样本（trunc_final=1 或
+                        # code_wasted>0）的 sample_weight=0：它们 adv=0 不贡献 pg_term，
+                        # 但 KL 仍活跃 → sample_mean 归一化会稀释 pg 梯度。sample_weight
+                        # 让 compute_loss 只在有效样本上归一化。
+                        "sw": torch.tensor(
+                            [0.0 if (s["trunc_final"] or s.get("code_wasted", 0))
+                             else 1.0 for s in code_stats[i * n:(i + 1) * n]],
+                            dtype=torch.float32),
                         "plen": plen_i})
     return results
 
@@ -1363,6 +1376,12 @@ def gen_worker(Q, cfg: dict):
                 for q, res in zip(inputs, results):
                     if res["status"] == "uniform":
                         samp_stats["uniform"] += 1
+                        # 【2026-09-21 健康检查选择偏差修复】丢弃组也观测：
+                        # overlong_filter 下高截断组被判 uniform，不观测则
+                        # trunc_rate 只看存活组 → 被低估 → 不触发告警。
+                        if is_retool and "acc" in res:
+                            health.observe(res["acc"].tolist(), res["fmt"].tolist(),
+                                           res["clen"], res["cu"], res["trunc"])
                         # 题目级过滤：零方差组（全错/全对）当前无梯度，累计达标拉黑
                         if sched is not None:
                             sched.report(q, "uniform")
@@ -1407,8 +1426,16 @@ def gen_worker(Q, cfg: dict):
                         # 【2026-09-12】本组轨迹是哪一版权重生成的（train micro-step）。
                         # 训练端据此算出**真实** staleness，不再靠"16 步推送周期"猜。
                         "gen_version": policy_version[0]}
-                xdata = encode_batch(meta, r["merged"], r["adv"], r["gen_logps"],
-                                     r["mask"], r["acc"], r["fmt"])
+                # 【2026-09-21 overlong_filter】有截断样本时传 sample_weight
+                # 让 compute_loss 排除它们（adv=0 但 KL 仍活跃 → 稀释 pg 梯度）
+                _sw = r.get("sw")
+                if _sw is not None:
+                    meta["has_sw"] = 1
+                    xdata = encode_batch(meta, r["merged"], r["adv"], r["gen_logps"],
+                                         r["mask"], r["acc"], r["fmt"], _sw)
+                else:
+                    xdata = encode_batch(meta, r["merged"], r["adv"], r["gen_logps"],
+                                         r["mask"], r["acc"], r["fmt"])
                 requests.post(f"{ref_server}/upload", data=xdata)
                 uploaded_total += 1
                 fout.write(json.dumps({

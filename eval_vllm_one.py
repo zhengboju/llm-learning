@@ -516,8 +516,14 @@ code_used = code_ok = None
 _sampling = args.val_n > 1
 if _sampling:
     _temp = args.temperature if args.temperature is not None else 1.0
-    _topp = args.top_p if args.top_p is not None else 0.7
-    print(f"  [采样评测] val_n={args.val_n} temperature={_temp} top_p={_topp}（Average@N，参考项目口径）")
+    # 【2026-09-21 top_p 与训练对齐】旧版硬编码 0.7（参考项目口径），但训练端
+    # retool_math 用 top_p=1.0。采样评测用 0.7 会截断训练分布的高尾 token →
+    # 测的是不同采样分布下的表现。从 run_info config 回读 top_p，无则回落 0.7。
+    _topp_default = _rcfg.get("top_p") if _rcfg else None
+    _topp_default = _topp_default if _topp_default is not None else 0.7
+    _topp = args.top_p if args.top_p is not None else _topp_default
+    print(f"  [采样评测] val_n={args.val_n} temperature={_temp} top_p={_topp}（Average@N，"
+          f"top_p 来源: {'CLI' if args.top_p is not None else 'run_info' if _rcfg else '默认0.7'}）")
 else:
     _temp = 0.0
     _topp = 1.0

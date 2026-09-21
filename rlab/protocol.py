@@ -129,6 +129,8 @@ def decode_batch(raw: bytes) -> dict:
       [meta, inputs, advantages, refs, gen_logps, acc_scores, format_scores]
       retool（meta['has_mask']=1）:
       [meta, inputs, advantages, refs, gen_logps, mask, acc_scores, format_scores]
+      retool + overlong_filter（meta['has_mask']=1 且 meta['has_sw']=1）:
+      [meta, inputs, advantages, refs, gen_logps, mask, acc_scores, format_scores, sample_weight]
     rfpp 输出（多一个服务端算好的 per-token advantages 段）:
       [meta, inputs, raw_rewards, refs, gen_logps, advantages(B,T), acc_scores, format_scores]
     """
@@ -152,6 +154,12 @@ def decode_batch(raw: bytes) -> dict:
                 data["acc_scores"] = bytes_to_tensor(dd[6])
             if len(dd) >= 8:
                 data["format_scores"] = bytes_to_tensor(dd[7])
+            # 【2026-09-21 overlong_filter·loss 排除截断样本】sample_weight (B,)
+            # 标记截断样本（weight=0）：它们 adv=0（不贡献 pg_term）但 KL 仍活跃，
+            # sample_mean 的 .mean() 会把它们的 KL 算进分母稀释 pg 梯度。
+            # sample_weight 让归一化只算有效样本，彻底排除截断样本的所有贡献。
+            if len(dd) >= 9:
+                data["sample_weight"] = bytes_to_tensor(dd[8])
         else:
             if len(dd) >= 6:
                 data["acc_scores"] = bytes_to_tensor(dd[5])

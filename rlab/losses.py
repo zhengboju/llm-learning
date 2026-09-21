@@ -188,13 +188,16 @@ def _finalize(loss: torch.Tensor, per_token_loss: torch.Tensor, ratio: torch.Ten
 def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
                  advantages: torch.Tensor, mask: torch.Tensor, cfg: dict,
                  ref_logps: torch.Tensor = None,
-                 num_items_in_batch: torch.Tensor = None) -> tuple:
+                 num_items_in_batch: torch.Tensor = None,
+                 sample_weight: torch.Tensor = None) -> tuple:
     """统一入口。
 
     policy_logps/gen_logps/refs : (B, T) completion 区 per-token logps（prompt 已裁掉）
     advantages                  : (B,) 标量 adv（组内已归一化）或 (B,T) per-token（rfpp）
     mask                        : (B, T) completion 有效位（pad=0），float
     num_items_in_batch          : rfpp 用——全局累积批的有效 token 总数（防梯度累积偏差）
+    sample_weight               : (B,) 每样本权重（0=截断样本，从 loss 归一化中排除）；
+                                  None=全 1（旧行为）。仅 sample_mean 路径生效。
     返回 (loss, stats)；loss 为标量 tensor（可 backward），stats 为纯 python dict。
     """
     beta = float(cfg.get("beta", 0.04))
@@ -214,7 +217,14 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
     if algo in ("grpo", "retool", "dapo", "rfpp"):
         per_token_loss = -(pg_term - kl_term)
         if norm == "sample_mean":       # GRPO/retool：样本级（每条样本 token 平均后再 batch 平均）
-            loss = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1)).mean()
+            per_sample = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1).clamp(min=1))
+            if sample_weight is not None:
+                # 【2026-09-21 overlong_filter】截断样本 weight=0 → 从归一化中排除：
+                # 它们 adv=0（pg_term=0）但 KL 仍活跃，.mean() 会把 KL 算进分母稀释 pg。
+                sw = sample_weight.to(per_sample.device)
+                loss = (per_sample * sw).sum() / sw.sum().clamp(min=1)
+            else:
+                loss = per_sample.mean()
         elif norm == "token_mean":      # DAPO：全 batch 按 token 归一化
             loss = (per_token_loss * mask).sum() / mask.sum()
         elif norm == "token_items":     # RF++：除以全局累积批有效 token 数
@@ -260,7 +270,12 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
         # 对齐参考实现的组内减均值；4 条小 group 除 std 放大噪声，8 条组才用此形态）
         per_token_loss = -(pg_term - kl_term)
         # 复用 sample_mean 逻辑（与 grpo/retool 同）
-        loss = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1)).mean()
+        per_sample = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1).clamp(min=1))
+        if sample_weight is not None:
+            sw = sample_weight.to(per_sample.device)
+            loss = (per_sample * sw).sum() / sw.sum().clamp(min=1)
+        else:
+            loss = per_sample.mean()
 
     else:
         raise KeyError(f"未知算法 {algo!r}")

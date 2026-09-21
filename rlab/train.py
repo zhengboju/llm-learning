@@ -489,7 +489,8 @@ def run_training(cfg, args):
                     use_checkpoint=True)[:, plen - 1:]
                 chunk_loss, chunk_stats = compute_loss(
                     cfg["algo"], chunk_logps, gen_logps[sl], advantages[sl],
-                    mask[sl], cfg, ref_logps=ref_logps[sl])
+                    mask[sl], cfg, ref_logps=ref_logps[sl],
+                    sample_weight=batch.get("sample_weight"))
                 engine.backward(chunk_loss * (sl.stop - sl.start) / R)
                 loss_total += float(chunk_loss.item()) * (sl.stop - sl.start) / R
                 stats_list.append(chunk_stats)
@@ -502,7 +503,8 @@ def run_training(cfg, args):
             loss, stats = compute_loss(
                 cfg["algo"], per_token_logps, gen_logps, advantages, mask, cfg,
                 ref_logps=ref_logps,
-                num_items_in_batch=batch.get("num_items_in_batch"))
+                num_items_in_batch=batch.get("num_items_in_batch"),
+                sample_weight=batch.get("sample_weight"))
             engine.backward(loss)
             loss = float(loss.item())
         # 梯度健康探针：策略梯度全零 = 零梯度 bug 的直接签名（cispo 教训：
