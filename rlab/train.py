@@ -125,6 +125,20 @@ def run_signature(cfg: dict) -> str:
     # 撞同一个 out_dir。约定同 stop_tag/of_tag：0/缺失 = 一个字符都不加。
     _caw = float(cfg.get("code_attempt_w", 0.0) or 0.0)
     caw_tag = f"-caw{_caw:g}" if _caw > 0.0 else ""
+    # 【2026-09-23 分档奖励进签名】code_w>0 时 reward 值域改变，必须进签名
+    _cw = float(cfg.get("code_w", 0.0) or 0.0)
+    cw_tag = f"-cw{_cw:g}" if _cw > 0.0 else ""
+    # 【2026-09-23 黑名单 TTL 进签名】>0 时题目调度行为改变（难题会重新入场）
+    _qt = int(cfg.get("q_blacklist_ttl", 0) or 0)
+    qt_tag = f"-qt{_qt}" if _qt > 0 else ""
+    # 【2026-09-23 组相对长度惩罚进签名】w>0 时 reward 值域改变；quantile/gate
+    # 只在惩罚开启时才有行为意义（关闭时它们是死参数，不占签名）
+    _lpw = float(cfg.get("len_penalty_w", 0.0) or 0.0)
+    lp_tag = ""
+    if _lpw > 0.0:
+        _lpq = int(cfg.get("len_penalty_quantile", 50) or 50)
+        _lpg = float(cfg.get("len_penalty_gate", 0.25) or 0.25)
+        lp_tag = f"-lp{_lpw:g}-lq{_lpq}-lg{_lpg:g}"
     # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
     # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
     # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
@@ -155,7 +169,7 @@ def run_signature(cfg: dict) -> str:
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{of_tag}{caw_tag}{_opt_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{of_tag}{caw_tag}{cw_tag}{qt_tag}{lp_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -174,6 +188,13 @@ def write_run_info(path: str, cfg: dict) -> None:
             "overlong_shaping": cfg.get("overlong_shaping"),
             "overlong_filter": cfg.get("overlong_filter"),
             "code_attempt_w": cfg.get("code_attempt_w"),
+            # 【2026-09-23 开发项】分档奖励/黑名单TTL/组相对长度惩罚（eval 端
+            # 回读采样档对齐时也能看到这些）
+            "code_w": cfg.get("code_w"),
+            "q_blacklist_ttl": cfg.get("q_blacklist_ttl"),
+            "len_penalty_w": cfg.get("len_penalty_w"),
+            "len_penalty_quantile": cfg.get("len_penalty_quantile"),
+            "len_penalty_gate": cfg.get("len_penalty_gate"),
             "difficulty_path": cfg.get("difficulty_path"),
             "difficulty_band": cfg.get("difficulty_band"),
             "lr": cfg.get("lr"),
@@ -198,7 +219,8 @@ def _ckpt_signature(ckpt_dir: str):
 
 # 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
 _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
-                     "tk", "tp", "qs", "qf", "ob")
+                     "tk", "tp", "qs", "qf", "ob",
+                     "cw", "qt", "lp", "lq", "lg")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -728,6 +750,26 @@ def main():
     ap.add_argument("--overlong_buffer", type=int, default=None,
                     help="覆盖 overlong 软悬崖缓冲区（BASE 默认 64，retool_math "
                          "preset=256）：越窄坡越陡、惩罚越早开始")
+    ap.add_argument("--code_w", type=float, default=None,
+                    help="【2026-09-23 分档奖励】答对且代码执行成功叠加 code_ok×code_w"
+                         "（ReTool 官方 per-success 口径；此前 config 字段是死代码）。"
+                         "剂量参考 0.05：0.05×3次=+0.15，让'高效解法'比'烧满预算的蒙对'"
+                         "多拿分但不淹没 ±1 outcome 主信号；0=关闭（旧行为）")
+    ap.add_argument("--q_blacklist_ttl", type=int, default=None,
+                    help="题目拉黑 TTL：拉黑后再采 ttl 轮题自动释放重新入场"
+                         "（修'训练分布单调变易'：难题随模型变强重新可学）。"
+                         "0=关闭（旧行为：streak 永久累计直到 floor 全量重置）")
+    ap.add_argument("--len_penalty_w", type=float, default=None,
+                    help="【MiMo Eq.4 组相对长度惩罚】对通过轨迹的长度分位数起坡、"
+                         "只在通过率超阈值的组生效、只罚未通过轨迹——与 trunc_shaping"
+                         "（绝对惩罚，run2 表面收尾事故根源）本质不同，无捷径可钻。"
+                         "0=关闭（旧行为）；overlong_filter 已覆盖大部分毒性，优先级低")
+    ap.add_argument("--len_penalty_quantile", type=int, default=None,
+                    help="组相对长度惩罚的分位数 B（0-100，MiMo Eq.4 的 B/100）："
+                         "参考长度 = 组内通过轨迹长度的 B 分位")
+    ap.add_argument("--len_penalty_gate", type=float, default=None,
+                    help="组相对长度惩罚的通过率门槛：组通过率 ≤ gate 时完全不罚"
+                         "（低通过率组里'长而对'可能是真推理）")
     ap.add_argument("--code_attempt_w", type=float, default=None,
                     help="尝试级 shaping：写出可执行代码块就给 code_attempt_w 小分"
                          "（不依赖 code_ok），对冲代码路径风险不对称的理性压灭"
@@ -876,6 +918,13 @@ def main():
     if args.q_pool_reset_floor is not None:
         overrides["q_pool_reset_floor"] = args.q_pool_reset_floor
     if args.overlong_buffer is not None: overrides["overlong_buffer"] = args.overlong_buffer
+    # 【2026-09-23 开发项接线】分档奖励 / 黑名单 TTL / 组相对长度惩罚
+    if args.code_w is not None: overrides["code_w"] = args.code_w
+    if args.q_blacklist_ttl is not None: overrides["q_blacklist_ttl"] = args.q_blacklist_ttl
+    if args.len_penalty_w is not None: overrides["len_penalty_w"] = args.len_penalty_w
+    if args.len_penalty_quantile is not None:
+        overrides["len_penalty_quantile"] = args.len_penalty_quantile
+    if args.len_penalty_gate is not None: overrides["len_penalty_gate"] = args.len_penalty_gate
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows

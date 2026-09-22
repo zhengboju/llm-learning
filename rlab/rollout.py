@@ -51,7 +51,7 @@ from rlab.protocol import (RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
                            segment_mask_from_spans, tensor_to_bytes)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          total_reward_math, total_reward_retool,
-                         total_reward_retool_math)
+                         total_reward_retool_math, group_length_penalty)
 from rlab.sandbox import run_code
 from rlab.sync import need_text_to_mm_remap, remap_text_to_multimodal, sync_weights_into_vllm
 
@@ -119,13 +119,44 @@ class QuestionScheduler:
     补给重排，语义近似但不影响黑名单的收敛速度（队首插入保证难题两轮内出局）。
     rng 默认用全局 random（gen_worker 已按 seed 播种 → 抽题顺序可复现）。"""
 
-    def __init__(self, QAs, streak_max, floor, rng=None):
+    def __init__(self, QAs, streak_max, floor, rng=None, ttl: int = 0):
         self.QAs = QAs
         self.streak_max = max(1, int(streak_max))
         self.floor = max(1, int(floor))
         self.rng = rng if rng is not None else random
+        # 【2026-09-23 黑名单 TTL】拉黑不是永久的：累计被报 uniform/overlong 达
+        # ttl 次后 streak 清零重新入场（难题随训练推进重新可学）。0 = 关闭
+        # （旧行为：streak 永久累计直到 floor 全量重置）。
+        self.ttl = max(0, int(ttl))
+        self._age = {}   # Q -> 自拉黑以来的 report 次数
+        self._ttl_released = 0   # TTL 释放累计（观测）
         self.q_stat = {}
         self.queue = deque()
+
+    def _tick_blacklist_ttl(self):
+        """拉黑题 TTL 计龄（在 draw 入口调用）：每次 draw 对所有已拉黑题 +1，
+        累计 ttl 次 draw 后释放（streak 清零 + 立即入队）。语义 = "拉黑后再采
+        ttl 轮题就给它重新入场的机会"，难题随训练推进重新可学。
+        【为什么挂在 draw 而不是 report】拉黑题被 draw 跳过、filter_question_pool
+        也不会把它排进队列——report 对拉黑题永远不会被调用，挂在那里是死代码。
+        draw 调用粒度 = 每次 attempt 一轮，与 attempt 数同量纲、可预期。"""
+        if not self.ttl:
+            return
+        for key in [k for k, v in self.q_stat.items() if v >= self.streak_max]:
+            n = self._age.get(key, 0) + 1
+            if n >= self.ttl:
+                self.q_stat[key] = 0
+                self._age.pop(key, None)
+                self._ttl_released += 1
+                for _q in self.QAs:
+                    if _q["Q"] == key:
+                        self.queue.append(_q)   # 立即入队，不等下次 refill
+                        break
+                if self._ttl_released % 10 == 1:
+                    print(f"[rollout] 黑名单到期释放（累计 {self._ttl_released} 题）："
+                          "难题随训练推进重新入场", flush=True)
+            else:
+                self._age[key] = n
 
     def _refill(self):
         cand, reset = filter_question_pool(
@@ -142,6 +173,7 @@ class QuestionScheduler:
         后第二次也 uniform 的题，队列里已无它——此分支只防极端交错）。"""
         out = []
         for _ in range(3):        # 补给上限：重置后为全池，两轮必够
+            self._tick_blacklist_ttl()   # 拉黑题 TTL 计龄（每次 draw 一次）
             while len(out) < k and self.queue:
                 q = self.queue.popleft()
                 if self.q_stat.get(q["Q"], 0) >= self.streak_max:
@@ -609,6 +641,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # 尝试级 shaping（#2 风险不对称修正）：默认 0 = 关闭，行为与旧版逐位相同
     _att_w = float(cfg.get("code_attempt_w", 0.0) or 0.0)
     _max_rounds = int(cfg.get("max_rounds", 8))
+    # 【2026-09-23 分档奖励】code_w>0：答对且代码执行成功叠加 code_ok×code_w
+    # （ReTool 官方 per-success 口径，打通此前硬编码 0 的死代码字段）
+    _code_w = float(cfg.get("code_w", 0.0) or 0.0)
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
@@ -625,6 +660,7 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     trunc_shaping=_trunc_w,
                     code_used=code_stats[idx]["code_used"],
                     code_attempt_w=_att_w,
+                    code_w=_code_w,
                     max_rounds=_max_rounds)
             else:
                 sc = total_reward_retool(
@@ -640,6 +676,19 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
             ck.append(code_stats[idx]["code_ok"])
             trunc_finals.append(_tf)
     rewards = torch.tensor(rewards, dtype=torch.float32)
+    # 【2026-09-23 组相对长度惩罚（MiMo Eq.4 形态）】在 advantage 之前按组应用：
+    # 对通过轨迹的长度分位数起坡、只在通过率超阈值的组生效、只罚未通过轨迹。
+    # 与 trunc_shaping（绝对惩罚，run2 表面收尾事故根源）本质不同：相对化后
+    # "组内都变短"不改变任何 advantage，无捷径可钻。weight=0 完全跳过（逐位同旧）。
+    _lp_w = float(cfg.get("len_penalty_w", 0.0) or 0.0)
+    _lp_clens = ([int(x) for x in (completion_lens if completion_lens is not None else [])]
+                 if _lp_w > 0.0 else [])
+    if _lp_w > 0.0 and len(_lp_clens) == len(rewards):
+        _pen = group_length_penalty(rewards.tolist(), _lp_clens,
+                                    weight=_lp_w,
+                                    quantile=int(cfg.get("len_penalty_quantile", 50)),
+                                    pass_gate=float(cfg.get("len_penalty_gate", 0.25)))
+        rewards = torch.tensor(_pen, dtype=torch.float32)
     # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除：
     # 组均值只算非截断 → 截断样本 adv=0 → 不贡献 pg_term。
     # 杀 NeMo-RL bug：全错组+混合截断不再因 trunc_shaping 产生假方差通过 group_ok。
@@ -675,6 +724,11 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     双重分叉。上传 meta 与 gen_logps/训练前向共用同一基准）。"""
     n = int(cfg["num_pre_Q"])
     nq = len(inputs)
+    # 【2026-09-23 在线通过率监控】题目指纹（与 eval_vllm_one 的 items.qk 同一
+    # 算法：sha1(Q)[:12]）——record.jsonl 从此带题标识，passrate.py 才能按题聚合
+    # 训练期通过率分布（观测 band 漂移 / 回填难度表）。
+    import hashlib as _hashlib
+    _qks = [_hashlib.sha1(str(x["Q"]).encode("utf-8")).hexdigest()[:12] for x in inputs]
     assert prompt_ids.shape[1] == plen, \
         f"prompt_ids 宽 {prompt_ids.shape[1]} != plen {plen}（调用约定：未剥 pad 的整批）"
     group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
@@ -715,7 +769,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             # trunc），让 health.observe 能观测到被过滤组的截断率——否则高截断组
             # 被 overlong_filter 判为 uniform 后健康检查只看存活组 → trunc_rate 被低估。
             results.append({"status": "uniform", "acc": acc_i, "fmt": fmt_i,
-                            "clen": clen_i, "cu": cu_i, "trunc": _trunc_i})
+                            "clen": clen_i, "cu": cu_i, "ck": ck_i,
+                            "trunc": _trunc_i,
+                            "qk": _qks[i], "Q": inputs[i]["Q"]})
             continue
         if use_vllm_logps:
             gen_logps_i = gen_logps_from_segs(segs_i)
@@ -730,6 +786,7 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
         results.append({"status": "ok", "merged": merged_i, "mask": mask_i,
                         "gen_logps": gen_logps_i, "adv": adv_i, "acc": acc_i,
                         "fmt": fmt_i, "cu": cu_i, "ck": ck_i, "phase": phase,
+                        "qk": _qks[i], "Q": inputs[i]["Q"],
                         "clen": clen_i,
                         "trunc": [int(s["trunc_final"])
                                   for s in code_stats[i * n:(i + 1) * n]],
@@ -1323,7 +1380,8 @@ def gen_worker(Q, cfg: dict):
     #   + q_stat 原样保留——阶段2 GSM8K 协议可比性不破坏。
     multi_q = max(1, int(cfg.get("gen_questions_per_attempt", 1) or 1))
     use_qqueue = is_retool and multi_q > 1 and bool(cfg.get("q_skip_streak"))
-    sched = (QuestionScheduler(QAs, cfg["q_skip_streak"], cfg["q_pool_reset_floor"])
+    sched = (QuestionScheduler(QAs, cfg["q_skip_streak"], cfg["q_pool_reset_floor"],
+                               ttl=int(cfg.get("q_blacklist_ttl", 0) or 0))
              if use_qqueue else None)
     q_stat = {}   # 旧路径专用：Q 文本 -> 连续零方差组次数
     # 【2026-09-12 反压状态机】外层轮次零产出计数 + 窗口丢弃率游标
@@ -1413,6 +1471,18 @@ def gen_worker(Q, cfg: dict):
                             sched.report(q, "uniform")
                         elif qkey is not None:
                             q_stat[qkey] = q_stat.get(qkey, 0) + 1
+                        # 【2026-09-23 在线通过率监控】uniform 组也落盘（带题指纹与
+                        # acc 数组——p≈0 题全错与 p≈1 题全对在 record 里可分）
+                        if "acc" in res:
+                            fout.write(json.dumps({
+                                "t": time.time(), "algo": cfg["algo"],
+                                "acc": res["acc"].tolist(), "fmt": res["fmt"].tolist(),
+                                "clen": res["clen"], "code_used": res["cu"],
+                                "code_ok": res["ck"],
+                                "trunc_final": res["trunc"], "code_wasted": [0] * len(res["cu"]),
+                                "qk": res.get("qk"), "q_status": "uniform",
+                                "gen_version": policy_version[0],
+                                "phase": "dropped"}, ensure_ascii=False) + "\n")
                     elif res["status"] == "overlong":
                         samp_stats["overlong"] += 1
                         # 【2026-09-12】超长也回填调度器（不再"与难度无关所以不管"）：
@@ -1470,6 +1540,9 @@ def gen_worker(Q, cfg: dict):
                     "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
                     "trunc_final": r["trunc"],
                     "code_wasted": r["cw"],
+                    # 【2026-09-23 在线通过率监控】题目指纹 + 状态（uniform 组也落盘，
+                    # 否则 p≈0 题在 record 里不可见，band 漂移观测有偏）
+                    "qk": r.get("qk"), "q_status": "ok",
                     "gen_version": policy_version[0],
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
                 health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"],

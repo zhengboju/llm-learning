@@ -516,7 +516,14 @@ code_used = code_ok = None
 #   · retool：多轮生成每样本独立 seed（参考项目逐条独立采样），聚合同理
 _sampling = args.val_n > 1
 if _sampling:
-    _temp = args.temperature if args.temperature is not None else 1.0
+    # 【2026-09-23 采样协议回读补全】temperature 也从 run_info 回读：此前只回读
+    # top_p，训练 CLI --temperature 0.8 覆盖后 eval 仍用默认 1.0——采样评测测的
+    # 是另一个探索分布（与 vk/sp 回落事故同一形态）。CLI > run_info > 默认。
+    _temp_default = _rcfg.get("temperature") if _rcfg else None
+    _temp_default = _temp_default if _temp_default is not None else 1.0
+    _temp = args.temperature if args.temperature is not None else _temp_default
+    print(f"  [采样评测] temperature 来源: "
+          f"{'CLI' if args.temperature is not None else 'run_info' if _rcfg.get('temperature') is not None else '默认1.0'}")
     # 【2026-09-21 top_p 与训练对齐】旧版硬编码 0.7（参考项目口径），但训练端
     # retool_math 用 top_p=1.0。采样评测用 0.7 会截断训练分布的高尾 token →
     # 测的是不同采样分布下的表现。从 run_info config 回读 top_p，无则回落 0.7。
@@ -633,6 +640,13 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
           "model_path": args.model,
           "eval_protocol": {"temperature": _temp, "top_p": _topp, "greedy": not _sampling,
                             "val_n": args.val_n, "seed": args.seed,
+                            # 【2026-09-23】temperature/top_p 出处自证（CLI/run_info/默认）
+                            "temperature_src": ("cli" if args.temperature is not None
+                                                else "run_info" if _rcfg.get("temperature") is not None
+                                                else "default"),
+                            "top_p_src": ("cli" if args.top_p is not None
+                                          else "run_info" if _rcfg.get("top_p") is not None
+                                          else "default"),
                             "max_rounds": args.max_rounds, "round_tokens": args.round_tokens,
                             "max_tokens": args.max_tokens, "max_len": args.max_len,
                             # 【2026-09-20】确定性档落盘：采样评测的跨 run 可比性前提。

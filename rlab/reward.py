@@ -12,6 +12,7 @@
 - format 正则与 grpo_ref_split.py 严格一致（紧连式），不与 rf++ 旧正则混用。
 """
 
+import math
 import re
 
 # 围栏正则复用协议层（与 extract_python_blocks 同一条），用于打分前剥离代码块
@@ -220,6 +221,47 @@ def reward_phase(steps_elapsed: int, switch_step: int) -> str:
     return "cold" if steps_elapsed < switch_step else "hot"
 
 
+def group_length_penalty(group_rewards: list, group_lens: list,
+                         weight: float = 0.0, quantile: int = 50,
+                         pass_gate: float = 0.25) -> list:
+    """组相对长度惩罚（纯函数，MiMo-V2.6 技术报告 §4.3.3 Eq.4 的最小实现）。
+
+    【形态与 trunc_shaping 的本质区别】trunc_shaping 是**绝对惩罚**（撞上限就扣），
+    run2"表面收尾"事故的根源——模型学会提前草草收尾骗过低长度惩罚。MiMo 的
+    设计是**组内相对**：对**通过轨迹**的长度分位数起坡，且只在组通过率超过
+    pass_gate 时生效（低通过率组里"长而对"可能是真推理，不能罚）：
+        ref = quantile_{B/100}(len[s 通过])；pen_i = max(0, len_i/ref - 1)
+        r_i' = r_i - weight * pen_i
+    通过轨迹（acc>0）不罚自身（pen 只对未通过者计算——通过者是长度分位的
+    定义者，罚它们等于惩罚"写出参考长度"的行为）；无通过轨迹的组恒零惩罚。
+    weight=0 时返回与输入逐位相同的副本（旧行为，单变量 A/B 对照位）。
+
+    【为什么这样无捷径】相对化后"组内都变短"不改变任何 advantage（组均值
+    已被 compute_advantages 减掉）；要降惩罚只有两条真路：变得比组内通过的
+    轨迹短（真提效），或组内通过率掉到 gate 以下（那是 acc 崩，health 会报）。
+    """
+    n = len(group_rewards)
+    if weight <= 0.0 or n == 0 or n != len(group_lens):
+        return list(group_rewards)
+    B = min(max(int(quantile), 1), 100) / 100.0
+    passed = [l for l, r in zip(group_lens, group_rewards) if r > 0.0]
+    if not passed:
+        return list(group_rewards)
+    passed.sort()
+    # 题级通过率：passed 数 / 组大小（每条轨迹一票；"通过率超阈值"按题判）
+    if len(passed) / n <= pass_gate:
+        return list(group_rewards)
+    k = int(math.ceil(B * (len(passed) - 1)))   # B=1.0 → k=m-1（最长通过轨迹）
+    ref = passed[k]
+    out = []
+    for r, l in zip(group_rewards, group_lens):
+        if r > 0.0:
+            out.append(float(r))           # 通过轨迹不罚
+        else:
+            out.append(float(r) - weight * max(0.0, l / ref - 1.0))
+    return out
+
+
 def total_reward_retool(ground_truth: str, answer: str, *, code_ok: int,
                         phase: str, code_w: float = 0.1,
                         cold_w: tuple = (1.0, 2.0, 2.0), hot_w: tuple = (2.0, 1.0, 1.0),
@@ -287,7 +329,7 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
                              overlong_buffer: int = 64, overlong_shaping: bool = False,
                              trunc_final: int = 0, trunc_shaping: float = 0.0,
                              code_used: int = 0, code_attempt_w: float = 0.0,
-                             max_rounds: int = 8) -> dict:
+                             code_w: float = 0.0, max_rounds: int = 8) -> dict:
     """retool-math outcome-only：与 total_reward_math 同 reward（±1），
     工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。
 
@@ -303,7 +345,16 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
 
     【2026-09-21 尝试级 shaping】code_attempt_w>0 时叠加
     code_used×code_attempt_w（不依赖 code_ok，对冲"代码路径风险不对称"的
-    理性压灭，见 reward_code_attempt）。权重 0 = 旧行为逐位相同（对照位）。"""
+    理性压灭，见 reward_code_attempt）。权重 0 = 旧行为逐位相同（对照位）。
+
+    【2026-09-23 分档奖励·code_w 死代码打通】此前本函数第 321 行
+    `reward_code(code_ok, 0.0)` 把 code_w 硬编码 0——config 里的字段是死代码，
+    改了也没用。现在 code_w>0 时叠加 code_ok×code_w（ReTool 官方 per-execution
+    成功 shaping 口径，reward_code 单点复用）："答对且代码执行成功"比"答对"
+    多一个正增量——往 MiMo GRS"让 reward 携带质量信息"的第一步（不需要
+    grader 模型，先让高效解法比烧满预算的蒙对多拿分）。
+    域约束：code_w ≤ max_rounds 分之 1 量级（0.05×3 次=+0.15），不要淹没 ±1
+    outcome 主信号；0 = 旧行为逐位相同（对照位）。"""
     base = total_reward_math(ground_truth, strip_code_blocks(answer),
                              completion_len=completion_len,
                              max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
@@ -317,7 +368,10 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
         base["reward"] = base["reward"] + attp
     base["attempt_penalty"] = 0.0  # 命名对称：这是奖励不是罚，但 record 列对齐
     base["code_attempt"] = attp
-    # 保留 code 字段供 record 监控，但 reward 不含它（code_w 路径）
-    base["code"] = reward_code(code_ok, 0.0)
+    # code 字段随 code_w 联动（record 监控列语义：code = code_ok×code_w）
+    _cw = float(code_w or 0.0)
+    base["code"] = reward_code(code_ok, _cw)
+    if _cw > 0.0 and code_ok > 0:
+        base["reward"] = base["reward"] + base["code"]
     base["code_ok"] = code_ok
     return base

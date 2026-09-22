@@ -4002,6 +4002,121 @@ def test_attempt_shaping_and_err_tier():
     check("_is_opt_suffix 识别新前缀 tk/tp/qs/qf/ob",
           _is_opt_suffix("-tk50-tp0.95-qs3") and not _is_opt_suffix("-zzz1"))
 
+    # ---- 5c.【2026-09-23】开发项落地：分档奖励/黑名单TTL/组相对长度惩罚 ----
+    # 契约：① code_w 打通（此前硬编码 0 的死代码）；② TTL 释放拉黑题；
+    # ③ 组相对长度惩罚按 MiMo Eq.4 形态工作；④ 全部默认 0 = 旧行为逐位相同；
+    # ⑤ 进签名（-cw/-qt/-lp-lq-lg，默认不加字符）。
+    from rlab.reward import total_reward_retool_math as _trm, group_length_penalty as _glp
+    # ⑤-1 分档奖励：code_w=0 旧行为逐位不变（对照位）
+    _ans = "the answer is \\boxed{42}"
+    check("5c code_w=0 旧行为逐位相同",
+          abs(_trm("42", _ans, code_ok=3)["reward"] - 1.0) < 1e-6
+          and _trm("42", _ans, code_ok=3, code_w=0.0)["code"] == 0.0)
+    # ⑤-2 分档奖励：答对+代码成功 → +code_ok*code_w；答对无代码/答错 → 不加
+    _sc = _trm("42", _ans, code_ok=3, code_w=0.05)
+    check("5c 分档奖励：答对+code_ok=3 → 1+0.15", abs(_sc["reward"] - 1.15) < 1e-6
+          and abs(_sc["code"] - 0.15) < 1e-6)
+    check("5c 分档奖励：答对但 code_ok=0 → 不加",
+          abs(_trm("42", _ans, code_ok=0, code_w=0.05)["reward"] - 1.0) < 1e-6)
+    check("5c 分档奖励：答错（code_ok>0）→ -1+0.15（成功率不救答错）",
+          abs(_trm("99", _ans, code_ok=2, code_w=0.05)["reward"] - (-0.9)) < 1e-6)
+    # ⑤-3 签名：默认无字符；偏离进签名且前缀兼容
+    check("5c 默认 -cw/-qt/-lp 不进签名",
+          all(f not in sig_base for f in ("-cw", "-qt", "-lp")))
+    for key, val, frag in (("code_w", 0.05, "-cw0.05"), ("q_blacklist_ttl", 64, "-qt64"),
+                           ("len_penalty_w", 0.3, "-lp0.3-lq50-lg0.25")):
+        sig_v = run_signature({**_base_cfg, key: val})
+        check(f"5c 偏离 {key}={val} 进签名（{frag}）", frag in sig_v)
+        check(f"5c {key} 偏离段满足前缀兼容",
+              sig_v.startswith(sig_base) and _is_opt_suffix(sig_v[len(sig_base):]))
+    check("5c CLI: --code_w/--q_blacklist_ttl/--len_penalty_w 存在且透传",
+          all(f in _tr for f in ('"--code_w"', '"--q_blacklist_ttl"', '"--len_penalty_w"')
+              and all(k in _tr for k in ('overrides["code_w"]',
+                                         'overrides["q_blacklist_ttl"]',
+                                         'overrides["len_penalty_w"]'))))
+    check("5c run_info: code_w/q_blacklist_ttl/len_penalty_* 落盘",
+          all(k in _tr for k in ('"code_w": cfg.get("code_w")',
+                                 '"q_blacklist_ttl": cfg.get("q_blacklist_ttl")',
+                                 '"len_penalty_w": cfg.get("len_penalty_w")')))
+
+    # ⑤-4 黑名单 TTL：到期释放（streak 清零 + 重新入队）
+    from rlab.rollout import QuestionScheduler
+    _qas = [{"Q": f"q{i}", "A": "1"} for i in range(6)]
+    _sch = QuestionScheduler(_qas, streak_max=2, floor=2, ttl=3)
+    _q0 = _qas[0]
+    _sch.report(_q0, "uniform"); _sch.report(_q0, "uniform")
+    check("5c TTL: streak 达标 = 拉黑", _sch.blacklisted_count() == 1)
+    for _ in range(2):                       # ttl=3：3 次 draw 后释放
+        _sch._tick_blacklist_ttl()
+    check("5c TTL: 未到 ttl 仍拉黑", _sch.blacklisted_count() == 1)
+    _sch._tick_blacklist_ttl()
+    check("5c TTL: 到期释放（streak 清零）", _sch.blacklisted_count() == 0)
+    check("5c TTL: 释放题立即重新入队",
+          any(q["Q"] == "q0" for q in _sch.queue))
+    _sch0 = QuestionScheduler(_qas, streak_max=2, floor=2, ttl=0)
+    _sch0.report(_q0, "uniform"); _sch0.report(_q0, "uniform")
+    for _ in range(5):
+        _sch0._tick_blacklist_ttl()
+    check("5c TTL=0 旧行为：永不释放", _sch0.blacklisted_count() == 1)
+
+    # ⑤-5 组相对长度惩罚（MiMo Eq.4 形态）
+    # 组：2 条通过（长 1000/2000）+ 2 条未通过（一长于 ref、一短于 ref）
+    # B=50 → ref = 通过轨迹 50 分位 = 2000
+    _gr = [1.0, 1.0, -1.0, -1.0]
+    _gl = [1000, 2000, 4000, 1500]
+    _out = _glp(_gr, _gl, weight=0.5, quantile=50, pass_gate=0.25)
+    check("5c 组相对长度：通过轨迹不罚",
+          _out[0] == 1.0 and _out[1] == 1.0)
+    check("5c 组相对长度：未通过者按 len/ref-1 罚（4000/2000-1=1 → -1-0.5）",
+          abs(_out[2] - (-1.5)) < 1e-6)
+    check("5c 组相对长度：未超出 ref 的未通过者不罚（只罚超出部分）",
+          abs(_out[3] - (-1.0)) < 1e-6)
+    # 通过率 25% 不超 gate=0.25 → 整组零惩罚（低通过率组不罚"长而对"）
+    _in4 = [-1.0, -1.0, -1.0, 1.0]
+    _out2 = _glp(_in4, [5000, 5000, 5000, 100],
+                 weight=0.5, quantile=50, pass_gate=0.25)
+    check("5c 通过率 <= gate → 整组零惩罚",
+          _out2 == [-1.0, -1.0, -1.0, 1.0])
+    # 无通过轨迹 → 零惩罚（ref 无法定义）
+    _out3 = _glp([-1.0, -1.0], [5000, 6000], weight=0.5, quantile=50, pass_gate=0.25)
+    check("5c 无通过轨迹 → 零惩罚", _out3 == [-1.0, -1.0])
+    # weight=0 → 逐位同旧（对照位）
+    check("5c weight=0 → 逐位同旧",
+          _glp(_gr, _gl, weight=0.0, quantile=50, pass_gate=0.25) == [1.0, 1.0, -1.0, -1.0])
+
+    # ⑤-6 passrate.py：qk 聚合 + band 切片 + 表回填
+    from rlab.passrate import (aggregate_by_qk as _agg, band_stats as _bst,
+                               merge_into_table as _merge, qk_of as _qkof)
+    import tempfile as _tf
+    _rec = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    _qtext = "某道题的题面文本"
+    _key = _qkof(_qtext)
+    _rec.write(json.dumps({"acc": [1, -1, -1, -1], "qk": _key}) + "\n")   # 1/4
+    _rec.write(json.dumps({"acc": [1, 1, -1, -1], "qk": _key}) + "\n")    # 累计 3/8
+    _rec.write(json.dumps({"acc": [1, -1, -1, -1]}) + "\n")               # 无 qk → 跳过
+    _rec.write("not json\n")                                              # 坏行 → 跳过
+    _rec.close()
+    _aggd = _agg(_rec.name)
+    check("5c passrate: 按题聚合（跨行累计 k/n_correct，坏行/缺 qk 跳过）",
+          _aggd.get(_key) == {"k": 8, "n_correct": 3, "n_rows": 2})
+    _bs = _bst(_aggd, 0.25, 0.75)
+    check("5c passrate: band 切片（3/8=0.375 在 band 内）",
+          _bs["n_questions"] == 1 and _bs["in_band"] == 1)
+    _tbl = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    _tbl.write(json.dumps({"Q": _qtext, "A": "7", "k": 4, "n_correct": 0,
+                           "pass_rate": 0.0}) + "\n")
+    _tbl.close()
+    _mout = _tf.NamedTemporaryFile(suffix=".jsonl", delete=False).name
+    _merge(_aggd, _tbl.name, _mout, min_k=8)
+    _newrow = json.loads(open(_mout, encoding="utf-8").read().strip())
+    check("5c passrate: 表回填（在线 k>=min_k 覆盖，原表未动）",
+          _newrow["k"] == 8 and _newrow["n_correct"] == 3
+          and abs(_newrow["pass_rate"] - 0.375) < 1e-9
+          and "online_meta" in _newrow
+          and json.loads(open(_tbl.name, encoding="utf-8").read().strip())["n_correct"] == 0)
+    os.unlink(_rec.name); os.unlink(_tbl.name); os.unlink(_mout)
+
+
     # ---- 6. #3 核对结论的文档锁：EOS 契约注释存在于 rollout.py ----
     _ro = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()

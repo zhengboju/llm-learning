@@ -203,6 +203,17 @@ BASE = dict(
     # 与 num_pre_Q 无关——只有题目级过滤能真正削减白跑。
     q_skip_streak=2,
     q_pool_reset_floor=64,
+    # 【2026-09-23 黑名单 TTL】拉黑后再采 ttl 轮题自动释放（修"训练分布单调
+    # 变易"：难题随模型变强重新可学）。0 = 关闭（旧行为：streak 永久累计直到
+    # floor 全量重置）。合理值 = 拉黑题预期"服刑"的 attempt 轮数（如 64）。
+    q_blacklist_ttl=0,
+    # 【2026-09-23 组相对长度惩罚】默认 0 = 关闭（旧行为逐位相同，单变量 A/B
+    # 对照位）。MiMo Eq.4 形态：通过轨迹分位数起坡 + 通过率门槛，只罚未通过轨迹。
+    # 分档奖励 code_w 不在此设：BASE 的 code_w=0.1 是 retool 家族阶段2 路径语义，
+    # retool_math preset 自带 code_w=0.0（math 路径此前是死代码，2026-09-23 打通）。
+    len_penalty_w=0.0,
+    len_penalty_quantile=50,
+    len_penalty_gate=0.25,
     # 生成端每次 attempt 并采题数（2026-09-10 vLLM 利用率修复）。=1 保持旧
     # 逐题协议（GSM8K 家族可比性）；>1 时走 QuestionScheduler 队列路径（题目
     # 过滤真正生效，见 rollout.py）并按题拆分上传——训练端 micro-batch 契约
