@@ -138,7 +138,7 @@ else:
 
 name = args.name or "_".join(args.model.rstrip("/").split("/")[-2:])
 out_path = args.out or f"eval_vllm_{name}.json"
-
+ 
 # ---- system_prompt 对齐训练 ----
 from rlab.config import default_system_prompt as _default_system_prompt
 # 【2026-09-17】训练用 --system_prompt_file 时，run_info.config.system_prompt 是文件内容；
