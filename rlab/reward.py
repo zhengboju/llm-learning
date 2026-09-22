@@ -192,6 +192,26 @@ def reward_code(code_ok: int, code_w: float = 0.1) -> float:
     return code_ok * code_w
 
 
+def reward_code_attempt(code_used: int, attempt_w: float = 0.0,
+                        max_rounds: int = 8) -> float:
+    """尝试级 shaping（纯函数）：只要真的写出了可执行的代码块就给小分，
+    不依赖执行成败（code_ok）。
+
+    【为什么需要它——#2 风险不对称的范式依据】当前 retool_math 是
+    outcome-only（code_w=0，代码只作监控）：选代码路径要冒"执行失败/超时/
+    白白多烧预算→更容易触顶截断"的全部风险，选纯推理路径零成本——
+    outcome 相同条件下，RL 的理性解就是放弃代码（p6 实测 code% 50→3 压灭）。
+    参考 ReTool 官方用 per-execution 成功 shaping（+0.1/次）对冲；
+    attempt 级比 success 级更激进一步：把"敢写"与"写对"分开奖励，
+    成败交给 outcome 与 code_w 去区分。权重为 0 时本项完全不存在
+    （行为与旧版逐位相同，单变量 A/B 的对照位）。
+
+    cap 在 max_rounds 内（防御：传入值异常大时不让 shaping 项爆炸）。"""
+    if attempt_w <= 0.0:
+        return 0.0
+    return min(int(code_used), max(1, int(max_rounds))) * attempt_w
+
+
 def reward_phase(steps_elapsed: int, switch_step: int) -> str:
     """冷启动/后期权重切换：optimizer step < switch_step 为 "cold"。
     Auto_Program 用 16 次权重推送(=16*16=256 步)作为阈值——冷启动期代码/格式权重
@@ -265,7 +285,9 @@ def total_reward_math(ground_truth: str, answer: str, *,
 def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0,
                              completion_len: int = 0, max_gen_tokens: int = 8192,
                              overlong_buffer: int = 64, overlong_shaping: bool = False,
-                             trunc_final: int = 0, trunc_shaping: float = 0.0) -> dict:
+                             trunc_final: int = 0, trunc_shaping: float = 0.0,
+                             code_used: int = 0, code_attempt_w: float = 0.0,
+                             max_rounds: int = 8) -> dict:
     """retool-math outcome-only：与 total_reward_math 同 reward（±1），
     工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。
 
@@ -277,7 +299,11 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
 
     【2026-09-12 长度控制】trunc_final（末段被轮长上限切断）叠加 trunc_shaping
     扣分——总长惩罚够不到单轮 prose 轨迹，这是唯一能作用于它的反向信号，
-    见 trunc_penalty 的实测依据。trunc_shaping=0 时行为与旧版逐位相同。"""
+    见 trunc_penalty 的实测依据。trunc_shaping=0 时行为与旧版逐位相同。
+
+    【2026-09-21 尝试级 shaping】code_attempt_w>0 时叠加
+    code_used×code_attempt_w（不依赖 code_ok，对冲"代码路径风险不对称"的
+    理性压灭，见 reward_code_attempt）。权重 0 = 旧行为逐位相同（对照位）。"""
     base = total_reward_math(ground_truth, strip_code_blocks(answer),
                              completion_len=completion_len,
                              max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
@@ -286,7 +312,12 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
     if tp:
         base["reward"] = base["reward"] - tp
     base["trunc_penalty"] = tp
-    # 保留 code 字段供 record 监控，但 reward 不含它
+    attp = reward_code_attempt(code_used, code_attempt_w, max_rounds)
+    if attp:
+        base["reward"] = base["reward"] + attp
+    base["attempt_penalty"] = 0.0  # 命名对称：这是奖励不是罚，但 record 列对齐
+    base["code_attempt"] = attp
+    # 保留 code 字段供 record 监控，但 reward 不含它（code_w 路径）
     base["code"] = reward_code(code_ok, 0.0)
     base["code_ok"] = code_ok
     return base

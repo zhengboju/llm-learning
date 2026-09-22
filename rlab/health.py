@@ -132,6 +132,23 @@ def window_check(hist, *, retool=False, max_clen=None):
                        "128 组后代码调用率仍为 0 → 代码信号未出现（冷启动权重过稀疏？"
                        "模型从未被奖励写代码），记录在案，验收时 code_rate 指标必然为 0"))
 
+    # --- 签名⑦：代码压灭（2026-09-21，#2 的训练期可观测签名）
+    # 事故形态（run2/p5/p6 三次复现）：code% 从开局水平单调下滑到个位数——
+    # outcome-only + 风险不对称下 RL "理性"放弃代码。既有规则探不到它：
+    # no_code 只看"恒为 0"（点火前才响），压灭是"点火后跌回"。
+    # 判据（基线锚定，同 retool_trunc 设计）：开局 code% ≥15%（点火成功）且
+    # 窗口均值较开局跌 ≥15pp → 报警（提示性，非致命——配合 --code-layer
+    # 分层分析判 H1/H2）。
+    if retool and n >= 96:
+        _cr_w = _wmean([h["code_rate"] for h in hist[-k:]])
+        _cr_0 = _wmean([h["code_rate"] for h in hist[:k]])
+        if _cr_0 >= 0.15 and _cr_w <= _cr_0 - 0.15:
+            alerts.append(("code_collapse",
+                           f"代码调用率较开局跌 {(_cr_0 - _cr_w) * 100:.0f}pp"
+                           f"（{_cr_0:.0%}→{_cr_w:.0%}）→ 代码压灭签名（outcome-only + "
+                           "风险不对称下 RL 放弃工具）。已落地杠杆：--code_attempt_w "
+                           "尝试级 shaping（先观察本 run 的 code 曲线再决定是否启用）"))
+
     return alerts
 
 

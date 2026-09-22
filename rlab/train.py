@@ -120,6 +120,11 @@ def run_signature(cfg: dict) -> str:
     # 约定同 stop_tag：只在开启时追加，历史签名逐字不变（前缀兼容由 _is_opt_suffix
     # 识别 "of" 段 → guard_ckpt_collision 放行）。
     of_tag = "-of1" if cfg.get("overlong_filter") else ""
+    # 【2026-09-21 尝试级 shaping 进签名】code_attempt_w 是 reward 函数的行为级
+    # 变量（>0 时轨迹 reward 值整体平移），必须进签名否则 shaping 开关不同的 run
+    # 撞同一个 out_dir。约定同 stop_tag/of_tag：0/缺失 = 一个字符都不加。
+    _caw = float(cfg.get("code_attempt_w", 0.0) or 0.0)
+    caw_tag = f"-caw{_caw:g}" if _caw > 0.0 else ""
     # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
     # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
     # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
@@ -144,7 +149,7 @@ def run_signature(cfg: dict) -> str:
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{of_tag}{_opt_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{of_tag}{caw_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -162,6 +167,7 @@ def write_run_info(path: str, cfg: dict) -> None:
             "trunc_shaping": cfg.get("trunc_shaping"),
             "overlong_shaping": cfg.get("overlong_shaping"),
             "overlong_filter": cfg.get("overlong_filter"),
+            "code_attempt_w": cfg.get("code_attempt_w"),
             "difficulty_path": cfg.get("difficulty_path"),
             "difficulty_band": cfg.get("difficulty_band"),
             "lr": cfg.get("lr"),
@@ -685,6 +691,10 @@ def main():
                     help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
                          "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
                          "--no-retool_stop 关闭 = p6 旧协议（A/B 对照位）")
+    ap.add_argument("--code_attempt_w", type=float, default=None,
+                    help="尝试级 shaping：写出可执行代码块就给 code_attempt_w 小分"
+                         "（不依赖 code_ok），对冲代码路径风险不对称的理性压灭"
+                         "（p6 实测 code%% 50→3）。默认取 preset（0=关闭，旧行为）")
     ap.add_argument("--gen_gpu_mem", type=float, default=None,
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
@@ -820,6 +830,7 @@ def main():
     if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
+    if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows

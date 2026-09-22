@@ -100,6 +100,14 @@ ALGO_DEFAULTS = {
                         # 杀 NeMo-RL bug：trunc_shaping>0 时全错组+混合截断不再
                         # 产生假方差通过 group_ok（p9 step100 -8.5pp 的根因）。
                         overlong_filter=True,
+                        # 【2026-09-21 尝试级 shaping（#2 风险不对称修正）】
+                        # code_attempt_w>0：写出可执行代码块就给小分（不依赖
+                        # code_ok）——对冲"代码路径风险不对称"的理性压灭
+                        # （p6 实测 code% 50→3，outcome-only 下 RL 放弃代码）。
+                        # 0 = 关闭（旧行为逐位相同，单变量 A/B 对照位）。
+                        # 剂量参考：轨迹 ±1 域内 0.05×3次=+0.15，足以翻转
+                        # "写代码期望净收益为负"的算术但不淹没 outcome 主信号。
+                        code_attempt_w=0.0,
                         # 训练内嵌评测：每个 checkpoint 自动跑 test+train
                         eval_during_training=True,
                         code_w=0.0, reward_switch_step=1000000000,

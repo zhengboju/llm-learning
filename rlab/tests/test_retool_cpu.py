@@ -496,13 +496,14 @@ def test_multi_rollout_and_scoring():
     # code_used/code_ok 的口径**刻意不变**（末轮仍不计入）——它们是跨 run 比较的
     # code% 列，改语义会让 p8 的 48~70% 与后续 run 不可比。末轮废码单列一个字段，
     # 既补上可观测性又不动历史口径。
+    # 【2026-09-21 err_types】H 组走真沙箱（print(6*7) 真执行），成功执行追加 "ok"
     check("code_used/ok 统计正确（末轮代码仍不计入——跨 run 口径不变）",
           code_stats[0] == {"code_used": 2, "code_ok": 2, "code_wasted": 1,
-                            "trunc_final": 0}
+                            "trunc_final": 0, "err_types": ["ok", "ok"]}
           and code_stats[1] == {"code_used": 0, "code_ok": 0, "code_wasted": 0,
-                                "trunc_final": 0}
+                                "trunc_final": 0, "err_types": []}
           and code_stats[2] == {"code_used": 1, "code_ok": 1, "code_wasted": 0,
-                                "trunc_final": 0})
+                                "trunc_final": 0, "err_types": ["ok"]})
     check("末轮写代码 → code_wasted=1（旧版三个统计量同时为 0，与'啰嗦跑飞'无法区分）",
           code_stats[0]["code_wasted"] == 1 and code_stats[0]["trunc_final"] == 0)
     check("工具段内容 = 沙箱 stdout",
@@ -3872,7 +3873,140 @@ def test_overlong_filter():
           '"overlong_filter": cfg.get("overlong_filter")' in _tr)
 
 
-if __name__ == "__main__":
+def test_attempt_shaping_and_err_tier():
+    """【2026-09-21 终止链/压灭三件套】#2 尝试级 shaping + #6 错误类型分级 +
+    #1 配套签名。
+
+    #3（EOS 是否进训练序列）已由 vLLM 0.12 V1 源码证据链核对关闭：
+    token_ids 恒含 EOS（detokenizer 对 stop token 只跳过文本、id 恒 append），
+    gen_logps 与 ids 严格平行（len 不齐即 raise）——"答完就停"一直在拿梯度。
+    """
+    print("[AK] 尝试级 shaping + 沙箱错误分级 + 签名")
+    from rlab.reward import (reward_code_attempt, total_reward_retool_math)
+    from rlab.sandbox import classify_error
+    from rlab.config import get_config
+    from rlab.rollout import retool_score_flat
+
+    # ---- 1. reward_code_attempt 纯函数 ----
+    check("attempt_w=0 → 恒 0（旧行为逐位相同）", reward_code_attempt(3, 0.0) == 0.0)
+    check("attempt_w=0.05 × 2 次 = 0.1", abs(reward_code_attempt(2, 0.05) - 0.1) < 1e-9)
+    check("cap 在 max_rounds（防御异常大值）",
+          abs(reward_code_attempt(999, 0.05, max_rounds=4) - 0.2) < 1e-9)
+    check("code_used=0 → 0（没写代码不给分）", reward_code_attempt(0, 0.05) == 0.0)
+
+    # ---- 2. total_reward_retool_math 集成 ----
+    good_boxed = "\\boxed{42}"
+    sc0 = total_reward_retool_math("42", good_boxed, code_used=2,
+                                   code_attempt_w=0.0)
+    sc1 = total_reward_retool_math("42", good_boxed, code_used=2,
+                                   code_attempt_w=0.05, max_rounds=4)
+    check("attempt_w=0 与旧口径一致（reward 不含 shaping 项）",
+          sc0["reward"] == sc0["acc"] and sc0["code_attempt"] == 0.0)
+    check("attempt_w=0.05 → reward = acc + 0.1",
+          abs(sc1["reward"] - (sc1["acc"] + 0.1)) < 1e-9)
+    check("code_attempt 分量落盘", abs(sc1["code_attempt"] - 0.1) < 1e-9)
+    # 答错 + 写了代码：shaping 照给（把"敢写"与"写对"分开）
+    sc2 = total_reward_retool_math("99", good_boxed, code_used=1,
+                                   code_attempt_w=0.05, max_rounds=4)
+    check("答错也拿尝试分（对冲风险不对称的语义）",
+          abs(sc2["reward"] - (-1.0 + 0.05)) < 1e-9)
+    # 截断罚与尝试分可叠加
+    sc3 = total_reward_retool_math("42", good_boxed, code_used=1,
+                                   code_attempt_w=0.05, max_rounds=4,
+                                   trunc_final=1, trunc_shaping=0.5)
+    check("trunc 罚与 attempt 分叠加", abs(sc3["reward"] - (1.0 - 0.5 + 0.05)) < 1e-9)
+
+    # ---- 3. classify_error 纯函数 ----
+    check("超时 → timeout", classify_error(None, "", timed_out=True) == "timeout")
+    check("rc=0 → ok", classify_error(0, "", timed_out=False) == "ok")
+    check("SyntaxError traceback → syntax",
+          classify_error(1, 'SyntaxError: invalid syntax', False) == "syntax")
+    check("ValueError traceback → exception",
+          classify_error(1, 'ValueError: bad value', False) == "exception")
+    check("ModuleNotFoundError → exception（子类不冒充 syntax）",
+          classify_error(1, 'ModuleNotFoundError: No module named x', False)
+          == "exception")
+    check("无 traceback 的非零退出 → exception",
+          classify_error(137, "Killed", False) == "exception")
+
+    # ---- 4. retool_score_flat 透传 code_attempt_w ----
+    inputs = [{"Q": "q", "A": "42"}]
+    asst_texts = ["\\boxed{42}"] * 4 + ["\\boxed{41}"] * 4
+    cs_off = [{"code_used": 2 if k % 2 else 0, "code_ok": 0, "trunc_final": 0}
+              for k in range(8)]
+    cfg_base = get_config("retool_math", use_wandb=False)
+    cfg_off = {**cfg_base, "overlong_filter": False}
+    adv_off, _, _, _, _, _ = retool_score_flat(
+        inputs, asst_texts, cs_off, cfg_off, steps_elapsed=0)
+    cfg_on = {**cfg_off, "code_attempt_w": 0.05}
+    adv_on, _, _, _, _, _ = retool_score_flat(
+        inputs, asst_texts, cs_off, cfg_on, steps_elapsed=0)
+    # 数学：开启后 rewards[r] += 0.05*code_used[r]（写码样本 +0.1）。
+    # group_mean 归一化（减均值不除 std）→ 每样本 adv 差 = 该样本加分 − 组均值加分
+    # = (+0.1) − (4×0.1/8) = +0.05（写码样本）；(0) − 0.05 = −0.05（纯推理样本）。
+    # 等价于整个 adv 向量对写码/不写码两类各平移 ±0.05——方向正确（写码样本
+    # 相对优势上升）且组内零和保持。
+    check("score_flat：写码样本 adv 抬升 +0.05、纯推理样本 −0.05（相对优势上移）",
+          abs(float(adv_on[1] - adv_off[1]) - 0.05) < 1e-5
+          and abs(float(adv_on[0] - adv_off[0]) + 0.05) < 1e-5)
+
+    # ---- 5. config/签名/CLI ----
+    from rlab.train import run_signature, _is_opt_suffix
+    check("retool_math preset: code_attempt_w=0.0（默认关）",
+          get_config("retool_math", use_wandb=False)["code_attempt_w"] == 0.0)
+    sig_off = run_signature(cfg_off)
+    check("签名无 -caw（关闭时不加字符）", "-caw" not in sig_off)
+    sig_on = run_signature({**cfg_off, "code_attempt_w": 0.05})
+    check("签名含 -caw0.05（开启时进签名）", "-caw0.05" in sig_on)
+    check("迁移兼容：关签名是开签名前缀 + caw 段为 opt 后缀",
+          sig_on.startswith(sig_off) and _is_opt_suffix(sig_on[len(sig_off):]))
+    _tr = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
+    check("CLI: --code_attempt_w 存在且透传 overrides",
+          'add_argument("--code_attempt_w"' in _tr
+          and 'overrides["code_attempt_w"]' in _tr)
+    check("run_info: code_attempt_w 落盘",
+          '"code_attempt_w": cfg.get("code_attempt_w")' in _tr)
+
+    # ---- 6. #3 核对结论的文档锁：EOS 契约注释存在于 rollout.py ----
+    _ro = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
+    check("rollout.py 记录 EOS 契约（#3 核对结论沉淀）",
+          "EOS" in _ro and "vllm_token_ids_keep_eos" in _ro)
+
+
+def test_health_code_collapse():
+    """【2026-09-21 签名⑦ code_collapse】点火后 code% 掉 15pp 的压灭签名。
+
+    no_code 只看"恒为 0"（点火前才响），压灭是"点火后跌回"——三次 run
+    （run2/p5/p6）的 code% 50→3 均无告警，本签名补上这个盲区。"""
+    print("[AL] health 签名⑦ code_collapse")
+    from rlab.health import window_check
+
+    def hist_of(code_rates, n_extra=0):
+        h = [{"acc": 0.0, "fmt": 1.0, "clen": 1000.0,
+              "code_rate": cr, "trunc_rate": 0.2} for cr in code_rates]
+        h += [{"acc": 0.0, "fmt": 1.0, "clen": 1000.0,
+               "code_rate": 0.5, "trunc_rate": 0.2} for _ in range(n_extra)]
+        return h
+
+    # 开局点火 50% → 后期跌到 20%（跌 30pp ≥ 15pp，96 组门槛）→ 报警
+    rates = [0.5] * 64 + [0.2] * 32
+    codes = [c for c, _ in window_check(hist_of(rates), retool=True)]
+    check("点火后跌 30pp → code_collapse", "code_collapse" in codes)
+
+    # 开局点火 → 保持 45%（跌 5pp < 15pp）→ 不报
+    rates_ok = [0.5] * 64 + [0.45] * 32
+    codes_ok = [c for c, _ in window_check(hist_of(rates_ok), retool=True)]
+    check("保持稳定 → 无 code_collapse", "code_collapse" not in codes_ok)
+
+    # 开局从未点火（0.02）→ 后期仍低 → no_code 管辖，code_collapse 不报
+    rates_nofire = [0.02] * 64 + [0.01] * 32
+    codes_nf = [c for c, _ in window_check(hist_of(rates_nofire), retool=True)]
+    check("未点火场景不误报 code_collapse（开局 <15% 不触发）",
+          "code_collapse" not in codes_nf)
+
+
     test_extract()
     test_mask_ab()
     test_sandbox()
@@ -3918,6 +4052,8 @@ if __name__ == "__main__":
     test_eval_determinism_wiring()
     test_preflight_audit_fixes()
     test_overlong_filter()
+    test_attempt_shaping_and_err_tier()
+    test_health_code_collapse()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

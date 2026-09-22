@@ -369,6 +369,18 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
     错位 → gen_logps 基线失真、采样分布≠训练序列。token id 续写后生成/训练/
     mask 三方共用同一序列，text 只用于围栏提取/沙箱/打分。
 
+    【2026-09-21 核对·EOS 契约（#3 终止链核对，vllm_token_ids_keep_eos）】
+    vLLM 0.12 V1 源码证据链（output_processor/detokenizer）：EngineCoreOutput
+    的 new_token_ids 原样透传到 CompletionOutput.token_ids，EOS 自然停止时
+    token_ids **恒含 EOS**（detokenizer 的 stop-token 排除只作用于文本，
+    token id 走 token_ids.append(skipped_stop_token_id) 恒保留）；且
+    sampled_logps_from_output 对 len(logprobs)!=len(ids) 直接 raise，logprobs
+    与 ids 严格平行 → EOS 位有 logprob。结论：merged 训练序列含 EOS、
+    gen_logps 覆盖它——"答完就停"这个决策一直在拿梯度，无需补 EOS。
+    附带推论：Qwen 的 tokenizer.eos ≠ generation_config stop 词的坑在 vLLM
+    采样路径天然规避。已知妥协：stop-string 停止也报 finish_reason="stop"，
+    record 的 finish_reason 无法区分 EOS 停与围栏停（code_wasted 单列补救）。
+
     对每组样本：生成一段 → 检测 python 围栏代码块 → 有则沙箱执行 → 结果按
     TOOL_START/TOOL_END 回填 → 续生成下一轮；本轮无代码块则该样本结束（后续
     应给出最终答案）。最多 cfg['max_rounds'] 轮，其中**只有前 max_rounds-1 轮
@@ -395,7 +407,8 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
     # 每条请求的无 pad prompt token（与批量左 pad prompt_ids 同源：去 pad 即得）
     ctx_ids = [tokenizer(p, add_special_tokens=False)["input_ids"] for p in prompts_text]
     segs = [[] for _ in range(n)]
-    code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0} for _ in range(n)]
+    code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0,
+                   "err_types": []} for _ in range(n)]
     active = list(range(n))            # 还在"代码-执行-续写"循环里的样本
     n_rounds = int(cfg.get("max_rounds", 3))
     for _rnd in range(n_rounds):
@@ -463,9 +476,16 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                 done = [_run(p) for p in exec_jobs]
             for i, res in done:
                 code_stats[i]["code_ok"] += int(res["ok"])
+                # 错误类型分级（2026-09-21，#6）：模型反馈里带上结构化错误类型，
+                # 学差异化修复（timeout≠syntax≠算错）；code_stats 记录供监控。
+                etype = res.get("error_type") or ("ok" if res["ok"] else "exception")
+                code_stats[i].setdefault("err_types", []).append(etype)
                 # 消毒后再拼回（2026-09-10）：沙箱 stdout 模型间接可控，
                 # 特殊 token/工具标记字面量必须剥除——见 protocol.sanitize_tool_text
-                tool_text = TOOL_START + sanitize_tool_text(res["display"]) + TOOL_END
+                body = sanitize_tool_text(res["display"])
+                if not res["ok"] and etype not in ("ok",):
+                    body = f"[{etype}] " + body
+                tool_text = TOOL_START + body + TOOL_END
                 tool_ids = tokenizer(tool_text, add_special_tokens=False)["input_ids"]
                 segs[i].append({"kind": "tool", "text": tool_text, "ids": tool_ids})
                 results[i] = tool_ids
@@ -586,6 +606,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     _ol_ref = overlong_ref_tokens(cfg)
     _trunc_w = float(cfg.get("trunc_shaping", 0.0) or 0.0)
     _do_filter = bool(cfg.get("overlong_filter", False))
+    # 尝试级 shaping（#2 风险不对称修正）：默认 0 = 关闭，行为与旧版逐位相同
+    _att_w = float(cfg.get("code_attempt_w", 0.0) or 0.0)
+    _max_rounds = int(cfg.get("max_rounds", 8))
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
@@ -599,7 +622,10 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     overlong_shaping=cfg.get("overlong_shaping", False),
                     # 末段被轮长上限切断 → 额外扣分（prose 路径唯一够得到的长度反向信号）
                     trunc_final=_tf,
-                    trunc_shaping=_trunc_w)
+                    trunc_shaping=_trunc_w,
+                    code_used=code_stats[idx]["code_used"],
+                    code_attempt_w=_att_w,
+                    max_rounds=_max_rounds)
             else:
                 sc = total_reward_retool(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],

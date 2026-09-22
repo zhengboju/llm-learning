@@ -22,12 +22,40 @@
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 
 _IS_LINUX = sys.platform.startswith("linux")
+
+# 【2026-09-21 错误类型分级（#6）】从 traceback 末行提取异常类名——模型看到的
+# 反馈从"一坨截断文本"变成结构化错误类型（TimeoutError/SyntaxError/
+# ZeroDivisionError...），才能学到差异化的修复策略（标准 TIR 实现做法）。
+_ERR_TYPE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_.]*)Error(?=:|$)")
+
+
+def classify_error(returncode: int | None, stderr_tail: str,
+                   timed_out: bool) -> str:
+    """纯函数：把执行失败归类为粗粒度错误类型（供反馈与监控）。
+
+    返回值域："timeout" | "syntax" | "exception" | "no_output" | "ok" | "sandbox"。
+    stderr_tail 取 traceback 末行（run_code 已截）。解析不出类型名的
+    非零退出归 "exception"（有 traceback 但正则没抓住，如实降级）。"""
+    if timed_out:
+        return "timeout"
+    if returncode == 0:
+        return "ok"
+    m = _ERR_TYPE_RE.search(stderr_tail or "")
+    if m:
+        name = m.group(1).split(".")[-1].lower()
+        if "syntax" in name:
+            return "syntax"
+        return "exception"
+    if returncode is not None and returncode != 0:
+        return "exception"
+    return "sandbox"
 
 # auto-print 的"不可包裹行"判定：块开头/赋值/控制流语句补 print() 轻则打印出
 # 无意义对象、重则语法错误把原本能跑的代码变成 Error——拿不准就不包（宁可
@@ -87,7 +115,7 @@ def run_code(code: str, *, timeout: float = 5.0, mem_mb: int = 256,
     t0 = time.time()
     res = {"ok": False, "returncode": None, "timed_out": False,
            "duration": 0.0, "display": "Error! Empty code block", "stderr": "",
-           "auto_printed": 0}
+           "auto_printed": 0, "error_type": "sandbox"}
     if not code or not code.strip():
         return res
 
@@ -111,15 +139,20 @@ def run_code(code: str, *, timeout: float = 5.0, mem_mb: int = 256,
             res["stderr"] = err[-max_chars:]
             if proc.returncode == 0:
                 res["display"] = out[-max_chars:] if out else "Error! No output"
+                res["error_type"] = "no_output" if not out else "ok"
             else:
                 # 崩溃/异常：只取最后几行错误摘要（traceback 太长）
                 tail = err.splitlines()[-1] if err.splitlines() else f"exit {proc.returncode}"
                 res["display"] = f"Error! {tail[:300]}"
+                res["error_type"] = classify_error(
+                    proc.returncode, tail, timed_out=False)
         except subprocess.TimeoutExpired:
             res["timed_out"] = True
             res["display"] = "Error! The Code Execution timeout!"
+            res["error_type"] = "timeout"
         except OSError as e:
             res["display"] = f"Error! Sandbox launch failed: {e}"
+            res["error_type"] = "sandbox"
         finally:
             res["duration"] = time.time() - t0
     return res
