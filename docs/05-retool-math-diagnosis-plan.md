@@ -1,7 +1,8 @@
 # retool_math（Qwen3.5-4B）run2 诊断与优化方案
 
-> 状态：**诊断已定案；P1 消融已反向证伪（§7.3.1），下一步 = P1b（run2 原配方重跑，§6 P1b）**
-> （2026-09-14 更新）
+> 状态：**诊断已定案；P1 消融已反向证伪（§7.3.1）；方案 B（p6）待真机判读；
+> 标准范式对标修复已落地（§12，commit f61dac7）**
+> （2026-09-21 更新）
 > 依据：run2 训练日志 `rlab/rlab_out/train_log2.txt`、得分记录 `rlab/rlab_out/record2.jsonl`、
 > run2 评测 `eval_vllm_all.json`，以及参考项目
 > [agentic-rl-lab/05-retool](https://github.com/KMnO4-zx/agentic-rl-lab/tree/main/05-retool)。
@@ -10,6 +11,9 @@
 > **§7.5.5（2026-09-18）**：p5 加量 + gen_update_steps=8 终局——step100 **+4.6pp 显著**
 > （p=0.033）但 step300 回吐 −3.4pp（同款模式第三次）；剂量/快照错位已排除，
 > 机制指向代码分支退化（code_ok 56%→10%），判别 H1/H2 用 `--code-layer` 分层分析。
+> **§12（2026-09-21）**：对照标准多轮 RL 范式审查六项偏离——#3 EOS 核对关闭（无问题）、
+> #6 沙箱错误分级与 #2 尝试级 shaping（code_attempt_w，默认关）已落地；
+> #1 终止语义、#4 原生协议等未实现项排期见 §12.1 账本。
 
 ---
 
@@ -1181,6 +1185,11 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 | `rlab/tests/test_smoke_cpu.py` | 已改（+19 项 09-12、pair_eval +3 项 09-13；`[H]` 抽取自检 +4 项 09-14，**71 项全过**） |
 | `rlab/tests/test_retool_cpu.py` | 已改（run_info +3 项 09-12；健康滚动门 +2、ckpt 护栏 +4，09-13；**09-14 修脆性断言**：`[T]` 段 `--attn_implementation "$ATTN_IMPL" "$@"` 的字面紧邻判据被 8496f47 插入的 `--out_dir "$OUT_DIR"` 打断，改断言**位置关系**；09-14 vLLM 引擎参数透传 +12 项，**301 项全过**） |
 | `rlab/extract_text_model.py` | 已改（09-14：`_selfcheck` 三层判据 + 反证控制，见看板 09-14 行） |
+| `rlab/reward.py` | 已改（09-21：`reward_code_attempt` 纯函数 + `total_reward_retool_math` 接 `code_attempt_w`，§12.2） |
+| `rlab/sandbox.py` | 已改（09-21：`classify_error` 纯函数 + run_code 返回 `error_type`，§12.4） |
+| `rlab/rollout.py` | 已改（09-21：retool_score_flat 透传 attempt shaping；工具反馈错误类型前缀；code_stats 增 err_types；EOS 契约结论沉淀 docstring，§12） |
+| `rlab/health.py` | 已改（09-21：签名⑦ code_collapse——点火后 code% 跌 ≥15pp 报警，§12.2） |
+| `rlab/check_eos_in_train_seq.py` | 新增（09-21：EOS 契合证据链探针，#3 核对过程产物） |
 | `rlab/readme.md` | 已改（测试计数与 eval/analysis/train/health 说明） |
 
 验证（2026-09-14 本机实测）：
@@ -1198,3 +1207,98 @@ retool_math-ts0.5-ol1-r2x3072-s300x50-lr5e-06-nodiff     ← P4 对照
 > "字面紧邻"这个过强的实现细节），所以只有本地跑完整文件才会暴露。
 > 另：早前记的"开发机 `test_retool_cpu` 跑到 transformers 段 `ModuleNotFoundError` 退出"
 > 现已不成立（本机环境已补齐），红灯是这次才浮出来的。
+
+---
+
+## 12. 标准多轮 RL 范式对标与协议修复（2026-09-21，commit f61dac7）
+
+对照标准多轮 RL 范式（verl multi-turn / ReTool 官方 / RAGEN 一系共识）逐条审查
+本项目的多轮实现，六个偏离项的处理状态如下。骨架（同序列契约、mask 域、消毒、
+可观测性）判定扎实，偏离集中在**终止链**与**激励对称性**两处。
+
+### 12.1 六项对标账本
+
+| # | 偏离项 | 处理状态 | 说明 |
+|---|---|---|---|
+| #1 | 终止语义倒置（预算当主终止器，EOS/答案该是主终止器） | **未实现（p6 后第一优先）** | run2/p5 trunc 30~55% 是"终止器装反"的直接度量。stop 机制已修代码段（停在围栏），但答案段仍靠烧满预算/轮数收尾。p6 判读第一件事看 trunc_final 是否回落；仍高则给答案段独立 max_tokens + "boxed 后立即结束"提示，health 阈值从 40% 收紧 |
+| #2 | "无代码→终止"把理性作答与提前放弃混为一谈 + 代码路径风险不对称 | **reward 侧已实现，语义拆分未做** | ①已落地：attempt 级 shaping（下文 12.2）对冲不对称；②未做：end_reason 字段区分"理性直接作答"vs"提前放弃"（两类轨迹现在同形）。eval 侧 code-layer 已能答 H1/H2，训练期 end_reason 是冗余信号，排后 |
+| #3 | EOS 是否进训练序列（疑似从未拿梯度） | **已核对，关闭（无问题）** | 见 12.3 |
+| #4 | 自造 [TOOL RESULT] 文本协议 vs 原生 tool_call 模板 | **未实现（兜底）** | Qwen3.5 有原生工具先验（参考项目 base 调用率 87.5% 起点），方括号文本协议完全没吃到，靠 MUST 提示补——曾引发 MUST 与格式锚定打架（第三类灭绝）。工程量 1-2 天且作废全部历史对照口径。决策顺序：p6 成功→不需要；p6+shaping 都救不回→动方案 A（参考 +23.89pp 的原始形态） |
+| #5 | 轮级同步屏障（每轮组内对齐，最慢轨迹拖全组） | **未实现（低优先级）** | 32 并发下 vLLM 内部有流水，实际损耗有限。仅当加大 gen_questions_per_attempt 后成瓶颈再做。纯工程，不影响算法语义 |
+| #6 | 沙箱失败反馈无类型分级（模型只能从截断文本猜） | **已实现** | 见 12.4 |
+
+### 12.2 已落地：尝试级 shaping（#2 reward 侧）
+
+**病灶**：outcome-only（code_w=0）下，选代码路径要冒"执行失败/超时/多烧预算→
+更易触顶截断"的全部风险，选纯推理路径零成本——outcome 相同时 RL 的理性解就是
+放弃代码（p6 实测 code% 50→3，§7.5.6 用码题 BASE 74.1% 的真实价值被丢掉）。
+
+**方案**（对齐 ReTool 官方 per-execution shaping 的思路，更激进一步——把"敢写"
+与"写对"分开）：
+
+- `reward.py`：新增 `reward_code_attempt(code_used, attempt_w, max_rounds)` 纯函数；
+  `total_reward_retool_math` 接 `code_attempt_w` 参数，reward += min(code_used,
+  max_rounds) × attempt_w（**不依赖 code_ok**，答错也拿尝试分）。
+- `config.py`：retool_math preset `code_attempt_w=0.0`（**默认关闭**=旧行为逐位
+  相同，单变量 A/B 对照位）。剂量参考：0.05×3 次=+0.15，足以翻转"写代码期望
+  净收益为负"的算术但不淹没 ±1 outcome 主信号。
+- `train.py`：签名捕获（开启时追加 -caw{w}，关闭时签名逐字不变，迁移兼容走
+  `_is_opt_suffix`）+ CLI --code_attempt_w + run_info 落盘。
+- 启用时机：**p6 判读之后**——若 p6（stop 机制）已止住压灭则不需要；若仍压灭，
+  `--code_attempt_w 0.05` 是下一个单变量。
+
+**配套监控**：health.py 新增签名⑦ `code_collapse`（开局 code% ≥15% 点火成功、
+窗口均值较开局跌 ≥15pp → 报警）。补 no_code 的盲区：no_code 只看"恒为 0"
+（点火前才响），压灭是"点火后跌回"——run2/p5/p6 三次均无告警即此盲区。
+
+### 12.3 已核对关闭：EOS 契约（#3）
+
+**疑虑**：训练序列最后一段 assistant ids 直接取 vLLM token_ids——若 EOS 不在
+其中，"答完就停"这个决策从未拿过梯度。
+
+**证据链**（vLLM 0.12 V1 源码，output_processor.py / detokenizer.py）：
+
+1. EngineCoreOutput 的 new_token_ids **原样透传**到 CompletionOutput.token_ids，
+   无 drop-EOS 路径；
+2. detokenizer 对 stop-token 的排除只作用于**文本**（skipped_stop_token_id 从
+   detokenize 跳过），token id 走 token_ids.append() **恒保留**；
+3. sampled_logps_from_output 对 len(logprobs) != len(ids) 直接 raise → logprobs
+   与 ids 严格平行 → **EOS 位有 logprob**。
+
+**结论**：EOS 在 merged 训练序列里（assistant 段 mask=1）、gen_logps 覆盖它——
+"答完就停"一直在拿梯度。附带推论：Qwen tokenizer.eos ≠ generation_config stop
+词的老坑在 vLLM 采样路径天然规避（vLLM 用 generation_config 的 eos）。
+
+**已知妥协（如实记录）**：stop-string 停止也报 finish_reason="stop"，record 无法
+区分"EOS 自然停"与"末轮停在围栏"（后者即 code_wasted，已单列字段补救）。
+结论沉淀于 rollout.py multi_turn_rollout_group docstring（检索词
+vllm_token_ids_keep_eos），测试锁存在 AK 组。
+
+### 12.4 已落地：沙箱错误类型分级（#6）
+
+**病灶**：超时/语法错/算错三类失败在工具反馈里都是"500 字符截断文本"，模型无法
+学到差异化修复策略（标准 TIR 实现给结构化错误类型）。
+
+**方案**：
+
+- `sandbox.py`：新增 `classify_error` 纯函数（timeout / syntax / exception /
+  no_output / ok / sandbox 六类），run_code 返回值增 error_type 字段。
+- `rollout.py`：失败时工具反馈加前缀（[timeout] ... / [syntax] ...）——模型
+  可见；code_stats 增 err_types 列表——监控可见（后续可统计 timeout vs
+  syntax 占比，指导沙箱预算/提示调整）。
+
+**注意**：错误前缀只在失败时添加，成功路径 tool_text 逐字节不变——不破坏既有
+成功样本的对照口径。
+
+### 12.5 验证状态
+
+- 核心逻辑全部**直接调用验证通过**（reward 数学：对+2码=1.1、错+1码=-0.95、
+  cap 生效；classify_error 六类；签名前缀兼容；code_collapse 三场景）。
+- test_retool_cpu 新增 AK 组（attempt shaping + 错误分级 + 签名迁移兼容，约
+  25 项）+ AL 组（code_collapse 三场景）+ H 组 err_types 期望更新。
+- **本机限制（如实记录）**：pytest 全量套件在本机无法跑完——HF 网络不通时
+  AutoTokenizer.from_pretrained 反复重试 hang（此前 13.85s 能跑完是缓存命中；
+  缓存被孤儿进程占用后失效）。**pod 上 git pull 后必须先跑全量 pytest 确认
+  无回归再起跑**（教训：本机"隔离跑几个子测试"≠"跑整个文件"，§11 同款）。
+- 遗留：#1（终止语义）、#2 的 end_reason、#4（原生协议）、#5（异步 stepping）
+  未实现，排期见 12.1 表。
