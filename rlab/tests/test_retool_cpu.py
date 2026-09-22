@@ -3968,6 +3968,40 @@ def test_attempt_shaping_and_err_tier():
     check("run_info: code_attempt_w 落盘",
           '"code_attempt_w": cfg.get("code_attempt_w")' in _tr)
 
+    # ---- 5b.【2026-09-23】CLI 缺口补齐：采样协议/题目调度/overlong_buffer ----
+    # 契约：① argparse 存在；② 透传到 overrides；③ 偏离进 run_signature 的
+    # opt 段（CLI 改的 run 必须可与旧 ckpt 分辨——不改签名就会撞 out_dir，
+    # --num_pre_Q 4 静默腰斩 lr 的同类盲区）；④ 默认 None（=不覆盖 preset，
+    # 历史签名逐字不变）。
+    for flag, key in (('"--temperature"', 'overrides["temperature"]'),
+                      ('"--top_k"', 'overrides["top_k"]'),
+                      ('"--top_p"', 'overrides["top_p"]'),
+                      ('"--q_skip_streak"', 'overrides["q_skip_streak"]'),
+                      ('"--q_pool_reset_floor"', 'overrides["q_pool_reset_floor"]'),
+                      ('"--overlong_buffer"', 'overrides["overlong_buffer"]')):
+        check(f"CLI: {flag} 存在且透传 overrides", flag in _tr and key in _tr)
+    _base_cfg = get_config("retool_math", use_wandb=False)
+    sig_base = run_signature(_base_cfg)
+    # 默认值下新键不加字符（历史签名前缀兼容）
+    for frag in ("-tk", "-tp", "-qs", "-qf", "-ob"):
+        check(f"默认 {frag} 不进签名（历史签名不变）", frag not in sig_base)
+    # 每个新键偏离时都进签名，且旧→新满足前缀兼容判据（_is_opt_suffix）
+    for key, val, frag in (("top_k", 50, "-tk50"), ("top_p", 0.95, "-tp0.95"),
+                           ("q_skip_streak", 3, "-qs3"),
+                           ("q_pool_reset_floor", 128, "-qf128"),
+                           ("overlong_buffer", 128, "-ob128")):
+        sig_v = run_signature({**_base_cfg, key: val})
+        check(f"偏离 {key}={val} 进签名（{frag}）", frag in sig_v)
+        check(f"{key} 偏离段满足前缀兼容（_is_opt_suffix 认得）",
+              sig_v.startswith(sig_base) and _is_opt_suffix(sig_v[len(sig_base):]))
+    # temperature 偏离走既有 "T" 键（回归：别把原有键改坏）
+    sig_T = run_signature({**_base_cfg, "temperature": 0.8})
+    check("temperature 偏离进签名（既有 -T 键不回归）", "-T0.8" in sig_T)
+    # 键名前缀冲突防回归："tk"/"tp" 都是 "t" 开头但与既有单字母段可区分
+    # ——_is_opt_suffix 的最长优先匹配必须把 "-tk50" 识别为 opt 段而非未知段
+    check("_is_opt_suffix 识别新前缀 tk/tp/qs/qf/ob",
+          _is_opt_suffix("-tk50-tp0.95-qs3") and not _is_opt_suffix("-zzz1"))
+
     # ---- 6. #3 核对结论的文档锁：EOS 契约注释存在于 rollout.py ----
     _ro = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()

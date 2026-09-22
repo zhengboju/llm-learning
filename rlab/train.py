@@ -136,10 +136,16 @@ def run_signature(cfg: dict) -> str:
     # "外来签名"，正在跑的 run 中途重启也不会被自己的护栏拦死。
     _opt_tag = ""
     _preset = ALGO_DEFAULTS.get(cfg.get("algo"), {})
+    # 【2026-09-23 新增四键】top_k/top_p/q_skip_streak/q_pool_reset_floor——
+    # 与新增 CLI 配套：CLI 偏离必须进签名（否则新旋钮的 run 又会撞名）。
+    # temperature 已在表里（"T"）。
     for _key, _pfx in (("beta", "b"), ("gradient_accumulation_steps", "g"),
                        ("num_pre_Q", "n"), ("gen_update_steps", "u"),
                        ("temperature", "T"), ("adv_mode", "a"),
-                       ("max_context_tokens", "c"), ("seed", "sd")):
+                       ("max_context_tokens", "c"), ("seed", "sd"),
+                       ("top_k", "tk"), ("top_p", "tp"),
+                       ("q_skip_streak", "qs"), ("q_pool_reset_floor", "qf"),
+                       ("overlong_buffer", "ob")):
         _cur = cfg.get(_key)
         _dflt = _preset.get(_key, BASE.get(_key))
         if _cur != _dflt:
@@ -191,7 +197,8 @@ def _ckpt_signature(ckpt_dir: str):
 
 
 # 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
-_OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of")
+_OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
+                     "tk", "tp", "qs", "qf", "ob")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -691,6 +698,36 @@ def main():
                     help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
                          "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
                          "--no-retool_stop 关闭 = p6 旧协议（A/B 对照位）")
+    # 【2026-09-23 补 CLI 缺口·采样协议三件套】temperature/top_k/top_p 此前只能改
+    # config.py preset —— 而 preset 偏离不进 run_signature 的优化器段（签名只对 CLI
+    # 偏离追加字符），改源码的 run 会与旧 ckpt 撞同一个 out_dir（--num_pre_Q 4
+    # 静默腰斩 lr 的同类盲区）。采样协议是探索分布的旋钮（temp0.9 格式率事件
+    # 已实证它的杠杆量级），A/B 必走 CLI 让签名可分辨。
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="覆盖采样温度（retool_math preset=1.0 对齐参考实现；"
+                         "降温会压探索 → 组内更易全对/全错 → 零方差丢弃率上升）")
+    ap.add_argument("--top_k", type=int, default=None,
+                    help="覆盖 top_k（-1=vLLM 全词表，retool_math preset；"
+                         "50=GSM8K 家族历史口径。与 loss_norm 有算法特异交互，"
+                         "见 AGENTS.local.md DAPO 缺口定案）")
+    ap.add_argument("--top_p", type=float, default=None,
+                    help="覆盖 top_p（默认 1.0）")
+    # 【2026-09-23 补 CLI 缺口·题目调度两件套】q_skip_streak/q_pool_reset_floor
+    # 此前只能改 BASE：训练分布单调变易（静态难度表过期）时，重置粒度是第一
+    # 调整位（调小 floor = 重置更频繁 = 难题更快重新入场），必须可从命令行做
+    # 单变量实验而不是改源码。
+    ap.add_argument("--q_skip_streak", type=int, default=None,
+                    help="覆盖题目拉黑阈值：同题连续 N 次零方差组后暂时移出池子"
+                         "（BASE 默认 2）")
+    ap.add_argument("--q_pool_reset_floor", type=int, default=None,
+                    help="覆盖题目过滤池重置下限：候选低于该数时全量重置"
+                         "（难题随模型变强重新入场；BASE 默认 64，训练后期"
+                         "分布漂移可调小让重置更频繁）")
+    # 【2026-09-23 补 CLI 缺口】overlong shaping 缓冲区宽度：trigger =
+    # overlong_ref_tokens − buffer，决定软悬崖的起点与斜率（shaping 调参高频项）。
+    ap.add_argument("--overlong_buffer", type=int, default=None,
+                    help="覆盖 overlong 软悬崖缓冲区（BASE 默认 64，retool_math "
+                         "preset=256）：越窄坡越陡、惩罚越早开始")
     ap.add_argument("--code_attempt_w", type=float, default=None,
                     help="尝试级 shaping：写出可执行代码块就给 code_attempt_w 小分"
                          "（不依赖 code_ok），对冲代码路径风险不对称的理性压灭"
@@ -831,6 +868,14 @@ def main():
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
+    # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
+    if args.temperature is not None: overrides["temperature"] = args.temperature
+    if args.top_k is not None: overrides["top_k"] = args.top_k
+    if args.top_p is not None: overrides["top_p"] = args.top_p
+    if args.q_skip_streak is not None: overrides["q_skip_streak"] = args.q_skip_streak
+    if args.q_pool_reset_floor is not None:
+        overrides["q_pool_reset_floor"] = args.q_pool_reset_floor
+    if args.overlong_buffer is not None: overrides["overlong_buffer"] = args.overlong_buffer
     if args.gen_gpu_mem is not None: overrides["gen_gpu_mem"] = args.gen_gpu_mem
     if args.zero_stage is not None: overrides["zero_stage"] = args.zero_stage
     if args.micro_rows is not None: overrides["micro_rows"] = args.micro_rows
