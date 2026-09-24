@@ -317,7 +317,7 @@ def save_checkpoint(cfg, engine, tokenizer, save_name, sd) -> str:
 
 
 def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
-                     eval_n=500):
+                     eval_n=500, eval_timeout_s=900):
     """checkpoint 保存后自动跑评测（test + train split），结果落进 step_N/eval_*.json。
 
     【2026-09-21 为什么需要它】p9 训练完 11 小时才发现 step100 测试集 -8.5pp（NeMo
@@ -350,9 +350,20 @@ def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
         print(f"[eval] step {step} {_split} ...", flush=True)
         try:
             _proc = _sp.run(_cmd, env=_env, capture_output=True, text=True,
-                            timeout=900)
-        except _sp.TimeoutExpired:
-            print(f"[eval] step {step} {_split} TIMEOUT (>15min)", flush=True)
+                            timeout=eval_timeout_s)
+        except _sp.TimeoutExpired as _te:
+            # 【2026-09-24 盲窗修复】超时不再静默吞掉：写一个"空结果"哨兵 json，
+            # 让后续 analysis 显式报"该 checkpoint 无评测（盲）"，而不是当作不存在。
+            # 否则"没结果"与"没评"无法区分，p10 的 8 路全 TIMEOUT 就是这样无声发生。
+            _stub = {"acc": None, "fmt": None, "code_rate": None, "n": None,
+                     "error": "timeout", "detail": str(_te)[:200]}
+            try:
+                with open(_out, "w", encoding="utf-8") as _f:
+                    json.dump(_stub, _f, ensure_ascii=False)
+            except OSError:
+                pass
+            print(f"[eval] step {step} {_split} TIMEOUT (>={eval_timeout_s}s)，"
+                  f"已落空结果哨兵 -> {_out}（此 checkpoint 本轮为盲窗）", flush=True)
             continue
         if _proc.returncode == 0 and os.path.exists(_out):
             with open(_out, encoding="utf-8") as f:
@@ -656,9 +667,10 @@ def run_training(cfg, args):
                     _eval_gpu = str(cfg.get("eval_gpu", "0"))
                     _eval_mem = float(cfg.get("eval_gpu_mem", 0.20))
                     _eval_n = int(cfg.get("eval_n", 500))
+                    _eval_to = int(cfg.get("eval_timeout_s", 900) or 900)
                     _run_inline_eval(cfg, save_name, step,
                                      eval_gpu=_eval_gpu, eval_gpu_mem=_eval_mem,
-                                     eval_n=_eval_n)
+                                     eval_n=_eval_n, eval_timeout_s=_eval_to)
             dist.barrier()
 
 
@@ -881,6 +893,12 @@ def main():
     ap.add_argument("--eval_gpu_mem", type=float, default=None,
                     help="内嵌评测 vLLM 显存占比（默认 0.20；4B 权重 8.6G+KV 池 "
                          "10G=18.6G < 0.20×96G=19.2G，与训练 vLLM 共存）")
+    ap.add_argument("--eval_timeout_s", type=int, default=None,
+                    help="内嵌评测每路（test/train）的超时上限秒。retool 多轮采样档"
+                         "（n=500×4轮）实测 15 分钟跑不完 → 旧硬编码 900s 让 p10 的 "
+                         "step100/200/300/400 共 8 路全 TIMEOUT、eval 全程盲窗。"
+                         "retool_math preset 默认 3600；超时会落空结果哨兵 json "
+                         "（不静默吞）")
     args = ap.parse_args()
 
     overrides = {}
@@ -959,6 +977,8 @@ def main():
         overrides["eval_gpu"] = args.eval_gpu
     if args.eval_gpu_mem is not None:
         overrides["eval_gpu_mem"] = args.eval_gpu_mem
+    if args.eval_timeout_s is not None:
+        overrides["eval_timeout_s"] = args.eval_timeout_s
 
     cfg = get_config(args.algo, **overrides)
     # 【2026-09-12】偏离签名先算好再打印/落盘：wandb run name 与 run_info.json 同源，

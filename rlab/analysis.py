@@ -535,6 +535,21 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         clen_cap, _cap_src = record_clen_cap(path)
     else:
         _cap_src = f"显式传入{clen_cap}"
+    # 【2026-09-24 盲窗可见性】推导本 record 目录下训练存档点：内嵌评测结果
+    # step_N/eval_test.json 缺失或为超时哨兵（acc=None）的 checkpoint 在曲线表上
+    # 标 "盲"，把"没评测"摆到明处（p10 8 路全 TIMEOUT 的盲窗教训）。
+    _dir = os.path.dirname(os.path.abspath(path))
+    _ckpt_steps = []
+    try:
+        _save = None
+        with open(os.path.join(_dir, "run_info.json"), encoding="utf-8") as _f:
+            _ri = json.load(_f)
+        _save = _ri.get("save_steps")
+        if _save and int(_save) > 0:
+            _all = int(_ri.get("all_steps", 0) or 0) or _save
+            _ckpt_steps = sorted({s for s in range(int(_save), _all + 1, int(_save))})
+    except (OSError, ValueError, TypeError):
+        _ckpt_steps = []
     accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
     cws = []             # 每样本末轮浪费的代码调用次数（2026-09-20）
     stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
@@ -622,8 +637,8 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
            f"「≥{int(0.9 * clen_cap)}」列 = 接近**全轨迹**预算（撞它会被整组丢弃）；"
            f"末段被单轮上限切断请看 trunc 列。",
            "",
-           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | 末轮废码率 | avg_clen | staleness | 阶段 | 会话 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | 末轮废码率 | avg_clen | staleness | 阶段 | 会话 | 评测 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
         out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
                       f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
@@ -667,11 +682,34 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         _a_rate = sum(chunk_a) / len(chunk_a)
         _f_rate = sum(chunk_f) / len(chunk_f)
         cond_col = f"{_a_rate / _f_rate * 100:.1f}%" if _f_rate > 0 else "—"
+        # 【2026-09-24 盲窗可见性】该窗口覆盖的样本区间若有 checkpoint（save_steps
+        # 间隔内第一个窗口），且其内嵌评测缺失或为超时哨兵（acc=None）→ 标 "盲"。
+        # p10 的 8 路内嵌评测全 TIMEOUT 且无任何提示，训练侧盲跑 30h——本列把
+        # "没评测"摆在表上，不再让盲窗隐形。
+        _bl = "—"
+        if _ckpt_steps and sess_ids and i < len(sess_ids):
+            _w_samp = [i, j - 1]
+            for _cs in _ckpt_steps:
+                _cs_samp = (_cs - 1) * 8
+                if _cs_samp < _w_samp[0] or _cs_samp > _w_samp[1]:
+                    continue
+                _es = os.path.join(_dir, f"step_{_cs}", "eval_test.json")
+                _blind = True
+                if os.path.exists(_es):
+                    try:
+                        with open(_es, encoding="utf-8") as _f:
+                            _er = json.load(_f)
+                        _blind = _er.get("n") is None or _er.get("acc") is None
+                    except (OSError, ValueError):
+                        _blind = True
+                if _blind:
+                    _bl = "盲"
+                break
         out.append(f"| {i}~{j} | {i // 8}~{j // 8} "
                    f"| {_a_rate * 100:.1f}% "
                    f"| {_f_rate * 100:.1f}% | {cond_col} | {code_col} "
                    f"| {ok_col} | {tr_col} | {wst_col} | {len_col} | {stal_col} "
-                   f"| {ph_col} | {sess_col} |")
+                   f"| {ph_col} | {sess_col} | {_bl} |")
     if sess_lines:
         out.append("")
         out.append(f"== 会话拆分（新协议=gen_version 回退；旧协议=>{SESS_GAP_S:.0f}s 间隔）==")

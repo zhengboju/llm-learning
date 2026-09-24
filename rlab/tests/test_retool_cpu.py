@@ -3513,6 +3513,66 @@ def test_eval_determinism_wiring():
               "action=argparse.BooleanOptionalAction" in src)
 
 
+def test_inline_eval_timeout_fix():
+    """【2026-09-24 内嵌评测盲窗修复（p10 事故）】
+
+    p10：retool 多轮采样档（n=500×4轮×6144 token）单路评测 >15min，train.py 硬编码
+    timeout=900 → step100/200/300/400 的 test+train 共 8 路全 TIMEOUT、eval_*.json
+    全缺失 → 30h 训练全程盲跑（2026-09-21 加内嵌评测治的正是 p9"训完 11h 才发现
+    深坑"——被这个超时反手做成同类盲窗）。
+
+    修复三件套（本测试锁死）：
+      1) 超时进配置：BASE=900 保旧行为、retool_math preset=3600（=手动跑预算），
+         可 CLI --eval_timeout_s 覆盖；
+      2) 超时不再静默：写"空结果哨兵" eval_*.json（acc=None/n=None），后续
+         analysis 显式报"盲"，不吞；
+      3) analysis --record 表加「评测」列：哨兵/缺失 checkpoint 所在窗口标"盲"。
+    """
+    print("[AK] 内嵌评测超时修复（p10 盲窗）")
+    tr = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    cf = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "config.py"), encoding="utf-8").read()
+    an = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "analysis.py"), encoding="utf-8").read()
+
+    # 1) 超时进配置 + preset 抬升（旧 900s 只该属于 BASE 档）
+    check("train: 内嵌评测超时取自 cfg 并透传（不再硬编码 900）",
+          "def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu=\"0\", eval_gpu_mem=0.20,\n"
+          "                     eval_n=500, eval_timeout_s=900):" in tr
+          and "timeout=eval_timeout_s" in tr
+          and "_eval_to = int(cfg.get(\"eval_timeout_s\", 900) or 900)" in tr)
+    check("config: BASE 默认 900（历史行为不变）且 retool_math preset 抬到 3600",
+          "eval_timeout_s=900," in cf and "eval_timeout_s=3600," in cf)
+    check("train: CLI --eval_timeout_s 存在并接进 overrides",
+          '"--eval_timeout_s"' in tr
+          and 'if args.eval_timeout_s is not None:\n        overrides["eval_timeout_s"] = args.eval_timeout_s' in tr)
+
+    # 2) 超时落"空结果哨兵"（acc=None）——不静默吞
+    check("train: 超时写哨兵 json（acc=None/n=None）并打印盲窗提示",
+          '"error": "timeout"' in tr and '"acc": None' in tr
+          and "已落空结果哨兵" in tr)
+
+    # 3) analysis --record 表加「评测」列：哨兵/缺失标 "盲"
+    check("analysis: 表头加「评测」列",
+          "| 评测 |" in an and "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|" in an)
+    check("analysis: 哨兵/缺失判盲（acc=None 或 n=None → 盲）",
+          "_er.get(\"n\") is None or _er.get(\"acc\") is None" in an
+          and "\"盲\"" in an)
+
+    # 4) 配置合并端到端：preset 覆盖 + CLI 覆盖都走 get_config
+    from rlab.config import get_config
+    _c = get_config("retool_math", use_wandb=False)
+    check("config: retool_math preset 的 eval_timeout_s=3600 生效（端到端）",
+          _c.get("eval_timeout_s") == 3600)
+    _c2 = get_config("retool_math", use_wandb=False, eval_timeout_s=7200)
+    check("config: --eval_timeout_s 显式覆盖生效（端到端）",
+          _c2.get("eval_timeout_s") == 7200)
+    _c3 = get_config("grpo", use_wandb=False)
+    check("config: BASE 档（grpo）保持 900（旧行为零变化）",
+          _c3.get("eval_timeout_s") == 900)
+
+
 def test_preflight_audit_fixes():
     """【2026-09-20 pre-flight 审查八项修复】每项都锁"旧行为会怎么错"。
 
@@ -4199,6 +4259,7 @@ def test_health_code_collapse():
     test_logprobs_n_fix_path()
     test_val_n_metric_fixes()
     test_eval_determinism_wiring()
+    test_inline_eval_timeout_fix()
     test_preflight_audit_fixes()
     test_overlong_filter()
     test_attempt_shaping_and_err_tier()

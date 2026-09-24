@@ -110,6 +110,10 @@ ALGO_DEFAULTS = {
                         code_attempt_w=0.0,
                         # 训练内嵌评测：每个 checkpoint 自动跑 test+train
                         eval_during_training=True,
+                        # 【2026-09-24 p10 盲窗事故】retool 多轮采样档 n=500×4 轮
+                        # 15 分钟跑不完 → 旧 900s 全部 TIMEOUT → 内嵌评测形同虚设。
+                        # 抬到 3600（与 eval_vllm_one.py 手动跑同预算）。
+                        eval_timeout_s=3600,
                         code_w=0.0, reward_switch_step=1000000000,
                         # 【2026-09-11 eval 全灭事故】思考开关收进 preset 单点同源：
                         # Qwen3.5 默认 enable_thinking=True，eval 端 prompt 构造从
@@ -326,6 +330,14 @@ BASE = dict(
     eval_n=500,
     eval_gpu="0",
     eval_gpu_mem=0.20,
+    # 【2026-09-24 内嵌评测超时（p10 盲窗事故）】每路（test/train）评测子进程的超时上限
+    # 秒。retool 多轮采样档（n=500×4轮×6144 token，temp1.0）实测 15 分钟物理上跑不完，
+    # 旧硬编码 900s 让 step100/200/300/400 共 8 路全部 TIMEOUT、eval_*.json 缺失——训练
+    # 期间全程盲跑（2026-09-21 加内嵌评测就是为了治 p9"训完 11h 才发现深坑"的教训，被
+    # 这个超时反手做成同类盲窗）。BASE 900 保持旧行为；retool_math preset 抬到 3600
+    # （与 eval_vllm_one.py 的手动跑一致），并落一个"超时即写空结果 json"的哨兵——
+    # 宁可留 null 让后续工具显式报"盲"，也不再静默吞掉（analysis 读到空 n 会拒绝下结论）。
+    eval_timeout_s=900,
     # 【2026-09-12 靶向 shaping·长度膨胀的真正出口】末段被轮长上限切断
     # （trunc_final=1）的额外扣分。为什么不能只靠 overlong_shaping：completion
     # 总长惩罚够不到"单轮就结束"的 prose 轨迹（clen ≤ round_gen_tokens < trigger）。

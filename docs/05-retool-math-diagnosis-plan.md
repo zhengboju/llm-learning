@@ -1302,3 +1302,24 @@ vllm_token_ids_keep_eos），测试锁存在 AK 组。
   无回归再起跑**（教训：本机"隔离跑几个子测试"≠"跑整个文件"，§11 同款）。
 - 遗留：#1（终止语义）、#2 的 end_reason、#4（原生协议）、#5（异步 stepping）
   未实现，排期见 12.1 表。
+
+### 12.6 内嵌评测盲窗修复（2026-09-24，p10 事故）
+
+**病灶**：`train.py _run_inline_eval` 硬编码 `timeout=900`，retool 多轮采样档
+（n=500×4轮×6144 token，temp1.0）单路评测 >15min 物理上跑不完 → p10 的
+step100/200/300/400 × test+train 共 **8 路内嵌评测全 TIMEOUT**、eval_*.json 全缺失
+→ 30h 训练全程盲跑。2026-09-21 加内嵌评测治的正是 p9"训完 11h 才发现深坑"——
+被这个超时反手做成同类盲窗。
+
+**修复三件套**（逐项可测，见 p10-diagnosis.md §3.2）：
+
+1. **超时进配置**：BASE `eval_timeout_s=900`（旧行为零变化）、retool_math preset
+   `3600`；CLI `--eval_timeout_s` 覆盖。config.py BASE 段 + retool_math preset 段。
+2. **超时不静默**：超时写"空结果哨兵" `eval_*.json`（acc=None/n=None/error=timeout）
+   并打印"此 checkpoint 本轮为盲窗"——"没评测"与"没结果"从此可区分。
+3. **盲窗可见**：`analysis.py --record` 表新增「评测」列，哨兵/缺失 checkpoint 所在
+   窗口标"盲"。
+
+**验证**：test_retool_cpu 新增 AK 组 `test_inline_eval_timeout_fix`（9 项，锁 config
+默认/preset/CLI 三层接线 + 哨兵形态 + analysis 判盲口径 + get_config 端到端）；
+合成 fixture 实测 `summarize_record` 判盲正确。
