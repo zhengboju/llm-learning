@@ -2524,6 +2524,9 @@ def test_pyflakes_undefined():
              "rlab/data.py", "rlab/prepare_dapo_math.py", "rlab/diag_logps.py",
              # 【2026-09-20】rlab/eval.py 此前漏在清单外（改它时无静态防线）
              "rlab/eval.py",
+             # 【2026-09-25】新增诊断脚本一律入清单（本文件初版就带过一个全角
+             # 括号笔误 → SyntaxError；静态检查是唯一能在提交前拦住它的防线）
+             "rlab/diag_eval_gap.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
