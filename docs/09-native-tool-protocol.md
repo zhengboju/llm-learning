@@ -281,6 +281,13 @@ mask 错时 loss≈3.4 且工具位梯度非 0（假信号）。
 | `system_prompt` | concise 围栏版 | **原生工具版** | 删围栏措辞 |
 | **其余全部** | — | **不变**（保持 `lr 1e-6` / `β 0.04` / 各 shaping 原值） | **单变量纪律** |
 
+> **⚠ "各 shaping 原值"这一行必须靠 CLI 显式传才成立**（2026-09-25 实算发现）：
+> p11 实跑是 `code_w=0.05 / code_attempt_w=0.05 / len_penalty_w=0.1`（run_info 实读，
+> 签名 `-caw0.05-cw0.05-lp0.1` 印证），而**当前 preset 里这三个都是 0.0**。
+> 照 §10.3 的命令原样跑会**静默用 0.0 覆盖 p11 的实跑值**，把 §5.2 的第 3、4 项
+> 并进协议变更里（9 处差异而非 5 处）。**要严格单变量，必须显式传这三个 flag**
+> ——完整命令与两个选法的代价对比见 §10.3.1。
+
 ### 5.2 后续单变量（**一轮一个，不要合并**）
 
 协议跑通（判据见 §6.2）后按序：
@@ -543,37 +550,122 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.native_probe --model_path /root/Qwen3.5-4B
 #    段边界合并（§10.6.2 事故 A/B）。已修：判据改为**解码文本相同**。
 #    重跑时应看到一次 "[protocol] 模板重渲染与拼接上下文 token 数差 N …只报这一次"，
 #    那是**正常**的表示层差异告警，不是错误。
+#
+#    ⚠ 步数 flag 是 **--steps**（映射到 all_steps），不是 --all_steps
+#      —— 实跑 `train.py: error: unrecognized arguments: --all_steps 20`。
+#
+#    ⚠ 严格单变量的完整命令 = 下面这行 + §10.3.1 选法① 的四个 flag
+#      （--code_w 0.05 --code_attempt_w 0.05 --len_penalty_w 0.1
+#       --difficulty_path <p11 那张表> --difficulty_band 0 1）
+#
+#    ⚠ 4B 显存四件套按 docs/04 §0/§4 的定版写（原命令有两处错）：
+#      · **不要 `--zero_stage 2`**——docs/04 §4 明写"本机锁页上限 + RAM 60G
+#        双重不可行"，定版是 **`--optim_8bit` 代替它**（B7/B8）。
+#        两个一起传 = 既付 offload 的不可行风险、又绕过 8bit 的收益。
+#      · **`--micro_rows 1`**（不是 4）：B9 的定版值，治"8 行批检查点包+图共存
+#        ~10G 动态峰"。传 4 会让 4 行图共存，动态峰值回升。
+#      · **`--gen_gpu_mem 0.30`** 必须显式传：B2 实测 vLLM 进程超支 ~15G
+#        （0.45 标称 43G 实际 68.4G）会挤爆 GPU0 三方共居。preset 默认是 0.45。
+#      · `--attn_implementation flash_attention_2` 保留（消除 head_dim=256 的
+#        T² math 回退，docs/04 B4；ref_server 在 FA2 档自动降 bf16）。
 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
     --tool_protocol native --native_tool_style function \
-    --out_dir rlab_out/native_p1 --all_steps 20 --save_steps 5 \
-    --attn_implementation flash_attention_2 --zero_stage 2 --optim_8bit \
-    --micro_rows 4 --vllm_gen_logps --vllm_logprobs_n 1 \
+    --out_dir rlab_out/native_p1 --steps 20 --save_steps 5 \
+    --attn_implementation flash_attention_2 --optim_8bit \
+    --micro_rows 1 --gen_gpu_mem 0.30 \
+    --vllm_gen_logps --vllm_logprobs_n 1 \
     --vllm_batch_invariant --vllm_attention_backend FLASH_ATTN \
     --seed 42
+# 启动 30 秒内自检（三行必须对上，否则静默跑偏）：
+#   signature=...-lr1e-06-...-c8192...    ← 含 -tpnative 与 -c8192
+#   [train] 剂量口径: all_steps=...
+#   [rollout] 权重同步键名映射: 开        ← 4B 多模态必须"开"
 # 盯三件事（§6.2 第 6 步）：code_calls 升 / degenerate≈0 / trunc << p11 的 53.8%
 # 若仍在**别的位置**炸出 "解码文本也不同" → 那才是真不同源（按报错里的两侧文本
 # 对照即可一眼判断），不是护栏问题。
 
-# ④ 200 步正式跑（同一命令，只改 --out_dir/--all_steps）
+# ④ 200 步正式跑（同一命令，只改 --out_dir / --steps / --save_steps）
 #    ⚠ gpu_mem 必须与训练同档（真机 A/B 差 +7.0pp，tools 变不了这个）
+#    ⚠ 20 步跑只是"闭环通不通"，正式跑建议直接把 --steps 抬到 §5.2 第 5 项的
+#      600~1200 档（p11 只有 300 步 / 75 次更新，剂量差参考 85 倍）
 ```
 
 > **不要**沿用 `rlab_out/retool_math/` —— 协议变了，必须新 `out_dir`
 > （§8：可比性永久断裂是刻意的，护栏 `guard_ckpt_collision` 也会拦）。
 
+#### ⚠ 10.3.1 跑之前必须先决定的一件事：shaping / 难度表要不要一起并进来
+
+**上面 ③④ 的命令是"会跑起来"的版本，但它不是严格的单变量版本。** 用
+`get_config` 实算过（`verify_single_var.py`），它与 p11 实跑有 **9 处**不同：
+
+```
+协议/预算四件套（§5.1 许可）：tool_protocol / max_rounds / round_gen_tokens
+                              / max_context_tokens / retool_stop
+★ 额外并进来的（不在许可清单里）：
+    code_w           p11=0.05   → 0.0     （= §5.2 第 3 项）
+    code_attempt_w   p11=0.05   → 0.0     （= §5.2 第 3 项）
+    len_penalty_w    p11=0.1    → 0.0     （= §5.2 第 4 项）
+    difficulty_path  p11=有表    → 无       （训练池被换掉！）
+```
+
+**为什么会这样**：`config.py` 的 `retool_math` preset 里这三个 shaping 值**已经是
+0.0**（`a28f4a7`/`f61dac7` 之后），而 p11 是**用 CLI 显式传** 0.05/0.05/0.1 跑的
+（docs/08 §0.6 从 run_info 实读，签名 `-caw0.05-cw0.05-lp0.1` 印证）。
+命令不传这三个 flag，就等于**用 preset 的 0.0 静默覆盖了 p11 的实跑值**。
+
+**两个选择，各有代价，跑之前定死**：
+
+| 选法 | 命令额外加 | 与 p11 的差异 | 能回答的问题 |
+|---|---|---|---|
+| **① 严格单变量（推荐起手）** | `--code_w 0.05 --code_attempt_w 0.05 --len_penalty_w 0.1 --difficulty_path <p11 那张表> --difficulty_band 0 1` | **只 5 处**（全是协议/预算） | "**协议**是不是根因"——干净 |
+| ② 一步到位 | 不加（照 ③④ 原样） | 9 处 | 混淆：协议 + shaping 撤销 + 换池 同时动，赢了也说不清是谁 |
+
+> **推荐 ①**：本方案的核心主张就是"**协议**是 11 版无效的根因"。若把 §5.2 的
+> 第 3、4 项（本来排在第 3、4 轮才做的单变量）混进来，即使看到增益也无法归因——
+> 这正是 docs/05 §4.3 已经付过学费的"复合变量"教训。等协议单独验证有效后，
+> 再按 §5.2 顺序逐个撤销 shaping。
+
+**注意 ① 有个前提**：`--difficulty_path` 必须指向 **p11 实际用的那张表**
+（`rlab_out/difficulty_probe.jsonl`），不能想当然换成 `_4b_v5_r6144_concise_full`
+（那是 6144/concise 档探的，与 p11 的表不是同一张，docs/08 §0.3 仍有存疑）。
+运行日志里会打 `[data][警告] 难度表 probe_meta[...] 与当前协议不符`——
+**换协议后这条告警是预期的**（表是围栏档探的、`tool_protocol` 字段必不符），
+它提醒的是"这张表的通过率不是原生协议下的通过率"，**不阻塞**。
+
+> **另一条更保守的选法**：不带难度表（`difficulty_path=None`）跑——
+> 训练池回到完整 17k。代价是丢弃率会显著上升（p11 靠表出清了 p≈0 的题），
+> 但省掉了"表是不是同一张"的不确定性。**若 pod 上确认不了表来源，选这条。**
+
+
 ### 10.4 eval 命令（与训练同轮改，否则增益看不见）
+
+**⚠ 2026-09-25 实跑核对修了两处**（原命令会直接 argparse 报错，且 BASE 评错模型）：
+
+1. **`--temperature` / `--top_p` 不是 `rlab.eval` 的参数**
+   （实跑：`eval.py: error: unrecognized arguments: --temperature 1.0 --top_p 0.7`）。
+   `eval_vllm_one.py` **自己有**这两个 flag，但 `rlab.eval` 没透传 —— 且
+   `--val_n>1` 时它**会从每个 ckpt 的 `run_info.json` 回读训练时的 temperature/top_p**
+   （`eval_vllm_one.py:576-590`，并打印 `temperature 来源: run_info`），
+   所以对齐是**自动的**、不需要手传。若确实要覆盖，得直接调 `eval_vllm_one.py`。
+2. **`--base_path` 必须显式传 `/root/Qwen3.5-4B`**：默认是 `/root/Qwen2.5-3B`
+   —— 不传会把 BASE 当成 3B 去评（4B run 与 3B base 对比，Δacc 直接失真）。
+   `--skip_base` 可跳过 BASE，但**同轮配对比较需要它**，不建议跳。
 
 ```bash
 python -m rlab.eval --algo retool_math --n 30 --seed 42 \
-  --val_n 12 --temperature 1.0 --top_p 0.7 \
+  --val_n 12 \
+  --base_path /root/Qwen3.5-4B \
   --vllm_batch_invariant --vllm_attention_backend FLASH_ATTN \
   --gpu_mem 0.78 \
-  --models "step50=./rlab_out/native_p1/step_50,step100=...,step200=..." \
+  --models "step50=./rlab_out/native_p1/step_50,step100=./rlab_out/native_p1/step_100,step200=./rlab_out/native_p1/step_200" \
   --out eval_vllm_native_p1.json
 ```
 `--tool_protocol` 会自动从每个 ckpt 的 `run_info.json` 回读（原生档训练的 ckpt
 用原生协议评）——BASE 是裸模型，靠调度器的 `--proto_from` 同档（`eval_vllm.py`
 的 `BASE_PROTO`，已支持）。
+启动后**先看这两行自证**（缺任一条就停下来查，否则评测口径可能是错的）：
+`[采样评测] val_n=12 temperature=... top_p=...` 与
+`[采样评测] temperature 来源: run_info`。
 
 ### 10.5 上机核实结果（2026-09-25 真机首跑，Qwen3.5-4B）
 
