@@ -176,7 +176,24 @@ print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认�
       f"(src={_proto_src}) | "
       f"algo={args.algo} eval_task={args.eval_task} | "
       f"round_tokens={args.round_tokens} max_len={args.max_len} max_rounds={args.max_rounds} | "
-      f"system_prompt={_sp_src} sp_sha={_sp_sha}")
+      f"system_prompt={_sp_src} sp_sha={_sp_sha} | gpu_mem={args.gpu_mem}")
+# 【2026-09-25 gpu_mem 错档告警】gpu_mem 决定 gpu_memory_utilization → KV 池块数
+# → chunked prefill 分块边界 → bf16 归约顺序 → near-tie token 翻转。真机 A/B
+# （空闲机、无训练进程、单变量只改 gpu_mem）实测同权重/同题/同 seed/greedy/
+# batch_invariant=True 下：0.20 → acc 63.3%/fmt 74.2%；0.78 → acc 70.3%/fmt 80.5%
+# —— 差 **+7.0pp**、52 题翻转。所以 gpu_mem 是协议的一部分，不是"资源参数"。
+# 典型事故形态（p11）：内嵌评测用 cfg 的 eval_gpu_mem=0.20（与训练 vLLM 共卡），
+# 训练后手动复评用默认 0.26 或调度器的 0.78 → 两套读数差 7pp，而协议 diff 全绿，
+# 查了三轮（先疑抽题、再疑沙箱超时，都被数据自身证伪）才定位到这里。
+_eval_gm_train = _rcfg.get("eval_gpu_mem")
+if _eval_gm_train is not None and abs(float(_eval_gm_train) - float(args.gpu_mem)) > 1e-9:
+    print(f"\n[eval][警告] gpu_mem 与该 ckpt 的**内嵌评测**不同档："
+          f"本次 {args.gpu_mem} ≠ run_info.eval_gpu_mem {_eval_gm_train}\n"
+          f"  gpu_mem 改变 KV 池容量 → 分块边界 → bf16 归约顺序 → near-tie token 翻转；\n"
+          f"  真机实测 0.20 vs 0.78 在同权重同题下差 +7.0pp（52 题翻转，非抖动）。\n"
+          f"  ⇒ 本次结果**不可与 step_N/eval_*.json 的内嵌读数直接比 Δacc**。\n"
+          f"  → 要可比：加 --gpu_mem {_eval_gm_train}（对齐内嵌档）；"
+          f"或整条曲线都用本档重评。\n", flush=True)
 # 【2026-09-20 回落告警】任何模型读不到 run_info 就会**静默**用 preset 默认协议跑。
 # 事故形态（本次实测）：`--skip_base --models "baseA=/root/Qwen3.5-4B,baseB=..."`
 # —— 裸模型目录没有 run_info，而调度器的同档兜底（eval_vllm.py 的 BASE_PROTO）
@@ -654,6 +671,20 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
                             # json 直接比 Δacc——同权重漂移可达 2pp。
                             "vllm_batch_invariant": bool(_bi),
                             "vllm_attention_backend": _attn_be,
+                            # 【2026-09-25 实测·gpu_mem 改变生成本身】gpu_mem 决定
+                            # gpu_memory_utilization → KV 池块数 → chunked prefill
+                            # 分块边界 → bf16 归约顺序 → near-tie token 翻转。
+                            # 真机 A/B（空闲机、无训练进程、单变量只改 gpu_mem）：
+                            #   gpu_mem=0.20 → acc 63.3% fmt 74.2% code_rate 63.3%
+                            #   gpu_mem=0.78 → acc 70.3% fmt 80.5% code_rate 67.6%
+                            # 同权重/同题/同 seed/greedy/batch_invariant=True 下差
+                            # **+7.0pp**，52 题翻转且方向偏斜（17/35）。
+                            # batch_invariant 只保证"结果不随 batch 组成变化"，**不**
+                            # 保证跨 KV 池容量一致——此前它不在 eval_protocol 里，于是
+                            # 协议 diff 印"实质完全一致"而根因恰在协议之外（p11 的
+                            # 内嵌 0.20 vs 单独 0.78 差 7pp 就这样查了三轮）。
+                            # 跨 run 比 Δacc 前必须先对齐本项。
+                            "gpu_mem": args.gpu_mem,
                             # 【2026-09-20】协议出处落盘：False = 回落 preset 默认
                             # （读不到 run_info）。事后核对"这一行测的是哪个协议"
                             # 的唯一凭据——本次 baseA/baseB 事故正是因为回落不留痕。

@@ -104,9 +104,13 @@ def compare(a, b, tag_a, tag_b):
     pa = a.get("eval_protocol") or {}
     pb = b.get("eval_protocol") or {}
     print(f"\n=== 协议逐键对比（{tag_a} vs {tag_b}）===")
+    # 【2026-09-25】gpu_mem 必须在列：它决定 KV 池容量 → chunked prefill 分块边界
+    # → bf16 归约顺序 → near-tie token 翻转。真机实测 0.20 vs 0.78 差 +7.0pp
+    # （同权重/同题/同 seed/greedy/batch_invariant=True）。它此前不在协议里，导致
+    # 本脚本印"协议实质完全一致"而根因恰在协议之外——查了三轮才定位。
     proto_keys = ["val_n", "greedy", "temperature", "top_p", "round_tokens",
                   "max_len", "max_rounds", "max_prompt_length",
-                  "vllm_batch_invariant", "vllm_attention_backend",
+                  "vllm_batch_invariant", "vllm_attention_backend", "gpu_mem",
                   "system_prompt_sha", "seed", "proto_src"]
     top_keys = ["split", "model_path", "n", "n_requested",
                 "n_dropped_long", "n_dropped_plen"]
@@ -130,6 +134,18 @@ def compare(a, b, tag_a, tag_b):
         if "n_requested" in diffs:
             print("     注：n_requested 不同但 n 相同 = 两边都取满了同一个池子，"
                   "题集可能仍相同（看下一层交集）")
+        if "gpu_mem" in diffs:
+            print("     ⚠ **gpu_mem 不同即根因，无需再往下查**：真机 A/B 实测"
+                  "（空闲机、无训练进程、单变量）")
+            print("       0.20 → acc 63.3%/fmt 74.2%/code 63.3% ；"
+                  "0.78 → acc 70.3%/fmt 80.5%/code 67.6%（差 +7.0pp，52 题翻转）")
+            print("       机制：KV 池块数 → chunked prefill 分块边界 → bf16 归约"
+                  "顺序 → near-tie token 翻转（开不开 ``` 围栏正是 near-tie）。")
+            print("       ⇒ 这两份读数**不可比**。跨 run 比 Δacc 必须先对齐 gpu_mem。")
+        if any(k in diffs for k in ("gpu_mem", "vllm_batch_invariant",
+                                    "vllm_attention_backend")):
+            print("     （若两份 json 之一缺 gpu_mem 键 = 2026-09-25 之前跑的，"
+                  "该值未落盘，需按当时命令行回忆或重跑）")
     return (not diffs), diffs
 
 

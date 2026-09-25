@@ -3810,6 +3810,66 @@ def test_sandbox_verdict_gating():
     check("纯函数：同输入两次调用结果相同",
           sandbox_verdict(**_args) == sandbox_verdict(**_args))
 
+    # ---- 8. gpu_mem 落盘 + 进协议 diff（已证实的根因不得再隐形）----
+    # 【2026-09-25 真机 A/B 定案】空闲机、无训练进程、单变量只改 gpu_mem：
+    #   0.20 → acc 63.3% fmt 74.2% code_rate 63.3% avg_rounds 0.742
+    #   0.78 → acc 70.3% fmt 80.5% code_rate 67.6% avg_rounds 0.793
+    # 差 +7.0pp、52 题翻转（17/35 偏斜）。gpu_mem 决定 KV 池块数 → chunked
+    # prefill 分块边界 → bf16 归约顺序 → near-tie token 翻转。
+    # 此前 gpu_mem 不在 eval_protocol 里 → 协议 diff 印"实质完全一致"而根因恰在
+    # 协议之外（p11 的 7pp 查了三轮：先疑抽题、再疑沙箱，都被自己的数据证伪）。
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _one = open(os.path.join(_root, "eval_vllm_one.py"), encoding="utf-8").read()
+    check("eval_one: gpu_mem 落进 eval_protocol（KV 池容量是生成的一部分）",
+          '"gpu_mem": args.gpu_mem' in _one)
+    _dg = open(os.path.join(_root, "rlab", "diag_eval_gap.py"), encoding="utf-8").read()
+    check("diag: gpu_mem 进协议逐键 diff 清单", '"gpu_mem",' in _dg)
+    check("diag: gpu_mem 不同时给出专门告警并判不可比",
+          'if "gpu_mem" in diffs:' in _dg and "不可比" in _dg)
+
+    # 端到端：两份只差 gpu_mem 的 result → compare 必须标出该键
+    from rlab.diag_eval_gap import compare
+    _mk = lambda gm: {"n": 256, "acc": 0.633, "split": "test",
+                      "n_requested": 300, "n_dropped_long": 0, "n_dropped_plen": 2,
+                      "model_path": "ck", "eval_protocol": {
+                          "val_n": 1, "greedy": True, "temperature": 0.0,
+                          "top_p": 1.0, "round_tokens": 6144, "max_len": 27424,
+                          "max_rounds": 4, "max_prompt_length": 1024,
+                          "vllm_batch_invariant": True,
+                          "vllm_attention_backend": "FLASH_ATTN",
+                          "gpu_mem": gm, "system_prompt_sha": "3aac5d",
+                          "seed": 42, "proto_src": "ck"}}
+    import contextlib
+    import io
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _same, _diffs = compare(_mk(0.20), _mk(0.78), "A", "B")
+    check("端到端：只差 gpu_mem 时 compare 判不一致且列出该键",
+          _same is False and _diffs == ["gpu_mem"])
+    check("端到端：gpu_mem 差异触发根因告警文案",
+          "gpu_mem 不同即根因" in _buf.getvalue())
+    _buf2 = io.StringIO()
+    with contextlib.redirect_stdout(_buf2):
+        _same2, _diffs2 = compare(_mk(0.20), _mk(0.20), "A", "B")
+    check("端到端：gpu_mem 相同时不误报（协议实质一致）",
+          _same2 is True and _diffs2 == [])
+
+    # ---- 9. 评测创建时就告警（不必等事后诊断）----
+    # p11 的 7pp 之所以查了三轮，是因为 gpu_mem 错档在**跑的时候**没有任何提示。
+    # 现在 eval_vllm_one.py 拿 run_info.eval_gpu_mem 与 --gpu_mem 对比，不同档即告警。
+    check("eval_one: 协议自证行打印 gpu_mem", "gpu_mem={args.gpu_mem}" in _one)
+    check("eval_one: 与 run_info.eval_gpu_mem 不同档时告警",
+          '_eval_gm_train = _rcfg.get("eval_gpu_mem")' in _one
+          and "gpu_mem 与该 ckpt 的**内嵌评测**不同档" in _one
+          and "不可与 step_N/eval_*.json 的内嵌读数直接比" in _one)
+    # 告警判定的四种情形（纯逻辑复刻，与源码同一条件式）
+    for _tg, _cg, _want in ((0.20, 0.78, True),    # 内嵌 vs 调度器档
+                            (0.20, 0.26, True),    # 内嵌 vs CLI 默认
+                            (0.20, 0.20, False),   # 对齐 → 静默
+                            (None, 0.78, False)):  # 旧 ckpt 无该键 → 不误报
+        _fire = _tg is not None and abs(float(_tg) - float(_cg)) > 1e-9
+        check(f"gpu_mem 告警判定 train={_tg} cli={_cg} → {_want}", _fire is _want)
+
 
 def test_preflight_audit_fixes():
     """【2026-09-20 pre-flight 审查八项修复】每项都锁"旧行为会怎么错"。
