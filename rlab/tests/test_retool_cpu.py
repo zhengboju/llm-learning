@@ -3718,6 +3718,78 @@ def test_inline_eval_protocol_attestation():
                   for k in ("n_requested", "n_dropped_plen", "n_dropped_long")))
 
 
+def test_sandbox_verdict_gating():
+    """【2026-09-25 诊断器自己的判据 bug】sandbox_verdict 的 ②必须被①门控。
+
+    背景：p11 的内嵌评测 vs 单独评测在 step100 差 +7.0pp，而前三层（出处/协议/题集）
+    全绿——题集交集 256/256、协议全键一致、两边 batch_invariant=True + greedy。
+    batch_invariant 只保证"结果不随 batch 组成变化"，管不到 vLLM 之外的进程：
+    retool 每个工具段都要跑 sandbox.run_code（5s **墙钟**超时 + SIGKILL），而内嵌
+    评测与训练进程共卡共 CPU、单独评测独占机器 → 墙钟超时被负载放大。
+
+    沙箱竞争的**定义**要求两条同时成立：
+      ① 单向劣化（超时只会让轨迹变差，不会变好 → 对称翻转在定义上排除它）
+      ② 与代码执行相关（空闲侧 code_ok 更多，或翻转富集在代码题上）
+
+    而初版把判据写成 `or`：
+        ck_b - ck_a >= 5  or  (not sym and enrich >= 10)
+    第一个 clause 能**单独**成立 → 方向完全对称（14/14）、富集 −38pp 的负例照样
+    印出"沙箱是主因 ✓"，只因 code_ok 差了 +11（fixture 里纯随机噪声）。
+    与 health.py 那条"判定规则有多个时先特例后一般，否则 elif 永远走不到"同源：
+    条件实为 and 却写成 or，最弱的证据会独自定案。本测试把门控锁死。
+    """
+    print("[AN] sandbox_verdict 判据门控（诊断器自身的 or/and bug）")
+    from rlab.diag_eval_gap import BF16_JITTER_MAX, sandbox_verdict
+
+    # ---- 1. 初版 bug 的精确复现：对称 + code_ok 差显著 → 必须判 not sandbox ----
+    v = sandbox_verdict(b_only=14, c_only=14, ck_a=100, ck_b=111,
+                        d_rate=14.0, base_rate=52.0, n_disagree=28)
+    check("对称 14/14 + ck 差 +11 → symmetric=True", v["symmetric"] is True)
+    check("对称翻转即使 ck 差显著也**不判**沙箱（初版 or 写法会误判 True）",
+          v["sandbox"] is False)
+    check("富集为负时 enrich 如实为负（不取绝对值）", v["enrich"] < 0)
+
+    # ---- 2. p11 实测形态：偏斜 18/36 + 代码富集 → 判 sandbox ----
+    v2 = sandbox_verdict(b_only=18, c_only=36, ck_a=88, ck_b=122,
+                         d_rate=80.0, base_rate=57.0, n_disagree=54)
+    check("偏斜 18/36 → symmetric=False", v2["symmetric"] is False)
+    check("偏斜 + 代码相关 → sandbox=True（①②同时成立）", v2["sandbox"] is True)
+    check("code_linked 由 ck 差或富集任一支撑", v2["code_linked"] is True)
+
+    # ---- 3. 偏斜但与代码无关 → 不判沙箱（另找非确定性源）----
+    v3 = sandbox_verdict(b_only=5, c_only=40, ck_a=100, ck_b=101,
+                         d_rate=20.0, base_rate=55.0, n_disagree=45)
+    check("偏斜但 ck 差 +1、富集 -35pp → code_linked=False",
+          v3["code_linked"] is False)
+    check("单向劣化但与代码无关 → sandbox=False（不硬套沙箱解释）",
+          v3["sandbox"] is False)
+
+    # ---- 4. 门控的形式性质：sandbox ≡ (not symmetric) and code_linked ----
+    import itertools
+    for b, c, ka, kb, dr, br in itertools.product(
+            (0, 3, 18), (0, 3, 36), (50,), (50, 58), (10.0, 80.0), (55.0,)):
+        _v = sandbox_verdict(b, c, ka, kb, dr, br, n_disagree=max(b + c, 1))
+        check_silent = ((not _v["symmetric"]) and _v["code_linked"]) == _v["sandbox"]
+        if not check_silent:
+            check(f"门控恒等式在 ({b},{c},{ka},{kb},{dr},{br}) 上成立", False)
+            break
+    else:
+        check("门控恒等式 sandbox ≡ (not symmetric) and code_linked 在全组合成立",
+              True)
+
+    # ---- 5. 对称性阈值与 bf16 地板联动（小分歧一律算对称）----
+    v5 = sandbox_verdict(b_only=1, c_only=3, ck_a=0, ck_b=99,
+                         d_rate=100.0, base_rate=0.0, n_disagree=4)
+    check(f"分歧极小（skew 2 < {BF16_JITTER_MAX}）→ 判对称，不下沙箱结论",
+          v5["symmetric"] is True and v5["sandbox"] is False)
+
+    # ---- 6. 纯函数性：同输入同输出、不改入参 ----
+    _args = dict(b_only=18, c_only=36, ck_a=88, ck_b=122, d_rate=80.0,
+                 base_rate=57.0, n_disagree=54)
+    check("纯函数：同输入两次调用结果相同",
+          sandbox_verdict(**_args) == sandbox_verdict(**_args))
+
+
 def test_preflight_audit_fixes():
     """【2026-09-20 pre-flight 审查八项修复】每项都锁"旧行为会怎么错"。
 
@@ -4424,6 +4496,7 @@ if __name__ == "__main__":
     test_inline_eval_timeout_fix()
     test_inline_eval_json_shape()
     test_inline_eval_protocol_attestation()
+    test_sandbox_verdict_gating()
     test_preflight_audit_fixes()
     test_overlong_filter()
     test_attempt_shaping_and_err_tier()
