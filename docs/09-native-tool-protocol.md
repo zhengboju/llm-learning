@@ -528,10 +528,12 @@ python -m rlab.native_probe --model_path /root/Qwen3.5-4B --no_vllm_smoke \
 #    Qwen3.5 的 GDN 层落回 FlashInfer 现场 JIT → ninja 打爆内存被 SIGKILL
 #    （只有 `Killed`、无 traceback）。现已默认 triton；若环境里有训练遗留的
 #    VLLM_BATCH_INVARIANT=1，先 unset（否则引擎启动即 RuntimeError）。
+#    【同轮修复】首版用玩具提示测调用率（等于手把手教模型用工具）→ 已改成
+#    从 preset 取正式提示与采样参数（探针与训练同口径铁律）。首轮实测 16/16=100%。
 unset VLLM_BATCH_INVARIANT
 CUDA_VISIBLE_DEVICES=0 python -m rlab.native_probe --model_path /root/Qwen3.5-4B \
     --n_smoke 16 --native_tool_style function --out /tmp/native_probe_smoke.txt
-#    ↑ 若 Q1 段的 tools 声明没渲染出来 → 方案 A 不成立，转 docs/08 SFT
+#    ↑ 若 Q1 段的工具声明段没渲染出来 → 方案 A 不成立，转 docs/08 SFT
 #    ↑ 判据看 **auto 与钉死档哪个高**（钉错形态 ≠ base 不会用工具）
 
 # ③ 20 步验证跑（参考的"两杯瑞幸"档）
@@ -576,12 +578,43 @@ python -m rlab.eval --algo retool_math --n 30 --seed 42 \
 | Q3 回包形态 | ✅ `role:"tool"` → user 轮 + `<tool_response>` | `<\|im_end\|>\n<\|im_start\|>user\n<tool_response>\n391\n</tool_response><\|im_end\|>` |
 | Q4 thinking 共存 | ✅ 开关生效 | 关思考档结尾 `<think>\n\n</think>`（**已闭合**，不是烧预算的未闭合形态） |
 | 往返证明 | ✅ 两种切法都过 | `kind=tool style=function code='print(17*23)'` → `derive_tool_style` ⇒ **function** |
+| Q5 拼接硬契约 | ✅ 三条全过 | 前缀 / 采样 token 逐位保留 / observation 真拼入 |
+| **base 调用率（go/no-go）** | ✅ **16/16 = 100%**（invalid 0） | 见 §10.5.1（含"玩具提示"口径警告与已修说明） |
 
 **这一条是本次上机的最大价值**：Qwen2.5 实测 JSON 形态、Qwen3.5 实测 function 形态，
 **证实两者不能互推**（§1.1 的立论）。双形态实现不是过度设计——若照抄参考正则
 只写 function 分支，Qwen2.5 档全废；若只写 JSON 分支，本 pod 的 4B 全废。
 
 **⇒ 训练/eval 命令钉死：`--native_tool_style function`**（依赖 auto 猜测没必要）。
+
+### 10.5.1 步 ② go/no-go 闸门：**通过（16/16 = 100%）**
+
+```
+调用率 = 16/16 = 100.0%（invalid 0 / answer 0）
+形态分布：命中调用 16 / 有调用标记但解析失败 0
+```
+
+**100% > 参考实现的 87.5%（base 调用率），且 invalid=0** —— 这是本方案最强的
+成立信号：base 的原生工具先验足够强，"跳过 cold-start SFT 直接 RL"对
+Qwen3.5-4B 成立（与参考项目对同一基座的结论一致）。
+
+**但必须记一条口径警告（我自己的首版探针犯了）**：首版冒烟用的是本文件里的
+**玩具提示** `SYS = "SYS: you solve math with a python tool."`——它把"用工具"
+直接写在提示里，等于手把手教模型调用，测出来的 100% 是"被提示后"的调用率，
+而参考的 87.5% 是在**它自己的正式提示**下测的 → **苹果比橘子**。
+
+本项目对探针有一条铁律（`probe_difficulty` 2026-09-17）：
+**探针与训练同口径**——提示是协议的一半。已修：`smoke_config()` 从 preset 取
+正式系统提示与采样参数，且 Q1–Q4 渲染核实、往返证明、拼接证明**四处全部**改用
+正式提示（模板行为可能依赖 system 段内容，玩具提示验出的形态不能外推）。
+**⇒ 这 100% 的结论仍成立，但要在"用正式提示重跑"之后再引用为最终数字。**
+
+顺带修了 Q1 的判据：旧版拿 `code_interpreter` 当"是否渲染了工具声明"的标志物，
+而**训练提示自己就写满了这个词** → "不带 tools"的对照档误报"含工具声明=是"
+（本机实测：对照档 1219 字符 vs 带 tools 2274 字符，确实差了一整个声明段）。
+改用 `CODE_TOOL` 描述里的独特短语 `"Execute code in an isolated environment"`
+（由模板**原样**插入声明段，故跨模板可移植；`<tools>` 是 Qwen2.5 模板特有的
+包装标签，不可移植）。
 
 **`arguments=str` 那一档 TypeError 是预期差异，不是故障**：Qwen3.5 模板用
 `arguments.items()` 展开实参，故要求 mapping；本项目从不把 `tool_calls` 喂给模板
@@ -627,11 +660,49 @@ python -m rlab.eval --algo retool_math --n 30 --seed 42 \
    本机复跑验证（Qwen2.5 真模板）：硬契约三条全 ✅，且与 canonical **逐 token 相同**
    （313 == 313）——反证了旧版那 4 token 是构造伪影。
 
-4. **顺手**：冒烟原本用 `17*23` 这种口算题 + `n_smoke` 条**同一 prompt**——base 直接
+4. **【口径失真·最隐蔽的一条】冒烟用了玩具提示。** 见 §10.5.1：首版
+   `SYS = "SYS: you solve math with a python tool."` 把"用工具"写进提示 = 手把手
+   教模型调用，与参考 87.5%（它自己的正式提示下测）不可比。已改为
+   `smoke_config()` 从 preset 取正式提示与采样参数，**四处**（渲染/往返/拼接/冒烟）
+   全部同口径。**这类 bug 不会让任何东西崩、也不会让测试翻红——它只是让数字偏乐观**，
+   正是本项目最需要警惕的一类。
+
+5. **【判据被自己的提示词污染】Q1 拿 `code_interpreter` 当"是否渲染工具声明"的
+   标志物**，而训练提示自己就写满了这个词 → "不带 tools"对照档误报"含工具声明=是"。
+   本机实测对照档 1219 字符 vs 带 tools 2274 字符（确实差一整个声明段）。
+   改用 `CODE_TOOL` 描述里的短语（模板原样插入，跨模板可移植）。**凡"对照档必须
+   为否"的判据，标志物必须只在被测那一侧出现**——否则对照形同虚设。
+
+6. **顺手**：冒烟原本用 `17*23` 这种口算题 + `n_smoke` 条**同一 prompt**——base 直接
    心算就把答案说了，"调用率 ≥50%"这个判据被系统性低估。改为 5 道竞赛风格题轮转
    （`SMOKE_QUESTIONS`），并让 `--native_tool_style` 可钉进冒烟（钉死档与 auto
    不一致时两者都打印，**以 auto 高者判断"base 会不会调用"**，防止把"钉错形态"
    读成"base 不会用工具"）。
+
+### 10.6.1 真机冒烟样本观察（判读用，16/16 全中）
+
+```
+样本0: "I'll solve this step by step.\n\nFirst, let me understand the condition:
+        $n^2 + 1$ is divisible by $n + 1$.\n\nThis means $(n^2+1)/(n+1)$ should be an
+        integer.\n\nLet me write a Python program to find all positive integers"
+样本1: "I'll solve this equation step by step.\n\nGiven: $\\frac{1}{m} + \\frac{1}{n}
+        = \\frac{1}{6}$ ...\n\nLet me manipulate this equation:\n$$...$$\n\nMultiply both si"
+```
+
+三点判读：
+
+1. **模型是"先叙述、再调用"**（`Let me write a Python program...` 然后才吐调用块）
+   ——与参考实现的节奏一致，说明 `native_stop_at_call=False`（默认）是对的：
+   若强行在调用边界 stop，会把这段有用的推理切掉。
+2. **`invalid=0` 很关键**：说明 base **调用后不再继续瞎写**（docs/09 §0.1 症状③
+   在原生协议下的对应形态没有出现）→ `native_stop_at_call` 兜底开关**不需要开**，
+   保持单变量纪律（先看基线行为）。
+3. **`answer=0`**：16 条全部走了工具路径，没有一条"直接给答案跳过工具"。
+   ⇒ base 在原生协议下的工具先验**不只高，而且稳**（对比 p11 围栏协议 ~48%
+   且需 SFT 才有格式）。
+
+> **注意**：以上三点是在**玩具提示**下观察到的；用正式提示复跑后应复核一遍
+> （正式提示更长、更详细，可能改变"先叙述 vs 直接调用"的比例）。
 
 **回归**：`pytest rlab/tests` → **82 passed**；`test_native_protocol` → 12 函数全过
 （新增 5 项 native_probe 静态检查，含**突变测试**验证：把 Q2 判据改回 JSON 启发式，
@@ -650,9 +721,9 @@ python -m rlab.eval --algo retool_math --n 30 --seed 42 \
 | `tools=` 模板渲染 | ✅ **已验证**（1748 vs 166 字符） | — |
 | `enable_thinking` 共存 | ✅ **已验证**（开关生效，think 已闭合） | — |
 | 拼接硬契约（本机 Qwen2.5） | ✅ **硬契约三条全过**；pod 上待复跑（§10.6 第 3 条修了判据） | 重跑步 ①（现在会打印 Q5 一行） |
-| **base 的真实调用率** | ⚠ **仍未测得**：冒烟被 FlashInfer GDN JIT 打断（§10.6 第 1 条，已修） | 重跑步 ②：`--n_smoke 16 --native_tool_style function` |
+| **base 的真实调用率** | ✅ **16/16 = 100%**（但首版用玩具提示，§10.5.1 已修；建议用正式提示复跑一次确认） | `python -m rlab.native_probe --n_smoke 16 --native_tool_style function` |
 | **vLLM 端到端（`prompt_token_ids` + 工具模板）** | ⚠ 未验证 | 步 ③ 的 20 步跑（4 处 fail-fast 会当场 raise） |
-| EOS 停 vs `</tool_call>` 停的实际分布 | ⚠ 未验证 | 步 ③ 的 `invalid_final`/`ctx_full` 列 + 健康检查 `native_invalid` |
+| EOS 停 vs `</tool_call>` 停的实际分布 | ⚠ 未验证 | 步 ③ 的 `invalid_final`/`ctx_full` 列 + 健康检查 `native_invalid`（冒烟 invalid=0 是好兆头） |
 | `gpu_mem` 档位对结论的影响 | ⚠ 已知 +7.0pp 是引擎档效应 | eval 必须 `--gpu_mem 0.78` 与训练同档 |
 | AIME25 OOD 集 | ❌ **仍未建**（docs/05 §6.6） | 与参考 +23.89pp 对话的前置条件 |
 

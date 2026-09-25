@@ -952,6 +952,26 @@ def test_protocol_wiring_static():
           and "Q5 拼接硬契约" in np_)
     check("native_probe：冒烟用竞赛题而非口算题 + 可钉死形态（防低估调用率）",
           "SMOKE_QUESTIONS" in np_ and "--native_tool_style" in np_)
+    # 【2026-09-25 真机首跑后的口径纠正】首版冒烟用的是本文件里的玩具提示
+    # `SYS = "SYS: you solve math with a python tool."`——等于手把手教模型调用，
+    # 测出的 100% 是"被提示后"的，与参考 87.5%（在它自己的正式提示下测）**不可比**。
+    # 本项目对探针的铁律：探针与训练同口径（probe_difficulty 2026-09-17）。
+    check("native_probe：用 preset 正式提示与采样参数（探针与训练同口径铁律）",
+          "def smoke_config" in np_
+          and "from rlab.config import default_system_prompt, get_config" in np_
+          and 'temperature=cfg["temperature"]' in np_)
+    check("native_probe：渲染/往返/拼接三处都收 sys_prompt+ctkw（不只冒烟）",
+          "def probe_render(tok, out_path, sys_prompt, question, ctkw)" in np_
+          and "def probe_roundtrip(tok, out_path, sys_prompt, question, ctkw)" in np_
+          and "def probe_build_next(tok, out_path, sys_prompt, question, ctkw)" in np_)
+    # 【判据不能拿工具名当标志物】训练提示自己就写了 code_interpreter → "不带 tools"
+    # 对照档会误报"含工具声明=是"。标志物必须只由声明段贡献且跨模板可移植
+    # （<tools> 是 Qwen2.5 模板特有的包装标签；CODE_TOOL 描述里的短语才可移植）。
+    check("native_probe：Q1 标志物与工具名解耦（从 CODE_TOOL 描述派生，跨模板可移植）",
+          '_decl_mark = "Execute code in an isolated environment"' in np_
+          and "has_decl = _decl_mark in p" in np_)
+    check("native_probe：Q4 断言训练档 render 不以未闭合 <think> 结尾（烧预算签名）",
+          "_open_think" in np_ and "烧穿轮预算" in np_)
 
 
 def test_p7_pyflakes():

@@ -44,6 +44,7 @@ from rlab.protocol import (CODE_TOOL, NATIVE_STYLES, TOOL_NAME,  # noqa: E402
                            parse_assistant, render_chat_ids, tool_message)
 from rlab.protocol import (_RE_TOOL_CALL_ANY,  # noqa: E402  （诊断用：数调用块）
                            _TOOL_CLOSE, _TOOL_OPEN)
+from rlab.config import TOOL_PROTOCOLS  # noqa: E402
 
 DEFAULT_ENGINE_KWARGS = {"gdn_prefill_backend": "triton"}
 
@@ -96,6 +97,26 @@ SMOKE_QUESTIONS = [
 ]
 
 
+def smoke_config(algo: str, tool_protocol: str):
+    """冒烟/渲染用的**训练同口径**配置（系统提示 + 采样参数）。
+
+    【2026-09-25 真机首跑后的自我纠正】首版冒烟用的是本文件里的玩具提示
+    `SYS = "SYS: you solve math with a python tool."`——它把"用工具"写在提示里，
+    等于**手把手教模型调用**，测出来的调用率是"被提示后的"而不是"base 自己的"。
+    于是那句 `100% vs 参考 87.5%` 是**苹果比橘子**：参考的 87.5% 是在它自己的
+    正式提示下测的。本项目对探针有一条铁律（probe_difficulty 2026-09-17）：
+    **探针与训练同口径**——提示是协议的一半（难度表就是"模型×提示×预算"的联合
+    产物），提示不同就是另一个分布。故这里改成从 preset 取真提示与真采样参数，
+    保证"调用率"这个 go/no-go 数字说的是**训练将遇到的那个协议**。
+
+    Q1–Q4 的渲染核实也用它：模板行为可能依赖 system 段内容（tools 声明的位置、
+    是否触发工具相关的分支），用玩具提示验出来的形态不能外推到训练提示。
+    """
+    from rlab.config import default_system_prompt, get_config
+    cfg = get_config(algo, tool_protocol=tool_protocol)
+    return cfg, default_system_prompt(algo, tool_protocol)
+
+
 def _section(title):
     print("\n" + "=" * 72)
     print(f"== {title}")
@@ -108,23 +129,37 @@ def _dump(path, name, text):
             f.write(f"\n--- {name} ---\n{text!r}\n")
 
 
-def probe_render(tok, out_path):
-    """Q1–Q4：渲染四件事并打印（repr 落盘——显示层会改写尖括号标签）。"""
-    base = initial_messages(SYS, Q)
+def probe_render(tok, out_path, sys_prompt, question, ctkw):
+    """Q1–Q4：渲染四件事并打印（repr 落盘——显示层会改写尖括号标签）。
+
+    一律用**训练同口径**的 system 提示与 chat_template_kwargs（见 smoke_config）：
+    模板行为可能依赖 system 段内容，玩具提示验出来的形态不能外推到训练提示。"""
+    base = initial_messages(sys_prompt, question)
     res = {}
+    # 【Q1 判据不能拿工具名当标志物】训练用的系统提示**自己**就写满了
+    # `code_interpreter`（提示的职责就是教模型用这个工具）——于是"不带 tools"
+    # 的对照档会打印"含工具声明=是"，把对照读成"模板没渲染也照样有声明"。
+    # 标志物必须**只由声明段贡献**，且**跨模板可移植**。实测（本机 Qwen2.5 + 正式提示）：
+    #   · `code_interpreter`      ❌ 提示自己就写了
+    #   · `<tools>`              ✅ 但那是 Qwen2.5 模板的包装标签，Qwen3.5 未必同名
+    #   · CODE_TOOL 描述里的短语  ✅✅ 模板把 description **原样**插进声明段，
+    #                                故该短语跨模板可移植（本轮真机已用 Qwen3.5 验证）
+    # 取 description 的一个独特子串，随 CODE_TOOL 自动一致（改描述不会让判据失效）。
+    _decl_mark = "Execute code in an isolated environment"
 
     # ---- Q1：初始 prompt 是否带 tools 声明 ----
     _section("Q1 · tools= 是否被模板接受并渲染")
-    for tag, tools, ctkw in (("带 tools + 关思考", True, {"enable_thinking": False}),
-                             ("带 tools + 默认思考", True, {}),
-                             ("不带 tools（对照）", False, {})):
+    for tag, tools, _kw in (("带 tools + 关思考", True, ctkw),
+                            ("带 tools + 默认思考", True, {}),
+                            ("不带 tools（对照）", False, {})):
         try:
             p = tok.apply_chat_template(base, tokenize=False,
                                         add_generation_prompt=True,
                                         **({"tools": [CODE_TOOL]} if tools else {}),
-                                        **ctkw)
-            has_decl = "code_interpreter" in p
-            print(f"  [{tag}] OK  长度={len(p)}  含工具声明={'是' if has_decl else '否'}")
+                                        **_kw)
+            has_decl = _decl_mark in p
+            print(f"  [{tag}] OK  长度={len(p)}  含工具声明段={'是' if has_decl else '否'}"
+                  f"（标志物 {_decl_mark!r}）")
             if tag.startswith("带 tools + 关思考"):
                 res["q1_prompt"] = p
             _dump(out_path, f"Q1 {tag}", p)
@@ -134,20 +169,36 @@ def probe_render(tok, out_path):
                 res["q1_error"] = f"{type(e).__name__}: {e}"
     if "q1_error" in res:
         print("\n  ✗ Q1 失败：模板不接受 tools= → **方案 A 不成立**，转 docs/08 SFT。")
+    elif not (_decl_mark in (res.get("q1_prompt") or "")):
+        print(f"\n  ✗ Q1 失败：模板接受了 tools= 但**没渲染出声明段**"
+              f"（找不到 {_decl_mark!r}）→ 模型看不到工具签名 → 方案 A 不成立。")
 
-    # ---- Q4：enable_thinking=False 与 tools 能否共存 ----
-    _section("Q4 · enable_thinking=False 与 tools= 共存")
+    # ---- Q4：配置档的 thinking 开关与 tools 能否共存 ----
+    _section("Q4 · thinking 开关与 tools= 共存（档位取训练同口径）")
     try:
         p0 = tok.apply_chat_template(base, tokenize=False, add_generation_prompt=True,
-                                     tools=[CODE_TOOL], **{"enable_thinking": False})
+                                     tools=[CODE_TOOL], **ctkw)
         p1 = tok.apply_chat_template(base, tokenize=False, add_generation_prompt=True,
-                                     tools=[CODE_TOOL], **{"enable_thinking": True})
-        print(f"  两档 prompt 相同? {'是（模板未引用该开关）' if p0 == p1 else '否（开关生效）'}")
-        # 关思考档不应以未闭合 <think> 结尾（那样生成会烧穿轮预算，docs/03 事故）
-        tail = p0.rstrip()[-20:]
-        print(f"  关思考档结尾 repr={tail!r}"
-              f"（若以未闭合的 '<think>' 结尾 → 知识模式仍会开启，是烧预算签名）")
-        res["q4_ok"] = True
+                                     tools=[CODE_TOOL],
+                                     **{**ctkw, "enable_thinking": True})
+        same = p0 == p1
+        print(f"  训练档 ctkw={ctkw}")
+        print(f"  与 enable_thinking=True 相同? {'是（模板未引用该开关）' if same else '否（开关生效）'}")
+        # 【判据】配置档必须让 think 段**闭合**。Qwen3.5 默认 enable_thinking=True，
+        # docs/03 已实锤 4B 开着 thinking 会烧穿单轮预算（探针 v1：截断 98.9%、
+        # 无 boxed 99.2%）。这里直接断言"训练档渲染出的结尾不是未闭合 <think>"。
+        tail = p0.rstrip()[-24:]
+        _open_think = tail.rstrip().endswith("<think>")
+        print(f"  训练档结尾 repr={tail!r}")
+        if _open_think:
+            print("  ✗ 训练档以**未闭合** <think> 结尾 → 知识模式仍开启，会烧穿轮预算！"
+                  "（docs/03 事故签名：末段截断↑、无 boxed↑）")
+            print("    处置：训练/eval 都必须带 --chat_template_kwargs "
+                  "'{\"enable_thinking\": false}'")
+        else:
+            print("  ✅ 训练档结尾不含未闭合 <think>（不烧预算）")
+        res["q4_ok"] = not _open_think
+        res["q4_same"] = same
     except Exception as e:
         print(f"  RAISED {type(e).__name__}: {e}")
         res["q4_ok"] = False
@@ -158,16 +209,15 @@ def probe_render(tok, out_path):
         msgs = base + [
             {"role": "assistant", "content": "let me compute",
              "tool_calls": [{"type": "function",
-                             "function": {"name": "code_interpreter",
+                             "function": {"name": TOOL_NAME,
                                           "arguments": args}}]},
             {"role": "tool", "tool_call_id": make_call_id(0, 0, 1),
-             "name": "code_interpreter", "content": "391"},
+             "name": TOOL_NAME, "content": "391"},
         ]
         try:
             t = tok.apply_chat_template(msgs, tokenize=False,
                                         add_generation_prompt=True,
-                                        tools=[CODE_TOOL],
-                                        **{"enable_thinking": False})
+                                        tools=[CODE_TOOL], **ctkw)
             print(f"\n  [arguments={tag}] 渲染 OK，长度 {len(t)}")
             _dump(out_path, f"Q2Q3 arguments={tag}", t)
             # 【为什么取**最后**一个调用块】templates 的 tools 声明段**自己也印**
@@ -216,20 +266,20 @@ def probe_render(tok, out_path):
     return res
 
 
-def probe_roundtrip(tok, out_path):
+def probe_roundtrip(tok, out_path, sys_prompt, question, ctkw):
     """往返证明：实测渲染的 assistant 文本 → parse_assistant 必须认出来。
 
     这是"正则与模板同源"的**运行时**证据。本机（Qwen2.5）实测 JSON 形态，
     参考正则（Qwen3.5 的 <function=…>）对它必然判 invalid——本函数就是让这个
     差异在 pod 上**当场可见**，而不是等训练 reward 恒 -1 才发现。"""
     _section("往返证明 · parse_assistant(实测渲染文本) 必须 kind='tool'")
-    base = initial_messages(SYS, Q)
+    base = initial_messages(sys_prompt, question)
     msgs = base + [{"role": "assistant", "content": "",
                     "tool_calls": [{"type": "function",
-                                    "function": {"name": "code_interpreter",
+                                    "function": {"name": TOOL_NAME,
                                                  "arguments": {"code": CODE}}}]}]
     t = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False,
-                               tools=[CODE_TOOL], **{"enable_thinking": False})
+                                tools=[CODE_TOOL], **ctkw)
     # 取模板里 assistant 那一段（工具调用在其内）作为"模型会吐出的文本"
     a0 = t.rfind("<|im_start|>assistant")
     a1 = t.find("<|im_end|>", a0)
@@ -262,7 +312,7 @@ def _decode(tok, ids):
         return repr(list(ids))
 
 
-def probe_build_next(tok, out_path):
+def probe_build_next(tok, out_path, sys_prompt, question, ctkw):
     """端到端拼接证明：断言 build_next_prompt 的**硬契约**，并解码任何偏差。
 
     比看 §3 的七步伪代码可靠：它真的跑一遍。分两层判据——
@@ -281,8 +331,7 @@ def probe_build_next(tok, out_path):
         不再打印"属预期"这类无信息量的判词（2026-09-25 真机首跑教训：
         该判词恰好盖住了一次未查明的 4-token 偏差）。"""
     _section("端到端拼接证明 · build_next_prompt 的硬契约 + 与模板 canonical 的逐 token 对照")
-    ctkw = {"enable_thinking": False}
-    base = initial_messages(SYS, Q)
+    base = initial_messages(sys_prompt, question)
     prev = render_chat_ids(tok, base, True, ctkw)
     msgs_a = base + [{"role": "assistant", "content": "",
                       "tool_calls": [{"type": "function",
@@ -379,19 +428,32 @@ def main():
                          "不传会落到 FlashInfer GDN 的现场 JIT，本 pod 实锤 SIGKILL 无 traceback）")
     ap.add_argument("--vllm_attention_backend", default=None,
                     help="显式 attention backend（如 FLASH_ATTN）；确定性档必需")
+    ap.add_argument("--algo", default="retool_math",
+                    help="取哪个 preset 的系统提示/采样参数（**必须与即将训练的算法一致**："
+                         "提示是协议的一半，用玩具提示测出的调用率会显著偏高）")
+    ap.add_argument("--tool_protocol", default="native", choices=list(TOOL_PROTOCOLS))
+    ap.add_argument("--question", default=SMOKE_QUESTIONS[0],
+                    help="Q1–Q4 渲染核实用的题面（默认取一道竞赛题）")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.model_path)
+    cfg, sys_prompt = smoke_config(args.algo, args.tool_protocol)
+    _ctkw = cfg.get("chat_template_kwargs")
     print(f"[probe] tokenizer = {args.model_path}")
-    print(f"[probe] tools 声明 = {CODE_TOOL['function']['name']}")
+    print(f"[probe] tools 声明 = {TOOL_NAME}")
+    print(f"[probe] 口径 = 训练同口径：algo={args.algo} tool_protocol={args.tool_protocol}")
+    print(f"[probe] system 提示 = {sys_prompt[:90]!r}...（preset 原文，共 "
+          f"{len(sys_prompt)} 字符）")
+    print(f"[probe] chat_template_kwargs = {_ctkw}")
+    tok = AutoTokenizer.from_pretrained(args.model_path)
     if args.out:
         open(args.out, "w", encoding="utf-8").close()   # 清空
         print(f"[probe] repr 落盘 -> {args.out}")
 
-    res = probe_render(tok, args.out)
-    style = probe_roundtrip(tok, args.out)
-    res["build_next_ok"] = probe_build_next(tok, args.out)
+    res = probe_render(tok, args.out, sys_prompt, args.question, _ctkw)
+    style = probe_roundtrip(tok, args.out, sys_prompt, args.question, _ctkw)
+    res["build_next_ok"] = probe_build_next(tok, args.out, sys_prompt,
+                                            args.question, _ctkw)
 
     # ---- vLLM 真采样冒烟（第 5 步的 go/no-go 闸门，docs/09 §6.2）----
     if not args.no_vllm_smoke:
@@ -409,10 +471,19 @@ def main():
             from vllm import LLM, SamplingParams
             from rlab.rollout import build_prompt_ids
             llm = LLM(model=args.model_path, gpu_memory_utilization=args.gpu_mem, **_kw)
-            sp = SamplingParams(n=1, temperature=1.0, top_p=1.0,
+            # 【采样参数也取训练同口径】首版硬编码 temperature=1.0/top_p=1.0——
+            # 恰好与 retool_math preset 相同，但那是巧合；从 cfg 取才是结构性保证
+            # （改了 preset 的采样参数，冒烟的"调用率"会跟着变，不该各写一份）。
+            sp = SamplingParams(n=1, temperature=cfg["temperature"],
+                                top_p=cfg["top_p"],
+                                top_k=int(cfg.get("top_k", -1)),
                                 max_tokens=args.smoke_max_tokens)
-            provs = [build_prompt_ids(initial_messages(SYS, SMOKE_QUESTIONS[k % len(SMOKE_QUESTIONS)]), tok,
-                                      {"enable_thinking": False}, tools=True)
+            print(f"  采样: temperature={sp.temperature} top_p={sp.top_p} "
+                  f"top_k={sp.top_k} max_tokens={sp.max_tokens}（preset 同口径）")
+            provs = [build_prompt_ids(
+                        initial_messages(sys_prompt,
+                                         SMOKE_QUESTIONS[k % len(SMOKE_QUESTIONS)]),
+                        tok, _ctkw, tools=True)
                      for k in range(args.n_smoke)]
             outs = llm.generate([{"prompt_token_ids": p} for p in provs], sp,
                                 use_tqdm=False)
@@ -446,7 +517,11 @@ def main():
                       f"derive 或核对 --native_tool_style。")
             print("  判据：≥50% ✅ 继续；<20% ✗ 回 §1.2 重查；"
                   "调用率高但 invalid 多 ✗ 正则没对齐实测形态")
-            print("  对照：参考实现 base **87.5%**；rlab p11（围栏协议）~48%")
+            print("  对照：参考实现 base 87.5%（**在它自己的正式提示下**测的——"
+                  "本探针现在也用 preset 正式提示，故两者可比；"
+                  "若你看到本行打印的是玩具提示，说明代码退回了旧版）")
+            print("  另注：rlab p11 围栏协议 ~48% 是**自造格式**的调用率，"
+                  "与原生协议的先验不可直接比（前者需 SFT，后者 base 自带）")
             if n_ok + n_inv > 0:
                 print(f"  形态分布：命中调用 {n_ok} / 有调用标记但解析失败 {n_inv}"
                       f"（后者 >0 说明 {args.native_tool_style or 'auto'} 与实际形态有偏差）")
