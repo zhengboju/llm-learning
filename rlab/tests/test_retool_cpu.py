@@ -4234,11 +4234,17 @@ def test_attempt_shaping_and_err_tier():
         check(f"5c 偏离 {key}={val} 进签名（{frag}）", frag in sig_v)
         check(f"5c {key} 偏离段满足前缀兼容",
               sig_v.startswith(sig_base) and _is_opt_suffix(sig_v[len(sig_base):]))
+    # 【2026-09-25 修复·断言本身是坏的】旧写法括号错位：
+    #   all(f in _tr for f in ('a','b','c') and all(k in _tr for k in (...)))
+    # `('a','b','c') and all(...)` 先求值 → 非空 tuple 为真 → 整个 and 表达式取右操作数
+    # = 一个 **bool**，于是 `for f in True` → TypeError: 'bool' object is not iterable。
+    # 即这条断言从落地起就从未验证过 CLI 透传，只是在抛异常（且因为它是本文件倒数第二
+    # 个测试，pytest 只报 TypeError 不报断言失败，看起来像"环境问题"）。
     check("5c CLI: --code_w/--q_blacklist_ttl/--len_penalty_w 存在且透传",
-          all(f in _tr for f in ('"--code_w"', '"--q_blacklist_ttl"', '"--len_penalty_w"')
-              and all(k in _tr for k in ('overrides["code_w"]',
-                                         'overrides["q_blacklist_ttl"]',
-                                         'overrides["len_penalty_w"]'))))
+          all(f in _tr for f in ('"--code_w"', '"--q_blacklist_ttl"', '"--len_penalty_w"'))
+          and all(k in _tr for k in ('overrides["code_w"]',
+                                     'overrides["q_blacklist_ttl"]',
+                                     'overrides["len_penalty_w"]')))
     check("5c run_info: code_w/q_blacklist_ttl/len_penalty_* 落盘",
           all(k in _tr for k in ('"code_w": cfg.get("code_w")',
                                  '"q_blacklist_ttl": cfg.get("q_blacklist_ttl")',
@@ -4361,6 +4367,17 @@ def test_health_code_collapse():
           "code_collapse" not in codes_nf)
 
 
+# 【2026-09-25 补 __main__ guard】本文件 docstring 写的入口是
+# `python -m rlab.tests.test_retool_cpu`，但这串调用此前**缩进在
+# test_health_code_collapse 函数体内**、且没有 guard，后果有两条：
+#   ① 直接跑该命令时只定义函数、不执行任何测试 —— 静默 exit 0、零字节输出，
+#      看起来像"全部通过"，实际一个检查都没跑（检查器自身无声失效，与本轮修的
+#      "内嵌评测读数恒 0"是同一类病：成功的表象由默认值/空动作伪造）。
+#   ② pytest 跑到 test_health_code_collapse 时会**顺带把全部测试再跑一遍**
+#      （含它自己 → 递归），于是别的测试一旦抛异常，就伪装成这个测试挂掉：
+#      test_attempt_shaping_and_err_tier 的 TypeError 正是这样显示成两个失败的。
+# 现在移到模块级并加 guard：pytest 只收集函数（不执行本块），直接跑才逐个执行。
+if __name__ == "__main__":
     test_extract()
     test_mask_ab()
     test_sandbox()
@@ -4414,3 +4431,4 @@ def test_health_code_collapse():
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
+
