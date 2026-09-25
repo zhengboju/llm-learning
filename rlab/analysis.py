@@ -285,6 +285,57 @@ def legacy_code_rate(r: dict):
     return v, False
 
 
+def read_eval_result(path: str):
+    """读单模型评测 json，返回**扁平**的 result dict（读不到/坏文件返回 {}）。
+
+    【2026-09-25 事故·内嵌评测全 0】eval_vllm_one.py 落盘的是 **{name: result}**
+    嵌套壳（`json.dump({name: result})`，这是全仓库的正典格式：eval_vllm.py 靠
+    `results.update(json.load(f))` 合并、eval_merge.py 靠 `rows.items()` 遍历、
+    summarize_eval 也按这个壳读）。而 train.py 的内嵌评测读它时直接
+    `_r.get("acc", 0)` —— 键在壳里，取不到，于是**默认值 0 被当成真实读数**印进
+    训练日志：
+
+        [eval] step 50 test: acc=0.0% fmt=0.0% code=0.0% (n=0)
+
+    评测其实跑成功了（exit=0，否则走 FAILED 分支），结果就在 step_N/eval_*.json
+    里完好无损——只是训练日志和 analysis 的「评测」列在读一个不存在的层级。
+    n=0 是这个 bug 的签名：真实评测永远 n>0（池空时 eval 端直接 RuntimeError
+    退出，走的是 FAILED 分支而不是打印 n=0）。
+
+    同一个壳还骗过了 p10 盲窗哨兵：嵌套壳里顶层没有 acc/n，判盲逻辑于是把**每一个
+    评测成功的 checkpoint** 都标成"盲"——为看见盲窗加的列自己变成了假盲窗。
+
+    两种壳都吃（哨兵历史上写的是扁平壳），统一出扁平 result。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    # 扁平壳（超时哨兵/老格式）：自带 acc 或 n 键
+    if "acc" in raw or "n" in raw:
+        return raw
+    # 嵌套壳 {name: result}（eval_vllm_one.py 正典）：取第一个非 _meta 条目
+    for k, v in raw.items():
+        if not str(k).startswith("_") and isinstance(v, dict):
+            return v
+    return {}
+
+
+def eval_is_blind(path: str) -> bool:
+    """该 checkpoint 的内嵌评测是否"盲"（缺失 / 超时哨兵 / 结果不可读）。
+
+    判据：文件不存在，或解出的 result 里 acc/n 任一为 None（哨兵签名）或缺失。
+    绝不把"读不出来"当成"评测正常"——盲窗可见性的全部意义就在这。"""
+    if not os.path.exists(path):
+        return True
+    r = read_eval_result(path)
+    if not r:
+        return True
+    return r.get("n") is None or r.get("acc") is None
+
+
 def summarize_eval(path: str, base_name: str = "BASE") -> str:
     with open(path, encoding="utf-8") as f:
         results = json.load(f)
@@ -694,15 +745,10 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
                 if _cs_samp < _w_samp[0] or _cs_samp > _w_samp[1]:
                     continue
                 _es = os.path.join(_dir, f"step_{_cs}", "eval_test.json")
-                _blind = True
-                if os.path.exists(_es):
-                    try:
-                        with open(_es, encoding="utf-8") as _f:
-                            _er = json.load(_f)
-                        _blind = _er.get("n") is None or _er.get("acc") is None
-                    except (OSError, ValueError):
-                        _blind = True
-                if _blind:
+                # 【2026-09-25】经 read_eval_result 解壳再判：旧版直接读顶层
+                # acc/n，对 eval_vllm_one.py 的 {name: result} 嵌套壳恒为 None
+                # → 每个评测成功的 checkpoint 都被误标"盲"。
+                if eval_is_blind(_es):
                     _bl = "盲"
                 break
         out.append(f"| {i}~{j} | {i // 8}~{j // 8} "

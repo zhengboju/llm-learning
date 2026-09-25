@@ -3556,8 +3556,10 @@ def test_inline_eval_timeout_fix():
     # 3) analysis --record 表加「评测」列：哨兵/缺失标 "盲"
     check("analysis: 表头加「评测」列",
           "| 评测 |" in an and "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|" in an)
-    check("analysis: 哨兵/缺失判盲（acc=None 或 n=None → 盲）",
-          "_er.get(\"n\") is None or _er.get(\"acc\") is None" in an
+    # 判盲逻辑 2026-09-25 收口到 eval_is_blind（旧版内联读顶层 acc/n，对嵌套壳恒判盲）
+    check("analysis: 哨兵/缺失判盲收口到 eval_is_blind（曲线表调它，不再内联读顶层）",
+          "def eval_is_blind(" in an
+          and "if eval_is_blind(_es):" in an
           and "\"盲\"" in an)
 
     # 4) 配置合并端到端：preset 覆盖 + CLI 覆盖都走 get_config
@@ -3571,6 +3573,94 @@ def test_inline_eval_timeout_fix():
     _c3 = get_config("grpo", use_wandb=False)
     check("config: BASE 档（grpo）保持 900（旧行为零变化）",
           _c3.get("eval_timeout_s") == 900)
+
+
+def test_inline_eval_json_shape():
+    """【2026-09-25 事故·内嵌评测日志全 0（p11）】训练日志里 6 个 checkpoint × 2 split
+    的内嵌评测读数全是 `acc=0.0% fmt=0.0% code=0.0% (n=0)`——看起来像"模型一步没学会"，
+    实际是**读错 json 层级**。
+
+    eval_vllm_one.py 落盘 `json.dump({name: result})`（嵌套壳，全仓库正典：
+    eval_vllm.py 靠 `results.update(...)` 合并、eval_merge.py 遍历 `rows.items()`、
+    summarize_eval 也按这个壳读）。而 train.py 的 _run_inline_eval 直读顶层
+    `_r.get("acc", 0)` → 键在壳里取不到 → **默认值 0 被当成真实读数印出来**。
+
+    为什么 n=0 是这个 bug 的签名而不是"真没题可评"：池空时 eval 端直接
+    RuntimeError 退出（returncode≠0）→ 走 FAILED 分支，压根到不了打印 n=0 的那行。
+    能打印出 n=0 就说明 exit=0、评测成功、结果在磁盘上完好。
+
+    连带：p10 为"让盲窗可见"加的哨兵判据同样内联读顶层 acc/n → 对嵌套壳恒为 None
+    → 每个**评测成功**的 checkpoint 都被标"盲"（治盲窗的列自己造假盲窗）。
+
+    本测试锁死：①解壳纯函数吃两种壳；②嵌套壳 acc 必须解出真值而不是 0；
+    ③判盲只对真哨兵/缺失为真；④train.py 不再直读顶层、且解不出 n 时不印假 0；
+    ⑤哨兵也落嵌套壳（磁盘上只有一种结构）。"""
+    print("[AL] 内嵌评测 json 壳层级（p11 全 0 事故）")
+    from rlab.analysis import eval_is_blind, read_eval_result
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tr = open(os.path.join(_root, "rlab", "train.py"), encoding="utf-8").read()
+
+    with tempfile.TemporaryDirectory() as d:
+        # ① 正典嵌套壳（eval_vllm_one.py 的真实产物形状）
+        real = {"acc": 0.327, "fmt": 0.993, "code_rate": 0.41, "both": 0.327,
+                "n": 300, "metrics_version": 2}
+        p_nest = os.path.join(d, "eval_test.json")
+        with open(p_nest, "w", encoding="utf-8") as f:
+            json.dump({"step50_test": real}, f)
+        r = read_eval_result(p_nest)
+        check("嵌套壳 {name: result} 解出真实 acc/n（旧读法在此拿到 0/0）",
+              abs(r.get("acc", 0) - 0.327) < 1e-9 and r.get("n") == 300)
+        # 旧读法的反向对照：直读顶层必然是缺键 → 这就是日志里的 0.0%/n=0
+        with open(p_nest, encoding="utf-8") as f:
+            _raw = json.load(f)
+        check("反向对照：直读顶层 acc/n 缺键（假 0 读数的来源）",
+              _raw.get("acc", 0) == 0 and _raw.get("n", 0) == 0)
+        check("嵌套壳且 acc/n 有值 → 不判盲（评测成功不得标盲）",
+              eval_is_blind(p_nest) is False)
+
+        # ② 扁平壳（历史哨兵格式）也要吃
+        p_flat = os.path.join(d, "eval_flat.json")
+        with open(p_flat, "w", encoding="utf-8") as f:
+            json.dump(real, f)
+        check("扁平壳（历史格式）同样解出真值 —— 两种壳都吃",
+              read_eval_result(p_flat).get("n") == 300)
+
+        # ③ 哨兵（两种壳）都必须判盲
+        stub = {"acc": None, "fmt": None, "code_rate": None, "n": None,
+                "error": "timeout"}
+        p_s1 = os.path.join(d, "eval_stub_nest.json")
+        p_s2 = os.path.join(d, "eval_stub_flat.json")
+        with open(p_s1, "w", encoding="utf-8") as f:
+            json.dump({"step50_test": stub}, f)
+        with open(p_s2, "w", encoding="utf-8") as f:
+            json.dump(stub, f)
+        check("超时哨兵（嵌套壳）判盲", eval_is_blind(p_s1) is True)
+        check("超时哨兵（扁平壳）判盲", eval_is_blind(p_s2) is True)
+        check("文件缺失判盲", eval_is_blind(os.path.join(d, "nope.json")) is True)
+
+        # ④ 坏文件/空壳：读不出来一律判盲，绝不当成"评测正常"
+        p_bad = os.path.join(d, "eval_bad.json")
+        with open(p_bad, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        check("坏 json 判盲且解壳返回 {}（不抛异常打断 analysis）",
+              read_eval_result(p_bad) == {} and eval_is_blind(p_bad) is True)
+        p_meta = os.path.join(d, "eval_meta_only.json")
+        with open(p_meta, "w", encoding="utf-8") as f:
+            json.dump({"_meta": {"n": 300}}, f)
+        check("只有 _meta 的壳 → 解不出 result（_meta 不是模型结果）",
+              read_eval_result(p_meta) == {} and eval_is_blind(p_meta) is True)
+
+    # ⑤ train.py 侧：走解壳函数、不再直读顶层、解不出 n 不印假 0
+    check("train: 内嵌评测经 read_eval_result 解壳",
+          "from rlab.analysis import read_eval_result" in tr
+          and "_r = read_eval_result(_out)" in tr)
+    check("train: 不再出现直读顶层的旧写法 _r.get(\"acc\", 0)",
+          '_r.get("acc", 0)' not in tr and '_r.get("fmt", 0)' not in tr
+          and '_r.get("code_rate", 0)' not in tr)
+    check("train: 解不出 n 时记盲窗、不打印 0.0% 假读数",
+          'if not _r or _n is None:' in tr and "不产生假 0 读数" in tr)
+    check("train: 超时哨兵也落 {name: result} 嵌套壳（磁盘只有一种结构）",
+          'json.dump({f"step{step}_{_split}": _stub}' in tr)
 
 
 def test_preflight_audit_fixes():
@@ -4260,6 +4350,7 @@ def test_health_code_collapse():
     test_val_n_metric_fixes()
     test_eval_determinism_wiring()
     test_inline_eval_timeout_fix()
+    test_inline_eval_json_shape()
     test_preflight_audit_fixes()
     test_overlong_filter()
     test_attempt_shaping_and_err_tier()

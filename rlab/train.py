@@ -359,21 +359,39 @@ def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
                      "error": "timeout", "detail": str(_te)[:200]}
             try:
                 with open(_out, "w", encoding="utf-8") as _f:
-                    json.dump(_stub, _f, ensure_ascii=False)
+                    # 【2026-09-25】哨兵也落 {name: result} 嵌套壳——与 eval_vllm_one.py
+                    # 同一个壳。旧版哨兵是扁平壳：磁盘上同名文件存在两种结构，读端
+                    # 必须猜，这正是"读顶层 acc 恒 0"那类 bug 的温床。
+                    json.dump({f"step{step}_{_split}": _stub}, _f, ensure_ascii=False)
             except OSError:
                 pass
             print(f"[eval] step {step} {_split} TIMEOUT (>={eval_timeout_s}s)，"
                   f"已落空结果哨兵 -> {_out}（此 checkpoint 本轮为盲窗）", flush=True)
             continue
         if _proc.returncode == 0 and os.path.exists(_out):
-            with open(_out, encoding="utf-8") as f:
-                _r = json.load(f)
-            _acc = _r.get("acc", 0)
-            _fmt = _r.get("fmt", 0)
-            _code = _r.get("code_rate", 0)
-            summary[_split] = {"acc": _acc, "fmt": _fmt, "code": _code, "n": _r.get("n", 0)}
+            # 【2026-09-25 事故修复·内嵌评测全 0】eval_vllm_one.py 落的是
+            # {name: result} 嵌套壳（全仓库正典：eval_vllm.py/eval_merge.py/
+            # summarize_eval 都按这个壳读）。旧版在这里直读顶层 acc/fmt/code_rate
+            # → 键全部取不到 → `.get(..., 0)` 的默认值被当成真实读数印进日志：
+            #     [eval] step 50 test: acc=0.0% fmt=0.0% code=0.0% (n=0)
+            # 评测本身是成功的（exit=0，结果就在 eval_*.json 里），但 p11 全程 6 个
+            # checkpoint × 2 split 的日志读数全是假 0，等于 p9/p10 想治的盲窗又回来
+            # 了一次——而且这次伪装成"模型完全学不会"。解壳收口到 analysis。
+            from rlab.analysis import read_eval_result
+            _r = read_eval_result(_out)
+            _n = _r.get("n")
+            if not _r or _n is None:
+                # 解不出 n = 哨兵/坏壳/空结果：明说读不到，不印 0.0% 假读数
+                print(f"[eval] step {step} {_split} 结果不可解析（exit=0 但 "
+                      f"{_out} 无有效 acc/n）→ 本 split 记为盲窗，不产生假 0 读数",
+                      flush=True)
+                continue
+            _acc = _r.get("acc") or 0.0
+            _fmt = _r.get("fmt") or 0.0
+            _code = _r.get("code_rate") or 0.0
+            summary[_split] = {"acc": _acc, "fmt": _fmt, "code": _code, "n": _n}
             print(f"[eval] step {step} {_split}: acc={_acc*100:.1f}% "
-                  f"fmt={_fmt*100:.1f}% code={_code*100:.1f}% (n={_r.get('n', 0)})",
+                  f"fmt={_fmt*100:.1f}% code={_code*100:.1f}% (n={_n})",
                   flush=True)
         else:
             print(f"[eval] step {step} {_split} FAILED (exit={_proc.returncode})"
