@@ -393,6 +393,28 @@ def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
             print(f"[eval] step {step} {_split}: acc={_acc*100:.1f}% "
                   f"fmt={_fmt*100:.1f}% code={_code*100:.1f}% (n={_n})",
                   flush=True)
+            # 【2026-09-25 口径自证】capture_output=True 把子进程所有 print 吃掉并在
+            # 成功时丢弃 → 训练日志里没有任何"这次评测用的什么协议/抽了哪些题"的
+            # 痕迹。后果实测：p11 的内嵌读数与训练后单独评测在 step100 差 +7.0pp，
+            # 而 log11.txt 里查不到任何可对账的信息（抽题 seed/剔题数/协议来源全在
+            # 被丢弃的 stdout 里）。两个读数不一致时，能不能当场定位差异，取决于
+            # 日志有没有留下口径——所以把关键几项摘进日志（一行，grep 友好）。
+            _ep = _r.get("eval_protocol") or {}
+            print(f"[eval] step {step} {_split} 口径: "
+                  f"n_req={_r.get('n_requested')} 剔题(plen/long)="
+                  f"{_r.get('n_dropped_plen')}/{_r.get('n_dropped_long')} "
+                  f"seed={_ep.get('seed')} val_n={_ep.get('val_n')} "
+                  f"greedy={_ep.get('greedy')} T={_ep.get('temperature')} "
+                  f"round_tok={_ep.get('round_tokens')} "
+                  f"bi={_ep.get('vllm_batch_invariant')} "
+                  f"sp={_ep.get('system_prompt_sha')} "
+                  f"proto_from_run_info={_ep.get('proto_from_run_info')}",
+                  flush=True)
+            # 子进程的警告（协议回落 preset / 池子不足 / 确定性档缺失）同样被
+            # capture 吃掉——回落是静默的，而回落恰好是"测了另一个协议"的根因。
+            for _ln in (_proc.stdout or "").splitlines():
+                if "[警告]" in _ln or "[eval][警告]" in _ln:
+                    print(f"[eval] step {step} {_split} ⤷ {_ln.strip()}", flush=True)
         else:
             print(f"[eval] step {step} {_split} FAILED (exit={_proc.returncode})"
                   f"\n  stderr: {(_proc.stderr or '')[:300]}", flush=True)

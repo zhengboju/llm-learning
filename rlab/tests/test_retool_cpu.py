@@ -3666,6 +3666,58 @@ def test_inline_eval_json_shape():
           'json.dump({f"step{step}_{_split}": _stub}' in tr)
 
 
+def test_inline_eval_protocol_attestation():
+    """【2026-09-25 口径自证】内嵌评测必须把协议摘进训练日志。
+
+    事故：p11 的内嵌读数（step100 test 63.3%）与训练后单独评测（70.3%）差 +7.0pp，
+    而 log11.txt 里**查不到任何可对账的信息**——`capture_output=True` 把 eval 子进程
+    的全部 print 收进 _proc.stdout，成功路径直接丢弃：抽题 seed、剔题数、协议来源、
+    确定性档、system_prompt 哈希全部随之消失。两个读数不一致时能否当场定位，取决于
+    日志有没有留下口径；否则只能像这次一样事后写脚本逐题配对。
+
+    另一半同因：子进程的 `[警告]`（协议回落 preset / 池子不足 / 确定性档缺失）也被
+    吃掉。而"静默回落 preset"正是"测了另一个协议"的头号根因（eval_vllm_one.py 自己
+    的注释就记着 baseA/baseB 事故）。
+    """
+    print("[AM] 内嵌评测口径自证（p11 +7.0pp 无从对账）")
+    tr = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+
+    check("train: 打印口径行（含 seed/剔题/协议来源）",
+          '{_split} 口径:' in tr
+          and "n_dropped_plen" in tr and "n_dropped_long" in tr
+          and "_ep.get('seed')" in tr
+          and "_ep.get('proto_from_run_info')" in tr)
+    check("train: 口径取自 eval_protocol（落盘字段，非重新推测）",
+          '_ep = _r.get("eval_protocol") or {}' in tr)
+    check("train: 确定性档与 system_prompt 哈希进日志（跨 run 可比性前提）",
+          "_ep.get('vllm_batch_invariant')" in tr
+          and "_ep.get('system_prompt_sha')" in tr)
+    check("train: 子进程 [警告] 转发到训练日志（静默回落不再隐形）",
+          '"[警告]" in _ln' in tr and "_proc.stdout" in tr)
+
+    # eval 端确实落了这些键（两端字段名对齐，否则日志印一排 None）
+    one = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "eval_vllm_one.py"), encoding="utf-8").read()
+    for _k in ("n_requested", "n_dropped_plen", "n_dropped_long"):
+        check(f"eval_one: 结果落 {_k}（口径行的数据源）", f'"{_k}"' in one)
+    for _k in ("seed", "val_n", "greedy", "round_tokens",
+               "vllm_batch_invariant", "system_prompt_sha", "proto_from_run_info"):
+        check(f"eval_one: eval_protocol 落 {_k}", f'"{_k}"' in one)
+
+    # 端到端：用真实形状的 result 跑一遍口径行的取值，确认无 None 漏项
+    _ep_keys = ("seed", "val_n", "greedy", "temperature", "round_tokens",
+                "vllm_batch_invariant", "system_prompt_sha", "proto_from_run_info")
+    _fake = {"acc": 0.633, "fmt": 0.74, "n": 256, "n_requested": 300,
+             "n_dropped_plen": 44, "n_dropped_long": 0,
+             "eval_protocol": {k: 1 for k in _ep_keys}}
+    _ep = _fake.get("eval_protocol") or {}
+    check("口径行所有字段在真实 result 形状下都取到值（无 None）",
+          all(_ep.get(k) is not None for k in _ep_keys)
+          and all(_fake.get(k) is not None
+                  for k in ("n_requested", "n_dropped_plen", "n_dropped_long")))
+
+
 def test_preflight_audit_fixes():
     """【2026-09-20 pre-flight 审查八项修复】每项都锁"旧行为会怎么错"。
 
@@ -4354,6 +4406,7 @@ def test_health_code_collapse():
     test_eval_determinism_wiring()
     test_inline_eval_timeout_fix()
     test_inline_eval_json_shape()
+    test_inline_eval_protocol_attestation()
     test_preflight_audit_fixes()
     test_overlong_filter()
     test_attempt_shaping_and_err_tier()
