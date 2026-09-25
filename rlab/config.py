@@ -13,6 +13,15 @@
 import copy
 import os
 
+# 【2026-09-25 原生协议（docs/09）】工具协议档位。
+#   "fence"  = p1–p11 的 python 围栏 + [TOOL RESULT] 文本回填（逐位可复现，回退位）
+#   "native" = Qwen 原生 <tool_call> 工具协议（方案 A 主线）
+# 做成**运行时开关**而不是重写：协议本身才是可 A/B 的单变量（docs/09 §8）。
+# 刻意**不另起 algo 名**——算法（loss/adv/打分口径）一字未改，变的是 rollout 协议；
+# 新起名字会让 losses/ALGOS/eval/ref_server 五处并列分叉，而收益只是命名好听。
+# 隔离由两处承担：①签名里加 -tp<native>；②新 run 必须换 out_dir（docs/09 §8）。
+TOOL_PROTOCOLS = ("fence", "native")
+
 # 各算法的默认差异项（其余超参全部继承 BASE）
 ALGO_DEFAULTS = {
     # GRPO 原版：对称 clip、样本级归一化、组内 std 标准化
@@ -400,6 +409,21 @@ BASE = dict(
     # 保证是 final 答案轮——末轮代码执行结果无人消费，2026-09-09 审查修复：
     # 旧版末轮执行 code_ok 还记分，模型却永远没机会读结果作答）。
     max_rounds=3,            # = 2 次代码-执行-续写 + 1 次 final 生成
+    # ---- 工具协议档位（docs/09-native-tool-protocol.md）----
+    # "fence"（缺省）= 自造围栏 + [TOOL RESULT] 文本（p1–p11 逐位可复现）；
+    # "native"       = Qwen 原生 <tool_call>（方案 A 主线，参考实现 +23.89pp 的形态）。
+    # 缺省必须是 "fence"：任何未显式改档的 run（含所有历史命令）行为逐字节不变。
+    tool_protocol="fence",
+    # 原生调用的解析形态："auto"=逐形态试（先 <function=…> 后 JSON）。
+    # 【为什么有开关】Qwen2.5 与 Qwen3.5 的 tools 渲染形态不同且不能互推
+    # （本机实测：2.5 是 JSON 形态，参考实现的正则吃的是 3.5 的 <function=…> 形态）。
+    # 可用 rlab/native_probe.py 在 pod 上探明后显式钉死，避免 auto 猜错时静默走错分支。
+    native_tool_style="auto",
+    # True = 用 "</tool_call>" 作 stop 串在调用边界硬停。默认 False（原生节奏：
+    # 模型自己吐 im_end）。只在 base 冒烟发现"调用后还继续瞎写"时才打开——
+    # 那种样本 parse 判 invalid → 无 boxed → reward -1，是原生协议唯一的结构性
+    # 负奖励入口（docs/09 §0.1 症状③ 的对应形态）。
+    native_stop_at_call=False,
     # 【2026-09-08 代码灭绝教训】280 太紧：代码块约占 80-150 token，写代码的样本
     # 极易在轮内写不完围栏 → 完整块检测不到 → 残缺结尾 → fmt=-1 且无答案——
     # "写代码"被结构性惩罚、几步内灭绝（真机两轮 code_rate=0 的根因）。
@@ -470,16 +494,60 @@ _RETOOL_MATH_SYSTEM = (
 )
 system_prompt_retool_math = _RETOOL_MATH_SYSTEM
 
+# 【2026-09-25 原生协议提示（docs/09 §2.3）】以参考实现的 SYSTEM_PROMPT 为蓝本。
+# 与围栏版的差别只有一件事：**删掉所有围栏/`[TOOL RESULT]` 措辞**——原生协议下
+# 工具声明由 chat template 的 tools 段提供，提示里再讲一遍围栏格式就是自相矛盾
+# （docs/02 第三类灭绝：MUST 写围栏 ⊕ 格式正则锚定互相打架）。boxed 收尾保留
+# （打分口径没变）。零标签字面量：本串不含任何尖括号标签字节。
+_RETOOL_MATH_SYSTEM_NATIVE = (
+    "You solve math problems step by step with help from a Python code interpreter.\n"
+    "Use the code_interpreter tool when calculation, symbolic manipulation, or "
+    "enumeration helps you solve the problem accurately and quickly.\n\n"
+    "How to use the code_interpreter tool:\n"
+    "- Call code_interpreter with a `code` string containing Python code. Call it at "
+    "most once per assistant turn, then wait for the execution result.\n"
+    "- Results are captured from what your code prints with print(). Always print the "
+    "values you want to see.\n"
+    "- Each execution is independent: no variables, files, or state carry over between "
+    "calls. Redefine everything you need in each piece of code.\n"
+    "- Code must finish within a few seconds and use little memory. Do not read or "
+    "write files. If you enumerate or brute-force, keep the search space small.\n"
+    "- If the execution returns an error, analyze it and retry with corrected code "
+    "when useful.\n\n"
+    "When you have the final answer, end with exactly one line in this format:\n"
+    "\\boxed{<your final answer>}\n"
+    "Do not call the tool and give the final answer in the same turn."
+)
+system_prompt_retool_math_native = _RETOOL_MATH_SYSTEM_NATIVE
 
-def default_system_prompt(algo: str) -> str:
+# 原生协议的预算档（docs/09 §5.1 档 A，实跑 validate_retool_budget 核对）：
+#   max_rounds(5) × round_gen_tokens(1024) + max_prompt_length(1024) + 预留(798) = 7208 ≤ 8192 ✅
+# 依据：参考实现 max_code_calls=4 / max_assistant_turns=6 / 单回合 1024 / 轨迹 ≤8192。
+# max_rounds=5 → 只有前 4 轮执行代码（末轮保证 final，docs/02 发现3 的语义不变），
+# 恰好对应参考的 max_code_calls=4。
+NATIVE_PROTOCOL_DEFAULTS = {
+    "max_rounds": 5,
+    "round_gen_tokens": 1024,
+    "max_context_tokens": 8192,
+    # 原生协议自然停在 im_end（EOS 已在 token_ids 里，docs/05 §12.3 已核对），
+    # 不需要围栏路径的 stop 串。
+    "retool_stop": False,
+}
+
+
+def default_system_prompt(algo: str, tool_protocol: str = "fence") -> str:
     """该算法 preset 的**默认**系统提示（供 run_signature 判定"提示被改过"）。
 
     【2026-09-17 为什么需要它】提示是探针/训练/评测的单一来源，也是难度表的
     协议的一半——表是"模型×提示×预算"三者的联合产物。改了提示却不进签名，
     就会把"新提示下探的表"和"旧提示下的 run"当成同一配方对照（与
-    `vllm_gen_kwargs` 不进签名同属一类静默偏离）。"""
+    `vllm_gen_kwargs` 不进签名同属一类静默偏离）。
+
+    【2026-09-25】加 tool_protocol 维：原生协议的提示与围栏版**必须不同**
+    （删围栏措辞），只按 algo 取名会让"改了协议没改提示"被签名判成"无偏离"。"""
     if algo == "retool_math":
-        return system_prompt_retool_math
+        return (system_prompt_retool_math_native if tool_protocol == "native"
+                else system_prompt_retool_math)
     if algo == "retool":
         return system_prompt_retool
     return BASE["system_prompt"]
@@ -535,11 +603,31 @@ def get_config(algo: str, **overrides) -> dict:
         if k not in cfg:
             raise KeyError(f"未知配置项 {k!r}")
         cfg[k] = v
+    # 工具协议档位校验（fail-fast 在 rollout/生成端之前——生成端崩溃的表现只是
+    # 训练端一句"生成端进程已退出"，错误必须留在能排查的地方）
+    if cfg.get("tool_protocol") not in TOOL_PROTOCOLS:
+        raise ValueError(
+            f"[config] 未知 tool_protocol={cfg.get('tool_protocol')!r}，可选 "
+            f"{TOOL_PROTOCOLS}（fence=p1–p11 围栏协议；native=Qwen 原生 tool_call）")
+    # 【2026-09-25 静默空转防线】native 只对 retool 家族有意义——多轮 rollout
+    # （multi_turn_rollout_group / collect_retool_group）才是它的消费点，单轮路径
+    # 从不读它。在 grpo/dapo 上传 native = 用户以为开了原生工具协议、实际什么都没
+    # 发生（本项目最贵的一类 bug：成功的表象由空动作伪造）。当场拦下。
+    if cfg.get("tool_protocol") == "native" and not algo.startswith("retool"):
+        raise ValueError(
+            f"[config] tool_protocol='native' 只对 retool 家族有效，当前 algo="
+            f"{algo!r} 走单轮路径（从不读该键）→ 传了等于没传。\n"
+            f"  要跑原生工具协议：--algo retool_math（或 retool）。")
+    # 原生协议预算档（docs/09 §5.1 档 A）。显式 override 优先（CLI 单变量微调位）。
+    if cfg.get("tool_protocol") == "native":
+        for _k, _v in NATIVE_PROTOCOL_DEFAULTS.items():
+            if _k not in overrides:
+                cfg[_k] = _v
     # retool 专用系统提示（除非用户显式覆盖）
     if algo == "retool" and "system_prompt" not in overrides:
         cfg["system_prompt"] = system_prompt_retool
     if algo == "retool_math" and "system_prompt" not in overrides:
-        cfg["system_prompt"] = system_prompt_retool_math
+        cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
     if cfg["wandb_name"] is None:
         cfg["wandb_name"] = f"{algo}"
     # 输出目录按算法隔离（防 grpo/dapo 的 step_N checkpoint 与 record 互相覆盖）

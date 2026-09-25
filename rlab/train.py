@@ -107,10 +107,20 @@ def run_signature(cfg: dict) -> str:
     # 预算"的联合产物）。与 vk_tag 同一约定——**只在确实偏离 preset 时追加**，
     # 默认档的签名串逐字不变（保 P1b 等历史 run 的对照口径与 ckpt 护栏）。
     _sp = cfg.get("system_prompt")
-    if _sp != default_system_prompt(cfg.get("algo")):
+    # 【2026-09-25 工具协议进签名】协议是 rollout 的一半（同一份预算参数下，围栏与
+    # 原生生成的序列/终止/上下文结构完全不同），不进签名两个 run 就会撞同一 out_dir。
+    # 与 vk_tag 同一约定：**缺省 "fence" 时一个字符都不加**，历史签名串逐字不变。
+    tp_tag = ("-tp" + str(cfg.get("tool_protocol"))
+              if (cfg.get("tool_protocol") or "fence") != "fence" else "")
+    # 提示比对也要按**同协议**的 preset 取名，否则原生档的默认提示会被判成"偏离
+    # preset"而多加一个 -sp（协议本身已有 -tp，重复标注会让签名难读）
+    if _sp != default_system_prompt(cfg.get("algo"), cfg.get("tool_protocol") or "fence"):
         sp_tag = "-sp" + hashlib.sha1(str(_sp).encode("utf-8")).hexdigest()[:6]
     else:
         sp_tag = ""
+    # 原生协议的调用边界硬停（native_stop_at_call）也是行为级开关：开了它，模型
+    # 在 "</tool_call>" 就被截停，采样分布与自然停档不同 → 必须进签名。
+    nsc_tag = "-nsc1" if cfg.get("native_stop_at_call") else ""
     # 【2026-09-18 stop 机制进签名】工具调用节奏是 rollout 协议的一半（带 stop 的
     # p7 与无 stop 的 p6 同预算参数但行为完全不同，不进签名就无法区分）。与
     # vk_tag/sp_tag 同一约定：键缺失或关闭 → 一个字符都不加，历史签名逐字不变。
@@ -169,7 +179,8 @@ def run_signature(cfg: dict) -> str:
     return (f"{cfg.get('algo')}-ts{ts:g}-ol{1 if cfg.get('overlong_shaping') else 0}"
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
-            f"-lr{lr_tag}-{dtag}{vk_tag}{sp_tag}{stop_tag}{of_tag}{caw_tag}{cw_tag}{qt_tag}{lp_tag}{_opt_tag}")
+            f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
+            f"{caw_tag}{cw_tag}{qt_tag}{lp_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -184,6 +195,12 @@ def write_run_info(path: str, cfg: dict) -> None:
             "reward_switch_step": cfg.get("reward_switch_step"),
             "round_gen_tokens": cfg.get("round_gen_tokens"),
             "max_rounds": cfg.get("max_rounds"),
+            # 【2026-09-25 原生协议】协议档位与解析形态落进 run_info：eval 端
+            # （--proto_from）必须能回读到"评测该用哪条协议"，否则原生档训练的
+            # ckpt 会被围栏档协议评（序列/终止结构完全不同 → 测的是另一个模型）。
+            "tool_protocol": cfg.get("tool_protocol"),
+            "native_tool_style": cfg.get("native_tool_style"),
+            "native_stop_at_call": cfg.get("native_stop_at_call"),
             "trunc_shaping": cfg.get("trunc_shaping"),
             "overlong_shaping": cfg.get("overlong_shaping"),
             "overlong_filter": cfg.get("overlong_filter"),
@@ -772,6 +789,24 @@ def main():
                     help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
                          "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
                          "--no-retool_stop 关闭 = p6 旧协议（A/B 对照位）")
+    # 【2026-09-25 原生工具协议（docs/09）】方案 A 主线：Qwen 原生 <tool_call>。
+    # 改档会同时改预算几何（见 config.NATIVE_PROTOCOL_DEFAULTS）与系统提示，
+    # 故必须换 --out_dir（历史 p1–p11 的对照口径**刻意**作废，docs/09 §8）。
+    ap.add_argument("--tool_protocol", choices=("fence", "native"), default=None,
+                    help="工具协议档：fence=p1–p11 围栏+[TOOL RESULT]（默认，逐位"
+                         "可复现）；native=Qwen 原生 <tool_call>（docs/09 方案 A，"
+                         "改档同时切换预算档 5×1024/8192 与原生系统提示）")
+    ap.add_argument("--native_tool_style", choices=("auto", "function", "json"),
+                    default=None,
+                    help="原生调用解析形态：auto=逐形态试（默认）；function=<function="
+                         "…>/<parameter=…>（Qwen3.x）；json=Qwen2.5 形态。用 "
+                         "rlab/native_probe.py 在 pod 上探明后钉死更安全")
+    ap.add_argument("--native_stop_at_call", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="原生协议：用 '</tool_call>' 作 stop 串在调用边界硬停"
+                         "（默认关 = 模型自然吐 im_end）。只在 base 冒烟看到"
+                         "'调用后还继续瞎写'时才开（那是原生协议唯一的结构性"
+                         "负奖励入口）")
     # 【2026-09-23 补 CLI 缺口·采样协议三件套】temperature/top_k/top_p 此前只能改
     # config.py preset —— 而 preset 偏离不进 run_signature 的优化器段（签名只对 CLI
     # 偏离追加字符），改源码的 run 会与旧 ckpt 撞同一个 out_dir（--num_pre_Q 4
@@ -967,6 +1002,13 @@ def main():
     if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
+    # 【2026-09-25 原生工具协议】tool_protocol 必须先落进 overrides——get_config
+    # 靠它决定要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感）。
+    if args.tool_protocol is not None: overrides["tool_protocol"] = args.tool_protocol
+    if args.native_tool_style is not None:
+        overrides["native_tool_style"] = args.native_tool_style
+    if args.native_stop_at_call is not None:
+        overrides["native_stop_at_call"] = args.native_stop_at_call
     if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
     # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
     if args.temperature is not None: overrides["temperature"] = args.temperature
@@ -1026,6 +1068,18 @@ def main():
     cfg["run_signature"] = run_signature(cfg)
     print(f"[train] 偏离签名 signature={cfg['run_signature']}"
           f"（对比参考 agentic-rl-lab/05-retool 与上轮 run 时先看这一行）")
+    # 【2026-09-25 原生协议档自证】协议档决定 rollout 的整条数据流（解析/续写/
+    # 预算/提示），与 p1–p11 **不可同表对照**（docs/09 §8）。这一行让"这次到底
+    # 跑的哪条协议"在日志第一屏就能看到，不必回读 run_info.json。
+    if (cfg.get("tool_protocol") or "fence") != "fence":
+        print(f"[train] ⚠ 工具协议 = {cfg['tool_protocol']}（原生 <tool_call>，docs/09）"
+              f"｜解析形态={cfg.get('native_tool_style')}"
+              f"｜调用边界硬停={'开' if cfg.get('native_stop_at_call') else '关'}"
+              f"｜预算 {cfg.get('max_rounds')}轮×{cfg.get('round_gen_tokens')}tok"
+              f"/ctx {cfg.get('max_context_tokens')}"
+              f"（前 {max(0, int(cfg.get('max_rounds', 1)) - 1)} 轮可执行代码）\n"
+              f"        与 p1–p11 的围栏协议**不可同表对照**（刻意）："
+              f"out_dir 必须是新的，评测需 --proto_from 回读本档。")
     # 【2026-09-20 剂量口径自证】`all_steps` 计的是 **micro-batch 拉取次数**，不是
     # optimizer 更新数 —— 每步拉一个上传批（=num_pre_Q 行），GAS 步才更新一次。
     # 旧注释/文档把 300 说成 "300 optimizer steps"，实际只有 75 次，差 4 倍，

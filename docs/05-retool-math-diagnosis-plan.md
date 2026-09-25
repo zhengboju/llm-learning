@@ -7,6 +7,16 @@
 > run2 评测 `eval_vllm_all.json`，以及参考项目
 > [agentic-rl-lab/05-retool](https://github.com/KMnO4-zx/agentic-rl-lab/tree/main/05-retool)。
 > 配套：迁移与协议层 checklist 见 `03-qwen35-4b-retool-math-checklist.md`；显存见 `04-qwen35-4b-gpu-memory-oom.md`。
+> **⚠ 2026-09-25 口径更新：本文档的全部诊断都在"从 base 直接 RL"的前提下进行。**
+> p11 定案训练从未超过 BASE（step100 p=0.892），本文档 §7.5 的四类代码灭绝机制
+> 是同一根因的四个投影。
+>
+> **根因已定位：本文档 §12.1 的 #4 偏离项（自造 `[TOOL RESULT]` 文本协议 vs
+> 原生 `<tool_call>`）就是主因**，而它的触发条件（"p6+shaping 都救不回"）在 p11
+> 已满足却从未执行。`agentic-rl-lab` 用同一基座 + 同一数据、**跳过 SFT 直接 RL**、
+> 靠原生 `<tool_call>` 协议拿到 +23.89pp。
+> **→ 实施方案见 `09-native-tool-protocol.md`（主线）。**
+> `08-sft-cold-start.md` 已降为 fallback。
 > **进度看板见 §7**（`[x]` 已落地 / `[ ]` 待执行）。
 > **§7.5.5（2026-09-18）**：p5 加量 + gen_update_steps=8 终局——step100 **+4.6pp 显著**
 > （p=0.033）但 step300 回吐 −3.4pp（同款模式第三次）；剂量/快照错位已排除，

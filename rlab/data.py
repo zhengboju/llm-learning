@@ -439,7 +439,11 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
                 table[str(q)] = r
                 if expected_meta and r.get("probe_meta"):
                     # k 刻意不在比对清单里（两端语义不同，见 docstring）
-                    for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp"):
+                    # 【2026-09-25】新增 tool_protocol：围栏档与原生档的通过率是
+                    # 两个分布（同模型同提示下 base 调用率 87.5% vs ~48%），换协议
+                    # 续跑同一 --out 会静默混表——这是"预算/提示"同类的协议级偏离。
+                    for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
+                                "tool_protocol"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

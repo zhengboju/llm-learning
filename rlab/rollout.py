@@ -45,15 +45,24 @@ from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.model_loading import load_causal_lm, resolve_load_config
-from rlab.protocol import (RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
-                           TOOL_END, TOOL_START, encode_batch, extract_python_blocks,
-                           make_bytes_list, sanitize_tool_text,
-                           segment_mask_from_spans, tensor_to_bytes)
+from rlab.protocol import (CODE_TOOL, NATIVE_CALL_STOP, NATIVE_STYLE_FUNCTION,
+                           NATIVE_STYLE_JSON, RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
+                           TOOL_END, TOOL_START, build_next_prompt, encode_batch,
+                           extract_python_blocks, initial_messages, make_call_id,
+                           make_bytes_list, parse_assistant, render_chat_ids,
+                           sanitize_tool_text, segment_mask_from_spans,
+                           tensor_to_bytes, tool_message)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math, group_length_penalty)
 from rlab.sandbox import run_code
 from rlab.sync import need_text_to_mm_remap, remap_text_to_multimodal, sync_weights_into_vllm
+
+# 工具协议档位（docs/09-native-tool-protocol.md）：
+#   "fence"  = p1–p11 的 python 围栏 + [TOOL RESULT] 文本回填（逐位可复现，回退位）
+#   "native" = Qwen 原生 <tool_call> 工具协议（方案 A 主线）
+TOOL_PROTOCOL_FENCE = "fence"
+TOOL_PROTOCOL_NATIVE = "native"
 
 # 清除分布式环境变量（gen worker 进程内 vLLM 不允许看到 DeepSpeed 的 WORLD_SIZE 等）
 _DEEPSPEED_ENV_KEYS = [
@@ -68,16 +77,81 @@ _DEEPSPEED_ENV_KEYS = [
 
 
 def build_prompt(question: str, system_prompt: str, tokenizer,
-                 chat_template_kwargs: dict | None = None) -> str:
-    """单轮 prompt 模板。阶段2 多轮工具调用时替换本函数。
+                 chat_template_kwargs: dict | None = None,
+                 tools: bool = False) -> str:
+    """单轮 prompt 模板。
 
     chat_template_kwargs 透传 apply_chat_template（Qwen3.5 系需
-    {"enable_thinking": false}，见 config.chat_template_kwargs 注释）。"""
+    {"enable_thinking": false}，见 config.chat_template_kwargs 注释）。
+    tools=True 时把 CODE_TOOL 声明进模板（原生协议用，docs/09 §2.2）。
+    默认 False —— 围栏家族（p1–p11）的 prompt 逐字节不变，回退位真的能回退。"""
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": system_prompt},
          {"role": "user", "content": question}],
         tokenize=False, add_generation_prompt=True,
+        **({"tools": [CODE_TOOL]} if tools else {}),
         **(chat_template_kwargs or {}))
+
+
+def build_prompt_ids(messages: list, tokenizer, chat_template_kwargs: dict | None = None,
+                     tools: bool = False) -> list:
+    """多轮消息 → prompt token ids（**生成端唯一入口**，与 build_next_prompt 同源）。
+
+    【为什么必须单独一个函数】原生协议下 build_next_prompt 内部会用
+    apply_chat_template(tokenize=True) 反推 canonical 序列，若生成首轮的 prompt
+    是另一条路径（如先 tokenize=False 再 tokenizer()），两条路径的 token 序列
+    可能不同源（BPE 边界/特殊 token 处理），build_next_prompt 的前缀校验会直接
+    raise。所有 prompt 一律走这里，契约才成立。"""
+    return render_chat_ids(tokenizer, messages, True, chat_template_kwargs, tools=tools)
+
+
+def prompt_messages_for(inputs, cfg: dict) -> list:
+    """每题一条初始消息（原生协议的唯一来源，纯函数）。
+
+    `build_prompt_batch`（生成端 ids）与 `collect_retool_group`（原生多轮
+    messages）都从这里取——两处若各自拼一遍，一旦分叉就是"喂给 vLLM 的序列"
+    与"续写用的 messages"不同源，`build_next_prompt` 的前缀校验会炸在几十步后
+    的运行期而不是启动期。"""
+    return [initial_messages(cfg["system_prompt"], x["Q"]) for x in inputs]
+
+
+def build_prompt_batch(inputs, cfg: dict, tokenizer, prompts_messages=None):
+    """按当前协议档位构造一批 prompt（生成端**唯一**入口，纯调度无 GPU）。
+
+    返回 (prompts_text, prompt_ids, plen)：
+      · 围栏档：prompts_text = 模板文本；prompt_ids = 文本批量左 pad tokenize
+        （历史路径逐字不变，p1–p11 可复现）；prompts_messages 被忽略。
+      · 原生档：prompts_text 仅作日志兜底；prompt_ids 由 `build_prompt_ids`
+        （= apply_chat_template(tokenize=True, tools=...)）产出并手工左 pad。
+
+    【为什么必须在这里分叉】`prompt_ids` 不只是"喂给 vLLM 的输入"——它同时是
+    `strip_left_pad` → `retool_build_batch` 里 merged 序列的 prompt 段。两条协议
+    的 prompt 渲染不同（原生档多一个 tools 声明段），若 prompt_ids 用错档位，
+    merged 序列与生成序列**逐 token 不同源** → gen_logps 基线失真（这正是
+    docs/09 §3 与 2026-09-09 同序列契约要防的同一类错，只是换了个入口）。
+
+    【prompts_messages 参数的作用】调用方（gen_worker 主循环）先算一次
+    `prompt_messages_for`，把**同一份**消息同时喂给本函数（出 ids）与
+    `collect_retool_group`（原生多轮用）——两处各自拼一遍也能对，但那靠的是
+    "两处代码恰好一致"这种约定；显式传同一对象才是结构性保证（一旦分叉，
+    build_next_prompt 的前缀校验会炸在运行期几十步后，而不是启动期）。"""
+    native = is_native_protocol(cfg)
+    ctkw = cfg.get("chat_template_kwargs")
+    if native:
+        msgs = prompts_messages or prompt_messages_for(inputs, cfg)
+        ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
+        # 文本仅供日志/记录（原生档实际喂 vLLM 的是 token ids）
+        texts = [tokenizer.decode(t, skip_special_tokens=False) for t in ids]
+        plen = max(len(t) for t in ids)
+        pad_id = tokenizer.pad_token_id
+        padded = torch.full((len(ids), plen), pad_id, dtype=torch.long)
+        for r, t in enumerate(ids):
+            padded[r, plen - len(t):] = torch.tensor(t, dtype=torch.long)
+        return texts, padded, plen
+    texts = [build_prompt(x["Q"], cfg["system_prompt"], tokenizer, ctkw) for x in inputs]
+    prompt_ids = tokenizer(texts, return_tensors="pt", padding=True,
+                           padding_side="left", add_special_tokens=False)["input_ids"]
+    return texts, prompt_ids, prompt_ids.shape[1]
 
 
 def group_ok(scores: torch.Tensor) -> bool:
@@ -388,9 +462,174 @@ def gen_logps_from_segs(segs, pad_value: float = 0.0):
     return pad_sequence(rows, batch_first=True, padding_value=pad_value)
 
 
+def tool_protocol_of(cfg: dict) -> str:
+    """当前 run 的工具协议档位（纯函数，CPU 可测）。缺键 = "fence"（历史行为）。
+
+    【为什么做成运行时开关而不是重写】docs/09 §8 的回退设计：`"fence"` 必须
+    逐位复现 p1–p11，协议本身才是**可 A/B 的单变量**；一次性重写会让"原生协议
+    到底有没有用"这个问题永远无法在同一个代码库里回答。"""
+    v = cfg.get("tool_protocol") or TOOL_PROTOCOL_FENCE
+    if v not in (TOOL_PROTOCOL_FENCE, TOOL_PROTOCOL_NATIVE):
+        raise ValueError(f"[rollout] 未知 tool_protocol={v!r}，可选 "
+                         f"{TOOL_PROTOCOL_FENCE!r} / {TOOL_PROTOCOL_NATIVE!r}")
+    return v
+
+
+def is_native_protocol(cfg: dict) -> bool:
+    return tool_protocol_of(cfg) == TOOL_PROTOCOL_NATIVE
+
+
+def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
+                                    prompts_messages, cfg, code_runner=run_code,
+                                    collect_logps: bool = False):
+    """原生 `<tool_call>` 协议的多轮工具调用（docs/09 方案 A 主线）。
+
+    与围栏版的**结构差异**（其余全部同构，便于 A/B 对照）：
+      · 检测：`parse_assistant`（正则从实测渲染派生）替代围栏正则；
+      · 续写：`build_next_prompt` 的 token 级增量取代"拼 [TOOL RESULT] 文本"；
+      · 停止：**不需要 stop 串**——模型自然停在 im_end（EOS 已在 token_ids 里，
+        docs/05 §12.3 已核对）；`cfg["native_stop_at_call"]` 只在 base 冒烟发现
+        "调用后又继续瞎写"时才打开（那是原生协议唯一的结构性负奖励入口）；
+      · 预算：`max_rounds` 轮，前 `max_rounds-1` 轮可执行代码（末轮保证是 final
+        轮，docs/02 发现3 的语义在原生协议下同样成立）。
+
+    参数同围栏版，只是 `prompts_messages` 是 `[[{role,...},...], ...]`——原生协议
+    必须从 messages 渲染（tools 声明在模板里），不能像围栏版那样只吃文本。
+
+    返回 (segs, full_text, code_stats)：结构与围栏版**完全一致**
+    （`retool_build_batch`/打分/上传三处零改动，这正是 docs/09 §4 的契约）。"""
+    n = len(prompts_messages)
+    ctkw = cfg.get("chat_template_kwargs")
+    style = cfg.get("native_tool_style") or "auto"
+    if style not in ("auto", NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON):
+        raise ValueError(f"[rollout] 未知 native_tool_style={style!r}（可选 auto/"
+                         f"{NATIVE_STYLE_FUNCTION}/{NATIVE_STYLE_JSON}）")
+    budget = int(cfg.get("max_context_tokens", 8192))
+    max_rounds = int(cfg.get("max_rounds", 5))
+    max_code_calls = max(0, max_rounds - 1)      # 末轮不许执行代码（发现3）
+    # 每样本状态：messages（协议用）/ prompt_ids（生成端喂 vLLM 的真实序列）/ 调用数
+    msgs = [list(m) for m in prompts_messages]
+    ctx_ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
+    segs = [[] for _ in range(n)]
+    code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0,
+                   "invalid_final": 0, "ctx_full": 0, "err_types": []}
+                  for _ in range(n)]
+    active = list(range(n))
+    for _rnd in range(max_rounds):
+        if not active:
+            break
+        is_final_round = (_rnd == max_rounds - 1)
+        if isinstance(sampling_params, list):
+            sps = [sampling_params[i] for i in active]
+        else:
+            sps = sampling_params
+        outs = vllm_gen.generate([{"prompt_token_ids": ctx_ids[i]} for i in active],
+                                 sps, use_tqdm=False)
+        exec_jobs = []
+        for i, o in zip(active, outs):
+            new_ids = list(o.outputs[0].token_ids)
+            new_text = o.outputs[0].text
+            fin = getattr(o.outputs[0], "finish_reason", None)
+            # 与参考实现一致：chat template 会 strip assistant 内容，解析与结束
+            # 边界计算都用 strip 后的文本，否则 canonical 位置对不上。
+            asst_text = (new_text or "").strip()
+            parsed = parse_assistant(asst_text, style=style)
+            seg = {"kind": "assistant", "text": new_text, "ids": new_ids,
+                   "finish_reason": fin}
+            if collect_logps:
+                seg["logps"] = sampled_logps_from_output(o.outputs[0], new_ids)
+            segs[i].append(seg)
+            if parsed.kind == "tool" and not is_final_round \
+                    and code_stats[i]["code_used"] < max_code_calls:
+                code_stats[i]["code_used"] += 1
+                exec_jobs.append((i, parsed.code, list(msgs[i]), new_ids, asst_text))
+            else:
+                # 终局：answer / invalid / 末轮写了调用 / 超出 max_code_calls。
+                # invalid 单列计数——它是原生协议**唯一**的结构性负奖励入口
+                # （无 boxed → reward -1），不单列就会与"啰嗦跑飞"在数据里同形。
+                if parsed.kind == "invalid":
+                    code_stats[i]["invalid_final"] += 1
+                elif parsed.kind == "tool":
+                    code_stats[i]["code_wasted"] += 1
+                msgs[i].append({"role": "assistant", "content": asst_text})
+
+        # 沙箱并行执行（与围栏版同一提速策略）
+        if exec_jobs:
+            workers = max(1, int(cfg.get("sandbox_workers", 4)))
+            def _run(job):
+                i, code, _m, _ids, _t = job
+                return i, code_runner(code, timeout=cfg.get("sandbox_timeout", 5.0),
+                                      mem_mb=cfg.get("sandbox_mem_mb", 256),
+                                      max_chars=cfg.get("tool_result_max_chars", 500))
+            if len(exec_jobs) > 1 and workers > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(workers, len(exec_jobs))) as ex:
+                    done = list(ex.map(_run, exec_jobs))
+            else:
+                done = [_run(j) for j in exec_jobs]
+            done_map = {i: r for i, r in done}
+            next_active = []
+            for i, _code, msgs_before, comp_ids, asst_text in exec_jobs:
+                res = done_map[i]
+                code_stats[i]["code_ok"] += int(res["ok"])
+                etype = res.get("error_type") or ("ok" if res["ok"] else "exception")
+                code_stats[i].setdefault("err_types", []).append(etype)
+                # 消毒后再拼回（消毒点不因协议变化而移动：沙箱 stdout 仍是注入面）
+                body = sanitize_tool_text(res["display"])
+                if not res["ok"] and etype != "ok":
+                    body = f"[{etype}] " + body
+                call_id = make_call_id(0, i, code_stats[i]["code_used"])
+                obs_msg = tool_message(call_id, body)
+                try:
+                    nxt = build_next_prompt(tokenizer, msgs_before, ctx_ids[i],
+                                            comp_ids, obs_msg, ctkw)
+                except ValueError as e:
+                    # 【不静默降级】模板行为异常是协议级问题，继续跑会产出成批错位
+                    # 序列并把整轮实验作废——当场抛，留下可排查的错（docs/09 §3）。
+                    raise RuntimeError(
+                        f"[rollout] 原生协议 token 增量拼接失败（样本 {i}，第 "
+                        f"{len(segs[i])} 段）：{e}") from e
+                if len(nxt) > budget:
+                    # 放不下 = 这条轨迹到此为止（与参考实现的 fit_tool_content 同
+                    # 语义：observation 进不去就终局，不硬塞）。工具段 ids 也不入
+                    # segs —— merged 序列必须与实际喂给模型的序列逐 token 相同，
+                    # 否则 gen_logps 的基线就是一串没发生过的位置。
+                    # 【为什么单列 ctx_full 而不并进 code_wasted】code_wasted 的既有
+                    # 语义是"写了代码但不会被执行的调用"（末轮/超调用上限），是
+                    # **协议结构性**的；ctx_full 是**预算**性的，两者混在一起
+                    # 会让"预算够不够"这个单变量失去可读数。
+                    code_stats[i]["ctx_full"] += 1
+                    msgs[i].append({"role": "assistant", "content": asst_text})
+                    continue
+                tool_ids = nxt[len(ctx_ids[i]) + len(comp_ids):]
+                # 只有 assistant 段进 loss；工具段 ids 是"结束符+observation"增量
+                segs[i].append({"kind": "tool", "ids": tool_ids,
+                                "text": tokenizer.decode(tool_ids,
+                                                         skip_special_tokens=False)})
+                msgs[i] = [*msgs_before, {"role": "assistant", "content": asst_text},
+                           obs_msg]
+                ctx_ids[i] = nxt
+                next_active.append(i)
+            active = next_active
+
+    full_text = ["".join(s["text"] for s in segs_i) for segs_i in segs]
+    for i in range(n):
+        last_a = next((s for s in reversed(segs[i]) if s["kind"] == "assistant"), None)
+        code_stats[i]["trunc_final"] = int(bool(last_a)
+                                           and last_a.get("finish_reason") == "length")
+    return segs, full_text, code_stats
+
+
 def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text, cfg,
-                             code_runner=run_code, collect_logps: bool = False):
+                             code_runner=run_code, collect_logps: bool = False,
+                             prompts_messages=None):
     """阶段2 ReTool：代码交织多轮生成（一组样本并行走）——token id 续写版。
+
+    两条协议分支（`cfg["tool_protocol"]`，docs/09 §8）：
+      · "fence"（缺省，p1–p11 逐位可复现）→ 本函数的下半部分（围栏正则 +
+        `[TOOL RESULT]` 文本回填）；
+      · "native"（方案 A 主线）→ 转 `multi_turn_rollout_group_native`
+        （原生 `<tool_call>` + token 级增量拼接），需提供 `prompts_messages`。
 
     【2026-09-09 修复·生成/训练同序列契约】续写一律走 token id（vLLM
     prompt_token_ids），每段直接采用 vLLM 采样返回的 token_ids：旧版给 vLLM
@@ -435,6 +674,15 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                    code_wasted = 末轮写了代码但不会被执行的次数——该轨迹
                    结构性无 boxed，且 retool_stop 下 trunc_final 也记不到它）
     """
+    if is_native_protocol(cfg):
+        if prompts_messages is None:
+            raise ValueError(
+                "[rollout] tool_protocol='native' 必须传 prompts_messages（原生协议从 "
+                "messages 渲染——tools 声明在模板里，只给纯文本无法渲染工具段）。\n"
+                "  调用点：collect_retool_group / probe_difficulty / eval_vllm_one。")
+        return multi_turn_rollout_group_native(
+            vllm_gen, sampling_params, tokenizer, prompts_messages, cfg,
+            code_runner=code_runner, collect_logps=collect_logps)
     n = len(prompts_text)
     # 每条请求的无 pad prompt token（与批量左 pad prompt_ids 同源：去 pad 即得）
     ctx_ids = [tokenizer(p, add_special_tokens=False)["input_ids"] for p in prompts_text]
@@ -703,7 +951,8 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
 
 def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                          inputs, prompts_text, prompt_ids, plen,
-                         sampling_params, steps_elapsed=0, verify_logps=None):
+                         sampling_params, steps_elapsed=0, verify_logps=None,
+                         prompts_messages=None):
     """多轮 rollout → 打分 → 按题拆分的上传就绪结果（模块级，FakeGen CPU 可测）。
 
     【2026-09-10 结构修改·采样并发与按题拆分】一次调用处理 len(inputs) 道题
@@ -732,11 +981,26 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     assert prompt_ids.shape[1] == plen, \
         f"prompt_ids 宽 {prompt_ids.shape[1]} != plen {plen}（调用约定：未剥 pad 的整批）"
     group_prompts = [p for p in prompts_text for _ in range(n)]   # Q*n 条
+    # 原生协议：从 messages 渲染（tools 声明在模板里）。每题先扩成 num_pre_Q 条
+    # 独立轨迹，与围栏版同构（2026-09-08 扩样 bug 的契约不变）。
+    # 【参数口径】prompts_messages 收的是**每题一条**（Q 条，与 inputs 等长）——
+    # 扩样（×num_pre_Q）在本函数内做，与 group_prompts 的扩样同构。调用方
+    # （gen_worker / FakeGen 测试）只负责给"与 inputs 对齐"的那一份，不必知道
+    # 内部要扩成几条（否则扩样口径会散落到每个调用点，正是 2026-09-08
+    # IndexError 的形态）。
+    if is_native_protocol(cfg):
+        if prompts_messages is None:
+            prompts_messages = prompt_messages_for(inputs, cfg)
+        if len(prompts_messages) != nq:
+            raise ValueError(
+                f"[rollout] prompts_messages 条数 {len(prompts_messages)} != 题数 {nq}"
+                "（约定：收每题一条，扩样在 collect_retool_group 内做）")
+        prompts_messages = [m for m in prompts_messages for _ in range(n)]
     # gen_logps 来源：vLLM 逐轮 logprobs（需采样时就带上 logprobs=0）或 torch 副本重算
     use_vllm_logps = bool(cfg.get("vllm_gen_logps"))
     segs, _full_texts, code_stats = multi_turn_rollout_group(
         vllm_gen, sampling_params, tokenizer, group_prompts, cfg,
-        collect_logps=use_vllm_logps)
+        collect_logps=use_vllm_logps, prompts_messages=prompts_messages)
     asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                   for segs_i in segs]
     results = []
@@ -771,6 +1035,14 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             results.append({"status": "uniform", "acc": acc_i, "fmt": fmt_i,
                             "clen": clen_i, "cu": cu_i, "ck": ck_i,
                             "trunc": _trunc_i,
+                            "inv": [int(s.get("invalid_final", 0))
+                                    for s in code_stats[i * n:(i + 1) * n]],
+                            # 【2026-09-25】uniform 组的末轮废码也如实上送：旧版这里
+                            # 硬编码 [0]*n，把"丢弃组的 code_wasted"永久记成 0——
+                            # 而原生协议的末轮调用正是丢弃组的高发形态（答案轮之前
+                            # 才想起来调用），恒 0 会让该列在丢弃组上系统性偏低。
+                            "cw": [int(s.get("code_wasted", 0))
+                                   for s in code_stats[i * n:(i + 1) * n]],
                             "qk": _qks[i], "Q": inputs[i]["Q"]})
             continue
         if use_vllm_logps:
@@ -794,6 +1066,17 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         # 且 retool_stop 下 trunc_final 记不到它）
                         "cw": [int(s.get("code_wasted", 0))
                                for s in code_stats[i * n:(i + 1) * n]],
+                        # 【2026-09-25 原生协议诊断列】两列在围栏档恒为 0（键仍在
+                        # record 里，方便同一张表逐列读两档）：
+                        #   inv = 有 <tool_call> 但形态不认识 / 调用后还跟内容
+                        #         （原生协议**唯一**的结构性负奖励入口）
+                        #   ctxf = observation 放不下预算而终局
+                        # 不落盘就看不见"模型在调用后又继续写"这种档位特有失效——
+                        # 它与"啰嗦跑飞"在 acc/code/trunc 三列里完全同形。
+                        "inv": [int(s.get("invalid_final", 0))
+                                for s in code_stats[i * n:(i + 1) * n]],
+                        "ctxf": [int(s.get("ctx_full", 0))
+                                 for s in code_stats[i * n:(i + 1) * n]],
                         # 【2026-09-21 overlong_filter】截断样本（trunc_final=1 或
                         # code_wasted>0）的 sample_weight=0：它们 adv=0 不贡献 pg_term，
                         # 但 KL 仍活跃 → sample_mean 归一化会稀释 pg 梯度。sample_weight
@@ -1178,6 +1461,9 @@ def gen_worker(Q, cfg: dict):
             "rounds": cfg.get("max_rounds"), "round_tokens": cfg.get("round_gen_tokens"),
             "ctx": cfg.get("max_context_tokens"), "temp": cfg.get("temperature"),
             "sp": _hl.sha1(str(cfg.get("system_prompt", "")).encode("utf-8")).hexdigest()[:6],
+            # 【2026-09-25】协议档也进比对：表是"模型×提示×预算×**协议**"的联合
+            # 产物（两档的 base 通过率是两个分布），不比对就会把围栏表当原生档用。
+            "tool_protocol": cfg.get("tool_protocol") or "fence",
         }
         _table = load_difficulty_table(cfg["difficulty_path"], expected_meta=_expected_meta)
         _lo, _hi = cfg.get("difficulty_band", (0.0, 1.0))
@@ -1342,7 +1628,17 @@ def gen_worker(Q, cfg: dict):
         kw = dict(n=1, temperature=cfg["temperature"],
                   max_tokens=cfg.get("round_gen_tokens", 400),
                   top_p=cfg["top_p"], top_k=cfg.get("top_k", 50))
-        if cfg.get("retool_stop"):
+        if is_native_protocol(cfg):
+            # 【原生协议默认不带 stop】模型自然停在 im_end（EOS 已在 token_ids 里，
+            # docs/05 §12.3 已核对），参考实现也只传 tokenizer.eos_token。
+            # `native_stop_at_call=True` 是**只在 base 冒烟看到"调用后还继续瞎写"**
+            # 时才打开的兜底：那种样本 parse_assistant 判 invalid → 终局无 boxed
+            # → reward -1，是原生协议唯一的结构性负奖励入口（docs/09 §0.1 症状③
+            # 在原生协议下的对应形态）。默认关 = 单变量纪律（先看基线行为）。
+            if cfg.get("native_stop_at_call"):
+                kw.update({"stop": [NATIVE_CALL_STOP],
+                           "include_stop_str_in_output": True})
+        elif cfg.get("retool_stop"):
             kw.update(_RETOOL_STOP_KWARGS)
         if _use_vllm_logps:
             # 被采样 token 的 logprob（= log π(tok|完整前文)），逐轮收集即 gen_logps。
@@ -1419,11 +1715,11 @@ def gen_worker(Q, cfg: dict):
                 else:
                     inputs = random.sample(QAs, need)
             qkey = inputs[0]["Q"] if need == 1 else None
-            prompts_text = [build_prompt(x["Q"], cfg["system_prompt"], tokenizer,
-                                         cfg.get("chat_template_kwargs")) for x in inputs]
-            prompt_ids = tokenizer(prompts_text, return_tensors="pt", padding=True,
-                                   padding_side="left", add_special_tokens=False)["input_ids"]
-            plen = prompt_ids.shape[1]
+            # 按协议档位构造 prompt。原生档**同一份 messages** 同时喂这里（出 ids）
+            # 与 collect_retool_group（多轮用）——结构性保证两处同源。
+            _pmsgs = prompt_messages_for(inputs, cfg) if is_native_protocol(cfg) else None
+            prompts_text, prompt_ids, plen = build_prompt_batch(
+                inputs, cfg, tokenizer, prompts_messages=_pmsgs)
             if plen > cfg["max_prompt_length"]:
                 continue
             if is_retool:
@@ -1434,7 +1730,7 @@ def gen_worker(Q, cfg: dict):
                     vllm_gen, tokenizer, cfg, compute_gen_logps,
                     inputs, prompts_text, prompt_ids, plen, sps,
                     steps_elapsed=pushes[0] * cfg["gen_update_steps"],
-                    verify_logps=_verifier)
+                    verify_logps=_verifier, prompts_messages=_pmsgs)
                 # 剥 pad 可见性（一次性）：本批最长 prompt token 数 vs 各题真实长度。
                 # 静默改变 token 预算是这类"口径修正"最难排查的形态，打一行自证。
                 if not _pad_logged[0]:
@@ -1465,7 +1761,8 @@ def gen_worker(Q, cfg: dict):
                         # trunc_rate 只看存活组 → 被低估 → 不触发告警。
                         if is_retool and "acc" in res:
                             health.observe(res["acc"].tolist(), res["fmt"].tolist(),
-                                           res["clen"], res["cu"], res["trunc"])
+                                           res["clen"], res["cu"], res["trunc"],
+                                           res.get("inv"))
                         # 题目级过滤：零方差组（全错/全对）当前无梯度，累计达标拉黑
                         if sched is not None:
                             sched.report(q, "uniform")
@@ -1479,7 +1776,9 @@ def gen_worker(Q, cfg: dict):
                                 "acc": res["acc"].tolist(), "fmt": res["fmt"].tolist(),
                                 "clen": res["clen"], "code_used": res["cu"],
                                 "code_ok": res["ck"],
-                                "trunc_final": res["trunc"], "code_wasted": [0] * len(res["cu"]),
+                                "trunc_final": res["trunc"],
+                                "code_wasted": res.get("cw", [0] * len(res["cu"])),
+                                "invalid_final": res.get("inv", [0] * len(res["cu"])),
                                 "qk": res.get("qk"), "q_status": "uniform",
                                 "gen_version": policy_version[0],
                                 "phase": "dropped"}, ensure_ascii=False) + "\n")
@@ -1540,13 +1839,15 @@ def gen_worker(Q, cfg: dict):
                     "clen": r["clen"], "code_used": r["cu"], "code_ok": r["ck"],
                     "trunc_final": r["trunc"],
                     "code_wasted": r["cw"],
+                    # 【2026-09-25 原生协议诊断】围栏档恒 0（键仍在，同表可逐列读）
+                    "invalid_final": r["inv"], "ctx_full": r["ctxf"],
                     # 【2026-09-23 在线通过率监控】题目指纹 + 状态（uniform 组也落盘，
                     # 否则 p≈0 题在 record 里不可见，band 漂移观测有偏）
                     "qk": r.get("qk"), "q_status": "ok",
                     "gen_version": policy_version[0],
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
                 health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"],
-                               r["trunc"])
+                               r["trunc"], r.get("inv"))
                 continue
             inputs, prompts_text, prompt_ids, ans_token_ids, adv, acc_s, fmt_s, plen = g
             tensor_list = [torch.tensor(t) for t in ans_token_ids]

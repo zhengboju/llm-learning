@@ -16,7 +16,7 @@ import math
 import re
 
 # 围栏正则复用协议层（与 extract_python_blocks 同一条），用于打分前剥离代码块
-from rlab.protocol import _PY_FENCE_RE
+from rlab.protocol import _PY_FENCE_RE, _RE_TOOL_CALL_ANY
 
 # 剥离专用正则：与 _PY_FENCE_RE 同结构，但额外吞掉围栏后的空白——
 # 代码块被移除后若残留换行，^ 锚定的格式正则依旧必败（2026-09-08 实测）。
@@ -112,8 +112,16 @@ def strip_code_blocks(text: str) -> str:
     （与"工具段只作上下文、不进 loss 不进打分"同一条原则在文本域的投影）。
     只剥离**完整**围栏块（与 extract_python_blocks 同一正则），并连同其后的
     空白一起移除（否则残留换行会让 ^ 锚定的格式正则依旧失败）；
-    未闭合围栏 = 模型没写完代码，结构仍算不合格，保留原文。"""
-    return _STRIP_FENCE_RE.sub("", text)
+    未闭合围栏 = 模型没写完代码，结构仍算不合格，保留原文。
+
+    【2026-09-25 原生协议：同一函数里连调用块一起剥】原生档的脚手架不是围栏而是
+    `<tool_call>…</tool_call>` 块——`{"code": "print(\\\\boxed{7})"}` 这类载荷若留在
+    打分文本里，"最后一个 boxed/数字"就会被判成模型的答案（与"工具 stdout 不是
+    答案"完全同型）。两档的标记**互不干扰**：原生文本里没有 ```python 围栏、
+    围栏文本里没有调用块（参考实现的围栏路径也没有），所以一次剥两种是安全的，
+    且省掉"每个调用点都要按协议选剥离函数"这个静默分叉源（改协议忘改打分域 =
+    docs/09 §10.2 第 3 类 bug 的同族）。"""
+    return _RE_TOOL_CALL_ANY.sub("", _STRIP_FENCE_RE.sub("", text))
 
 
 def reward_format_retool(answer: str) -> float:

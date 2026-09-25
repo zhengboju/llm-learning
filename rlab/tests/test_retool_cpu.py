@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 
+import ast as _ast
 import torch
 
 from rlab.config import get_config
@@ -1847,9 +1848,23 @@ def test_eval_thinking_switch():
     check("eval_vllm_one.py 复用训练端 build_prompt（调用形态单点同源，"
           "包裹形态 chat_template_kwargs= 会被 transformers 静默忽略——二次全灭教训）",
           "from rlab.rollout import build_prompt" in src
-          and "_build_prompt(item[\"Q\"], system_prompt, tokenizer, _ctkw)" in src)
-    check("eval_vllm_one.py 不再自带 apply_chat_template 调用（杜绝形态分叉复发）",
-          "apply_chat_template" not in src)
+          # 【2026-09-25 原生协议】调用新增 tools= 形参（协议档必须同时决定是否
+          # 声明工具，否则 eval 用围栏档的 prompt 去问原生档训出的模型）；
+          # 判据改为"前四个实参逐字不变 + tools 由协议档显式给出"。
+          and '_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw' in src
+          and "tools=_tools_flag" in src)
+    # 【2026-09-25 改为 AST 判据】旧版是纯文本 `"apply_chat_template" not in src`——
+    # 注释里提到函数名也会命中（本轮原生协议的说明注释正好踩上），于是"文本里没这
+    # 个词"与"代码里没这个调用"被混为一谈：改注释就能让检查变红/变绿。
+    # 判据必须看**真调用**（Attribute 名为 apply_chat_template 的 Call 节点）。
+    _ev_ast = _ast.parse(src)
+    _ac_t_calls = [n for n in _ast.walk(_ev_ast)
+                   if isinstance(n, _ast.Call)
+                   and isinstance(n.func, _ast.Attribute)
+                   and n.func.attr == "apply_chat_template"]
+    check("eval_vllm_one.py 不再自带 apply_chat_template 调用（杜绝形态分叉复发；"
+          "AST 判据，注释里的函数名不算）",
+          _ac_t_calls == [])
     check("eval_vllm_one.py 有 enable_thinking 未生效的 fail-fast 告警",
           "模板未响应 enable_thinking=False" in src)
 
@@ -2527,6 +2542,9 @@ def test_pyflakes_undefined():
              # 【2026-09-25】新增诊断脚本一律入清单（本文件初版就带过一个全角
              # 括号笔误 → SyntaxError；静态检查是唯一能在提交前拦住它的防线）
              "rlab/diag_eval_gap.py",
+             # 【2026-09-25 原生工具协议】native_probe 只在 pod 上跑（纯 tokenizer，
+             # 无 GPU），静态检查是它唯一的提交前防线。
+             "rlab/native_probe.py",
              "eval_vllm_one.py", "eval_vllm.py"]
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
@@ -4054,9 +4072,26 @@ def test_preflight_audit_fixes():
     # p8 的 48~70% 是"末轮不计入"口径，p9 若计入就凭空抬高一截（≈末轮废码率），
     # 而 code% 正是要跨 run 比较的轴之一 —— 修可观测性不该以牺牲可比性为代价。
     # 现在：code_used 逐位不变，末轮废码走独立的 code_wasted 计数。
-    check("⑦ code_used 仍在 is_final_round 之后自增（口径与 p8 逐位可比）",
-          _roll.index("if is_final_round:")
-          < _roll.index('code_stats[i]["code_used"] += 1'))
+    # 【2026-09-25 原生协议】rollout.py 现在有**两条**多轮实现，判据必须只看围栏
+    # 那一条的源码段——全文件搜 "if is_final_round:" 会先命中原生实现（它的自增写在
+    # 条件表达式里，位置在前），把一条正确的断言变成红。判据的作用域收窄到
+    # `def multi_turn_rollout_group(` .. `def retool_build_batch(` 之间。
+    _roll_fence = _roll[_roll.index("def multi_turn_rollout_group(vllm_gen, sampling_params,"
+                                    " tokenizer, prompts_text"):
+                        _roll.index("def retool_build_batch(")]
+    check("⑦ 围栏档 code_used 仍在 is_final_round 之后自增（口径与 p8 逐位可比）",
+          _roll_fence.index("if is_final_round:")
+          < _roll_fence.index('code_stats[i]["code_used"] += 1'))
+    # 原生实现（新协议，docs/09 §8：与 p1–p11 **刻意**不可比）单独锁它的口径：
+    # 末轮调用不得计入 code_used（条件里必须出现 not is_final_round）
+    _roll_nat = _roll[_roll.index("def multi_turn_rollout_group_native("):
+                      _roll.index("def multi_turn_rollout_group(")]
+    check("⑦ 原生档：末轮调用同样不计入 code_used（not is_final_round 在条件里）",
+          "not is_final_round" in _roll_nat
+          and _roll_nat.index("not is_final_round")
+          < _roll_nat.index('code_stats[i]["code_used"] += 1'))
+    check("⑦ 原生档：超出 max_code_calls 的调用也不计入（回退位兜底）",
+          'code_stats[i]["code_used"] < max_code_calls' in _roll_nat)
     check("⑦ 末轮代码单独记 code_wasted（新增信号，不动既有列）",
           'code_stats[i]["code_wasted"] += 1' in _roll)
     check("⑦ code_wasted 在 code_stats 初始化时就有（无缺键 KeyError 风险）",

@@ -132,6 +132,28 @@ def window_check(hist, *, retool=False, max_clen=None):
                        "128 组后代码调用率仍为 0 → 代码信号未出现（冷启动权重过稀疏？"
                        "模型从未被奖励写代码），记录在案，验收时 code_rate 指标必然为 0"))
 
+    # --- 签名⑧：原生协议解析失效（提示性，非致命）
+    # 【2026-09-25 原生协议专属】invalid_final = 有 <tool_call> 但形态不认识 /
+    # 调用后还跟着内容。它是原生协议**唯一**的结构性负奖励入口：该轨迹终局无
+    # boxed → reward -1，且它会被 RL 学成"别调用工具"（docs/09 §0.1 症状③ 在
+    # 原生协议下的对应形态）。围栏档没有这一列（恒 0），故只在 retool 且真见过
+    # 非零时才可能响。
+    # 判据：窗口均值 >10% 即报。两种成因的处置完全不同——
+    #   · 正则没对齐实测形态（invalid 高 + code_rate 极低）→ 回 docs/09 §1.2
+    #     重跑 native_probe，用 --native_tool_style 钉死形态；
+    #   · 模型调用后又继续写（invalid 高 + 部分 code_rate>0）→ 开
+    #     --native_stop_at_call（调用边界硬停）。
+    if retool and n >= 64:
+        _iv = _wmean([h.get("invalid_rate", 0.0) for h in hist[-k:]])
+        if _iv > 0.10:
+            alerts.append(("native_invalid",
+                           f"原生协议解析失效率 {_iv:.0%}（窗口均值）→ 有工具调用但"
+                           "解析不通过（形态不认识 / 调用后还有内容）。后果：该轨迹"
+                           "终局无 boxed、reward -1，且会被学成'别调用工具'。"
+                           "处置二选一：①形态错 → 重跑 python -m rlab.native_probe 并用"
+                           "--native_tool_style 钉死；②调用后继续写 → 开 "
+                           "--native_stop_at_call"))
+
     # --- 签名⑦：代码压灭（2026-09-21，#2 的训练期可观测签名）
     # 事故形态（run2/p5/p6 三次复现）：code% 从开局水平单调下滑到个位数——
     # outcome-only + 风险不对称下 RL "理性"放弃代码。既有规则探不到它：
@@ -183,14 +205,17 @@ class HealthMonitor:
         self._last_check = 0
 
     def observe(self, acc_list, fmt_list, clen_list, code_used_list=None,
-                trunc_list=None):
+                trunc_list=None, invalid_list=None):
         """聚合一个组的标量摘要（acc/fmt 为 ±1 口径列表）。trunc_list：每条轨迹
-        末段是否被轮长上限切断（0/1，retool 家族；缺省按 0 记）。"""
+        末段是否被轮长上限切断（0/1，retool 家族；缺省按 0 记）。
+        invalid_list：原生协议档的 invalid_final（0/1，围栏档恒缺省 0）——
+        它是原生协议**唯一**的结构性负奖励入口，不观测就看不见。"""
         e = {"acc": _wmean(list(acc_list)), "fmt": _wmean(list(fmt_list)),
              "clen": _wmean(list(clen_list)),
              "code_rate": (sum(1 for u in code_used_list if u > 0) / len(code_used_list))
              if code_used_list else 0.0,
-             "trunc_rate": (_wmean(list(trunc_list)) if trunc_list else 0.0)}
+             "trunc_rate": (_wmean(list(trunc_list)) if trunc_list else 0.0),
+             "invalid_rate": (_wmean(list(invalid_list)) if invalid_list else 0.0)}
         self.hist.append(e)
 
     def maybe_check(self, retool: bool = False, max_clen=None):

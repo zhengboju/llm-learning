@@ -269,6 +269,7 @@ def main():
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
 
     from rlab.data import load_qas, load_difficulty_table
+    from rlab.protocol import initial_messages
     from rlab.reward import overlong_ref_tokens, total_reward_retool_math
     from rlab.rollout import build_prompt, multi_turn_rollout_group
 
@@ -300,6 +301,13 @@ def main():
     print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
           f"| 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
           f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
+    # 【2026-09-25 原生协议】协议档也必须落进表指纹：同一模型同一提示，围栏档与
+    # 原生档的通过率是两个分布（原生档 base 调用率 87.5% vs 围栏档 ~48%）——
+    # 表不自证协议，训练端就会把围栏表当原生档的难度表用。
+    _tp = cfg.get("tool_protocol") or "fence"
+    if _tp != "fence":
+        print(f"[probe] ⚠ 工具协议 = {_tp}（原生 <tool_call>）：本表只对同档训练有效"
+              f"（表指纹含协议档）")
     # 【2026-09-18 M4】协议指纹落进每行：表是"模型×提示×预算"的联合产物，行必须
     # 自证出处——换预算/提示/k 续跑同一 --out 会静默混两个分布的表，训练端无从
     # 检测（训练签名已有 -t<sha6> 表指纹，闭环缺半边：表自己不含协议指纹）。
@@ -310,6 +318,9 @@ def main():
         "ctx": cfg["max_context_tokens"], "temp": cfg["temperature"],
         "sp": _sp_sha,   # 提示指纹（-sp<hash6> 同源）
         "seed": args.seed,
+        # 【2026-09-25】协议档（围栏/原生）——同模型同提示下两档的通过率是两个
+        # 分布，行必须自证，否则换档续跑同一 --out 会静默混表。
+        "tool_protocol": _tp,
     }
     if not todo:
         print("[probe] 无剩余题，直接输出统计")
@@ -365,10 +376,16 @@ def main():
     n_traj = 0   # 全局轨迹计数（seed 盐：防不同波次复采同轨迹）
     for w0 in range(0, len(todo), wq):
         wave = todo[w0:w0 + wq]
-        group_prompts, rows = [], []
+        group_prompts, group_msgs, rows = [], [], []
+        _nat = (cfg.get("tool_protocol") or "fence") != "fence"
         for x in wave:
+            if _nat:
+                # 【2026-09-25 原生协议】探针必须与训练同档（铁律：表的语义是
+                # "模型×提示×预算×协议"的联合产物）——原生档要从 messages 渲染
+                # tools 声明，text 路径渲染不出工具段。
+                group_msgs.extend([initial_messages(cfg["system_prompt"], x["Q"])] * k)
             p = build_prompt(x["Q"], cfg["system_prompt"], tokenizer,
-                             cfg.get("chat_template_kwargs"))
+                             cfg.get("chat_template_kwargs"), tools=_nat)
             group_prompts.extend([p] * k)   # 每题扩成 k 条独立轨迹（与训练扩样同构）
         sps = [SamplingParams(n=1, temperature=cfg["temperature"],
                               max_tokens=cfg["round_gen_tokens"], top_p=cfg["top_p"],
@@ -376,7 +393,8 @@ def main():
                for j in range(len(group_prompts))]
         n_traj += len(group_prompts)
         segs, texts, code_stats = multi_turn_rollout_group(
-            vllm_gen, sps, tokenizer, group_prompts, cfg)
+            vllm_gen, sps, tokenizer, group_prompts, cfg,
+            prompts_messages=(group_msgs or None))
         for qi, x in enumerate(wave):
             for j in range(k):
                 idx = qi * k + j

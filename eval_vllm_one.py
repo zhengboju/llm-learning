@@ -47,6 +47,13 @@ parser.add_argument("--dump_items", action=argparse.BooleanOptionalAction, defau
                     help="落盘 per-item 明细（默认开，供 analysis.py 做配对检验/分层）；--no-dump_items 关闭")
 parser.add_argument("--max_rounds", type=int, default=None, help="--retool 时最多代码-执行轮数；None=取训练配置")
 parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置")
+# 【2026-09-25 原生工具协议（docs/09）】协议档必须与被测 ckpt 的 run_info 一致，
+# 否则测的是"另一个模型的另一条协议"。None = 从 run_info 回读（缺键 → fence）。
+parser.add_argument("--tool_protocol", choices=("fence", "native"), default=None,
+                    help="工具协议档：None=从被测 ckpt 的 run_info 回读（缺键→fence）。"
+                         "fence=p1–p11 围栏；native=Qwen 原生 <tool_call>（docs/09）")
+parser.add_argument("--native_tool_style", choices=("auto", "function", "json"),
+                    default=None, help="原生调用解析形态；None=随训练 run_info（默认 auto）")
 # 【2026-09-18 采样评测】参考项目（agentic-rl-lab/05-retool）的增益全在采样下显现
 # （Average@N，temp 1.0 / top_p 0.7）；greedy 会把多轮代码行为测成灭绝（docs §7.5.2
 # mode vs mixture 已记录）。--val_n>1 时每题采样 val_n 条（per-item 记首条，
@@ -118,6 +125,20 @@ except KeyError:
 # 【2026-09-17】run_info 的训练 config 优先于 preset：CLI 显式传参仍覆盖（见下）。
 if _run_cfg:
     _rcfg = {**_rcfg, **_run_cfg}
+# 【2026-09-25 原生工具协议（docs/09）】协议档必须来自**被测 ckpt 自己**的 run_info，
+# 再回落 preset：原生档训练的 ckpt 若被围栏档协议评（或反之），测的是"另一个模型的
+# 另一条协议"，Δacc 里混进协议变量——本文件里已发生过两次同类事故（gpu_mem 0.20 vs
+# 0.78 差 +7pp；sp 回落 preset 让 fmt 从 70% 掉到 34%）。CLI 可显式覆盖做 A/B。
+_tool_protocol = (args.tool_protocol if getattr(args, "tool_protocol", None)
+                  else _rcfg.get("tool_protocol") or "fence")
+_rcfg["tool_protocol"] = _tool_protocol
+# 原生档的解析形态同源回读（探针钉死的值必须与训练一致）
+if getattr(args, "native_tool_style", None):
+    _rcfg["native_tool_style"] = args.native_tool_style
+if _tool_protocol != "fence":
+    print(f"[eval] 工具协议 = {_tool_protocol}（原生 <tool_call>）"
+          f"｜解析形态={_rcfg.get('native_tool_style') or 'auto'}"
+          f"｜边界硬停={'开' if _rcfg.get('native_stop_at_call') else '关'}")
 
 if is_retool_family:
     if args.round_tokens is None:
@@ -144,17 +165,14 @@ from rlab.config import default_system_prompt as _default_system_prompt
 # 【2026-09-17】训练用 --system_prompt_file 时，run_info.config.system_prompt 是文件内容；
 # eval 端回读同一内容，并用 run_info 的 signature 里的 `-sp<hash>` 校验哈希。
 _sp_run = _run_cfg.get("system_prompt")
-if args.algo == "retool_math":
-    from rlab.config import system_prompt_retool_math
-    _sp_preset = system_prompt_retool_math
-elif args.algo == "retool":
-    from rlab.config import system_prompt_retool
-    _sp_preset = system_prompt_retool
-else:
+# 【2026-09-25】preset 提示必须按**被测协议**取：原生档的默认提示与围栏版不同
+# （删围栏措辞），拿错一份 = eval 用围栏措辞去问一个原生档训出来的模型。
+_sp_preset = _default_system_prompt(args.algo, _tool_protocol)
+if args.algo not in ("retool_math", "retool"):
     _sp_preset = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
  The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
 
-if _sp_run and _sp_run != _default_system_prompt(args.algo):
+if _sp_run and _sp_run != _default_system_prompt(args.algo, _tool_protocol):
     system_prompt = _sp_run
     _sp_src = "run_info(config.system_prompt)"
 else:
@@ -342,7 +360,16 @@ from rlab.rollout import build_prompt as _build_prompt
 tokenizer = AutoTokenizer.from_pretrained(args.model)
 _ctkw = _rcfg.get("chat_template_kwargs")
 print(f"  chat_template_kwargs={_ctkw}（经训练端 build_prompt 单点同源）")
-prompts = [_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw) for item in sample]
+# 【2026-09-25 原生协议】tools 声明必须与训练同档：原生档 prompt 里多一段工具
+# 声明，围栏档没有。用错档 = 测另一个协议的另一个模型（本文件已两次同类事故）。
+_native = _tool_protocol != "fence"
+_tools_flag = bool(_native)
+prompts = [_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw, tools=_tools_flag)
+           for item in sample]
+# 原生档的多轮 messages（与 prompt 渲染同源；协议分支要它，围栏档不需要）
+from rlab.protocol import NATIVE_CALL_STOP, initial_messages as _initial_messages
+_prompt_msgs = ([_initial_messages(system_prompt, it["Q"]) for it in sample]
+                if _native else None)
 # fail-fast：请求关思考但模板没响应（如 transformers 版本行为变化），立刻告警
 if _ctkw and _ctkw.get("enable_thinking") is False \
         and prompts[0].rstrip().endswith("<think>"):
@@ -361,28 +388,41 @@ if _ctkw and _ctkw.get("enable_thinking") is False \
 _max_plen = int(_rcfg.get("max_prompt_length") or 0)
 _gen_budget = (args.max_rounds * args.round_tokens + 512) if is_retool_family \
     else (args.max_tokens + 64)
+# 【2026-09-25 原生档长度口径】原生档 prompt 由 apply_chat_template(tokenize=True)
+# 直接产出 ids（tools 声明段 + 特殊 token）；把渲染文本再 tokenize 一遍**不保证**
+# 回到同一串 id（特殊 token 的文本形态往返是有损的——本项目"文本往返 0/6 相等"
+# 的探针结论）。所以原生档按 ids 量长度，围栏档保持历史文本口径逐字不变。
+if _native:
+    from rlab.rollout import build_prompt_ids as _bpids
+    _plens = [len(_bpids(m, tokenizer, _ctkw, tools=True)) for m in _prompt_msgs]
+else:
+    _plens = [len(tokenizer(_p, add_special_tokens=False)["input_ids"]) for _p in prompts]
 _kept, _dropped_long, _dropped_plen = [], 0, 0
-for _item, _p in zip(sample, prompts):
-    _pl = len(tokenizer(_p, add_special_tokens=False)["input_ids"])
+for _i, (_item, _p, _pl) in enumerate(zip(sample, prompts, _plens)):
     if _max_plen and _pl > _max_plen:
         _dropped_plen += 1          # 训练端同规则跳组 → 分布内一致性
         continue
     if _pl + _gen_budget > args.max_len:
         _dropped_long += 1          # 兜底：防多轮 ctx 撞 max_model_len
         continue
-    _kept.append((_item, _p))
+    _kept.append(_i)
 if _dropped_plen:
     print(f"  [对齐] {_dropped_plen} 题 prompt>{_max_plen}(max_prompt_length)，已剔除"
           f"（训练端同规则跳组，这些题不在训练分布内）")
 if _dropped_long:
     print(f"  [警告] {_dropped_long} 题 prompt+生成预算超 max_len={args.max_len}，已剔除"
           "（与训练端跳组规则对齐）")
-if not sample:
+if not _kept:
     raise RuntimeError(
         f"所有抽中题目的 prompt+生成预算都超 max_len={args.max_len}，无题可评；"
         "请调大 --max_len 或检查数据")
-sample = [it for it, _ in _kept]
-prompts = [p for _, p in _kept]
+# 【为什么按索引重建而不是过滤后 zip】_prompt_msgs 与 prompts 必须**逐项同源**：
+# 原生档的 messages 少了任何一题、或错位一题，多轮续写的 tool 回包就会落到别的
+# 题的上下文里（解析照样成功，只是答案全错——最难发现的一类静默错位）。
+sample = [sample[i] for i in _kept]
+prompts = [prompts[i] for i in _kept]
+if _prompt_msgs is not None:
+    _prompt_msgs = [_prompt_msgs[i] for i in _kept]
 
 # ---------- 起引擎前的显存前置检查（fail-fast 在 vLLM init_device 之前）----------
 def _mem_shortfall(gpu_mem: float, free: int, total: int):
@@ -558,7 +598,13 @@ if is_retool_family:
     # 【2026-09-18 stop 机制】评测与训练同节奏铁律：stop 从训练 config 回读
     # （_rcfg 即 --proto_from 对齐的那份），旧 ckpt（无 retool_stop 键）不带 stop
     # → 评测行为与训练严格一致，新旧协议不混测。
-    _stop = dict(_STOP_KW) if _rcfg.get("retool_stop") else {}
+    # 【2026-09-25 原生档】原生协议**不需要**围栏的 stop 串（模型自然停在 im_end）；
+    # 只有显式开了 native_stop_at_call 才用调用边界硬停，且同样从训练 config 回读。
+    if _native:
+        _stop = ({"stop": [NATIVE_CALL_STOP], "include_stop_str_in_output": True}
+                 if _rcfg.get("native_stop_at_call") else {})
+    else:
+        _stop = dict(_STOP_KW) if _rcfg.get("retool_stop") else {}
     if _sampling:
         # 每条轨迹独立请求 + 独立 seed（与训练同形态；vLLM 同 seed 会生成相同轨迹）
         import random as _rnd
@@ -570,16 +616,46 @@ if is_retool_family:
     else:
         sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens, **_stop)
     mt_cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
-              "sandbox_mem_mb": 256, "tool_result_max_chars": 500}
+              "sandbox_mem_mb": 256, "tool_result_max_chars": 500,
+              # 【2026-09-25】协议档与解析形态必须显式进 mt_cfg——multi_turn_rollout_group
+              # 靠它选分支（缺键 = "fence" = 历史行为），不能靠"调用点记得传"。
+              "tool_protocol": _tool_protocol,
+              "native_tool_style": _rcfg.get("native_tool_style") or "auto",
+              "native_stop_at_call": bool(_rcfg.get("native_stop_at_call")),
+              "max_context_tokens": _rcfg.get("max_context_tokens", 8192),
+              "chat_template_kwargs": _ctkw}
     _probe_prompts = [p for p in prompts for _ in range(args.val_n)] if _sampling else prompts
+    if _native:
+        # 原生档：多轮 messages 是唯一真源（prompt 文本只是渲染结果，续写从
+        # apply_chat_template(tokenize=True) 的 canonical 序列反推）
+        _probe_msgs = ([m for m in _prompt_msgs for _ in range(args.val_n)]
+                       if _sampling else _prompt_msgs)
+        # fail-fast：请求 tools 但渲染结果里没有工具声明 → 档位没接对（Q1）
+        if "tool_call" not in prompts[0] and "tools" not in prompts[0]:
+            print("  [警告] 原生档 prompt 里看不到工具声明痕迹——模板可能未响应 "
+                  "tools= 参数（docs/09 §1.2 Q1）；解析会大量 invalid")
+    else:
+        _probe_msgs = None
     _segs, _full, code_stats = multi_turn_rollout_group(
-        llm, sp_mt, tokenizer, _probe_prompts, mt_cfg)
+        llm, sp_mt, tokenizer, _probe_prompts, mt_cfg, prompts_messages=_probe_msgs)
     answers = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                for segs_i in _segs]
     # 打分域：retool_math 剥离代码块（与训练端 total_reward_retool_math 同口径）
     answers = [_strip_code_blocks(a) for a in answers]
     code_used = [s["code_used"] for s in code_stats]
     code_ok = [s["code_ok"] for s in code_stats]
+    # 【2026-09-25 原生档诊断】invalid_final = 有 <tool_call> 但形态不认识 / 调用后
+    # 还跟着内容。它是原生协议唯一的结构性负奖励入口，且在围栏档根本不存在这一列
+    # ——不打印就看不见"模型在调用后又继续写"这种档位特有的失效模式。
+    if _native:
+        _inv = sum(s.get("invalid_final", 0) for s in code_stats)
+        _full_ctx = sum(s.get("ctx_full", 0) for s in code_stats)
+        _ro = sum(1 for s in code_stats if s["code_used"] == 0)
+        if _inv or _full_ctx:
+            print(f"  [原生诊断] invalid_final={_inv}（调用后还有内容/形态不认识）"
+                  f"｜ctx_full={_full_ctx}（observation 放不下而终局）")
+        print(f"  [原生诊断] 零调用轨迹 {_ro}/{len(code_stats)}"
+              f"（{_ro / max(1, len(code_stats)) * 100:.1f}%，参考 base 调用率 87.5%）")
 else:
     if _sampling:
         outs = llm.generate(prompts, SamplingParams(temperature=_temp, top_p=_topp,

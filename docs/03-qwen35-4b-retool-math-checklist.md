@@ -5,6 +5,11 @@
 > 且随训练下降），而 rlab 的 Qwen2.5-3B base 实测丢弃率 81%（p≈5%）。
 > 结论：换强基座是丢弃率的一杆到底解，但不是"换个 model_path"，以下是全部连带项。
 >
+> **2026-09-25：迁移已完成但 RL 无效（p1–p11 全部未超 BASE）。根因已定位为
+> `docs/05 §12.1 #4` 的工具协议偏离（自造 `[TOOL RESULT]` 文本 vs 原生
+> `<tool_call>`），方案见 `09-native-tool-protocol.md`（主线）；
+> `08-sft-cold-start.md` 为 fallback。本清单的协议层结论仍然有效。**
+>
 > **后续：run2（1000 步）实测结论与优化方案见 `05-retool-math-diagnosis-plan.md`**
 > —— 含与 `05-retool` 的逐维对照、退化根因排序（`trunc_shaping` / 轮次协议 / 步数）、
 > P0–P4 方案与进度看板。本清单第 2 节"`max_rounds` 3→2 / TIR 对 4B 可能不必要"的
