@@ -3738,54 +3738,75 @@ def test_sandbox_verdict_gating():
     与 health.py 那条"判定规则有多个时先特例后一般，否则 elif 永远走不到"同源：
     条件实为 and 却写成 or，最弱的证据会独自定案。本测试把门控锁死。
     """
-    print("[AN] sandbox_verdict 判据门控（诊断器自身的 or/and bug）")
-    from rlab.diag_eval_gap import BF16_JITTER_MAX, sandbox_verdict
+    print("[AN] sandbox_verdict 判据门控 + 混淆量剔除（诊断器自身两次 bug）")
+    from rlab.diag_eval_gap import (BF16_JITTER_MAX, cond_ok_rate,
+                                    sandbox_verdict)
 
-    # ---- 1. 初版 bug 的精确复现：对称 + code_ok 差显著 → 必须判 not sandbox ----
-    v = sandbox_verdict(b_only=14, c_only=14, ck_a=100, ck_b=111,
-                        d_rate=14.0, base_rate=52.0, n_disagree=28)
-    check("对称 14/14 + ck 差 +11 → symmetric=True", v["symmetric"] is True)
-    check("对称翻转即使 ck 差显著也**不判**沙箱（初版 or 写法会误判 True）",
-          v["sandbox"] is False)
-    check("富集为负时 enrich 如实为负（不取绝对值）", v["enrich"] < 0)
+    # ---- 0. 真机 p11 数据：修正后必须判 sandbox=False（第二次 bug 的回归锁）----
+    # 内嵌 162 写代码/157 成功 = 96.9%；单独 173/165 = 95.4%
+    # 绝对数差 +8 曾被当成"空闲侧更好 ✓"，但条件成功率是**内嵌更高 1.5pp**，
+    # 与沙箱超时假设方向相反 → 沙箱被证伪。这条 fixture 用的是真机原始数字。
+    vp = sandbox_verdict(b_only=18, c_only=36, cu_a=162, ck_a=157,
+                         cu_b=173, ck_b=165, n_disagree=54)
+    check("真机 p11：条件成功率 内嵌 96.9% > 单独 95.4%",
+          abs(vp["cond_a"] - 157 / 162) < 1e-9
+          and abs(vp["cond_b"] - 165 / 173) < 1e-9)
+    check("真机 p11：cond_drop 为负（高负载侧并未更差）", vp["cond_drop"] < 0)
+    check("真机 p11：sandbox=False（旧判据在此数据上误判为 True）",
+          vp["sandbox"] is False)
+    check("真机 p11：used_gap=+11 被如实报出（真正的矛盾）", vp["used_gap"] == 11)
 
-    # ---- 2. p11 实测形态：偏斜 18/36 + 代码富集 → 判 sandbox ----
-    v2 = sandbox_verdict(b_only=18, c_only=36, ck_a=88, ck_b=122,
-                         d_rate=80.0, base_rate=57.0, n_disagree=54)
-    check("偏斜 18/36 → symmetric=False", v2["symmetric"] is False)
-    check("偏斜 + 代码相关 → sandbox=True（①②同时成立）", v2["sandbox"] is True)
-    check("code_linked 由 ck 差或富集任一支撑", v2["code_linked"] is True)
+    # ---- 1. 绝对数 code_ok 差大但条件率不降 → 不得判沙箱（混淆量剔除）----
+    v1 = sandbox_verdict(b_only=18, c_only=36, cu_a=100, ck_a=97,
+                         cu_b=200, ck_b=190, n_disagree=54)
+    check("code_ok 绝对数差 +93 但条件率 97% vs 95% → code_linked=False",
+          v1["code_linked"] is False and v1["sandbox"] is False)
 
-    # ---- 3. 偏斜但与代码无关 → 不判沙箱（另找非确定性源）----
-    v3 = sandbox_verdict(b_only=5, c_only=40, ck_a=100, ck_b=101,
-                         d_rate=20.0, base_rate=55.0, n_disagree=45)
-    check("偏斜但 ck 差 +1、富集 -35pp → code_linked=False",
-          v3["code_linked"] is False)
-    check("单向劣化但与代码无关 → sandbox=False（不硬套沙箱解释）",
-          v3["sandbox"] is False)
+    # ---- 2. 沙箱真超时的形态：条件率显著下降 → 判 True ----
+    v2 = sandbox_verdict(b_only=18, c_only=36, cu_a=162, ck_a=130,
+                         cu_b=173, ck_b=165, n_disagree=54)
+    check("条件率 80.2% vs 95.4%（降 15.1pp）+ 方向偏斜 → sandbox=True",
+          v2["sandbox"] is True and v2["cond_drop"] > 2.0)
 
-    # ---- 4. 门控的形式性质：sandbox ≡ (not symmetric) and code_linked ----
+    # ---- 3. 门控：条件率骤降但方向对称 → 仍不判沙箱（①门控②）----
+    v3 = sandbox_verdict(b_only=14, c_only=14, cu_a=162, ck_a=130,
+                         cu_b=173, ck_b=165, n_disagree=28)
+    check("对称 14/14 即使条件率降 15pp 也不判沙箱（①门控②）",
+          v3["symmetric"] is True and v3["code_linked"] is True
+          and v3["sandbox"] is False)
+
+    # ---- 4. 门控恒等式：sandbox ≡ (not symmetric) and code_linked ----
     import itertools
-    for b, c, ka, kb, dr, br in itertools.product(
-            (0, 3, 18), (0, 3, 36), (50,), (50, 58), (10.0, 80.0), (55.0,)):
-        _v = sandbox_verdict(b, c, ka, kb, dr, br, n_disagree=max(b + c, 1))
-        check_silent = ((not _v["symmetric"]) and _v["code_linked"]) == _v["sandbox"]
-        if not check_silent:
-            check(f"门控恒等式在 ({b},{c},{ka},{kb},{dr},{br}) 上成立", False)
+    _bad = None
+    for b, c, cua, cka, cub, ckb in itertools.product(
+            (0, 3, 18), (0, 3, 36), (100, 162), (60, 97, 157),
+            (100, 173), (95, 165)):
+        _v = sandbox_verdict(b, c, cua, min(cka, cua), cub, min(ckb, cub),
+                             n_disagree=max(b + c, 1))
+        if ((not _v["symmetric"]) and _v["code_linked"]) != _v["sandbox"]:
+            _bad = (b, c, cua, cka, cub, ckb)
             break
-    else:
-        check("门控恒等式 sandbox ≡ (not symmetric) and code_linked 在全组合成立",
-              True)
+    check("门控恒等式 sandbox ≡ (not symmetric) and code_linked 在全组合成立",
+          _bad is None)
 
-    # ---- 5. 对称性阈值与 bf16 地板联动（小分歧一律算对称）----
-    v5 = sandbox_verdict(b_only=1, c_only=3, ck_a=0, ck_b=99,
-                         d_rate=100.0, base_rate=0.0, n_disagree=4)
+    # ---- 5. 边界：无写代码题 → 条件率无从计算，不得定案 ----
+    v5 = sandbox_verdict(b_only=18, c_only=36, cu_a=0, ck_a=0,
+                         cu_b=0, ck_b=0, n_disagree=54)
+    check("两侧都没写代码 → cond_drop=None 且 sandbox=False（不硬定案）",
+          v5["cond_drop"] is None and v5["sandbox"] is False)
+    check("cond_ok_rate(0, 0) → None（不除零、不假装 0%）",
+          cond_ok_rate(0, 0) is None)
+    check("cond_ok_rate 常规值正确", abs(cond_ok_rate(162, 157) - 157 / 162) < 1e-12)
+
+    # ---- 6. 小分歧一律算对称（与 bf16 地板联动）----
+    v6 = sandbox_verdict(b_only=1, c_only=3, cu_a=10, ck_a=1,
+                         cu_b=10, ck_b=10, n_disagree=4)
     check(f"分歧极小（skew 2 < {BF16_JITTER_MAX}）→ 判对称，不下沙箱结论",
-          v5["symmetric"] is True and v5["sandbox"] is False)
+          v6["symmetric"] is True and v6["sandbox"] is False)
 
-    # ---- 6. 纯函数性：同输入同输出、不改入参 ----
-    _args = dict(b_only=18, c_only=36, ck_a=88, ck_b=122, d_rate=80.0,
-                 base_rate=57.0, n_disagree=54)
+    # ---- 7. 纯函数性 ----
+    _args = dict(b_only=18, c_only=36, cu_a=162, ck_a=130, cu_b=173, ck_b=165,
+                 n_disagree=54)
     check("纯函数：同输入两次调用结果相同",
           sandbox_verdict(**_args) == sandbox_verdict(**_args))
 

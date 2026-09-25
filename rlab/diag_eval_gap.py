@@ -168,31 +168,50 @@ def pair(a, b, tag_a, tag_b):
     return common, ia, ib, b_only, c_only
 
 
-def sandbox_verdict(b_only, c_only, ck_a, ck_b, d_rate, base_rate, n_disagree,
-                    ck_min=5, enrich_min=10.0):
+def cond_ok_rate(code_used_n, code_ok_n):
+    """条件成功率 = code_ok | code_used（写了代码的题里执行成功的比例）。
+
+    这是沙箱健康度的**唯一无混淆口径**：绝对数 code_ok 会随"写代码的题数"
+    一起动，两侧写代码题数不同时绝对数差毫无信息量。None = 没题可算。"""
+    if not code_used_n:
+        return None
+    return code_ok_n / code_used_n
+
+
+def sandbox_verdict(b_only, c_only, cu_a, ck_a, cu_b, ck_b, n_disagree,
+                    cond_drop_min=2.0):
     """沙箱资源竞争判据（纯函数，CPU 可测）。
 
-    返回 {"symmetric", "code_linked", "sandbox", "enrich", "skew"}。
     `sandbox=True` 仅当**两条同时成立**：
-      ① 单向劣化（方向偏斜）——沙箱超时只会让轨迹变差，不会变好，所以对称翻转
-         在定义上就不可能是它；
-      ② 与代码执行相关——空闲侧 code_ok 显著更多，或翻转显著富集在代码题上。
+      ① 单向劣化（方向偏斜）——沙箱超时只会让轨迹变差不会变好，对称翻转在
+         定义上就不可能是它；
+      ② **条件成功率**在高负载侧更低：cond_a < cond_b − cond_drop_min(pp)。
+         墙钟超时被 SIGKILL 的直接后果就是"写了代码但没拿到结果"。
 
-    【2026-09-25 这个函数是为了修自己的 bug 才抽出来的】旧版判据写成
-        ck_b - ck_a >= ck_min  or  (not sym and enrich >= enrich_min)
-    第一个 clause 能**单独**成立 → 负例（方向 14/14 完全对称、富集 −38pp）照样
-    印出"沙箱是主因 ✓"，只因 code_ok 差了 +11（fixture 里纯随机噪声）。
-    ②必须被①**门控**（and），不能并联（or）——与 health.py 那条"判定规则有多个时
-    先特例后一般，否则 elif 永远走不到"同源：条件实为 and 时写成 or，最弱的证据
-    会独自定案。抽成纯函数后这条门控被单测锁死，不再只靠 fixture 肉眼看。
+    【2026-09-25 第二次修这个函数——上一版判据是被混淆的】
+    上一版 ② 用 `ck_b - ck_a >= 5`（code_ok **绝对数**差）。在真机 p11 数据上
+    它给出了自信的错误结论：
+        内嵌 code_used=162 code_ok=157 → 条件成功率 96.9%
+        单独 code_used=173 code_ok=165 → 条件成功率 95.4%
+    绝对数差 +8 看着像"空闲侧代码成功更多 ✓"，但那 +8 完全是"单独侧写代码的题
+    本来就多 11 题"的派生量——**条件成功率其实是内嵌更高 1.5pp**，与沙箱超时
+    假设的方向相反。绝对数是混淆量，条件率才是无混淆量。
+    教训与上一版（or 写成 and）不同源但同类：**判据必须用"若假设为真则必然
+    单向变化"的量**，任何会被第三变量（此处=写代码题数）带动的量都不能当证据。
     """
     skew = abs(b_only - c_only)
     symmetric = skew < max(BF16_JITTER_MAX, 0.2 * max(n_disagree, 1))
-    enrich = d_rate - base_rate
-    code_linked = (ck_b - ck_a >= ck_min) or (enrich >= enrich_min)
+    ca, cb = cond_ok_rate(cu_a, ck_a), cond_ok_rate(cu_b, ck_b)
+    if ca is None or cb is None:
+        cond_drop = None
+        code_linked = False
+    else:
+        cond_drop = (cb - ca) * 100.0        # >0 = 高负载侧条件成功率更低
+        code_linked = cond_drop >= cond_drop_min
     return {"symmetric": symmetric, "code_linked": code_linked,
             "sandbox": (not symmetric) and code_linked,
-            "enrich": enrich, "skew": skew}
+            "cond_a": ca, "cond_b": cb, "cond_drop": cond_drop,
+            "used_gap": cu_b - cu_a, "skew": skew}
 
 
 def code_layer(a, b, common, ia, ib, b_only, c_only, tag_a, tag_b):
@@ -201,7 +220,8 @@ def code_layer(a, b, common, ia, ib, b_only, c_only, tag_a, tag_b):
     判据（两条同时成立才算沙箱竞争实锤）：
       ① 方向偏斜：沙箱超时只会让轨迹变差不会变好 → 分歧应显著偏向空闲那侧，
          而非对称（bf16 抖动是对称的）；
-      ② 代码相关性：翻转富集在写过代码的题上，且空闲侧 code_ok 更高。
+      ② **条件成功率**（code_ok | code_used）在高负载侧更低——绝对数 code_ok
+         会被"写代码题数"带动，是混淆量，不能当证据（见 sandbox_verdict 注释）。
     """
     print(f"\n=== 代码执行分层（{tag_a} vs {tag_b}）===")
     cu_a = sum(1 for q in common if (ia[q].get("code_used") or 0) > 0)
@@ -211,12 +231,15 @@ def code_layer(a, b, common, ia, ib, b_only, c_only, tag_a, tag_b):
     print(f"  配对集内 code_used>0: {tag_a} {cu_a} 题 / {tag_b} {cu_b} 题"
           f"   （差 {cu_b - cu_a:+d}）")
     print(f"  配对集内 code_ok >0: {tag_a} {ck_a} 题 / {tag_b} {ck_b} 题"
-          f"   （差 {ck_b - ck_a:+d}）")
+          f"   （差 {ck_b - ck_a:+d}，**混淆量**，仅供参照）")
+    _ca, _cb = cond_ok_rate(cu_a, ck_a), cond_ok_rate(cu_b, ck_b)
+    print(f"  条件成功率 code_ok|code_used: {tag_a} {_pct(_ca)} / "
+          f"{tag_b} {_pct(_cb)}   ← **无混淆口径**")
 
     disagree = [q for q in common if (ia[q]["acc"] > 0) != (ib[q]["acc"] > 0)]
     if not disagree:
         print("  无分歧题，无需分层")
-        return
+        return None
     used_in = lambda q: ((ia[q].get("code_used") or 0) > 0
                          or (ib[q].get("code_used") or 0) > 0)
     d_code = [q for q in disagree if used_in(q)]
@@ -227,36 +250,49 @@ def code_layer(a, b, common, ia, ib, b_only, c_only, tag_a, tag_b):
           f" | 全集写代码占比 {base_rate:.0f}%（基础率对照）")
 
     print("\n  判读：")
-    v = sandbox_verdict(b_only, c_only, ck_a, ck_b, d_rate, base_rate, len(disagree))
-    enrich = v["enrich"]
+    v = sandbox_verdict(b_only, c_only, cu_a, ck_a, cu_b, ck_b, len(disagree))
+    _cd = v["cond_drop"]
     if v["symmetric"]:
         print(f"    ① 方向基本对称 {b_only}/{c_only} → 不是单向劣化 ✗")
-        print(f"    ② 代码成功数差 {ck_b - ck_a:+d}、翻转富集 {enrich:+.0f}pp"
-              f"（① 未成立，本项不单独定案）")
-        print("    → 沙箱竞争**不成立**（它只会单向变差）。对称的大量翻转指向"
-              "另一类源：")
-        print("       KV 池容量差异（gpu_mem 0.20 vs 0.78）导致抢占/重算路径不同、"
-              "attn backend 实际生效值、\n"
-              "       多轮上下文在不同 KV 容量下的分块边界不同。"
-              "先核 eval 日志里两边的 KV cache blocks 与 preemption 计数。")
-        return v
-    hi = tag_b if c_only > b_only else tag_a
-    print(f"    ① 方向偏斜 {b_only}/{c_only}（{hi} 明显更优）→ 单向劣化，"
-          f"不是 bf16 抖动（那是对称的）✓")
-    if v["code_linked"]:
-        print(f"    ② 代码成功数差 {ck_b - ck_a:+d}、翻转富集 {enrich:+.0f}pp"
-              f" → 劣化与代码执行相关 ✓")
-        print("    → 综合：①+② 同时成立 = 内嵌评测与训练进程共卡共 CPU"
-              "（gpu_mem 0.20 vs 0.78，且与 sandbox_workers=8 抢 CPU），"
-              "\n       5s 墙钟沙箱超时被负载放大。")
-        print("       结论：两个读数都不是 bug——内嵌是**带资源竞争的悲观读数**。")
-        print("       用法：趋势判断用内嵌（同条件跨 step 可比）；"
-              "绝对值/对外汇报用单独评测。")
     else:
-        print(f"    ② 代码成功数差 {ck_b - ck_a:+d}、翻转富集 {enrich:+.0f}pp"
-              f"（不显著）→ 劣化与代码执行无关 ✗")
-        print("    → 单向劣化但不由沙箱解释：查 KV 抢占/重算、"
-              "轮间上下文截断位置、两边 max_num_seqs 实际值。")
+        hi = tag_b if c_only > b_only else tag_a
+        print(f"    ① 方向偏斜 {b_only}/{c_only}（{hi} 明显更优）→ 单向劣化，"
+              f"不是 bf16 抖动（那是对称的）✓")
+    if _cd is None:
+        print("    ② 无写代码题，条件成功率无从计算 ✗")
+    elif v["code_linked"]:
+        print(f"    ② 条件成功率 {tag_a} {_pct(v['cond_a'])} < {tag_b} "
+              f"{_pct(v['cond_b'])}（低 {_cd:.1f}pp）→ 高负载侧沙箱确实在丢结果 ✓")
+    else:
+        print(f"    ② 条件成功率 {tag_a} {_pct(v['cond_a'])} vs {tag_b} "
+              f"{_pct(v['cond_b'])}（差 {_cd:+.1f}pp）→ 高负载侧**并未**更差 ✗")
+
+    if v["sandbox"]:
+        print("    → ①+② 同时成立 = 内嵌与训练进程共卡共 CPU（gpu_mem 0.20 vs "
+              "0.78，且与 sandbox_workers=8 抢 CPU），5s 墙钟沙箱超时被负载放大。")
+        print("       两个读数都不是 bug——内嵌是**带资源竞争的悲观读数**。")
+        print("       趋势判断用内嵌（同条件跨 step 可比）；绝对值用单独评测。")
+        return v
+
+    # 沙箱被否 → 把矛盾摆出来，并指向真正该查的地方
+    print("    → 沙箱竞争**不成立**。")
+    if v["used_gap"]:
+        print(f"\n  ⚠ 真正的矛盾在更前面：两侧「写代码的题数」差 "
+              f"{v['used_gap']:+d} 题（{cu_a} vs {cu_b}）。")
+        print("     greedy(temp=0) + 同权重 + 同 prompt + batch_invariant=True 下，"
+              "第一轮该逐 token 相同 →")
+        print("     「写不写代码」本不该有任何差异。它变了，说明**分歧发生在生成层"
+              "而非沙箱层**。")
+        print("     batch_invariant 只保证「结果不随 batch 组成变化」，"
+              "它不保证跨 KV 池容量一致：")
+        print("       gpu_mem 0.20 vs 0.78 → KV 池块数不同 → chunked prefill 分块"
+              "边界不同 → bf16 归约顺序不同")
+        print("       → near-tie token 翻转（是否开 ``` 围栏正是这种 near-tie）。")
+        print("     ⇒ 待验证的唯一假设：**gpu_mem 改变了生成本身**。"
+              "判别实验见 docs（空闲机上跑 gpu_mem A/B）。")
+    else:
+        print("     两侧写代码题数相同，分歧不在代码路径 → 查 KV 抢占/重算计数、"
+              "轮间上下文截断位置、max_num_seqs 实际值。")
     return v
 
 
