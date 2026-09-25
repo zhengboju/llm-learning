@@ -311,41 +311,63 @@ def suffix_prefix_overlap(tokens: list, suffix: list) -> int:
     return 0
 
 
-# 纯空白 token 的判别缓存（token id → bool）。整段 decode 在热路径上太贵
-# （每段都可能命中：8 样本 × 4 轮 × 每步），单 token decode 便宜且可缓存。
-_WS_TOKEN_CACHE: dict = {}
+def _norm_text(tokenizer, ids):
+    """token ids → 规范化文本（去掉所有空白）；解码失败返回 None。
 
+    【为什么校验① 必须停在**文本**层面，而不是 token 序列层面】
+    本项目"生成/训练同序列"的实质是：**两条路径表示同一段历史文本**。而 token
+    序列层面的全等是**不可满足**的——因为 BPE 分词不是"分段可加"的：
 
-def _drop_ws_tokens(tokenizer, ids):
-    """去掉**纯空白 token**；解码失败 → 返回 None（调用方退回严格比较，宁严不宽）。
+        encode("```") + encode("\\n")  = [73594, 198]
+        encode("```\\n")               = [13874, 3989]      ← 同一文本，token 不同
 
-    【为什么判据是"单 token 解码后 strip 为空"】Qwen 是 byte-level BPE，ASCII 空白
-    （空格/换行）都是单 token 且单独解码干净；多字节字符被切开时单 token 解码成
-    替换符（非空白）→ **保守保留**。故该判据只会"漏容忍"、不会"错容忍"——正是
-    要的方向（宁可多 raise 一次，不可静默拼出错位序列）。
+    （本机 Qwen2.5 实测；docs/05 早已把它记为"text↔token 重编码不可逆"，官方复现
+    也正因此要求 token-in token-out。）而我们的 `prev` 是**逐段累积**出来的
+    （每段的观测由模板渲染后切片、再拼到上一段之后），模板重渲染整段历史时则是
+    **一次成串**分词——两条路径在**段边界**上必然可能出现这种合并差异。
 
-    【本函数只服务校验，不参与构造】序列永远由原始 token 拼出（token-in token-out），
-    绝不拿这里的结果去构造任何东西。见 build_next_prompt 校验① 的事故说明。"""
-    out = []
-    for t in ids:
-        t = int(t)
-        hit = _WS_TOKEN_CACHE.get(t)
-        if hit is None:
-            try:
-                s = tokenizer.decode([t], skip_special_tokens=False)
-            except Exception:
-                return None
-            if not isinstance(s, str):
-                return None
-            hit = (s.strip() == "")
-            _WS_TOKEN_CACHE[t] = hit
-        if not hit:
-            out.append(t)
-    return out
+    真机第二次 abort 就是这样（16 次实锤之后才看清）：
+        模板侧 [1484:1492] = [91450, 17, 7461, 198, 1302, 925, 91748, 64208]
+        拼接侧 [1484:1492] = [2387, 332, 17, 7461, 198, 1302, 925, 91748]
+                            └ 1 个 token    └ 2 个 token，之后**逐位重合**
+    两侧解码文本**完全相同**（都是 `…has no attribute 'now`），总长恰好差 1。
+    **这是 token-in token-out 的固有属性，不是"不同源"。** 旧判据（含只容忍空白的
+    版本）会把它误判成错误——而它恰恰是我们主动选择 token 续写所换来的东西：
+    模型采样出的 token 原样保留，绝不拿模板去重分词（重分词会让 gen_logps 与
+    序列错位，正是 docs/05 的 NaN 来源）。
+
+    故容忍口径 = **解码文本（去空白）相同**。它同时覆盖两种固有差异：
+      · 模板对 assistant 内容 strip（首尾空白消失）；
+      · BPE 段边界合并（同一文本、token 数不同）。
+    而任何**可见内容**的差异（tools 档不一致、enable_thinking 档不一致、模板改写
+    历史、内容不同）都会让文本不同 → 仍然 raise。
+
+    【残留风险·如实声明（两条）】
+      · "文本相同但 token 不同"的差异不会被发现——这是**刻意**的：它本就是两条
+        合法分词路径的产物，且生成/训练/打分三方共用同一条 `prev` 序列，不存在
+        "错位"可言；
+      · **只差空白**的差异也不会被发现（含空白在语义上有意义的位置，如代码缩进、
+        stdout 排版）。理由：模板对 assistant 内容 strip 是既成事实，而空白在
+        模板渲染中会被归一化，故"空白"这一层无法可靠地区分"模板改写"与"原文如此"。
+        代价可接受：校验① 的本职是拦 **tools / chat_template_kwargs 档不一致**
+        （那会产生整段 `# Tools` 声明或 think 段的**可见**差异，照样 raise），
+        而不是做逐字节的模板一致性证明。
+    """
+    try:
+        txt = tokenizer.decode([int(t) for t in ids], skip_special_tokens=False)
+    except Exception:
+        return None
+    if not isinstance(txt, str):
+        return None
+    return re.sub(r"\s+", "", txt)
 
 
 def _decode_span(tokenizer, ids, start, width):
-    """把分歧位附近解码成文本，供报错信息直接显示（数字看不出"错在哪"）。"""
+    """把分歧位附近解码成文本，供报错信息直接显示（数字看不出"错在哪"）。
+
+    【只在"两侧 token 数相同"时可用于并排比较】窗口按 **token 宽度**取；两侧分词
+    不同的容器差（1 token vs 2 tokens）会让同样宽度的窗口覆盖不同字符数 → 尾部
+    错位、凭空显出"内容不同"。跨分词比较一律用 `_char_aligned_span`。"""
     lo = max(0, int(start) - 4)
     hi = min(len(ids), int(start) + int(width))
     try:
@@ -354,8 +376,35 @@ def _decode_span(tokenizer, ids, start, width):
         return repr([int(t) for t in ids[lo:hi]])
 
 
+def _char_aligned_span(tokenizer, ids_a, ids_b, width: int = 60):
+    """按**字符**对齐展示两条序列的差异窗口（跨分词比较的唯一正确做法）。
+
+    【这是一次真实误判的修复】校验① 的报错原本用 `_decode_span` 各自取 token 窗口，
+    真机上打出来的是（一侧显示 `…has no attribute 'now`、另一侧 `…has no attribute '`）：
+
+    看起来"可见内容不同"（一侧多 `now`），但那一整段**实际完全相同**——只是模板侧
+    是 1 个 token、拼接侧是 2 个 token（真机 1556 vs 1557），于是**同样 64 个 token
+    的窗口**在拼接侧少覆盖一个下游 token，尾部便凭空差出一截。本机已复现该假象
+    （整段文本相同、两个 token 窗口尾部不同）。
+
+    报错信息是给人看的诊断，必须按**字符**对齐：先各自整段解码，在**字符域**定位
+    分歧，再取同一字符区间。这样显示的差异一定是真差异。
+    """
+    try:
+        a = tokenizer.decode([int(t) for t in ids_a], skip_special_tokens=False)
+        b = tokenizer.decode([int(t) for t in ids_b], skip_special_tokens=False)
+    except Exception:
+        return None
+    if not isinstance(a, str) or not isinstance(b, str):
+        return None
+    n = min(len(a), len(b))
+    i = next((k for k in range(n) if a[k] != b[k]), n)
+    lo = max(0, i - 24)
+    return i, a[lo:i + width], b[lo:i + width]
+
+
 # 容忍只告警一次（否则每个样本每轮都刷一行，训练日志被淹没）
-_WS_TOLERANCE_WARNED = False
+_RENDER_TOLERANCE_WARNED = False
 
 
 def build_next_prompt(tokenizer, messages_before_assistant: list,
@@ -379,41 +428,67 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
     普通叙述——算出的 observation 逐 token 完全相同），这正是占位法成立的根据。
 
     三处 fail-fast（异常当场抛，不静默产出错位序列）：
-      ① canonical_prompt 与 prev 的**可见内容**不同（模板 tokenize 路径与生成端
-         喂给 vLLM 的 ids 不同源；空白差异容忍——见 _visible_text 的事故说明）；
+      ① canonical_prompt 与 prev 的**解码文本**不同（模板 tokenize 路径与生成端
+         喂给 vLLM 的 ids 不同源）。注意判据是**文本**而非 token 序列——BPE 分段
+         编码 ≠ 整串编码，token 级全等是不可满足的；见 _norm_text 的事故说明；
       ② 占位 assistant 拼接后前缀不等（模板改写了历史）；
       ③ 加入 tool 消息后前缀不等（observation 渲染污染了历史）。"""
-    global _WS_TOLERANCE_WARNED
+    global _RENDER_TOLERANCE_WARNED
     prev = [int(t) for t in previous_prompt_tokens]
     canonical_prompt = render_chat_ids(tokenizer, messages_before_assistant, True,
                                        chat_template_kwargs)
     if canonical_prompt != prev:
-        # 【两级判据】先看是否**只是空白归一化差异**（模板 strip vs 原样采样）；
-        # 是 → 容忍（否则"某段以换行开头"就会炸掉整轮训练）；否 → 真不同源，抛。
-        _cv = _drop_ws_tokens(tokenizer, canonical_prompt)
-        _pv = _drop_ws_tokens(tokenizer, prev)
+        # 【两级判据】token 序列全等 → 通过（原路径，零开销）。不等时**退到文本层面**：
+        #   文本（去空白）相同 → 容忍（模板 strip 与 BPE 段边界合并都是固有差异）；
+        #   文本不同         → 真不同源，抛（tools / chat_template_kwargs 档不一致、
+        #                      模板改写历史等都会让文本不同）。
+        # 为什么不能停在 token 层面：见 _norm_text 的实测说明（分段编码 ≠ 整串编码）。
+        _cv = _norm_text(tokenizer, canonical_prompt)
+        _pv = _norm_text(tokenizer, prev)
         if _cv is not None and _cv == _pv:
-            if not _WS_TOLERANCE_WARNED:
-                _WS_TOLERANCE_WARNED = True
-                print(f"[protocol] 模板渲染与拼接上下文差 {abs(len(canonical_prompt) - len(prev))} "
-                      f"个 token，但**去掉空白 token 后完全相同**（模板对 assistant 内容做 "
-                      f"strip，拼接保留原样采样 token）→ 判为归一化差异、继续。"
-                      f"只报这一次。", flush=True)
+            if not _RENDER_TOLERANCE_WARNED:
+                _RENDER_TOLERANCE_WARNED = True
+                print(f"[protocol] 模板重渲染与拼接上下文 token 数差 "
+                      f"{abs(len(canonical_prompt) - len(prev))}（{len(canonical_prompt)} vs "
+                      f"{len(prev)}），但**解码文本完全相同**——要么模板 strip 了 assistant "
+                      f"内容、要么 BPE 在段边界合并（分段编码≠整串编码，docs/05）。"
+                      f"两条路径表示同一段历史 → 判为归一化差异、继续。只报这一次。",
+                      flush=True)
         else:
             _n = min(len(canonical_prompt), len(prev))
             _i = next((k for k in range(_n) if canonical_prompt[k] != prev[k]), _n)
-            _ctx = 60
+            # 【文本窗口必须按字符对齐】不能各自取 token 窗口——两侧分词不同时
+            # 等宽 token 窗口覆盖的字符数不同，会凭空显出"内容不同"（真机误判实录
+            # 见 _char_aligned_span）。先整段解码、在字符域定位，再取同一区间。
+            _al = _char_aligned_span(tokenizer, canonical_prompt, prev)
+            if _al is not None:
+                _ci, _ta, _tb = _al
+                _diff = (f"  字符域首个分歧位 {_ci}（模板侧共 {len(_ta)} 字符窗口）\n"
+                         f"  模板侧文本 …{_ta!r}\n"
+                         f"  拼接侧文本 …{_tb!r}\n")
+            else:
+                _diff = (f"  模板侧文本 …{_decode_span(tokenizer, canonical_prompt, _i, 60)!r}\n"
+                         f"  拼接侧文本 …{_decode_span(tokenizer, prev, _i, 60)!r}\n")
             raise ValueError(
                 "[protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致"
                 f"（长度 {len(canonical_prompt)} vs {len(prev)}，首个分歧位 {_i}）；"
-                f"且差异**不只是空白**（可见内容不同）→ 真的不同源。\n"
+                f"且**解码文本也不同**（不只是分词/空白差异）→ 真的不同源。\n"
                 f"  模板侧 [{_i}:{_i + 8}] = {[int(t) for t in canonical_prompt[_i:_i + 8]]}\n"
                 f"  拼接侧 [{_i}:{_i + 8}] = {[int(t) for t in prev[_i:_i + 8]]}\n"
-                f"  模板侧文本 …{_decode_span(tokenizer, canonical_prompt, _i, _ctx)!r}\n"
-                f"  拼接侧文本 …{_decode_span(tokenizer, prev, _i, _ctx)!r}\n"
-                "  后果：续写序列与采样序列不同源 → gen_logps 基线失真、训练/生成分布分叉。\n"
+                + _diff
+                + "  后果：续写序列与采样序列不同源 → gen_logps 基线失真、训练/生成分布分叉。\n"
                 "  处置：检查 build_prompt 的 tools/chat_template_kwargs 是否与 "
                 "apply_chat_template 同参（tools 必须两边都传或都不传）。")
+    # 【占位符为什么必须是不以空白开头的可见字符】校验② 比较的是
+    #     canonical_prompt + encode(占位符)   vs   模板整串渲染
+    # 而 BPE 分段编码 ≠ 整串编码（与校验① 同一性质）。本机 Qwen2.5 实测：
+    #     prompt 以 "<|im_start|>assistant\n" 结尾时
+    #       + encode("x")  → 与整串渲染**一致**（\n 与 x 不合并）
+    #       + encode("\n") → **不一致**（\n\n 合并，275 vs 276）← 会误杀整轮训练
+    # 占位符只为"定位 assistant 结束边界"，内容无意义，故固定用 "x"：既避开
+    # 空白合并，也避开与 </think> 等结构串冲突。**不要改成空白或空串**——那会
+    # 让校验② 变成一个新的"护栏误杀"入口（同类事故已在真机发生两次，见
+    # docs/09 §10.6.2）。测试 P2b 有专门断言锁死这一点。
     placeholder = {"role": "assistant", "content": "x"}
     with_placeholder = [*messages_before_assistant, placeholder]
     canonical_end = render_chat_ids(tokenizer, with_placeholder, False,

@@ -375,24 +375,38 @@ def test_p2_sequence_contract():
 # P2b 空白容忍（2026-09-25 真机第 5 段事故的修复）
 # =====================================================================
 def test_p2b_whitespace_tolerance():
-    """真机事故：模板 strip assistant 内容 vs 拼接原样保留采样 token。
+    """真机两次 abort 的修复：**表示层归一化**不得被误判成"生成/训练不同源"。
 
-    真机报（原生协议第一次上机就命中）：
+    连续两次真机事故（原生协议刚上机就命中），报错形态几乎一样：
         [protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致
         （长度 1556 vs 1557，首个分歧位 1484）
-    机制：**prev 比 canonical 多 1 个 token**。我们的 ctx 把 vLLM 采样的 token
-    原样累积（必须原样——那是模型自己吐的字节、也是它下一轮上下文里的真实内容），
-    而模板渲染 assistant 内容时把**段首空白**吃掉。两者只差空白 token。
-    命中条件是"某一段 assistant 以换行/空格开头"，故前几段不炸、第 5 段才炸。
 
-    旧判据逐 token 全等 → 把**模板归一化**误判成"生成/训练不同源"而 abort 训练
-    （本项目最贵的一类：协议其实是对的，校验自己把正确的运行打死了）。
+    ① 第一次（模板 strip）：我们的 ctx 把 vLLM 采样的 token **原样**累积（必须
+       原样——那是模型自己吐的字节、也是它下一轮上下文里的真实内容），而模板
+       渲染 assistant 内容时把**段首空白**吃掉。命中条件是"某一段以空白开头"，
+       故前几段不炸、第 5 段才炸。
+    ② 第二次（BPE 段边界合并）：两侧 token **数**差 1、**解码文本完全相同**——
+          模板侧 [1484:1492] = [91450, 17, 7461, 198, 1302, 925, 91748, 64208]
+          拼接侧 [1484:1492] = [2387, 332, 17, 7461, 198, 1302, 925, 91748]
+       1 个 token vs 2 个 token，之后**逐位重合**。这是 BPE **分段编码 ≠ 整串
+       编码**（本机 Qwen2.5 实测：encode("```")+encode("\\n") = [73594,198]，
+       而 encode("```\\n") = [13874,3989]）。模板重渲染整段历史是**一次成串**
+       分词，我们的 prev 是**逐段累积**——两条路径在段边界必然可能出现这种合并
+       差异。**它是 token-in token-out 的固有属性**（docs/05/09 明写"text↔token
+       重编码不可逆"正是为此改成 token 续写），不是 bug。
 
-    本组锁死两件事：
-      · 只差空白 → **容忍**（否则"模型某段以换行开头"就是必然 abort）；
-      · 差任何**可见**字符 / tools 档不一致 → **仍然 raise**（校验① 的本职不能丢）。
+    旧判据（无论是最早的逐 token 全等，还是只容忍空白的中间版）都把这两种**表示
+    层**差异误判成语义不同源而 abort（本项目最贵的一类：协议其实是对的，校验自己
+    把正确的运行打死了）。故判据改为**解码文本（去空白）相同**。
+
+    本组锁死三件事：
+      · 只差空白            → 容忍；
+      · 文本相同但分词不同  → 容忍（BPE 段边界合并，第二次事故）；
+      · 差任何**可见**字符 / tools 档不一致 / thinking 档不一致 / 模板改写历史
+        → **仍然 raise**（校验① 的本职不能丢）。
+    并锁死"容忍 ≠ 篡改"：返回序列必须以**原样 prev** 开头（绝不 trim 采样 token）。
     """
-    print("[P2b] 空白归一化容忍：模板 strip vs 拼接原样（真机第 5 段事故）")
+    print("[P2b] 表示层归一化容忍：模板 strip + BPE 段边界合并（两次真机事故）")
     base, _ = _tool_msg()
     obs = tool_message(make_call_id(0, 0, 1), "42")
     t = MockTok()                       # strip_assistant=True（Qwen 真实行为）
@@ -427,6 +441,86 @@ def test_p2b_whitespace_tolerance():
             ok = False
         check(f"空白变体 {c_raw!r} → 容忍", ok)
 
+    # ---- 正例 3【第二次真机事故】BPE 段边界合并：文本相同、token 数不同 → 容忍 ----
+    # MockTok 是字符级编码，**刻意不模拟 BPE 合并**（见其 docstring）——所以这里
+    # 用一个子类显式模拟"整串编码会把相邻两字符合并成单 token，而分段编码不会"。
+    # 真机形态（样本 25 第 5 段，1556 vs 1557，首个分歧位 1484）：
+    #     模板侧 1 个 token  vs  拼接侧 2 个 token，之后**逐位重合**，文本完全相同。
+    # 本机 Qwen2.5 实测同型：encode("```")+encode("\n") = [73594,198]，
+    # 而 encode("```\n") = [13874,3989]。**这是 token-in token-out 的固有属性**，
+    # 旧判据（逐 token 全等 / 只容忍空白）必炸。
+    class BPETok(MockTok):
+        """模拟 BPE：整串编码时把 pair 合并成单 token，分段编码不合并。"""
+        MERGE = {("`", "\n"): 100901}
+        apply_merges = True
+
+        def _enc_merged(self, s):
+            ids = [ord(c) for c in s]
+            if not self.apply_merges:
+                return ids
+            out, k = [], 0
+            while k < len(ids):
+                if k + 1 < len(ids):
+                    hit = self.MERGE.get((chr(ids[k]), chr(ids[k + 1])))
+                    if hit is not None:
+                        out.append(hit)
+                        k += 2
+                        continue
+                out.append(ids[k])
+                k += 1
+            return out
+
+        # 整串渲染走合并路径；decode 把合成 id 还原成两个字符（保证文本相同）
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=True, tools=None, **kw):
+            toks = super().apply_chat_template(messages, tokenize=False,
+                                               add_generation_prompt=add_generation_prompt,
+                                               tools=tools, **kw)
+            ids = [ord(c) for c in toks] if isinstance(toks, str) else list(toks)
+            if not self.apply_merges:
+                return ids if tokenize else self.decode(ids)
+            out, k = [], 0
+            while k < len(ids):
+                if k + 1 < len(ids):
+                    hit = self.MERGE.get((chr(ids[k]), chr(ids[k + 1])))
+                    if hit is not None:
+                        out.append(hit)
+                        k += 2
+                        continue
+                out.append(ids[k])
+                k += 1
+            return out if tokenize else self.decode(out)
+
+        def decode(self, ids, skip_special_tokens=False):
+            rev = {v: k for k, v in self.MERGE.items()}
+            parts = []
+            for i in ids:
+                i = int(i)
+                if i in rev:
+                    parts.append("".join(rev[i]))
+                else:
+                    parts.append(chr(i) if i < 0x10000 else f"\x00{i}")
+            return "".join(parts)
+
+    t_whole = BPETok()                  # 整串路径：合并
+    t_seg = BPETok()                    # 分段路径：不合并（模拟逐段累积）
+    t_seg.apply_merges = False
+    b_msgs = [*base, {"role": "assistant", "content": "```\nprint(1)"}]
+    prev_seg = render_chat_ids(t_seg, b_msgs, True, {})      # 拼接侧（未合并）
+    canon_whole = render_chat_ids(t_whole, b_msgs, True, {})  # 模板侧（合并）
+    check("前提：BPE 段边界合并使两侧 token 数不同（复现真机 1556 vs 1557 形态）",
+          len(prev_seg) == len(canon_whole) + 1 and prev_seg != canon_whole)
+    check("前提：两侧**解码文本完全相同**（真机两侧文本一致的形态）",
+          t_whole.decode(prev_seg) == t_whole.decode(canon_whole))
+    try:
+        got_b = build_next_prompt(t_whole, b_msgs, prev_seg,
+                                  encoded_text_tokens(t_whole, "42"), obs)
+        check("文本相同但 token 分词不同 → 容忍（修复前此处必 ValueError）",
+              got_b[:len(prev_seg)] == prev_seg)
+    except ValueError as e:
+        check("文本相同但 token 分词不同 → 容忍（修复前此处必 ValueError）", False)
+        print(f"  !! {e}")
+
     # ---- 反例 1：可见内容不同 → 必须 raise（容忍不能变成"什么都放过"）----
     prev_vis = render_chat_ids(t, [*base, {"role": "assistant",
                                            "content": "let me compute ZZZ"}], True, {})
@@ -436,7 +530,7 @@ def test_p2b_whitespace_tolerance():
         check("可见内容不同（多一个可见字符）→ 仍 raise", False)
     except ValueError as e:
         check("可见内容不同（多一个可见字符）→ 仍 raise",
-              "不同源" in str(e) and "不只是空白" in str(e))
+              "不同源" in str(e) and "解码文本也不同" in str(e))
 
     # ---- 反例 2：tools 档不一致（1000+ token 的声明段）→ 必须 raise ----
     t_nt = MockTok()
@@ -490,7 +584,7 @@ def test_p2b_whitespace_tolerance():
         check("enable_thinking 档不一致 → 仍 raise（可见 think 段不可容忍）", False)
     except ValueError as e:
         check("enable_thinking 档不一致 → 仍 raise（可见 think 段不可容忍）",
-              "不同源" in str(e) and "不只是空白" in str(e))
+              "不同源" in str(e) and "解码文本也不同" in str(e))
 
     # ---- 端到端：真机事故的精确复现（第 5 段才炸）----
     # 真机首个分歧位 1484 / 长度 1556 vs 1557：不是"某段特别长"，而是
@@ -520,6 +614,92 @@ def test_p2b_whitespace_tolerance():
                  tool_message(make_call_id(0, 0, _r), str(_r))]
     check("端到端 5 段（每段 assistant 都以换行开头）全部通过且不改动采样 token",
           _ok)
+
+    # ---- 【同类隐患的静态锁】占位符必须是"不以空白开头的可见字符" ----
+    # 校验② 比较 `canonical_prompt + encode(占位符)` 与模板整串渲染，而 BPE
+    # **分段编码 ≠ 整串编码**（与校验① 同一性质）。本机 Qwen2.5 实测：prompt 以
+    # "<|im_start|>assistant\n" 结尾时，`+ encode("\n")` 会与前面的 \n **合并**
+    # （275 vs 276）→ 校验② 当场误杀整轮训练；而 `+ encode("x")` 一致。
+    # 占位内容本身无意义（只用来定位 assistant 结束边界），故必须钉住 "x"：
+    # 它既避开空白合并、也避开 </think> 等结构串——**这是一个载荷常量**，
+    # 后人"顺手简化"成空白/空串就会重新打开护栏误杀入口。
+    _src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+        __file__))), "protocol.py"), encoding="utf-8").read()
+    _t = _ast.parse(_src)
+    _ph_vals = []
+    for _n in _ast.walk(_t):
+        if isinstance(_n, _ast.Assign) and any(
+                isinstance(_tt, _ast.Name) and _tt.id == "placeholder"
+                for _tt in _n.targets):
+            _ph_vals.append(_n.value)
+    check("build_next_prompt 里 placeholder 赋值恰好一处（静态可查）",
+          len(_ph_vals) == 1)
+    _ph_content = None
+    if _ph_vals:
+        for _k, _v in zip(_ph_vals[0].keys, _ph_vals[0].values):
+            if getattr(_k, "value", None) == "content" and isinstance(_v, _ast.Constant):
+                _ph_content = _v.value
+    check("占位符是不以空白开头的可见字符（避免 BPE 段边界合并误杀校验②；"
+          "实测 '\\n' 会合并 → 275 vs 276）",
+          isinstance(_ph_content, str) and _ph_content != ""
+          and _ph_content.strip() == _ph_content)
+
+    # ---- 【报错信息自身的假象】跨分词比较必须按**字符**对齐，不能按 token 宽度 ----
+    # 真机第二次报错打出"模板侧 …attribute 'now / 拼接侧 …attribute '"，看起来
+    # 内容不同——但整段文本**完全相同**，只是模板侧 1 token、拼接侧 2 tokens，
+    # 于是等宽 token 窗口在拼接侧少覆盖一个下游 token，尾部凭空差一截。
+    # 报错是给人看的诊断，必须用 _char_aligned_span（字符域）而不是 _decode_span。
+    from rlab.protocol import _char_aligned_span, _decode_span
+    _TAIL = "".join(f"word{i} " for i in range(40))
+
+    class _SegTok(MockTok):
+        """整串把 "`\\n" 合并成单 token；分段（apply_merges=False）不合并。"""
+        MERGE = {("`", "\n"): 100901}
+
+        def _merge(self, ids):
+            out, k = [], 0
+            while k < len(ids):
+                if k + 1 < len(ids):
+                    hit = self.MERGE.get((chr(ids[k]), chr(ids[k + 1])))
+                    if hit is not None:
+                        out.append(hit)
+                        k += 2
+                        continue
+                out.append(ids[k])
+                k += 1
+            return out
+
+        def decode(self, ids, skip_special_tokens=False):
+            rev = {v: k for k, v in self.MERGE.items()}
+            parts = []
+            for i in ids:
+                i = int(i)
+                parts.append("".join(rev[i]) if i in rev
+                             else (chr(i) if i < 0x10000 else f"\x00{i}"))
+            return "".join(parts)
+
+    _st = _SegTok()
+    _whole = _st._merge([ord(c) for c in ("`\n" + _TAIL)])       # 1 token + 尾
+    _seg = [ord("`"), ord("\n")] + [ord(c) for c in _TAIL]        # 2 tokens + 尾
+    check("前提：两侧 token 数差 1（复现真机 1556 vs 1557 的容器差）",
+          len(_seg) == len(_whole) + 1)
+    check("前提：两侧**整段文本完全相同**（真机实际情况）",
+          _st.decode(_whole) == _st.decode(_seg))
+    # 按 token 宽度取窗口 → 尾部错位（这就是那个假象）
+    _w = _decode_span(_st, _whole, 0, 20)
+    _s = _decode_span(_st, _seg, 0, 20)
+    check("按 token 宽度取窗口会**凭空显出内容不同**（假象可复现）", _w != _s)
+    # 按字符对齐 → 一致（真相）
+    _al = _char_aligned_span(_st, _whole, _seg)
+    check("按字符对齐后两侧一致（假象消失）",
+          _al is not None and _al[1] == _al[2])
+    check("_char_aligned_span 在真差异时能报出来（不是恒等函数）",
+          _char_aligned_span(_st, _whole, _st._merge([ord(c) for c in ("`\n" + "X" + _TAIL)]))
+          is not None
+          and _char_aligned_span(_st, _whole,
+                                 _st._merge([ord(c) for c in ("`\n" + "X" + _TAIL)]))[1]
+          != _char_aligned_span(_st, _whole,
+                                _st._merge([ord(c) for c in ("`\n" + "X" + _TAIL)]))[2]) 
 
 
 # =====================================================================
