@@ -13,6 +13,7 @@
 
 运行：python -m rlab.tests.test_native_protocol
 """
+import ast as _ast
 import os
 
 import torch
@@ -880,6 +881,7 @@ def test_protocol_wiring_static():
               encoding="utf-8").read()
     cf = open(os.path.join(root, "config.py"), encoding="utf-8").read()
     pd = open(os.path.join(root, "probe_difficulty.py"), encoding="utf-8").read()
+    np_ = open(os.path.join(root, "native_probe.py"), encoding="utf-8").read()
     check("rollout：native 分支转 multi_turn_rollout_group_native",
           "multi_turn_rollout_group_native" in ro
           and "if is_native_protocol(cfg):" in ro)
@@ -915,6 +917,41 @@ def test_protocol_wiring_static():
     check("data：难度表比对清单含 tool_protocol",
           '"tool_protocol"' in open(os.path.join(root, "data.py"),
                                     encoding="utf-8").read())
+    # 【2026-09-25 真机首跑】native_probe 曾是仓库里**唯一**不传 gdn_prefill_backend
+    # 的 GPU 入口 → Qwen3.5 的 GDN 层落回 FlashInfer 现场 JIT → ninja 打爆内存被
+    # SIGKILL（只有 `Killed`、无 traceback），go/no-go 那一关根本没跑出数字。
+    # 这条检查防"新加的探针又漏引擎档"（同 probe_difficulty 2026-09-17 的教训）。
+    check("native_probe：LLM() 传引擎参数（默认 gdn_prefill_backend=triton，免 JIT）",
+          'DEFAULT_ENGINE_KWARGS = {"gdn_prefill_backend": "triton"}' in np_
+          and "llm = LLM(model=args.model_path, gpu_memory_utilization=args.gpu_mem, **_kw)"
+          in np_)
+    check("native_probe：起引擎前对缺 backend / 继承的 VLLM_BATCH_INVARIANT 告警",
+          "def engine_env_warn" in np_ and "gdn_backend_missing" in np_
+          and "VLLM_BATCH_INVARIANT" in np_)
+    # 【防"诊断自己说谎"】旧版 Q2 用 `"{" in 块 and "name" in 块` 数"真调用"，
+    # 那只对 JSON 形态成立：Qwen3.5 的 <function=…> 形态下数出 0 个，打印
+    # "含实参 0 个"，把正常渲染读成"调用段是空的"（真机首跑撞上）。判据必须用
+    # 生产解析器（parse_assistant），它才是"正规形态"的唯一定义者。
+    # 【检查用 AST 而非文本包含】上面这段注释本身就含那个被禁的字面量——纯文本
+    # 检查会被**注释**误伤（改了说明文字就翻红 / 删掉说明文字反而变绿），这正是
+    # 本项目"静态检查被注释打伤"的第二次（前一次：apply_chat_template）。故这里
+    # 读 AST：只看真正被赋值的 `_real = [...]` 的推导式条件。
+    _t = _ast.parse(np_)
+    _real_conds = []
+    for _n in _ast.walk(_t):
+        if isinstance(_n, _ast.Assign) and any(
+                isinstance(_tt, _ast.Name) and _tt.id == "_real" for _tt in _n.targets):
+            for _g in _ast.walk(_n.value):
+                if isinstance(_g, _ast.Call):
+                    _real_conds.append(_ast.unparse(_g))
+    check("native_probe：Q2 用 parse_assistant 判真调用（不用 JSON 启发式）",
+          any("parse_assistant" in _c for _c in _real_conds)
+          and not any('"name" in' in _c or "'name' in" in _c for _c in _real_conds))
+    check("native_probe：拼接证明断言硬契约（前缀/采样保留/回包拼入）",
+          "ok_pref" in np_ and "ok_samp" in np_ and "ok_long" in np_
+          and "Q5 拼接硬契约" in np_)
+    check("native_probe：冒烟用竞赛题而非口算题 + 可钉死形态（防低估调用率）",
+          "SMOKE_QUESTIONS" in np_ and "--native_tool_style" in np_)
 
 
 def test_p7_pyflakes():

@@ -31,20 +31,69 @@ reward 恒 -1 → 整轮实验作废（本项目被"标签经管道被改写"坑
     并把该形态用 --native_tool_style 钉进训练/eval（不依赖 auto 猜）。
 """
 import argparse
+import json
 import os
 import sys
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rlab.protocol import (CODE_TOOL, NATIVE_STYLES, build_next_prompt,  # noqa: E402
-                           derive_tool_style, initial_messages, make_call_id,
+from rlab.protocol import (CODE_TOOL, NATIVE_STYLES, TOOL_NAME,  # noqa: E402
+                           build_next_prompt, derive_tool_style,
+                           encoded_text_tokens, initial_messages, make_call_id,
                            parse_assistant, render_chat_ids, tool_message)
-from rlab.protocol import _RE_TOOL_CALL_ANY  # noqa: E402  （诊断用：数调用块）
+from rlab.protocol import (_RE_TOOL_CALL_ANY,  # noqa: E402  （诊断用：数调用块）
+                           _TOOL_CLOSE, _TOOL_OPEN)
+
+DEFAULT_ENGINE_KWARGS = {"gdn_prefill_backend": "triton"}
+
+
+def engine_kwargs(args) -> dict:
+    """vLLM 引擎构造参数（默认档 = triton GDN prefill）。
+
+    【2026-09-25 真机首跑·本文件自己的 bug】Qwen3.5-4B 带 GDN 层，vLLM 默认走
+    FlashInfer 的 GDN prefill kernel——那是一次 **ninja 现场 JIT 编译**，本 pod
+    实锤打爆宿主内存被 SIGKILL（只打印 `Killed`，**无 traceback**，看起来像
+    "冒烟没输出"）。仓库里其它 GPU 入口（rollout.gen_worker / probe_difficulty /
+    diag_logps / eval）都传 `gdn_prefill_backend=triton`，唯独本文件漏了——于是
+    "go/no-go 判据"那一关根本没跑出数字。探针与训练同档是铁律，这里补默认档。"""
+    if args.vllm_gen_kwargs:
+        return json.loads(args.vllm_gen_kwargs)     # 整体替换语义（与 train.py 一致）
+    return dict(DEFAULT_ENGINE_KWARGS)
+
+
+def engine_env_warn(model_path, kwargs):
+    """起引擎前的两条环境告警（都是本 pod 实锤过的、无 traceback 的坑）。"""
+    try:
+        from rlab.rollout import gdn_backend_missing
+        if gdn_backend_missing(model_path, kwargs):
+            print("[probe][警告] 引擎参数里没有 gdn_prefill_backend → Qwen3.5 的 GDN "
+                  "prefill 会落到 FlashInfer **现场 JIT**（本 pod 实锤：ninja 打爆宿主 "
+                  "RAM → SIGKILL、无 traceback）。", flush=True)
+    except Exception:
+        pass
+    _bi = str(os.environ.get("VLLM_BATCH_INVARIANT", "")).strip().lower()
+    if _bi not in ("", "0", "false"):
+        print(f"[probe][警告] 环境里继承的 VLLM_BATCH_INVARIANT="
+              f"{os.environ.get('VLLM_BATCH_INVARIANT')!r}（多半是训练 run 留下的 "
+              f"export）——vLLM 的 batch-invariant 检查跑在 attention backend 解析"
+              f"**之前**，没同时给 attention backend 会启动即 RuntimeError。冒烟不需要"
+              f"确定性档，建议先 `unset VLLM_BATCH_INVARIANT` 再跑。", flush=True)
 
 SYS = "SYS: you solve math with a python tool."
 Q = "What is 17*23? Use the tool if helpful."
 CODE = "print(17*23)"
+
+# 冒烟用题：**不能用 17*23 这种口算题**——base 直接心算就把答案说了，调用率被
+# 系统性低估（判据 ≥50% 是"会不会主动用工具"，必须给它一个值得用工具的问题）。
+# 取几道竞赛风格题，n_smoke 条请求轮着喂，避免单题方差。
+SMOKE_QUESTIONS = [
+    "Find the sum of all positive integers n such that n^2 + 1 is divisible by n + 1.",
+    "How many ordered pairs of positive integers (m, n) satisfy 1/m + 1/n = 1/6?",
+    "Let f(x) = x^3 - 3x + 1. Find the sum of the squares of the roots of f(x) = 0.",
+    "Compute the remainder when 7^2024 is divided by 1000.",
+    "A sequence satisfies a_1 = 1, a_{n+1} = a_n + 2n. Find a_100.",
+]
 
 
 def _section(title):
@@ -129,19 +178,38 @@ def probe_render(tok, out_path):
             # 后者命中的是最终 `add_generation_prompt` 那个空 assistant（在调用之后）。
             # 真正要看的调用永远在**消息历史里**，也就是说明段之后的最后一个块。
             _blocks = list(_RE_TOOL_CALL_ANY.finditer(t))
-            _real = [m for m in _blocks if "{" in m.group(0) and "name" in m.group(0)]
+            # 【判据用**生产解析器**，不用"像不像 JSON"的启发式】旧版按 `"{" in 块
+            # and "name" in 块` 找真调用——那只对 Qwen2.5 的 JSON 形态成立；在
+            # Qwen3.5 的 `<function=…>` 形态下它会数出 **0 个**，于是打印
+            # "含实参 0 个"，把一次正常的渲染读成"调用段是空的"（真机首跑就撞上了）。
+            # 现在直接问 parse_assistant：它认的才是"真调用"，且天然跨形态。
+            _real = [m for m in _blocks if parse_assistant(m.group(0)).kind == "tool"]
             _pick = _real[-1] if _real else (_blocks[-1] if _blocks else None)
             if _pick is None:
                 print("    !! 渲染里没有调用段")
             else:
                 i, j = _pick.start(), _pick.end()
-                print(f"    调用段 repr={t[i:j]!r}"
-                      f"（共 {len(_blocks)} 个 tool_call 块，含实参 {len(_real)} 个）")
+                print(f"    调用段 repr={t[i:j]!r}")
+                print(f"    （共 {len(_blocks)} 个 tool_call 块：{len(_real)} 个真调用 + "
+                      f"{len(_blocks) - len(_real)} 个模板自己的格式说明块——"
+                      f"说明块在 system 段，是占位符，不是模型输出）")
+                for _n, _m in enumerate(_blocks):
+                    _inner = _m.group(0)[len(_TOOL_OPEN):-len(_TOOL_CLOSE)]
+                    print(f"      块{_n}: {'真调用' if _m in _real else '格式说明'} "
+                          f"载荷={_inner[:120]!r}")
                 k = t.find("<tool_response>", j)
                 if k < 0:
                     k = t.find("<|im_start|>user", j)
                 print(f"    **回包段** repr={t[j:k + 400][:400]!r}" if k >= 0 else "")
             res[f"q2_{tag}"] = t
+        except TypeError as e:
+            # 【预期差异，不是故障】Qwen3.5 的模板用 `arguments.items()` 展开实参，
+            # 故 arguments 必须是 mapping；Qwen2.5 的模板能吃 JSON 字符串。本项目
+            # 从不给模板喂 `tool_calls`（token-in token-out 走拼接，见 build_next_prompt），
+            # 所以这一档只影响本探针的渲染测试——不要为此改协议。
+            print(f"\n  [arguments={tag}] 模板不接受（{e}）——该版模板要求 arguments "
+                  f"是 mapping。**对本项目无影响**：我们从不把 tool_calls 喂给模板"
+                  f"（续写走 token 拼接），此项仅用于对照各代模板的严格程度。")
         except Exception as e:
             print(f"\n  [arguments={tag}] RAISED {type(e).__name__}: {e}")
             traceback.print_exc()
@@ -187,30 +255,47 @@ def probe_roundtrip(tok, out_path):
         return None
 
 
-def probe_build_next(tok, out_path):
-    """端到端拼接证明：build_next_prompt 的输出 == 模板给出的完整序列。
+def _decode(tok, ids):
+    try:
+        return tok.decode([int(t) for t in ids], skip_special_tokens=False)
+    except Exception:
+        return repr(list(ids))
 
-    比看 §3 的七步伪代码可靠：它真的跑一遍，并断言
-      prev + sampled + closing + observation == canonical_next
-    任何一处错位（overlap 算错、模板改写历史、observation 切片偏一位）
-    都会在这里当场暴露，而不是在训练第 100 步变成 NaN grad_norm。"""
-    _section("端到端拼接证明 · build_next_prompt 必须等于模板 canonical 序列")
+
+def probe_build_next(tok, out_path):
+    """端到端拼接证明：断言 build_next_prompt 的**硬契约**，并解码任何偏差。
+
+    比看 §3 的七步伪代码可靠：它真的跑一遍。分两层判据——
+
+      【硬契约·必须成立】拼接结果 = prev + sampled + (结束符差额) + observation：
+        ① got 以 prev 开头（前缀校验不炸隐含了这条，这里显式断言）
+        ② got[len(prev):] 以 sampled 开头（模型采样的 token 逐位保留，没被重编码）
+        ③ got 比 prev+sampled 长（observation 真的拼进去了）
+      这三条才是"生成/训练同一条序列"的实质。任何一条不成立 = 协议不可用。
+
+      【参考对照·可解释】与模板 canonical 比对，**逐 token 解码**出差异区间。
+        canonical 用 `tool_calls` 字段（模板认可的形态）构造；探针若用
+        `content=` 塞调用标记，模板会把它当**普通文本**渲染，多出/少掉
+        `<tool_call>` 之类的结构标记——那种差异是**探针构造方式**造成的，
+        不是 build_next_prompt 的 bug。故差异一律解码打印，由人判读归属，
+        不再打印"属预期"这类无信息量的判词（2026-09-25 真机首跑教训：
+        该判词恰好盖住了一次未查明的 4-token 偏差）。"""
+    _section("端到端拼接证明 · build_next_prompt 的硬契约 + 与模板 canonical 的逐 token 对照")
     ctkw = {"enable_thinking": False}
     base = initial_messages(SYS, Q)
     prev = render_chat_ids(tok, base, True, ctkw)
-    # 模拟"模型采样出的 token"：把一段含调用与推理的文本编码成 ids
-    asst_text = f"Let me compute.\n<tool_call>\n{{\"name\": \"{CODE_TOOL['function']['name']}\","
-    # 用真实模板产出的形态，而不是我手写的（否则证明的是我的手写能力）
     msgs_a = base + [{"role": "assistant", "content": "",
                       "tool_calls": [{"type": "function",
-                                      "function": {"name": "code_interpreter",
+                                      "function": {"name": TOOL_NAME,
                                                    "arguments": {"code": CODE}}}]}]
     t = tok.apply_chat_template(msgs_a, tokenize=False, add_generation_prompt=False,
-                               tools=[CODE_TOOL], **ctkw)
+                                tools=[CODE_TOOL], **ctkw)
     a0 = t.rfind("<|im_start|>assistant")
     a1 = t.find("<|im_end|>", a0)
-    inner = t[a0 + len("<|im_start|>assistant\n"):a1] if a0 >= 0 and a1 > a0 else asst_text
-    sampled = [int(x) for x in tok.encode(inner, add_special_tokens=False)]
+    inner = t[a0 + len("<|im_start|>assistant\n"):a1] if a0 >= 0 and a1 > a0 else ""
+    # 模拟"模型采样出的 token"：模板渲染出的 assistant 段原文逐字编码（含 im_end，
+    # 与 vLLM 实际采样一致——EOS 在 token_ids 里，docs/05 §12.3）。
+    sampled = encoded_text_tokens(tok, inner)
     obs = tool_message(make_call_id(0, 0, 1), "391")
     try:
         got = build_next_prompt(tok, base, prev, sampled, obs, ctkw)
@@ -218,20 +303,61 @@ def probe_build_next(tok, out_path):
         print(f"  ✗ build_next_prompt RAISED {type(e).__name__}: {e}")
         traceback.print_exc()
         return False
-    # canonical：模板直接渲染 messages + assistant + tool 三步（手工拼出真值）
-    full = base + [{"role": "assistant", "content": inner.strip()}, obs]
-    want = render_chat_ids(tok, full, True, ctkw)
-    n = min(len(got), len(want))
-    i = next((k for k in range(n) if got[k] != want[k]), n)
-    print(f"  拼接结果长 {len(got)}，模板 canonical 长 {len(want)}，首个分歧位 {i}")
-    if got == want:
-        print("  ✅ 逐 token 相同 —— token 级增量拼接成立（生成/训练同序列契约）")
-        return True
-    print(f"  ⚠ 不完全相同：got[{i}:{i + 8}]={got[i:i + 8]} want[...]={want[i:i + 8]}")
-    print("    两者长度/内容差异属**预期**：手工 messages 用真实文本重建 assistant 段，"
-          "与直接渲染的 canonical 在 strip/重构上可能不等（这正是参考实现用占位 'x'"
-          "绕开的问题）。判据以「不 raise + 长度同量级」为准；若 raise 才是协议不成立。")
-    return len(got) > 0
+
+    # ---- 硬契约三条 ----
+    ok_pref = got[:len(prev)] == prev
+    ok_samp = got[len(prev):len(prev) + len(sampled)] == sampled
+    ok_long = len(got) > len(prev) + len(sampled)
+    print(f"  ① got 以 prev 开头                : {'✅' if ok_pref else '✗'} "
+          f"(prev {len(prev)} tok)")
+    print(f"  ② got[len(prev):] 以 sampled 开头 : {'✅' if ok_samp else '✗'} "
+          f"(sampled {len(sampled)} tok)")
+    print(f"  ③ observation 真的拼进去了        : {'✅' if ok_long else '✗'} "
+          f"(got {len(got)} vs prev+sampled {len(prev) + len(sampled)}，"
+          f"增量 {len(got) - len(prev) - len(sampled)} tok)")
+    if not ok_long:
+        print("  ✗ 硬契约失败：observation 没拼进去 → 该版模板的 tool 回包渲染"
+              "不可用（看 Q3 的 repr），方案 A 不成立。")
+    if not (ok_pref and ok_samp):
+        print("  ✗ 硬契约失败：拼接改动了模型已采样的 token → 生成/训练序列分叉。")
+
+    # ---- 参考对照：模板认可的 canonical（tool_calls 形态）----
+    asst_tc = {"role": "assistant", "content": "",
+               "tool_calls": [{"type": "function",
+                               "function": {"name": TOOL_NAME,
+                                            "arguments": {"code": CODE}}}]}
+    try:
+        want = render_chat_ids(tok, base + [asst_tc, obs], True, ctkw)
+    except Exception as e:
+        print(f"  （canonical 渲染失败，跳过对照：{type(e).__name__}: {e}）")
+        want = None
+    if want is not None:
+        n = min(len(got), len(want))
+        i = next((k for k in range(n) if got[k] != want[k]), n)
+        print(f"\n  对照模板 canonical（tool_calls 形态）：got {len(got)} tok / "
+              f"want {len(want)} tok，首个分歧位 {i}")
+        if got == want:
+            print("  ✅ 与模板 canonical 逐 token 相同")
+        else:
+            lo, hi = max(0, i - 2), min(max(len(got), len(want)), i + 10)
+            print("    差异区间解码（判读归属：拼接 bug / 探针构造差异）：")
+            print(f"      got [{lo}:{hi}] ids={list(got[lo:hi])}")
+            print(f"          文本={_decode(tok, got[lo:hi])!r}")
+            print(f"      want[{lo}:{hi}] ids={list(want[lo:hi])}")
+            print(f"          文本={_decode(tok, want[lo:hi])!r}")
+            # 多出来的那段单独指认（真机首跑就是这样一段 4-token 结构标记）
+            if len(got) > len(want) and got[:i] == want[:i] and got[i + (len(got) - len(want)):] == want[i:]:
+                _extra = got[i:i + (len(got) - len(want))]
+                print(f"    ⇒ got 比 want 多出 {len(_extra)} tok：ids={list(_extra)} "
+                      f"文本={_decode(tok, _extra)!r}")
+                print("      若该段是**空的调用块**（结构标记包着空内容），说明"
+                      "canonical 的 tool_calls 被模板展开成了真调用段，而拼接路径"
+                      "把它当作已在 prev/sampled 里——两者对**同一状态的表示**不同。")
+            print(f"    ⇒ 硬契约{'成立' if (ok_pref and ok_samp and ok_long) else '不成立'}"
+                  f"；此处差异{'不影响' if (ok_pref and ok_samp and ok_long) else '影响'}"
+                  f"「生成/训练同序列」这一实质判据。")
+    _dump(out_path, "拼接 got", _decode(tok, got))
+    return bool(ok_pref and ok_samp and ok_long)
 
 
 def main():
@@ -242,6 +368,17 @@ def main():
     ap.add_argument("--no_vllm_smoke", action="store_true",
                     help="跳过 vLLM 真采样冒烟（只验 tokenizer 层）")
     ap.add_argument("--n_smoke", type=int, default=8, help="vLLM 冒烟采样条数")
+    ap.add_argument("--gpu_mem", type=float, default=0.30, help="vLLM 显存占比")
+    ap.add_argument("--smoke_max_tokens", type=int, default=1024,
+                    help="冒烟单轮生成上限（要够写下一个完整调用块）")
+    ap.add_argument("--native_tool_style", default=None,
+                    help="钉死解析形态（把 --no_vllm_smoke 那轮的 derive 结论传进来，"
+                         "冒烟的 invalid 计数才可归因）")
+    ap.add_argument("--vllm_gen_kwargs", default=None,
+                    help='JSON dict 覆盖引擎参数（默认 {"gdn_prefill_backend": "triton"}——'
+                         "不传会落到 FlashInfer GDN 的现场 JIT，本 pod 实锤 SIGKILL 无 traceback）")
+    ap.add_argument("--vllm_attention_backend", default=None,
+                    help="显式 attention backend（如 FLASH_ATTN）；确定性档必需")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -254,39 +391,65 @@ def main():
 
     res = probe_render(tok, args.out)
     style = probe_roundtrip(tok, args.out)
-    probe_build_next(tok, args.out)
+    res["build_next_ok"] = probe_build_next(tok, args.out)
 
     # ---- vLLM 真采样冒烟（第 5 步的 go/no-go 闸门，docs/09 §6.2）----
     if not args.no_vllm_smoke:
         _section("vLLM 冒烟 · base 工具调用率（判据：≥50% 通过 / <20% 失败）")
+        _kw = engine_kwargs(args)
+        if args.vllm_attention_backend:
+            try:
+                from rlab.rollout import attention_backend_kwargs
+                _kw.update(attention_backend_kwargs(args.vllm_attention_backend))
+            except Exception as e:
+                print(f"  （attention backend 参数未能接线：{type(e).__name__}: {e}）")
+        engine_env_warn(args.model_path, _kw)
+        print(f"  引擎参数: {_kw}")
         try:
             from vllm import LLM, SamplingParams
             from rlab.rollout import build_prompt_ids
-            llm = LLM(model=args.model_path, gpu_memory_utilization=0.30)
-            sp = SamplingParams(n=1, temperature=1.0, top_p=1.0, max_tokens=1024)
-            prov = build_prompt_ids(initial_messages(SYS, Q), tok,
-                                    {"enable_thinking": False}, tools=True)
-            outs = llm.generate([{"prompt_token_ids": prov}] * args.n_smoke, sp,
+            llm = LLM(model=args.model_path, gpu_memory_utilization=args.gpu_mem, **_kw)
+            sp = SamplingParams(n=1, temperature=1.0, top_p=1.0,
+                                max_tokens=args.smoke_max_tokens)
+            provs = [build_prompt_ids(initial_messages(SYS, SMOKE_QUESTIONS[k % len(SMOKE_QUESTIONS)]), tok,
+                                      {"enable_thinking": False}, tools=True)
+                     for k in range(args.n_smoke)]
+            outs = llm.generate([{"prompt_token_ids": p} for p in provs], sp,
                                 use_tqdm=False)
             n_ok = n_inv = n_ans = 0
+            n_ok_auto = 0
+            _pin = args.native_tool_style or "auto"
             for k, o in enumerate(outs):
                 txt = o.outputs[0].text
-                p = parse_assistant(txt)
+                p = parse_assistant(txt, style=_pin)
                 if p.kind == "tool":
                     n_ok += 1
                 elif p.kind == "invalid":
                     n_inv += 1
                 else:
                     n_ans += 1
+                if parse_assistant(txt).kind == "tool":
+                    n_ok_auto += 1
                 if k < 2:
                     print(f"    样本{k} repr={txt[:220]!r}")
                 _dump(args.out, f"vLLM 冒烟样本{k}", txt)
             rate = n_ok / max(1, args.n_smoke)
             print(f"\n  调用率 = {n_ok}/{args.n_smoke} = **{rate * 100:.1f}%**"
                   f"（invalid {n_inv} / answer {n_ans}）")
+            if _pin != "auto" and n_ok_auto != n_ok:
+                # 【防"钉错形态被读成 base 不会调工具"】钉死档与 auto 不一致时两者
+                # 都打印：auto 高说明 base 会调用、只是形态与钉死档不同（改钉
+                # derive 的结论），而不是能力问题。
+                print(f"  ⚠ 钉死档({_pin}) 与 auto 计数不一致：auto = {n_ok_auto}/"
+                      f"{args.n_smoke}。以 **auto 高者**判断「base 会不会调用」，"
+                      f"以钉死档判断「训练将用哪套解析」——两者不等就要重跑 "
+                      f"derive 或核对 --native_tool_style。")
             print("  判据：≥50% ✅ 继续；<20% ✗ 回 §1.2 重查；"
                   "调用率高但 invalid 多 ✗ 正则没对齐实测形态")
             print("  对照：参考实现 base **87.5%**；rlab p11（围栏协议）~48%")
+            if n_ok + n_inv > 0:
+                print(f"  形态分布：命中调用 {n_ok} / 有调用标记但解析失败 {n_inv}"
+                      f"（后者 >0 说明 {args.native_tool_style or 'auto'} 与实际形态有偏差）")
         except Exception as e:
             print(f"  vLLM 冒烟跳过/失败：{type(e).__name__}: {e}")
             traceback.print_exc()
@@ -298,6 +461,9 @@ def main():
     print(f"  Q3 回包形态              : "
           f"{'见上方 Q2/Q3 段的 repr（role:tool 渲染）' if args.out else '用 --out 落盘看 repr'}")
     print(f"  Q4 enable_thinking 共存  : {'✅' if res.get('q4_ok') else '✗'}")
+    _bn = res.get("build_next_ok")
+    print(f"  Q5 拼接硬契约(前缀/采样/回包): "
+          f"{'✅' if _bn else ('✗ 不成立' if _bn is False else '未跑')}")
     if style:
         print(f"\n  ⇒ 训练命令加：--tool_protocol native --native_tool_style {style}")
     else:

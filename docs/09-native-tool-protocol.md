@@ -518,17 +518,25 @@ Mock tokenizer + 纯函数 + FakeGen，**不碰 GPU**：
 ```bash
 cd ~/llm-learning && git pull
 
-# ① 核实形态（几秒，不占 GPU）——把末尾的「⇒ 训练命令加：--native_tool_style X」抄下来
-python -m rlab.native_probe --model_path /root/Qwen3.5-4B --out /tmp/native_probe.txt
+# ① 核实形态（几秒，不占 GPU）——Qwen3.5-4B 实测结论 = function（§10.5）
+python -m rlab.native_probe --model_path /root/Qwen3.5-4B --no_vllm_smoke \
+    --out /tmp/native_probe.txt
+#    ↑ 看末段 Q2 一行确认形态 + Q5 拼接硬契约是否 ✅
 
 # ② base 冒烟（go/no-go 闸门：调用率 ≥50% 才继续）
+#    【2026-09-25 修复】旧版此处必崩：本文件漏传 gdn_prefill_backend=triton →
+#    Qwen3.5 的 GDN 层落回 FlashInfer 现场 JIT → ninja 打爆内存被 SIGKILL
+#    （只有 `Killed`、无 traceback）。现已默认 triton；若环境里有训练遗留的
+#    VLLM_BATCH_INVARIANT=1，先 unset（否则引擎启动即 RuntimeError）。
+unset VLLM_BATCH_INVARIANT
 CUDA_VISIBLE_DEVICES=0 python -m rlab.native_probe --model_path /root/Qwen3.5-4B \
-    --n_smoke 16 --out /tmp/native_probe_smoke.txt
+    --n_smoke 16 --native_tool_style function --out /tmp/native_probe_smoke.txt
 #    ↑ 若 Q1 段的 tools 声明没渲染出来 → 方案 A 不成立，转 docs/08 SFT
+#    ↑ 判据看 **auto 与钉死档哪个高**（钉错形态 ≠ base 不会用工具）
 
 # ③ 20 步验证跑（参考的"两杯瑞幸"档）
 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
-    --tool_protocol native --native_tool_style <①的值> \
+    --tool_protocol native --native_tool_style function \
     --out_dir rlab_out/native_p1 --all_steps 20 --save_steps 5 \
     --attn_implementation flash_attention_2 --zero_stage 2 --optim_8bit \
     --micro_rows 4 --vllm_gen_logps --vllm_logprobs_n 1 \
@@ -557,14 +565,96 @@ python -m rlab.eval --algo retool_math --n 30 --seed 42 \
 用原生协议评）——BASE 是裸模型，靠调度器的 `--proto_from` 同档（`eval_vllm.py`
 的 `BASE_PROTO`，已支持）。
 
-### 10.5 尚未验证的部分（如实声明）
+### 10.5 上机核实结果（2026-09-25 真机首跑，Qwen3.5-4B）
 
-| 项 | 为什么未验证 | 怎么验 |
+**步 ① `native_probe --no_vllm_smoke` 通过 —— 方案 A 成立。**
+
+| 问题 | 结论 | 证据 |
 |---|---|---|
-| **Qwen3.5-4B 的真实调用形态** | 本机只有 Qwen2.5 tokenizer（已证两者形态不同且不能互推） | `native_probe.py` 第一段（§10.3 步 ①） |
-| **`tools=` 在 Qwen3.5 模板上的实际渲染** | 同上 | 同上（Q1 段） |
-| **base 的真实调用率** | 需要 GPU 采样 | `native_probe.py --n_smoke`（步 ②，go/no-go） |
-| **vLLM 对 `prompt_token_ids` + 工具模板的端到端行为** | 需要真机 | 步 ③ 的 20 步跑 |
-| EOS 停 vs `</tool_call>` 停的实际分布 | 需要真机 | 步 ③ 的 `invalid_final`/`ctx_full` 列 + 健康检查 `native_invalid` |
-| AIME25 OOD 集 | **仍未建**（docs/05 §6.6） | 与参考 +23.89pp 对话的前置条件 |
+| Q1 `tools=` 渲染 | ✅ 接受并渲染 | 带 tools 1748 字符 / 不带 166（差 1582 = 工具声明段） |
+| Q2 调用形态 | ✅ **`function`** | 实测 `<tool_call>\n<function=code_interpreter>\n<parameter=code>\nprint(17*23)\n</parameter>\n</function>\n</tool_call>` |
+| Q3 回包形态 | ✅ `role:"tool"` → user 轮 + `<tool_response>` | `<\|im_end\|>\n<\|im_start\|>user\n<tool_response>\n391\n</tool_response><\|im_end\|>` |
+| Q4 thinking 共存 | ✅ 开关生效 | 关思考档结尾 `<think>\n\n</think>`（**已闭合**，不是烧预算的未闭合形态） |
+| 往返证明 | ✅ 两种切法都过 | `kind=tool style=function code='print(17*23)'` → `derive_tool_style` ⇒ **function** |
+
+**这一条是本次上机的最大价值**：Qwen2.5 实测 JSON 形态、Qwen3.5 实测 function 形态，
+**证实两者不能互推**（§1.1 的立论）。双形态实现不是过度设计——若照抄参考正则
+只写 function 分支，Qwen2.5 档全废；若只写 JSON 分支，本 pod 的 4B 全废。
+
+**⇒ 训练/eval 命令钉死：`--native_tool_style function`**（依赖 auto 猜测没必要）。
+
+**`arguments=str` 那一档 TypeError 是预期差异，不是故障**：Qwen3.5 模板用
+`arguments.items()` 展开实参，故要求 mapping；本项目从不把 `tool_calls` 喂给模板
+（续写走 token 拼接），此项仅作各代模板严格度的对照。
+
+### 10.6 这次上机暴露的、**我自己的探针**的两个 bug（已修）
+
+> 这一节单列，因为它们的共同性质是：**诊断工具本身在说谎**，比协议 bug 更危险
+> ——它会把"没测到"伪装成"测出来是坏的"。
+
+1. **【阻塞闸门·我的 bug】`native_probe.py` 是仓库里唯一不传引擎参数的 GPU 入口。**
+   冒烟段建 `LLM(model=..., gpu_memory_utilization=0.30)`，没有
+   `gdn_prefill_backend="triton"` → Qwen3.5 的 GDN 层落回 **FlashInfer 现场 JIT**
+   → `ninja` 打爆宿主内存被 **SIGKILL**（日志只留 `Killed`，**无 traceback**，
+   看起来像"冒烟没输出"）。仓库其它入口（`rollout.gen_worker` / `probe_difficulty`
+   / `diag_logps` / `eval`）全都传了，`probe_difficulty` 甚至专门写了注释讲这个
+   SIGKILL——**只有新写的这个文件漏了**。于是 go/no-go 判据那一关**根本没跑出数字**。
+   修复：加 `DEFAULT_ENGINE_KWARGS = {"gdn_prefill_backend": "triton"}` +
+   `--vllm_gen_kwargs`/`--vllm_attention_backend` 入口 + 起引擎前对"缺 backend"
+   和"继承的 `VLLM_BATCH_INVARIANT`"两条告警；
+   **并加了静态检查防再犯**（"新探针又漏引擎档"是这个仓库的复发性错误）。
+
+2. **【诊断自己说谎】Q2 段的"真调用"计数用了 JSON 专用的启发式。**
+   旧判据 `"{" in 块 and "name" in 块` 只对 Qwen2.5 的 JSON 形态成立；在 Qwen3.5 的
+   `<function=…>` 形态下数出 **0 个**，于是打印 `含实参 0 个`——把一次**完全正常**
+   的渲染读成"调用段是空的"，会把排查引向"正则不匹配"的错方向（首版还因此打印过
+   `'<tool_call></tool_call>'` 的假象，见代码内注释）。修复：改用**生产解析器**
+   `parse_assistant` 判真调用（它才是"正规形态"的唯一定义者），并逐个块打印载荷
+   + 标注"真调用 / 格式说明"——顺带把"模板自己印的格式说明块"这件事显式说清
+   （实测量：Qwen2.5 与 Qwen3.5 都各印 **2 个说明块** + 1 个真调用）。
+
+3. **【判词掩盖未查明偏差】端到端拼接证明的"⚠ 不完全相同 → 属预期"是危险措辞。**
+   真机报 `got 448 / want 444，首个分歧位 389`，旧版打印"差异属预期、判据以不 raise
+   为准"——**这句话恰好盖住了一次没查明的 4-token 偏差**。本机拿真模板复核后确认：
+   偏差来自**探针的 canonical 构造方式**（旧版用 `content=` 把调用标记当纯文本塞给
+   模板，模板于是按纯文本渲染；现在改用模板认可的 `tool_calls` 形态），
+   **不是** `build_next_prompt` 的 bug。修复：判据拆成两层——
+   **硬契约**（① got 以 prev 开头 ② `got[len(prev):]` 以 sampled 开头
+   ③ observation 真的拼进去了）必须成立，违者即"方案不成立"；
+   与 canonical 的差异**一律逐 token 解码打印**（含"多出来的是哪几个 token、
+   文本是什么"的指认），由人判读归属，不再打印"属预期"这种无信息量判词。
+
+   本机复跑验证（Qwen2.5 真模板）：硬契约三条全 ✅，且与 canonical **逐 token 相同**
+   （313 == 313）——反证了旧版那 4 token 是构造伪影。
+
+4. **顺手**：冒烟原本用 `17*23` 这种口算题 + `n_smoke` 条**同一 prompt**——base 直接
+   心算就把答案说了，"调用率 ≥50%"这个判据被系统性低估。改为 5 道竞赛风格题轮转
+   （`SMOKE_QUESTIONS`），并让 `--native_tool_style` 可钉进冒烟（钉死档与 auto
+   不一致时两者都打印，**以 auto 高者判断"base 会不会调用"**，防止把"钉错形态"
+   读成"base 不会用工具"）。
+
+**回归**：`pytest rlab/tests` → **82 passed**；`test_native_protocol` → 12 函数全过
+（新增 5 项 native_probe 静态检查，含**突变测试**验证：把 Q2 判据改回 JSON 启发式，
+新检查确实翻红）。诊断工具的修复也**必须被测试锁住**——否则下次又是"探针说没事"。
+
+**修正后的静态检查教训（本项目第二次）**：新加的 Q2 判据检查最初用纯文本包含
+（`'"{" in ' not in np_`），结果被**我自己写的解释注释**误伤而翻红。改 **AST**
+（只读真正被赋值的 `_real = [...]` 推导式）。与 §10.2 第 8 条同一类：
+**凡"禁止某写法"的静态检查，一律读 AST，不读文本。**
+
+### 10.7 尚未验证的部分（如实声明，2026-09-25 更新）
+
+| 项 | 状态 | 怎么验 |
+|---|---|---|
+| Qwen3.5-4B 真实调用形态 | ✅ **已验证 = `function`**（§10.5） | — |
+| `tools=` 模板渲染 | ✅ **已验证**（1748 vs 166 字符） | — |
+| `enable_thinking` 共存 | ✅ **已验证**（开关生效，think 已闭合） | — |
+| 拼接硬契约（本机 Qwen2.5） | ✅ **硬契约三条全过**；pod 上待复跑（§10.6 第 3 条修了判据） | 重跑步 ①（现在会打印 Q5 一行） |
+| **base 的真实调用率** | ⚠ **仍未测得**：冒烟被 FlashInfer GDN JIT 打断（§10.6 第 1 条，已修） | 重跑步 ②：`--n_smoke 16 --native_tool_style function` |
+| **vLLM 端到端（`prompt_token_ids` + 工具模板）** | ⚠ 未验证 | 步 ③ 的 20 步跑（4 处 fail-fast 会当场 raise） |
+| EOS 停 vs `</tool_call>` 停的实际分布 | ⚠ 未验证 | 步 ③ 的 `invalid_final`/`ctx_full` 列 + 健康检查 `native_invalid` |
+| `gpu_mem` 档位对结论的影响 | ⚠ 已知 +7.0pp 是引擎档效应 | eval 必须 `--gpu_mem 0.78` 与训练同档 |
+| AIME25 OOD 集 | ❌ **仍未建**（docs/05 §6.6） | 与参考 +23.89pp 对话的前置条件 |
+
+
 
