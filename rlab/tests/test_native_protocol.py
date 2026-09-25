@@ -112,6 +112,10 @@ class MockTok:
     strip_assistant = True
     rewrite_history = False
     json_tools = True
+    # 是否让模板响应 enable_thinking（默认 False = 忽略，与 Qwen2.5 真行为一致）。
+    # 打开后 enable_thinking=False 会渲染出闭合的 think 段、True 渲染未闭合形态
+    # ——用于验证"空白容忍**不会**放过 enable_thinking 档位不一致"。
+    thinking_switch = False
 
     def __init__(self):
         self.pad_token = "\x00pad"
@@ -191,6 +195,14 @@ class MockTok:
         if add_generation_prompt:
             toks.extend([self.IM_START, self.ROLE_PREFIX, *self._enc("assistant"),
                          *self._enc("\n")])
+            # 【Qwen3.5 真实行为】enable_thinking=False → 预填闭合的 think 段
+            # （模型直接进 content）；默认/True → 留下未闭合 <think>（知识模式）。
+            # 两档的 token 序列不同 → 是**可见**差异，空白容忍绝不能放过它。
+            if self.thinking_switch:
+                if kw.get("enable_thinking") is False:
+                    toks.extend(self._enc("<think>\n\n</think>"))
+                else:
+                    toks.extend(self._enc("<think>"))
         # 【故障注入】rewrite_history：一旦消息历史里出现 tool 段，模板就**回头改写**
         # 前面的内容（模拟"模板根据 observation 重新组织历史"这一真实存在的可能，
         # 例如把 assistant+tool 折叠成一段 reasoning）。这会精确触发 build_next_prompt
@@ -357,6 +369,157 @@ def test_p2_sequence_contract():
     got4 = build_next_prompt(t, base2, prev2, encoded_text_tokens(t, "again"), obs2)
     check("多轮递推：第二轮输出仍以第一轮输出为前缀",
           got4[:len(prev2)] == prev2 and len(got4) > len(prev2))
+
+
+# =====================================================================
+# P2b 空白容忍（2026-09-25 真机第 5 段事故的修复）
+# =====================================================================
+def test_p2b_whitespace_tolerance():
+    """真机事故：模板 strip assistant 内容 vs 拼接原样保留采样 token。
+
+    真机报（原生协议第一次上机就命中）：
+        [protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致
+        （长度 1556 vs 1557，首个分歧位 1484）
+    机制：**prev 比 canonical 多 1 个 token**。我们的 ctx 把 vLLM 采样的 token
+    原样累积（必须原样——那是模型自己吐的字节、也是它下一轮上下文里的真实内容），
+    而模板渲染 assistant 内容时把**段首空白**吃掉。两者只差空白 token。
+    命中条件是"某一段 assistant 以换行/空格开头"，故前几段不炸、第 5 段才炸。
+
+    旧判据逐 token 全等 → 把**模板归一化**误判成"生成/训练不同源"而 abort 训练
+    （本项目最贵的一类：协议其实是对的，校验自己把正确的运行打死了）。
+
+    本组锁死两件事：
+      · 只差空白 → **容忍**（否则"模型某段以换行开头"就是必然 abort）；
+      · 差任何**可见**字符 / tools 档不一致 → **仍然 raise**（校验① 的本职不能丢）。
+    """
+    print("[P2b] 空白归一化容忍：模板 strip vs 拼接原样（真机第 5 段事故）")
+    base, _ = _tool_msg()
+    obs = tool_message(make_call_id(0, 0, 1), "42")
+    t = MockTok()                       # strip_assistant=True（Qwen 真实行为）
+
+    # ---- 正例：prev 是"原样采样含段首换行"，msgs 是 strip 后的同一内容 ----
+    # 用 strip_assistant=False 的实例造"生成端真实收到的序列"（未被归一化）
+    t_raw = MockTok()
+    t_raw.strip_assistant = False
+    msgs = [*base, {"role": "assistant", "content": "let me compute"}]
+    prev_raw = render_chat_ids(t_raw, [*base, {"role": "assistant",
+                                               "content": "\nlet me compute"}], True, {})
+    canon = render_chat_ids(t, msgs, True, {})
+    check("前提：prev 确实比 canonical 多空白 token（复现真机 1557 vs 1556 的形态）",
+          len(prev_raw) == len(canon) + 1 and prev_raw != canon)
+    got = build_next_prompt(t, msgs, prev_raw, encoded_text_tokens(t, "42"), obs)
+    check("只差空白 → 容忍、不 raise（修复前此处必 ValueError）",
+          got[:len(prev_raw)] == prev_raw)
+    check("容忍不等于篡改：返回序列仍以**原样采样**的 prev 开头（不做 trim）",
+          got[:len(prev_raw)] == prev_raw and len(got) > len(prev_raw))
+
+    # ---- 正例 2：段首双换行 / 首尾空格同样容忍 ----
+    for c_raw, c_stored in (("\n\nlet me compute", "let me compute"),
+                            ("  let me compute", "let me compute"),
+                            ("let me compute\n", "let me compute")):
+        _prev = render_chat_ids(t_raw, [*base, {"role": "assistant", "content": c_raw}],
+                                True, {})
+        _msgs = [*base, {"role": "assistant", "content": c_stored}]
+        try:
+            _got = build_next_prompt(t, _msgs, _prev, encoded_text_tokens(t, "42"), obs)
+            ok = _got[:len(_prev)] == _prev
+        except ValueError:
+            ok = False
+        check(f"空白变体 {c_raw!r} → 容忍", ok)
+
+    # ---- 反例 1：可见内容不同 → 必须 raise（容忍不能变成"什么都放过"）----
+    prev_vis = render_chat_ids(t, [*base, {"role": "assistant",
+                                           "content": "let me compute ZZZ"}], True, {})
+    msgs_vis = [*base, {"role": "assistant", "content": "let me compute"}]
+    try:
+        build_next_prompt(t, msgs_vis, prev_vis, encoded_text_tokens(t, "42"), obs)
+        check("可见内容不同（多一个可见字符）→ 仍 raise", False)
+    except ValueError as e:
+        check("可见内容不同（多一个可见字符）→ 仍 raise",
+              "不同源" in str(e) and "不只是空白" in str(e))
+
+    # ---- 反例 2：tools 档不一致（1000+ token 的声明段）→ 必须 raise ----
+    t_nt = MockTok()
+    prev_no_tools = render_chat_ids(t_nt, base, True, {}, tools=False)
+    try:
+        build_next_prompt(t_nt, base, prev_no_tools, encoded_text_tokens(t_nt, "x"), obs)
+        check("tools 档不一致 → 仍 raise（校验① 的本职）", False)
+    except ValueError as e:
+        check("tools 档不一致 → 仍 raise（校验① 的本职）", "不同源" in str(e))
+
+    # ---- 反例 3：解码失败时**退回严格比较**（宁严不宽，不静默放行）----
+    class BadDecodeTok(MockTok):
+        def decode(self, ids, skip_special_tokens=False):
+            raise RuntimeError("decode 不可用")
+
+    t_bad = BadDecodeTok()
+    prev_bad = render_chat_ids(t_raw, [*base, {"role": "assistant",
+                                               "content": "\nx"}], True, {})
+    try:
+        build_next_prompt(t_bad, msgs, prev_bad, encoded_text_tokens(t_bad, "42"), obs)
+        check("tokenizer.decode 失败 → 退回严格比较并 raise（不静默放行）", False)
+    except ValueError as e:
+        check("tokenizer.decode 失败 → 退回严格比较并 raise（不静默放行）",
+              "不同源" in str(e))
+
+    # ---- 反例 4：中间可见字符被吞（不是空白差异）必须 raise ----
+    # 防止"容忍"被写宽成"只看长度"或"只看前后缀"
+    _p = render_chat_ids(t_raw, [*base, {"role": "assistant",
+                                         "content": "\nlet me compute A"}], True, {})
+    try:
+        build_next_prompt(t, [*base, {"role": "assistant", "content": "let me compute B"}],
+                          _p, encoded_text_tokens(t, "42"), obs)
+        check("段中可见字符不同（A vs B）→ 仍 raise", False)
+    except ValueError:
+        check("段中可见字符不同（A vs B）→ 仍 raise", True)
+
+    # ---- 反例 5【高风险档】enable_thinking 档位不一致必须 raise ----
+    # 这是本项目真出过的事故档（docs/03：eval 端没传 enable_thinking=False →
+    # 生成以 <think> 开头烧穿预算 → fmt/acc 双灭）。差异是**可见**的 think 段
+    # （未闭合 <think> vs 闭合 <think>\n\n</think>），空白容忍绝不能放过它——
+    # 否则"探针/训练/eval 三档必须同参"这条铁律就被静默架空。
+    t_th = MockTok()
+    t_th.thinking_switch = True
+    prev_off = render_chat_ids(t_th, base, True, {"enable_thinking": False})
+    prev_on = render_chat_ids(t_th, base, True, {})           # 未关 thinking
+    check("前提：两档 token 序列确实不同（think 段形态不同）", prev_off != prev_on)
+    try:
+        # msgs 走"关了 thinking"的 canonical，prev 是"没关"的生成序列
+        build_next_prompt(t_th, base, prev_on, encoded_text_tokens(t_th, "x"), obs,
+                          {"enable_thinking": False})
+        check("enable_thinking 档不一致 → 仍 raise（可见 think 段不可容忍）", False)
+    except ValueError as e:
+        check("enable_thinking 档不一致 → 仍 raise（可见 think 段不可容忍）",
+              "不同源" in str(e) and "不只是空白" in str(e))
+
+    # ---- 端到端：真机事故的精确复现（第 5 段才炸）----
+    # 真机首个分歧位 1484 / 长度 1556 vs 1557：不是"某段特别长"，而是
+    # **第一次有 assistant 段以空白开头**。这里让每一段都以换行开头（最坏情况），
+    # 旧判据第 2 段就炸、修复后 5 段全过——锁死"以空白开头不再是 abort 条件"。
+    _raw = MockTok()
+    _raw.strip_assistant = False          # 生成端收到的序列（未被归一化）
+    _msgs = list(base)
+    _ctx = render_chat_ids(_raw, _msgs, True, {})
+    _ok = True
+    for _r in range(1, 6):
+        _txt_raw = f"\n\nseg {_r} reasoning"
+        _comp = encoded_text_tokens(_raw, _txt_raw)
+        _m_before = list(_msgs)
+        try:
+            _nxt = build_next_prompt(t, _m_before, _ctx, _comp,
+                                     tool_message(make_call_id(0, 0, _r), str(_r)), {})
+        except ValueError:
+            _ok = False
+            break
+        # 原样累积（不 trim 采样的 token）
+        if _nxt[:len(_ctx)] != _ctx or _nxt[len(_ctx):len(_ctx) + len(_comp)] != _comp:
+            _ok = False
+            break
+        _ctx = _nxt
+        _msgs = [*_m_before, {"role": "assistant", "content": _txt_raw.strip()},
+                 tool_message(make_call_id(0, 0, _r), str(_r))]
+    check("端到端 5 段（每段 assistant 都以换行开头）全部通过且不改动采样 token",
+          _ok)
 
 
 # =====================================================================
@@ -1004,6 +1167,7 @@ def test_p7_pyflakes():
 if __name__ == "__main__":
     test_p1_parse()
     test_p2_sequence_contract()
+    test_p2b_whitespace_tolerance()
     test_p3_template_guard()
     test_p4_mask_and_grad()
     test_scoring_domain()

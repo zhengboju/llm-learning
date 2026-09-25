@@ -311,6 +311,53 @@ def suffix_prefix_overlap(tokens: list, suffix: list) -> int:
     return 0
 
 
+# 纯空白 token 的判别缓存（token id → bool）。整段 decode 在热路径上太贵
+# （每段都可能命中：8 样本 × 4 轮 × 每步），单 token decode 便宜且可缓存。
+_WS_TOKEN_CACHE: dict = {}
+
+
+def _drop_ws_tokens(tokenizer, ids):
+    """去掉**纯空白 token**；解码失败 → 返回 None（调用方退回严格比较，宁严不宽）。
+
+    【为什么判据是"单 token 解码后 strip 为空"】Qwen 是 byte-level BPE，ASCII 空白
+    （空格/换行）都是单 token 且单独解码干净；多字节字符被切开时单 token 解码成
+    替换符（非空白）→ **保守保留**。故该判据只会"漏容忍"、不会"错容忍"——正是
+    要的方向（宁可多 raise 一次，不可静默拼出错位序列）。
+
+    【本函数只服务校验，不参与构造】序列永远由原始 token 拼出（token-in token-out），
+    绝不拿这里的结果去构造任何东西。见 build_next_prompt 校验① 的事故说明。"""
+    out = []
+    for t in ids:
+        t = int(t)
+        hit = _WS_TOKEN_CACHE.get(t)
+        if hit is None:
+            try:
+                s = tokenizer.decode([t], skip_special_tokens=False)
+            except Exception:
+                return None
+            if not isinstance(s, str):
+                return None
+            hit = (s.strip() == "")
+            _WS_TOKEN_CACHE[t] = hit
+        if not hit:
+            out.append(t)
+    return out
+
+
+def _decode_span(tokenizer, ids, start, width):
+    """把分歧位附近解码成文本，供报错信息直接显示（数字看不出"错在哪"）。"""
+    lo = max(0, int(start) - 4)
+    hi = min(len(ids), int(start) + int(width))
+    try:
+        return tokenizer.decode([int(t) for t in ids[lo:hi]], skip_special_tokens=False)
+    except Exception:
+        return repr([int(t) for t in ids[lo:hi]])
+
+
+# 容忍只告警一次（否则每个样本每轮都刷一行，训练日志被淹没）
+_WS_TOLERANCE_WARNED = False
+
+
 def build_next_prompt(tokenizer, messages_before_assistant: list,
                       previous_prompt_tokens: list, completion_tokens: list,
                       next_tool_message: dict,
@@ -328,24 +375,45 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
     含 `</think>` 时还会被重构成 reasoning/content 两段——用真实文本定位结束边界
     必然失败。增量片段只与 tool 消息有关、与 assistant 内容无关，故 canonical
     计算一律用占位 "x"。
+    **"增量与 assistant 内容无关"已实测**（9 种内容变体——空/首部换行/首尾空格/
+    普通叙述——算出的 observation 逐 token 完全相同），这正是占位法成立的根据。
 
     三处 fail-fast（异常当场抛，不静默产出错位序列）：
-      ① canonical_prompt != previous_prompt_tokens（模板 tokenize 路径与生成端
-         喂给 vLLM 的 ids 不同源）；
+      ① canonical_prompt 与 prev 的**可见内容**不同（模板 tokenize 路径与生成端
+         喂给 vLLM 的 ids 不同源；空白差异容忍——见 _visible_text 的事故说明）；
       ② 占位 assistant 拼接后前缀不等（模板改写了历史）；
       ③ 加入 tool 消息后前缀不等（observation 渲染污染了历史）。"""
+    global _WS_TOLERANCE_WARNED
     prev = [int(t) for t in previous_prompt_tokens]
     canonical_prompt = render_chat_ids(tokenizer, messages_before_assistant, True,
                                        chat_template_kwargs)
     if canonical_prompt != prev:
-        _n = min(len(canonical_prompt), len(prev))
-        _i = next((k for k in range(_n) if canonical_prompt[k] != prev[k]), _n)
-        raise ValueError(
-            "[protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致"
-            f"（长度 {len(canonical_prompt)} vs {len(prev)}，首个分歧位 {_i}）。\n"
-            "  后果：续写序列与采样序列不同源 → gen_logps 基线失真、训练/生成分布分叉。\n"
-            "  处置：检查 build_prompt 的 tools/chat_template_kwargs 是否与 "
-            "apply_chat_template 同参（tools 必须两边都传或都不传）。")
+        # 【两级判据】先看是否**只是空白归一化差异**（模板 strip vs 原样采样）；
+        # 是 → 容忍（否则"某段以换行开头"就会炸掉整轮训练）；否 → 真不同源，抛。
+        _cv = _drop_ws_tokens(tokenizer, canonical_prompt)
+        _pv = _drop_ws_tokens(tokenizer, prev)
+        if _cv is not None and _cv == _pv:
+            if not _WS_TOLERANCE_WARNED:
+                _WS_TOLERANCE_WARNED = True
+                print(f"[protocol] 模板渲染与拼接上下文差 {abs(len(canonical_prompt) - len(prev))} "
+                      f"个 token，但**去掉空白 token 后完全相同**（模板对 assistant 内容做 "
+                      f"strip，拼接保留原样采样 token）→ 判为归一化差异、继续。"
+                      f"只报这一次。", flush=True)
+        else:
+            _n = min(len(canonical_prompt), len(prev))
+            _i = next((k for k in range(_n) if canonical_prompt[k] != prev[k]), _n)
+            _ctx = 60
+            raise ValueError(
+                "[protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致"
+                f"（长度 {len(canonical_prompt)} vs {len(prev)}，首个分歧位 {_i}）；"
+                f"且差异**不只是空白**（可见内容不同）→ 真的不同源。\n"
+                f"  模板侧 [{_i}:{_i + 8}] = {[int(t) for t in canonical_prompt[_i:_i + 8]]}\n"
+                f"  拼接侧 [{_i}:{_i + 8}] = {[int(t) for t in prev[_i:_i + 8]]}\n"
+                f"  模板侧文本 …{_decode_span(tokenizer, canonical_prompt, _i, _ctx)!r}\n"
+                f"  拼接侧文本 …{_decode_span(tokenizer, prev, _i, _ctx)!r}\n"
+                "  后果：续写序列与采样序列不同源 → gen_logps 基线失真、训练/生成分布分叉。\n"
+                "  处置：检查 build_prompt 的 tools/chat_template_kwargs 是否与 "
+                "apply_chat_template 同参（tools 必须两边都传或都不传）。")
     placeholder = {"role": "assistant", "content": "x"}
     with_placeholder = [*messages_before_assistant, placeholder]
     canonical_end = render_chat_ids(tokenizer, with_placeholder, False,

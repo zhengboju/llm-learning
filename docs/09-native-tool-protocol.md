@@ -14,7 +14,7 @@
 >   p1–p11 逐位可复现（已用 AST 比对脚本证明围栏分支 71 行逐行相同）；
 > - `rlab/native_probe.py`：pod 上第一条命令，把 Q1–Q4 一次问完并直接给出
 >   `--native_tool_style` 该钉哪个值；
-> - `rlab/tests/test_native_protocol.py`：**140 项** CPU 测试（P1–P7 + 打分域全覆盖）。
+> - `rlab/tests/test_native_protocol.py`：**162 项** CPU 测试（P1–P7 + 打分域 + P2b 空白容忍全覆盖）。
 
 ---
 
@@ -370,7 +370,7 @@ python -m rlab.eval --algo retool_math --n 30 --seed 42 \
 
 ## 7. CPU 测试（新增 `test_native_protocol`，按既有风格）
 
-**已实现：`rlab/tests/test_native_protocol.py`，140 项全部通过**
+**已实现：`rlab/tests/test_native_protocol.py`，162 项全部通过**
 （`python -m rlab.tests.test_native_protocol`）。
 Mock tokenizer + 纯函数 + FakeGen，**不碰 GPU**：
 
@@ -428,6 +428,7 @@ Mock tokenizer + 纯函数 + FakeGen，**不碰 GPU**：
 | 历史对照全部作废 | **确定** | **刻意**：协议变了，p1–p11 不可与新 run 同表。新开 out_dir 与报告章节 |
 | 加了开关但漏接线（新键没人读） | 中 | S 组 14 项静态接线检查 + `-tpnative` 进签名 + 启动自证行 |
 | 原生档"调用后又继续写" | **中** | `invalid_final` 列 + `native_invalid` 健康告警；兜底 `--native_stop_at_call` |
+| **护栏误杀**（校验把模板归一化当不同源） | **高·已实际发生** | §10.6.2：校验① 改两级判据（空白容忍），P2b 组双向锁死 |
 
 **回退路径**：本方案只动 `protocol.py` / `rollout.py` 的**新增分支**，
 旧围栏路径保留（`extract_python_blocks` 不删）。用 `cfg["tool_protocol"]`
@@ -466,11 +467,11 @@ Mock tokenizer + 纯函数 + FakeGen，**不碰 GPU**：
 | `rlab/health.py` | +31 行 | `invalid_rate` 观测 + `native_invalid` 告警（>10%，附两种成因的处置） |
 | `rlab/reward.py` | +14 行 | `strip_code_blocks` 一并剥调用块（**打分域脚手架**：载荷里的 `\boxed{}` 不得劫持答案）；两档标记互不干扰，一次剥两种是 no-op 安全的 |
 | `rlab/native_probe.py` | **新文件 309 行** | pod 核实脚本（Q1–Q4 + 往返 + 端到端 + vLLM 冒烟） |
-| `rlab/tests/test_native_protocol.py` | **新文件 903 行** | 125 项 CPU 测试 |
+| `rlab/tests/test_native_protocol.py` | **新文件 ~1100 行** | 162 项 CPU 测试（含 P2b 空白容忍组） |
 | `rlab/tests/test_retool_cpu.py` | +47 行 | J 组清单加 `native_probe.py`；④⑦ 两处判据收窄到围栏分支；`apply_chat_template` 判据改 **AST**（注释里提函数名不再误判） |
 
 **回归**：`pytest rlab/tests` → **82 passed**（含新 12 个测试函数）；
-`test_native_protocol` 单跑 → **140 项全部通过**。
+`test_native_protocol` 单跑 → **162 项全部通过**（P2b 空白容忍组为 2026-09-25 真机事故后新增）。
 
 ### 10.2 实施中发现并修掉的坑（都不是设计里预见到的）
 
@@ -537,6 +538,10 @@ CUDA_VISIBLE_DEVICES=0 python -m rlab.native_probe --model_path /root/Qwen3.5-4B
 #    ↑ 判据看 **auto 与钉死档哪个高**（钉错形态 ≠ base 不会用工具）
 
 # ③ 20 步验证跑（参考的"两杯瑞幸"档）
+#    【2026-09-25 第二次上机】首次跑到样本 25 第 5 段被护栏误杀（校验① 把模板
+#    的 strip 归一化当"不同源"，§10.6.2）——已修（空白容忍 + 报错带解码文本）。
+#    重跑时应看到一次 "[protocol] 模板渲染与拼接上下文差 N 个 token …只报这一次"，
+#    那是**正常**的归一化告警，不是错误。
 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
     --tool_protocol native --native_tool_style function \
     --out_dir rlab_out/native_p1 --all_steps 20 --save_steps 5 \
@@ -679,6 +684,88 @@ Qwen3.5-4B 成立（与参考项目对同一基座的结论一致）。
    不一致时两者都打印，**以 auto 高者判断"base 会不会调用"**，防止把"钉错形态"
    读成"base 不会用工具"）。
 
+### 10.6.2 【最重要的一条】协议是对的，是**校验自己把正确的运行打死了**
+
+**真机现象**（20 步跑，样本 25 第 5 段）：
+
+```
+ValueError: [protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致
+            （长度 1556 vs 1557，首个分歧位 1484）
+```
+
+这次**不是协议 bug，也不是探针 bug——是护栏误杀**。分析过程值得完整记下来。
+
+**第一步：看数字，别看结论。** `1556 vs 1557` = canonical 比 prev **少一个 token**。
+不是"某段特别长"（那会是几百 token 的差），而是**恰好一个**——这个量级只可能是
+空白/标点类的单 token 差异。
+
+**第二步：本机复现（Qwen2.5 真模板 + 真 tokenizer）。** 结论：
+
+| 实验 | 结果 |
+|---|---|
+| 模板渲染 assistant `"  hello  "` | 原文**完整保留**（不 strip） |
+| 模板渲染 assistant `"\n\nhello"` | 渲染成 `hello` ← **段首空白被吃掉** |
+| `closing(C)` 对 9 种内容变体 | **2 种取值**——但差异只出现在"段首空白"变体上（前缀对不上） |
+| `observation(C)` 对 9 种内容变体 | **1 种取值，逐 token 完全相同** ✅ |
+
+**第三步：机制。** 两边对"同一段历史"的表示不同，且**各自都是对的**：
+
+- `ctx_ids[i]`（我们拼接的）= vLLM 采样的**原始 token**，**必须原样保留**
+  （那是模型自己吐的字节、也是它下一轮上下文里的真实内容；trim 掉会让 gen_logps
+  与序列错位）；
+- `msgs[i]`（模板重渲染的）= `asst_text.strip()` 后的文本 → 模板再渲染时
+  段首空白没了。
+
+于是校验①（逐 token 全等）**必然**在"某一段 assistant 以换行/空格开头"时报错，
+且与"第几段"无关——真机第 5 段才炸，只是因为**前面的段恰好没以空白开头**。
+换句话说：**这个 abort 迟早会发生，且越到后面越容易**（段数越多，命中概率越高）。
+
+**第四步：为什么这比协议 bug 更危险。** 判据本身把语义搞错了——
+"模板归一化"(strip) 被当成了 "生成/训练不同源"。而**真正的风险从来没有发生**：
+`observation` 增量与 assistant 内容完全无关（上表第 4 行实测），这正是占位法成立
+的根据，也是"token-in token-out 拼接"正确的根据。**协议一直是对的，是护栏把正确的
+运行打死了**——若不修，这个 bug 会让整套方案看起来"上机就崩、方案不成立"。
+
+**修复（`protocol.py`）**：校验① 改成**两级判据**——
+1. 逐 token 全等 → 通过（原路径，零额外开销）；
+2. 不等时，比较**去掉纯空白 token 后**的序列：相同 → 判为归一化差异，**容忍**
+   （只告警一次，附差值 token 数）；不同 → **仍然 raise**，且报错里直接解码
+   双方在分歧位附近的**文本**（不再只给数字——那是这次多花一小时的原因）。
+
+实现细节：`_drop_ws_tokens` 按**单 token** 解码判"是否纯空白"并缓存
+（Qwen byte-level BPE 下 ASCII 空白都是干净单 token；多字节字符被切开时单 token
+解码成替换符 → 保守**保留**，故该判据只会漏容忍、不会错容忍）；
+`tokenizer.decode` 失败 → 返回 None → **退回严格比较**（宁严不宽）。
+**序列构造路径一个字没动**——容忍只作用于校验，序列永远是原始 token 拼接。
+
+**测试（P2b 组，10 项）**——两个方向都锁死：
+- 正例：段首 `\n` / `\n\n` / 空格 / 首尾空白 → 容忍，且**返回序列仍以原样 prev 开头**
+  （容忍 ≠ trim，专门有一条断言）；
+- 反例：可见字符不同 / 段中 A vs B / **tools 档不一致** / **`enable_thinking` 档
+  不一致**（可见 think 段）/ decode 失败 → **全部仍然 raise**。
+  最后一条尤其重要：docs/03 那次"eval 没传 `enable_thinking=False` → 烧穿预算 →
+  fmt/acc 双灭"的事故档，绝不能被这条容忍静默放过。
+- 端到端：5 段**每段都以换行开头**（最坏情况）→ 全过且逐 token 不改动采样 token
+  （修复前第 2 段就炸）。
+
+**突变测试（双向）**：删掉容忍 → P2b 失败 ✅；把容忍写成"无限容忍"（不看可见
+内容）→ P2b + P3 双双失败 ✅。两个方向都有测试兜住。
+
+**元教训（已入全局）**：
+> **护栏的判据必须区分"表示层归一化"与"语义层不一致"。** 逐字节全等是最容易写、
+> 也最容易把正确运行打死的判据——凡"两边各自渲染同一份历史"的比对，先问
+> "这两条路径会不会对同一内容做等价的归一化（strip/大小写/Unicode 规范化）"。
+> 另外：**报错信息要带解码后的文本，不只给 token id / 位置**——
+> `1556 vs 1557 @1484` 三个数字花了很久才定位，而"一侧是 `\n\n` 一侧是空"
+> 是一眼可见的。
+
+**为什么这个 bug 没被 140 项 CPU 测试抓住**：MockTok 的 `strip_assistant` 与真实
+模板行为一致（都会 strip），但**测试里从未让"拼接的 prev"与"模板渲染的 msgs"
+在不 strip 档下并排比较**——即没有构造"原样采样 token 累积 vs strip 后重渲染"
+这个**真机必然出现**的组合。已由 P2b 补上（用 `strip_assistant=False` 的实例造
+生成端序列，与 `strip_assistant=True` 的模板对照）。
+**这是"两个各自正确的行为组合起来才出问题"的典型**——单看每一侧都测过。
+
 ### 10.6.1 真机冒烟样本观察（判读用，16/16 全中）
 
 ```
@@ -704,9 +791,10 @@ Qwen3.5-4B 成立（与参考项目对同一基座的结论一致）。
 > **注意**：以上三点是在**玩具提示**下观察到的；用正式提示复跑后应复核一遍
 > （正式提示更长、更详细，可能改变"先叙述 vs 直接调用"的比例）。
 
-**回归**：`pytest rlab/tests` → **82 passed**；`test_native_protocol` → 12 函数全过
-（新增 5 项 native_probe 静态检查，含**突变测试**验证：把 Q2 判据改回 JSON 启发式，
-新检查确实翻红）。诊断工具的修复也**必须被测试锁住**——否则下次又是"探针说没事"。
+**回归**：`pytest rlab/tests` → **83 passed**；`test_native_protocol` → 13 函数 / 162 项全过
+（新增 5 项 native_probe 静态检查 + P2b 空白容忍组，两者都含**突变测试**验证：
+把 Q2 判据改回 JSON 启发式、以及删掉空白容忍，对应检查都确实翻红）。
+诊断工具与护栏的修复也**必须被测试锁住**——否则下次又是"探针/护栏说没事"。
 
 **修正后的静态检查教训（本项目第二次）**：新加的 Q2 判据检查最初用纯文本包含
 （`'"{" in ' not in np_`），结果被**我自己写的解释注释**误伤而翻红。改 **AST**
@@ -722,7 +810,8 @@ Qwen3.5-4B 成立（与参考项目对同一基座的结论一致）。
 | `enable_thinking` 共存 | ✅ **已验证**（开关生效，think 已闭合） | — |
 | 拼接硬契约（本机 Qwen2.5） | ✅ **硬契约三条全过**；pod 上待复跑（§10.6 第 3 条修了判据） | 重跑步 ①（现在会打印 Q5 一行） |
 | **base 的真实调用率** | ✅ **16/16 = 100%**（但首版用玩具提示，§10.5.1 已修；建议用正式提示复跑一次确认） | `python -m rlab.native_probe --n_smoke 16 --native_tool_style function` |
-| **vLLM 端到端（`prompt_token_ids` + 工具模板）** | ⚠ 未验证 | 步 ③ 的 20 步跑（4 处 fail-fast 会当场 raise） |
+| **vLLM 端到端（`prompt_token_ids` + 工具模板）** | ⚠ **首次上机即命中护栏误杀**（§10.6.2，已修）——生成端已跑通到第 5 段 | 重跑步 ③：应能跑完 20 步 |
+| 拼接校验①（真机运行条件） | ✅ **已被真机覆盖**：修前在"段首空白"处 abort；修后 5 段全过 | 见 §10.6.2 的 P2b 组 |
 | EOS 停 vs `</tool_call>` 停的实际分布 | ⚠ 未验证 | 步 ③ 的 `invalid_final`/`ctx_full` 列 + 健康检查 `native_invalid`（冒烟 invalid=0 是好兆头） |
 | `gpu_mem` 档位对结论的影响 | ⚠ 已知 +7.0pp 是引擎档效应 | eval 必须 `--gpu_mem 0.78` 与训练同档 |
 | AIME25 OOD 集 | ❌ **仍未建**（docs/05 §6.6） | 与参考 +23.89pp 对话的前置条件 |
