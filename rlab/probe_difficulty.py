@@ -215,6 +215,21 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset；参考实现 6 轮）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    # 【2026-10-01 原生协议入口】此前本脚本没有 --tool_protocol：get_config 恒得
+    # fence，采样循环里的 _nat 原生分支从 CLI 不可达——任何产物表都是**围栏档**
+    # 探的，而训练端 load_difficulty_table 对协议指纹不符只告警不拦截（data.py），
+    # → native run 会静默用围栏表（"原生可学但围栏 p≈0"的题被训练池/评测池两端
+    # 一起滤掉）。补上入口让"探针与训练同档"铁律在协议维也成立。
+    ap.add_argument("--tool_protocol", choices=("fence", "native"), default=None,
+                    help="工具协议档（**必须与训练同档**；表指纹 probe_meta 含该字段，"
+                         "训练端逐项比对）。native=Qwen 原生 <tool_call>，经 get_config "
+                         "自动套用原生预算档 5×1024/8192 与原生系统提示（可被下面的 "
+                         "--round_gen_tokens/--system_prompt_file 等覆盖）；"
+                         "缺省=fence（历史行为零变化）")
+    ap.add_argument("--native_tool_style", choices=("auto", "function", "json"),
+                    default=None,
+                    help="原生调用解析形态（与训练同档钉死；Qwen3.5-4B 实测=function，"
+                         "见 docs/09 §10.5）")
     ap.add_argument("--dump_samples", type=int, default=0,
                     help="额外把前 N 条截断轨迹 + 前 3 条正常轨迹的原文落盘到 "
                          "<out>.samples.jsonl（截断率高时定位 token 去向用）")
@@ -236,8 +251,17 @@ def main():
     args = ap.parse_args()
 
     from rlab.config import get_config, validate_retool_budget
-    cfg = get_config("retool_math", model_path=args.model_path, use_wandb=False,
-                     seed=args.seed)
+    # 【2026-10-01 原生协议入口】协议档必须先落进 overrides——get_config 靠它决定
+    # 要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感，与 train.py 同一约定）；
+    # preset 系统提示也随档切换（native → system_prompt_retool_math_native，
+    # "提示是协议的一半"在探针侧同样成立）。下方的 --round_gen_tokens 等预算覆盖
+    # 仍走旧路径（get_config 之后直接改 cfg + validate_retool_budget 重校）。
+    _cfg_over = {"model_path": args.model_path, "use_wandb": False, "seed": args.seed}
+    if args.tool_protocol is not None:
+        _cfg_over["tool_protocol"] = args.tool_protocol
+    if args.native_tool_style is not None:
+        _cfg_over["native_tool_style"] = args.native_tool_style
+    cfg = get_config("retool_math", **_cfg_over)
     if args.data_task:
         cfg["data_task"] = args.data_task
     if args.temp is not None:
@@ -298,13 +322,13 @@ def main():
               f"（各片 --out 不同，最后 cat 合并成完整表）")
     if done:
         print(f"[probe] 续跑: 本片表中已有 {len(done)} 题，本片剩余 {len(todo)} 题")
-    print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
-          f"| 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
-          f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
     # 【2026-09-25 原生协议】协议档也必须落进表指纹：同一模型同一提示，围栏档与
     # 原生档的通过率是两个分布（原生档 base 调用率 87.5% vs 围栏档 ~48%）——
     # 表不自证协议，训练端就会把围栏表当原生档的难度表用。
     _tp = cfg.get("tool_protocol") or "fence"
+    print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
+          f"| 协议 {_tp} | 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
+          f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
     if _tp != "fence":
         print(f"[probe] ⚠ 工具协议 = {_tp}（原生 <tool_call>）：本表只对同档训练有效"
               f"（表指纹含协议档）")
@@ -449,9 +473,15 @@ def main():
     _disk = load_difficulty_table(args.out) if os.path.exists(args.out) else {}
     print(summarize(all_rows, aggregate_rows(all_rows, probe_meta),
                     disk_per_q=list(_disk.values()) or None))
+    _tp_tail = ""
+    if _tp != "fence":
+        _style = cfg.get("native_tool_style") or "auto"
+        _tp_tail = (f"\n[probe] ⚠ 本表是 {_tp} 协议档探的：训练命令必须同带 "
+                    f"--tool_protocol {_tp} --native_tool_style {_style}，否则 "
+                    "load_difficulty_table 的指纹比对会告警（且不拦截）")
     print(f"[probe] 表已写出: {args.out}\n"
           f"[probe] 训练启用: bash rlab/run_gsm8k.sh retool_math <model> "
-          f"--difficulty_path {args.out}")
+          f"--difficulty_path {args.out}" + _tp_tail)
 
 
 if __name__ == "__main__":

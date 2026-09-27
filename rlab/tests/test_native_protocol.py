@@ -1388,6 +1388,30 @@ def test_protocol_wiring_static():
           "NATIVE_PROTOCOL_DEFAULTS" in cf and "for _k, _v in NATIVE_PROTOCOL_DEFAULTS" in cf)
     check("probe_difficulty：原生档走 messages + 表指纹含协议档",
           "group_msgs" in pd and '"tool_protocol": _tp' in pd)
+    # 【2026-10-01 F2】probe 的 --tool_protocol CLI 入口：此前 get_config 恒得 fence，
+    # 采样循环的 _nat 分支从 CLI 不可达 → 任何表都是围栏档探的，native run 静默混表
+    # （训练端 load_difficulty_table 对协议指纹只告警不拦截）。锁三件事：flag 存在、
+    # 协议档先落 overrides 再进 get_config（顺序敏感——NATIVE_PROTOCOL_DEFAULTS 与
+    # 原生 preset 提示都靠它触发）、结尾的训练启用提示带协议档。
+    check("probe_difficulty：--tool_protocol/--native_tool_style CLI 入口存在",
+          'ap.add_argument("--tool_protocol"' in pd
+          and 'ap.add_argument("--native_tool_style"' in pd)
+    check("probe_difficulty：协议档先落 overrides 再进 get_config（顺序敏感锁）",
+          '_cfg_over["tool_protocol"] = args.tool_protocol' in pd
+          and 'get_config("retool_math", **_cfg_over)' in pd
+          and pd.index('_cfg_over["tool_protocol"] = args.tool_protocol')
+          < pd.index('cfg = get_config("retool_math", **_cfg_over)'))
+    check("probe_difficulty：结尾训练启用提示带协议档（防忘带 --tool_protocol）",
+          '"--tool_protocol {_tp}"' in pd or 'f"--tool_protocol {_tp}' in pd)
+    # 功能侧锚点：native 档 get_config 自动套预算档 + 原生提示（探针"同档"的来源；
+    # 全量断言在 test_config_protocol_switch，这里只锁探针依赖的两项）。
+    from rlab.config import get_config as _gc
+    _c = _gc("retool_math", tool_protocol="native", use_wandb=False)
+    check("get_config(native)：自动套 5×1024/8192 + 原生提示（无围栏措辞）",
+          _c["max_rounds"] == 5 and _c["round_gen_tokens"] == 1024
+          and _c["max_context_tokens"] == 8192
+          and "code_interpreter" in _c["system_prompt"]
+          and "```" not in _c["system_prompt"])
     check("health：新增 native_invalid 签名",
           "native_invalid" in open(os.path.join(root, "health.py"),
                                    encoding="utf-8").read())
