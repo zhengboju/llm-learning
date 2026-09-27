@@ -45,9 +45,11 @@ from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.model_loading import load_causal_lm, resolve_load_config
-from rlab.protocol import (CODE_TOOL, NATIVE_CALL_STOP, NATIVE_STYLE_FUNCTION,
-                           NATIVE_STYLE_JSON, RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
-                           TOOL_END, TOOL_START, build_next_prompt, encode_batch,
+from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
+                           NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON,
+                           RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
+                           TOOL_END, TOOL_START, assert_native_sampling_ban,
+                           build_next_prompt, encode_batch,
                            extract_python_blocks, initial_messages, make_call_id,
                            make_bytes_list, parse_assistant, render_chat_ids,
                            sanitize_tool_text, segment_mask_from_spans,
@@ -504,6 +506,10 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     if style not in ("auto", NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON):
         raise ValueError(f"[rollout] 未知 native_tool_style={style!r}（可选 auto/"
                          f"{NATIVE_STYLE_FUNCTION}/{NATIVE_STYLE_JSON}）")
+    # 假 </think> 禁言 fail-fast（事故 C，docs/09 §10.6.3）：缺禁言时"会不会炸
+    # 校验①"是随机事件（哪一条采样在第几步吐出 </think>），真机形态是运行几十
+    # 步后 abort——入口断言把失败提前到第 1 组之前。
+    assert_native_sampling_ban(sampling_params)
     budget = int(cfg.get("max_context_tokens", 8192))
     max_rounds = int(cfg.get("max_rounds", 5))
     max_code_calls = max(0, max_rounds - 1)      # 末轮不许执行代码（发现3）
@@ -1638,6 +1644,17 @@ def gen_worker(Q, cfg: dict):
             if cfg.get("native_stop_at_call"):
                 kw.update({"stop": [NATIVE_CALL_STOP],
                            "include_stop_str_in_output": True})
+            # 假 </think> 禁言（事故 C 根因修复，docs/09 §10.6.3）：et=False 档
+            # think 段已由生成提示预填闭合，内容里再出现 </think> 永远是协议垃圾；
+            # 不禁言时它进入 history 会被 Qwen3.5 模板重构成 reasoning/content 两段，
+            # build_next_prompt 校验① 必炸。gen_logps 取 raw_logprobs（禁言前的
+            # 真实策略 logp），训练 ratio 不失真——与 top_k=50 截断同一性质。
+            if "bad_words" not in _sp_fields:
+                raise ValueError(
+                    "[rollout] 原生协议需要 SamplingParams.bad_words（禁言假 "
+                    f"{NATIVE_BAD_WORDS[0]}，docs/09 §10.6.3），当前 vLLM 版本的 "
+                    "SamplingParams 没有该字段——升级 vLLM 或回退 fence 档。")
+            kw["bad_words"] = list(NATIVE_BAD_WORDS)
         elif cfg.get("retool_stop"):
             kw.update(_RETOOL_STOP_KWARGS)
         if _use_vllm_logps:

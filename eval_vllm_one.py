@@ -367,7 +367,8 @@ _tools_flag = bool(_native)
 prompts = [_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw, tools=_tools_flag)
            for item in sample]
 # 原生档的多轮 messages（与 prompt 渲染同源；协议分支要它，围栏档不需要）
-from rlab.protocol import NATIVE_CALL_STOP, initial_messages as _initial_messages
+from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
+                           initial_messages as _initial_messages)
 _prompt_msgs = ([_initial_messages(system_prompt, it["Q"]) for it in sample]
                 if _native else None)
 # fail-fast：请求关思考但模板没响应（如 transformers 版本行为变化），立刻告警
@@ -603,18 +604,24 @@ if is_retool_family:
     if _native:
         _stop = ({"stop": [NATIVE_CALL_STOP], "include_stop_str_in_output": True}
                  if _rcfg.get("native_stop_at_call") else {})
+        # 假 </think> 禁言（事故 C，docs/09 §10.6.3）：与训练同口径——采样内容
+        # 混入 </think> 会让续写的校验① 必炸；eval 的多轮走同一 build_next_prompt。
+        # 只限原生档：围栏档的格式契约要求模型自己写 </think>，绝不能禁。
+        _bad = {"bad_words": list(NATIVE_BAD_WORDS)}
     else:
         _stop = dict(_STOP_KW) if _rcfg.get("retool_stop") else {}
+        _bad = {}
     if _sampling:
         # 每条轨迹独立请求 + 独立 seed（与训练同形态；vLLM 同 seed 会生成相同轨迹）
         import random as _rnd
         _base = _rnd.randrange(1 << 30)
         sp_mt = [SamplingParams(temperature=_temp, top_p=_topp,
                                 max_tokens=args.round_tokens, seed=_base + k,
-                                **_stop)
+                                **_stop, **_bad)
                  for k in range(len(prompts) * args.val_n)]
     else:
-        sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens, **_stop)
+        sp_mt = SamplingParams(temperature=0, max_tokens=args.round_tokens,
+                               **_stop, **_bad)
     mt_cfg = {"max_rounds": args.max_rounds, "sandbox_timeout": 5.0,
               "sandbox_mem_mb": 256, "tool_result_max_chars": 500,
               # 【2026-09-25】协议档与解析形态必须显式进 mt_cfg——multi_turn_rollout_group

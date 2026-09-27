@@ -24,16 +24,25 @@ from rlab.config import (BASE, NATIVE_PROTOCOL_DEFAULTS, TOOL_PROTOCOLS,
                          system_prompt_retool_math_native,
                          validate_retool_budget)
 from rlab.losses import compute_loss
-from rlab.protocol import (NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON, NATIVE_STYLES,
+from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_STYLE_FUNCTION,
+                           NATIVE_STYLE_JSON, NATIVE_STYLES,
                            TOOL_NAME, _RE_TOOL_CALL_ANY, _TOOL_CLOSE, _TOOL_OPEN,
-                           build_next_prompt, derive_tool_style,
+                           assert_native_sampling_ban, build_next_prompt,
+                           derive_tool_style,
                            encoded_text_tokens, initial_messages, make_call_id,
                            parse_assistant, render_chat_ids, segment_mask_from_spans,
                            stop_sequences, suffix_prefix_overlap, tool_message)
 from rlab.rollout import (TOOL_PROTOCOL_FENCE, TOOL_PROTOCOL_NATIVE, build_prompt,
                           build_prompt_batch, build_prompt_ids, is_native_protocol,
-                          multi_turn_rollout_group, prompt_messages_for,
+                          multi_turn_rollout_group, multi_turn_rollout_group_native,
+                          prompt_messages_for,
                           strip_left_pad, tool_protocol_of)
+
+
+class _SPStub:
+    """vLLM SamplingParams 桩（入口断言只读 bad_words 属性，见事故 C 修复）。"""
+    def __init__(self, bad_words=None):
+        self.bad_words = bad_words
 
 PASS = []
 
@@ -101,6 +110,8 @@ class MockTok:
       · tool 消息渲染成 user 段里的 tool_response 包裹（Qwen2.5 实测形态）。
     可通过 cls.no_tools / cls.strip_assistant / cls.rewrite_history 注入故障，
     用于 P3（模板改写防护）的反证。
+    think_restructure=True 时模拟 Qwen3.5 模板对 assistant 历史的 think 重构
+    （事故 C 的真模板行为，见 _msg_tokens）。
     """
 
     IM_START, IM_END = 100000, 100001
@@ -116,6 +127,12 @@ class MockTok:
     # 打开后 enable_thinking=False 会渲染出闭合的 think 段、True 渲染未闭合形态
     # ——用于验证"空白容忍**不会**放过 enable_thinking 档位不一致"。
     thinking_switch = False
+    # 【事故 C 的真模板行为】Qwen3.5 模板渲染 assistant 历史时，内容含 </think>
+    # 就按**首个** </think> 拆成 reasoning/content 两段、重排成
+    # "<think>\n{reasoning}\n</think>\n\n{content}"——与逐 token 拼接流里的原始
+    # 字节结构性不同（</think> 搬了家）。这是表示层之外的**语义重构**，校验① 的
+    # 去空白容忍盖不住（也不该盖——见 NATIVE_BAD_WORDS 的设计取舍）。
+    think_restructure = False
 
     def __init__(self):
         self.pad_token = "\x00pad"
@@ -174,6 +191,20 @@ class MockTok:
                 txt = (content.strip() + ("\n" if content.strip() else "") + body)
             else:
                 txt = content.strip() if self.strip_assistant else content
+            if self.think_restructure:
+                # Qwen3.5 实测模板分支（tokenizer_config.json 的 chat_template）：
+                #   if '</think>' in content:
+                #       reasoning = content.split('</think>')[0]…split('<think>')[-1]…
+                #       content   = content.split('</think>')[-1].lstrip('\n')
+                #   渲染为 '<think>\n' + reasoning + '\n</think>\n\n' + content
+                from rlab.protocol import NATIVE_BAD_WORDS as _NBW
+                _bw = _NBW[0]
+                if _bw in txt:
+                    _reason = txt.split(_bw)[0].rstrip("\n") \
+                                 .split(_bw.replace("/", ""))[-1].lstrip("\n") \
+                                 .strip("\n")
+                    _body = txt.split(_bw)[-1].lstrip("\n")
+                    txt = ("<think>\n" + _reason + "\n" + _bw + "\n\n" + _body)
             out.extend(self._enc(txt))
         elif role == "tool":
             # 回包渲染：assistant 结束 → user 段里的 tool_response 包裹
@@ -703,6 +734,107 @@ def test_p2b_whitespace_tolerance():
 
 
 # =====================================================================
+# P2c 假 </think> 禁言（2026-09-28 真机事故 C：运行几十步后校验① abort）
+# =====================================================================
+def test_p2c_think_leak_guard():
+    """事故 C 复现与修复锁（docs/09 §10.6.3）。
+
+    真机形态：et=False 档生成提示以预填空 think 段收尾；某轮采样在**内容里**
+    又吐出 </think>（普通可采样 token）→ 该轮文本原样入 history 后，Qwen3.5
+    模板按首个 </think> 把它重构成 reasoning/content 两段 → canonical 重渲染
+    与逐 token 拼接流**文本层面**不同源（拼接侧是"空 think 段+全文"，模板侧把
+    前文搬进了 think 段）→ 校验① raise。
+
+    修复 = 采样端禁言（NATIVE_BAD_WORDS），**不是**放宽校验①（放宽会把
+    enable_thinking 档不一致也放过——P2b 反例 5 钉死它必须 raise）。
+
+    本组锁死五件事：
+      ① 不经禁言时该形态必然 raise（事故复现，MockTok.think_restructure 模拟
+         Qwen3.5 真实模板分支）；
+      ② 报错带事故 C 分流提示（不再只指 tools/ctkw 档——旧建议已误导一次真机排查）；
+      ③ 不含 </think> 的同形态内容照常通过（不误伤）；
+      ④ 禁言断言本体：缺/错/部分缺都 raise，带齐放行；rollout 入口先断言再碰
+         生成器（缺禁言时 vllm_gen 根本不会被调用）；
+      ⑤ 训练/eval/探针三处接线（源码锁）。
+    """
+    print("[P2c] 假 </think> 禁言：事故 C 复现 + 入口 fail-fast + 三处接线")
+    BW = NATIVE_BAD_WORDS[0]
+    check("禁言清单的唯一真源就是 </think>（模板分拆条件只认它）",
+          NATIVE_BAD_WORDS == ["</think>"])
+
+    t = MockTok()
+    t.think_restructure = True          # Qwen3.5 模板的 reasoning/content 重构
+    base = initial_messages("SYS", "Q1")
+    obs = tool_message(make_call_id(0, 0, 1), "42")
+
+    # ---- ① 事故复现：round-1 采样含假 </think>，round-2 续写必炸 ----
+    prev1 = render_chat_ids(t, base, True, {})
+    raw1 = "We need the constant a" + BW + "then call the tool"
+    nxt1 = build_next_prompt(t, base, prev1, encoded_text_tokens(t, raw1), obs)
+    check("前提：round-1 续写本身不炸（history 里还没有 assistant 段）",
+          nxt1[:len(prev1)] == prev1)
+    msgs2 = [*base, {"role": "assistant", "content": raw1.strip()}, obs]
+    obs2 = tool_message(make_call_id(0, 0, 2), "43")
+    try:
+        build_next_prompt(t, msgs2, nxt1, encoded_text_tokens(t, "second"), obs2)
+        check("事故 C 复现：采样内容含假 </think> → round-2 校验① 必 raise", False)
+    except ValueError as e:
+        check("事故 C 复现：采样内容含假 </think> → round-2 校验① 必 raise",
+              "不同源" in str(e))
+        # ② 分流提示：含 </think> 签名时必须指到事故 C/禁言，而非只指 tools 档
+        check("报错带事故 C 分流提示（bad_words + 事故 C，不再只指 tools/ctkw）",
+              "事故 C" in str(e) and "bad_words" in str(e))
+
+    # ---- ③ 对照：同形态但不含 </think> → 照常通过（不误伤）----
+    raw0 = "We need the constant a then call the tool"
+    nxt0 = build_next_prompt(t, base, prev1, encoded_text_tokens(t, raw0), obs)
+    msgs0 = [*base, {"role": "assistant", "content": raw0.strip()}, obs]
+    got0 = build_next_prompt(t, msgs0, nxt0, encoded_text_tokens(t, "second"), obs2)
+    check("对照：内容不含 </think> → round-2 正常续写（重构分支不触发）",
+          got0[:len(nxt0)] == nxt0)
+
+    # ---- ④ 禁言断言本体 + rollout 入口 fail-fast ----
+    assert_native_sampling_ban(_SPStub(list(NATIVE_BAD_WORDS)))            # 不炸
+    assert_native_sampling_ban([_SPStub(list(NATIVE_BAD_WORDS)) for _ in range(3)])
+    for bad in (_SPStub(), _SPStub([]),
+                [_SPStub(list(NATIVE_BAD_WORDS)), _SPStub(["别的"])]):
+        try:
+            assert_native_sampling_ban(bad)
+            ok = False
+        except ValueError as e:
+            ok = "禁言" in str(e) or "bad_words" in str(e)
+        check(f"禁言缺失/错误形态 {getattr(bad, 'bad_words', bad)!r} → raise", ok)
+    # 入口断言必须先于任何生成调用：vllm_gen=None 时若断言没拦住，会炸
+    # AttributeError 而不是 ValueError
+    cfg_n = {"max_rounds": 2, "tool_protocol": "native", "system_prompt": "SYS"}
+    try:
+        multi_turn_rollout_group_native(
+            None, _SPStub(), t, prompt_messages_for([{"Q": "Q1"}], cfg_n), cfg_n)
+        check("rollout 入口：SP 缺禁言 → 生成器还没被碰就 ValueError", False)
+    except ValueError as e:
+        check("rollout 入口：SP 缺禁言 → 生成器还没被碰就 ValueError",
+              "bad_words" in str(e))
+
+    # ---- ⑤ 三处接线（源码锁：训练/eval/探针）----
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    ev = open(os.path.join(root, "eval_vllm_one.py"), encoding="utf-8").read()
+    pd_ = open(os.path.join(root, "rlab", "probe_difficulty.py"),
+               encoding="utf-8").read()
+    _nat_slice = ro[ro.index("def multi_turn_rollout_group_native("):
+                    ro.index("def multi_turn_rollout_group(")]
+    check("rollout 入口断言在原生函数体内（不是只在 SP 构造侧）",
+          "assert_native_sampling_ban(sampling_params)" in _nat_slice)
+    check("训练 SP 接线：make_retool_sps 原生档带 bad_words 禁言 + 字段探测 fail-fast",
+          'kw["bad_words"] = list(NATIVE_BAD_WORDS)' in ro
+          and '"bad_words" not in _sp_fields' in ro)
+    check("eval 接线：原生档 SP 带 bad_words（围栏档不带——围栏格式契约需要 think 标签）",
+          '"bad_words": list(NATIVE_BAD_WORDS)' in ev and "NATIVE_BAD_WORDS" in ev)
+    check("probe_difficulty 接线（探针与训练同档铁律）",
+          '"bad_words": list(NATIVE_BAD_WORDS)' in pd_ and "NATIVE_BAD_WORDS" in pd_)
+
+
+# =====================================================================
 # P3 模板改写防护（fail-fast，不静默降级）
 # =====================================================================
 def test_p3_template_guard():
@@ -1094,9 +1226,11 @@ def test_fakegen_native_rollout():
     # 这里直接调底层，故显式给出 4 条。
     msgs = prompt_messages_for([{"Q": "Q1"}], cfg) * 4
     fg = FakeGen([r1, r2, r3])
+    # 原生档的 SamplingParams 必须带假 </think> 禁言（事故 C 入口断言）——
+    # 桩对象显式带上，锁死"调用方负责接线"的契约。
     segs, full, cs = multi_turn_rollout_group(
-        fg, [object()] * 4, t, ["P"] * 4, cfg, code_runner=fake_run,
-        prompts_messages=msgs)
+        fg, [_SPStub(list(NATIVE_BAD_WORDS)) for _ in range(4)], t, ["P"] * 4, cfg,
+        code_runner=fake_run, prompts_messages=msgs)
 
     check("轨迹数 = 4", len(segs) == 4 and len(cs) == 4)
     check("生成端收到 prompt_token_ids（token id 续写，非文本）",
@@ -1348,6 +1482,7 @@ if __name__ == "__main__":
     test_p1_parse()
     test_p2_sequence_contract()
     test_p2b_whitespace_tolerance()
+    test_p2c_think_leak_guard()
     test_p3_template_guard()
     test_p4_mask_and_grad()
     test_scoring_domain()

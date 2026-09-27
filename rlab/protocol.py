@@ -132,6 +132,54 @@ _TOOL_OPEN, _TOOL_CLOSE = _RE_TOOL_CALL_ANY.pattern.split(".*?")
 # 字面量**从正则派生**（零标签字面量铁律：全模块只此一处真源）。
 NATIVE_CALL_STOP = _TOOL_CLOSE
 
+# 【2026-09-28 假 </think> 禁言·事故 C 根因修复】原生协议采样端必须禁掉的 token。
+# 形态（真机 abort，长度 2301 vs 2303，分歧位 863）：
+#   enable_thinking=False 档的生成提示以**预填的空 think 段**（<think>\n\n</think>\n\n）
+#   收尾，模型此后正常写内容——但 </think> 是个**普通可采样 token**，base/早期策略
+#   会偶发在内容里再吐一个。该轮文本原样存入 history 后，Qwen3.5 模板的 assistant
+#   分支按"首个 </think>"把内容重构成 reasoning/content 两段（模板固有大纲行为），
+#   canonical 重渲染 = "assistant\n<think>\n{前文}</think>\n\n{后文}"，而拼接侧原始
+#   流 = "assistant\n<think>\n\n</think>\n\n{全文}"——**文本层面**结构性不同
+#   （</think> 搬了家），_norm_text 的去空白容忍盖不住 → build_next_prompt 校验①
+#   必炸。这不是 tools/ctkw 档不一致（报错里的旧处置建议对这个签名是误导）。
+# 为什么选"禁言"而不是"容忍"：
+#   · et=False 下内容里的 </think> **永远是**协议垃圾（think 段已由预填闭合），
+#     禁掉它对采样分布的扭曲与 top_k/top_p 截断同类且更小；
+#   · raw_logprobs 口径下 gen_logps 取的是禁言**前**的真实策略 logp，训练 ratio
+#     不失真（与既有 top_k=50 的设计同一性质）；
+#   · 容忍方向（校验① 剥 think 段再比）会把 enable_thinking 档不一致也一并放过
+#     ——那是 docs/03 真事故的签名，P2b 反例 5 钉死了它必须 raise，不能动。
+# 只列 </think> 不列 <think>：模板的分拆条件是 `'</think>' in content`，单独的
+# <think> 不触发重构（原样渲染，无害）。
+NATIVE_BAD_WORDS = ["</think>"]
+
+
+def assert_native_sampling_ban(sampling_params) -> None:
+    """原生协议的 SamplingParams 必须带 NATIVE_BAD_WORDS 禁言（事故 C 护栏）。
+
+    【为什么 fail-fast 放在 rollout 入口】缺禁言时"会不会炸校验①"是随机事件
+    （取决于哪一条采样在哪一步吐出 </think>），真机形态是**运行几十步后 abort**
+    ——比启动期拒跑贵得多。入口检查把失败提前到第 1 组之前，且报错直接指向
+    缺失的接线（而不是让操作者从校验① 的 token 分歧窗口反推）。
+
+    sampling_params 与 multi_turn_rollout_group_native 同构：单个 SP（eval 贪心
+    共用）或逐请求 SP 列表。SP 是 vLLM 对象（测试里是带 bad_words 属性的桩），
+    只读 getattr，不构造。"""
+    sps = (list(sampling_params)
+           if isinstance(sampling_params, (list, tuple)) else [sampling_params])
+    for sp in sps:
+        bw = set(getattr(sp, "bad_words", None) or [])
+        missing = [w for w in NATIVE_BAD_WORDS if w not in bw]
+        if missing:
+            raise ValueError(
+                "[protocol] 原生协议的 SamplingParams 缺禁言 bad_words="
+                f"{missing}（protocol.NATIVE_BAD_WORDS）——采样内容一旦混入假 "
+                f"{NATIVE_BAD_WORDS[0]}，Qwen3.5 模板会把它重构成 reasoning/content "
+                "两段，build_next_prompt 校验① 必然在运行中期 abort"
+                "（事故 C，docs/09 §10.6.3）。处置：构造 SamplingParams 时带 "
+                "bad_words=list(NATIVE_BAD_WORDS)（训练 make_retool_sps / "
+                "eval_vllm_one / probe_difficulty 三处已接线，自定义入口照抄）。")
+
 
 @dataclass(frozen=True)
 class ParsedAssistant:
@@ -469,6 +517,26 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
             else:
                 _diff = (f"  模板侧文本 …{_decode_span(tokenizer, canonical_prompt, _i, 60)!r}\n"
                          f"  拼接侧文本 …{_decode_span(tokenizer, prev, _i, 60)!r}\n")
+            # 【事故 C 签名识别】若分歧两侧任一含 </think>，最可能是"采样内容混入
+            # 假 </think> 被模板重构成 reasoning/content 两段"（docs/09 §10.6.3），
+            # 而不是 tools/ctkw 档不一致——处置完全不同，必须在报错里分流，
+            # 否则操作者会去查一场不存在的档位事故（真机已误导一次）。
+            _think_hint = ""
+            try:
+                _bw = NATIVE_BAD_WORDS[0]
+                if any(_bw in tokenizer.decode([int(t) for t in ids],
+                                               skip_special_tokens=False)
+                       for ids in (canonical_prompt, prev)):
+                    _think_hint = (
+                        f"  另查：分歧两侧文本含 {_bw}——若是“采样内容混入假 "
+                        f"{_bw} 被模板重构成 reasoning/content 两段”（事故 C 签名："
+                        "拼接侧是空 think 段+全文、模板侧把前文搬进了 think 段），"
+                        "则与 tools/ctkw 档无关；\n"
+                        "    处置：确认采样端 bad_words=protocol.NATIVE_BAD_WORDS "
+                        "已接线（multi_turn_rollout_group_native 入口有断言），"
+                        "且 enable_thinking=False 真正生效。\n")
+            except Exception:
+                pass
             raise ValueError(
                 "[protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致"
                 f"（长度 {len(canonical_prompt)} vs {len(prev)}，首个分歧位 {_i}）；"
@@ -476,6 +544,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
                 f"  模板侧 [{_i}:{_i + 8}] = {[int(t) for t in canonical_prompt[_i:_i + 8]]}\n"
                 f"  拼接侧 [{_i}:{_i + 8}] = {[int(t) for t in prev[_i:_i + 8]]}\n"
                 + _diff
+                + _think_hint
                 + "  后果：续写序列与采样序列不同源 → gen_logps 基线失真、训练/生成分布分叉。\n"
                 "  处置：检查 build_prompt 的 tools/chat_template_kwargs 是否与 "
                 "apply_chat_template 同参（tools 必须两边都传或都不传）。")

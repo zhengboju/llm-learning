@@ -961,6 +961,7 @@ else:                                 # 文本也不同 → 真不同源 → rai
 > （正式提示更长、更详细，可能改变"先叙述 vs 直接调用"的比例）。
 
 **回归**：`pytest rlab/tests` → **83 passed**；`test_native_protocol` → 13 函数 / 172 项全过
+（2026-09-28 事故 C 修复后：14 函数 / **184 项**全过，新增 P2c 假 `</think>` 禁言组 13 项，见 §10.6.3）
 （新增 5 项 native_probe 静态检查 + P2b 表示层容忍组，两者都含**突变测试**验证：
 把 Q2 判据改回 JSON 启发式、删掉容忍、以及把容忍判据退回"只容忍纯空白 token"
 （`mutate_guard.py`），对应检查都确实翻红）。
@@ -971,7 +972,69 @@ else:                                 # 文本也不同 → 真不同源 → rai
 （只读真正被赋值的 `_real = [...]` 推导式）。与 §10.2 第 8 条同一类：
 **凡"禁止某写法"的静态检查，一律读 AST，不读文本。**
 
-### 10.7 尚未验证的部分（如实声明，2026-09-25 更新）
+### 10.6.3 事故 C（2026-09-28）：采样内容混入假 `</think>` → 模板 think 重构 → 校验① 几十步后 abort
+
+**真机报错形态**（`multi_turn_rollout_group_native` → `build_next_prompt` 校验①）：
+
+```
+长度 2301 vs 2303，首个分歧位 863；解码文本也不同
+模板侧 [863:871] = [198, 1596, 1144, 310, ...]      = '\n' + "We need to determ..."
+拼接侧 [863:871] = [271, 248069, 271, 1596, ...]    = '\n\n' + '</think>' + '\n\n' + "We need..."
+模板侧文本 …'tart|>assistant\n<think>\nWe need to determine the values of constants a and b such th'
+拼接侧文本 …'tart|>assistant\n<think>\n\n</think>\n\nWe need to determine the values of constants a an'
+```
+
+**根因链（五环，缺一不可）**：
+
+1. `enable_thinking=False` 档的生成提示以**预填的空 think 段**收尾
+   （Qwen3.5 模板：`add_generation_prompt` 且 et=False → `<|im_start|>assistant\n<think>\n\n</think>\n\n`）；
+   这段预填字节经 token-in token-out 原样进入续写序列；
+2. 模型此后正常写内容——但 `</think>`（248069）是**普通可采样 token**
+   （added_tokens 里 `special: false`），base/早期策略会偶发在内容中间再吐一个；
+3. 该轮文本原样存入 history（`msgs[i]`，续写契约要求原样）；
+4. 下一轮 `build_next_prompt` 的 canonical 重渲染命中 Qwen3.5 模板的 assistant 分支：
+   `'</think>' in content` → `reasoning_content = split('</think>')[0]…`、
+   `content = split('</think>')[-1]…`，重排成 `<think>\n{reasoning}\n</think>\n\n{content}`
+   ——**`</think>` 之前的全部内容被搬进了 think 段**；
+5. 于是模板侧 = `assistant\n<think>\nWe need…`（前文进 think），拼接侧 =
+   `assistant\n<think>\n\n</think>\n\nWe need…`（空 think 段 + 原文）——**文本层面**结构性
+   不同，`_norm_text` 的去空白容忍盖不住（也不该盖），校验① 正确地 raise。
+
+**为什么判"采样端禁言"而不是"校验① 再容忍一层"**：
+
+- 容忍方向需要把 think 段从比较中剥掉——而那正是 `enable_thinking` 档不一致
+  （docs/03 真事故）的签名，P2b 反例 5 钉死了它必须 raise。**再容忍 = 拆掉真护栏**；
+- et=False 下内容里的 `</think>` **永远是协议垃圾**（think 段已由预填闭合），
+  禁掉它对采样分布的扭曲与 top_k/top_p 截断同类且更小；
+- `logprobs_mode=raw_logprobs` 口径下 gen_logps 取的是禁言**前**的真实策略 logp，
+  训练 ratio 不失真——与既有 top_k=50 的设计同一性质；
+- 只禁 `</think>` 不禁 `<think>`：模板分拆的条件是 `'</think>' in content`，
+  单独的 `<think>` 不触发重构（原样渲染，无害）。
+
+**落地（四处，单一真源 `protocol.NATIVE_BAD_WORDS = ["</think>"]`）**：
+
+| 位置 | 改动 |
+|---|---|
+| `make_retool_sps`（训练） | 原生档 `kw["bad_words"] = list(NATIVE_BAD_WORDS)`；vLLM 缺该字段 → 当场 raise（不拿运行中期 abort 赌版本） |
+| `multi_turn_rollout_group_native` 入口 | `assert_native_sampling_ban(sampling_params)` fail-fast——缺禁言时"会不会炸"是随机事件，入口断言把它提前到第 1 组之前 |
+| `eval_vllm_one.py` | 原生档两条 SP 构造同带（贪心也一样会漏 `</think>`）；**围栏档不带**——围栏的格式契约要求模型自己写 `</think>` |
+| `probe_difficulty.py` | 同带（探针与训练同档铁律） |
+| `build_next_prompt` 报错 | 分歧两侧文本含 `</think>` 时追加事故 C 分流提示（旧处置只指 tools/ctkw 档，已误导一次真机排查） |
+
+**测试（P2c 组，13 项）**：MockTok 新增 `think_restructure` 开关模拟 Qwen3.5 真实模板分支
+（`</think>` 触发 reasoning/content 重排）；事故复现（round-1 采样含假 `</think>` →
+round-2 校验① 必 raise 且带分流提示）；对照（不含 `</think>` 不误伤）；断言本体
+（缺/错/部分缺全 raise）；入口 fail-fast（`vllm_gen=None` 时仍 ValueError = 断言先于
+任何生成调用）；三处接线源码锁。
+
+**元教训（补 §10.6.2 四条之后）**：
+> ⑤ **"模型采样空间"与"模板能表达的空间"是两个集合。** token-in token-out 保留了
+> 采样空间的全集（包括垃圾 token），而模板重渲染只认它自己的结构语法——凡采样能产出、
+> 模板会重构的字节（`</think>` 是这类字节的代表），都是校验① 的潜在炸点。修法和
+> stop 串同一哲学：**在采样端把协议外的字节禁掉**，比在比对端"认识"它们便宜得多、
+> 也安全得多。
+
+### 10.7 尚未验证的部分（如实声明，2026-09-25 更新；2026-09-28 补事故 C 行）
 
 | 项 | 状态 | 怎么验 |
 |---|---|---|
@@ -980,8 +1043,8 @@ else:                                 # 文本也不同 → 真不同源 → rai
 | `enable_thinking` 共存 | ✅ **已验证**（开关生效，think 已闭合） | — |
 | 拼接硬契约（本机 Qwen2.5） | ✅ **硬契约三条全过**；pod 上待复跑（§10.6 第 3 条修了判据） | 重跑步 ①（现在会打印 Q5 一行） |
 | **base 的真实调用率** | ✅ **16/16 = 100%**（但首版用玩具提示，§10.5.1 已修；建议用正式提示复跑一次确认） | `python -m rlab.native_probe --n_smoke 16 --native_tool_style function` |
-| **vLLM 端到端（`prompt_token_ids` + 工具模板）** | ⚠ **两次上机都被护栏误杀**（§10.6.2 事故 A/B，均已修）——生成端已跑通到第 5 段 | 重跑步 ③：应能跑完 20 步 |
-| 拼接校验①（真机运行条件） | ✅ **已被真机两次覆盖**：先在"段首空白"处 abort（事故 A）、修后又在"BPE 段边界合并"处 abort（事故 B）；判据最终定为解码文本比较，P2b 用 `BPETok` 复现真机形态并突变验证 | 见 §10.6.2 的 P2b 组 |
+| **vLLM 端到端（`prompt_token_ids` + 工具模板）** | ⚠ **三次上机三 abort**：事故 A/B 是护栏误杀（§10.6.2，已修），事故 C 是采样混入假 `</think>` 触发模板 think 重构（§10.6.3，已修 = 采样端禁言）——生成端已跑通到第 5 段 | 重跑步 ③（禁言已接线，应能跑完 20 步） |
+| 拼接校验①（真机运行条件） | ✅ **已被真机三次覆盖**：段首空白（事故 A）→ BPE 段边界合并（事故 B）→ 假 `</think>` 触发模板 reasoning/content 重构（事故 C）。A/B 修了判据（解码文本比较，P2b），C 修了采样端（NATIVE_BAD_WORDS 禁言，P2c）——C 的判据本身是**正确**的（真不同源），炸点是采样空间与模板表达空间的差集 | 见 §10.6.2 P2b 组 / §10.6.3 P2c 组 |
 | EOS 停 vs `</tool_call>` 停的实际分布 | ⚠ 未验证 | 步 ③ 的 `invalid_final`/`ctx_full` 列 + 健康检查 `native_invalid`（冒烟 invalid=0 是好兆头） |
 | `gpu_mem` 档位对结论的影响 | ⚠ 已知 +7.0pp 是引擎档效应 | eval 必须 `--gpu_mem 0.78` 与训练同档 |
 | AIME25 OOD 集 | ❌ **仍未建**（docs/05 §6.6） | 与参考 +23.89pp 对话的前置条件 |
