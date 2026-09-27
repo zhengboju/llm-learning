@@ -1388,7 +1388,7 @@ def test_protocol_wiring_static():
           "NATIVE_PROTOCOL_DEFAULTS" in cf and "for _k, _v in NATIVE_PROTOCOL_DEFAULTS" in cf)
     check("probe_difficulty：原生档走 messages + 表指纹含协议档",
           "group_msgs" in pd and '"tool_protocol": _tp' in pd)
-    # 【2026-10-01 F2】probe 的 --tool_protocol CLI 入口：此前 get_config 恒得 fence，
+    # 【2026-09-28 F2】probe 的 --tool_protocol CLI 入口：此前 get_config 恒得 fence，
     # 采样循环的 _nat 分支从 CLI 不可达 → 任何表都是围栏档探的，native run 静默混表
     # （训练端 load_difficulty_table 对协议指纹只告警不拦截）。锁三件事：flag 存在、
     # 协议档先落 overrides 再进 get_config（顺序敏感——NATIVE_PROTOCOL_DEFAULTS 与

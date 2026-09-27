@@ -215,7 +215,7 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset；参考实现 6 轮）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
-    # 【2026-10-01 原生协议入口】此前本脚本没有 --tool_protocol：get_config 恒得
+    # 【2026-09-28 原生协议入口】此前本脚本没有 --tool_protocol：get_config 恒得
     # fence，采样循环里的 _nat 原生分支从 CLI 不可达——任何产物表都是**围栏档**
     # 探的，而训练端 load_difficulty_table 对协议指纹不符只告警不拦截（data.py），
     # → native run 会静默用围栏表（"原生可学但围栏 p≈0"的题被训练池/评测池两端
@@ -251,7 +251,7 @@ def main():
     args = ap.parse_args()
 
     from rlab.config import get_config, validate_retool_budget
-    # 【2026-10-01 原生协议入口】协议档必须先落进 overrides——get_config 靠它决定
+    # 【2026-09-28 原生协议入口】协议档必须先落进 overrides——get_config 靠它决定
     # 要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感，与 train.py 同一约定）；
     # preset 系统提示也随档切换（native → system_prompt_retool_math_native，
     # "提示是协议的一半"在探针侧同样成立）。下方的 --round_gen_tokens 等预算覆盖

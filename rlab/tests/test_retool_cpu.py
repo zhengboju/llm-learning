@@ -4267,7 +4267,7 @@ def test_overlong_filter():
 
 
 def test_code_wasted_adv_exclusion():
-    """【2026-10-01 F1】code_wasted（末轮废码）与 trunc_final 同一排除口径。
+    """【2026-09-28 F1】code_wasted（末轮废码）与 trunc_final 同一排除口径。
 
     背景：loss 侧 sample_weight 一直把 trunc OR code_wasted 整行清零
     （collect_retool_group 的 sw），但 advantage 侧旧版只排 trunc_final——
