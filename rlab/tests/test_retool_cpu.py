@@ -4266,6 +4266,70 @@ def test_overlong_filter():
           '"overlong_filter": cfg.get("overlong_filter")' in _tr)
 
 
+def test_code_wasted_adv_exclusion():
+    """【2026-10-01 F1】code_wasted（末轮废码）与 trunc_final 同一排除口径。
+
+    背景：loss 侧 sample_weight 一直把 trunc OR code_wasted 整行清零
+    （collect_retool_group 的 sw），但 advantage 侧旧版只排 trunc_final——
+    废码样本以 -1 进组均值（基线污染：4对2错2废码 组里答对者 adv 从 0.667
+    虚高到 1.000），自身又因 sw=0 零梯度："末轮写调用"永远拿不到直接惩罚，
+    且与 sw 注释声称的"它们 adv=0"矛盾。修复后两侧排除同一人群。
+    """
+    print("[T2] F1：code_wasted 并入 advantage 排除口径（与 sw 同人群）")
+    from rlab.rollout import group_ok, retool_score_flat
+    from rlab.config import get_config
+
+    cfg = get_config("retool_math", use_wandb=False)   # overlong_filter=True / group_mean
+    inputs = [{"Q": "q", "A": "42"}]
+
+    def _cs(trunc=0, wasted=0):
+        return {"code_used": 0, "code_ok": 0, "trunc_final": trunc,
+                "code_wasted": wasted}
+
+    # ---- 1. 4对2错 + 2条末轮废码（-1）：废码 adv=0、基线只算 6 条有效 ----
+    asst = ["\\boxed{42}"] * 4 + ["wrong"] * 2 + ["no answer"] * 2
+    stats = [_cs() for _ in range(6)] + [_cs(wasted=1) for _ in range(2)]
+    adv, *_ = retool_score_flat(inputs, asst, stats, cfg, steps_elapsed=0)
+    mean_valid = (4 * 1 + 2 * (-1)) / 6          # 废码不进组统计：mean=1/3
+    check("F1：末轮废码样本 adv=0（与截断同语义）",
+          adv[6].item() == 0 and adv[7].item() == 0)
+    check("F1：组均值只算非截断非废码（基线不再被废码 -1 污染）",
+          abs(adv[0].item() - (1 - mean_valid)) < 1e-5
+          and abs(adv[4].item() - (-1 - mean_valid)) < 1e-5)
+    check("F1：修复前口径的对照（旧：废码进统计 mean=0 → 答对 adv=1.000，"
+          "新：0.667——污染方向 = 虚增幸存样本优势）",
+          abs(adv[0].item() - 2 / 3) < 1e-5)
+
+    # ---- 2. 无 code_wasted 键的旧形态 code_stats：.get 兜底，行为逐位不变 ----
+    stats_legacy = [{"code_used": 0, "code_ok": 0, "trunc_final": 0}
+                    for _ in range(8)]
+    asst2 = ["\\boxed{42}"] * 4 + ["wrong"] * 4
+    adv2, *_ = retool_score_flat(inputs, asst2, stats_legacy, cfg, steps_elapsed=0)
+    check("F1：旧形态 code_stats（无 code_wasted 键）→ ±1 行为逐位不变",
+          abs(adv2[0].item() - 1.0) < 1e-5 and abs(adv2[4].item() + 1.0) < 1e-5)
+
+    # ---- 3. 全组都是废码 → 全 adv=0 → group_ok=False（不产生假方差训练） ----
+    stats_dead = [_cs(wasted=1) for _ in range(8)]
+    adv3, *_ = retool_score_flat(inputs, ["no answer"] * 8, stats_dead, cfg,
+                                 steps_elapsed=0)
+    check("F1：全废码组 → adv 全 0 且 group_ok 不通过",
+          bool((adv3.abs() < 1e-6).all()) and not bool(group_ok(adv3)))
+
+    # ---- 4. overlong_filter=False → 废码照常进统计（对照位不变） ----
+    cfg_off = {**cfg, "overlong_filter": False}
+    adv4, *_ = retool_score_flat(inputs, asst, stats, cfg_off, steps_elapsed=0)
+    check("F1：overlong_filter=False 时废码样本参与组统计（对照位逐位不变）",
+          adv4[6].item() != 0)
+
+    # ---- 5. 两侧同人群的源码锁（防 advantage/loss 口径再次分叉） ----
+    _ro = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
+    check("F1：advantage 侧排除 = trunc OR wasted",
+          "for tf, wf in zip(trunc_finals, wasted_flags)" in _ro)
+    check("F1：loss 侧 sw 排除 = trunc OR wasted（两侧同一人群）",
+          '0.0 if (s["trunc_final"] or s.get("code_wasted", 0))' in _ro)
+
+
 def test_attempt_shaping_and_err_tier():
     """【2026-09-21 终止链/压灭三件套】#2 尝试级 shaping + #6 错误类型分级 +
     #1 配套签名。

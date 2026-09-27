@@ -881,6 +881,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     phase = reward_phase(steps_elapsed, cfg["reward_switch_step"])
     rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
     trunc_finals = []  # overlong filtering: 1=末段被截断 → 从 advantage/组统计中移除
+    # 【2026-10-01 F1】code_wasted（末轮写了调用但不执行）与截断同语义：结构性
+    # 无 boxed 的 -1 轨迹。必须与截断**同一排除口径**（见下方 advantage 段注释）。
+    wasted_flags = []
     n = cfg["num_pre_Q"]
     assert len(asst_texts) == len(inputs) * n, \
         f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
@@ -929,6 +932,7 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
             fmt_s.append(sc["format"]); cu.append(code_stats[idx]["code_used"])
             ck.append(code_stats[idx]["code_ok"])
             trunc_finals.append(_tf)
+            wasted_flags.append(int(code_stats[idx].get("code_wasted", 0)))
     rewards = torch.tensor(rewards, dtype=torch.float32)
     # 【2026-09-23 组相对长度惩罚（MiMo Eq.4 形态）】在 advantage 之前按组应用：
     # 对通过轨迹的长度分位数起坡、只在通过率超阈值的组生效、只罚未通过轨迹。
@@ -946,8 +950,16 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除：
     # 组均值只算非截断 → 截断样本 adv=0 → 不贡献 pg_term。
     # 杀 NeMo-RL bug：全错组+混合截断不再因 trunc_shaping 产生假方差通过 group_ok。
-    if _do_filter and any(trunc_finals):
-        sample_mask = torch.tensor([0 if tf else 1 for tf in trunc_finals],
+    # 【2026-10-01 F1】code_wasted（末轮废码）并入同一排除口径：它与截断一样是
+    # 结构性无 boxed 的 -1，且 loss 侧 sample_weight 早已把它整行清零
+    # （collect_retool_group 的 sw 构造）——旧版只把 trunc 排出统计，废码样本以 -1
+    # 进组均值（基线被压低 → 其他样本 adv 被系统性抬高，实测扭曲 +0.07/组），自身
+    # 又因 sw=0 零梯度（"末轮写调用"永远拿不到直接惩罚），与 sw 注释声称的
+    # "它们 adv=0" 矛盾。修复后：组统计与 loss 归一化排除**同一人群**
+    # （trunc_final OR code_wasted），旧行为仅在 overlong_filter 关闭时保留。
+    excl = [1 if (tf or wf) else 0 for tf, wf in zip(trunc_finals, wasted_flags)]
+    if _do_filter and any(excl):
+        sample_mask = torch.tensor([0 if e else 1 for e in excl],
                                    dtype=torch.float32)
         adv = compute_advantages(rewards, n, cfg["adv_mode"], sample_mask=sample_mask)
     else:
@@ -1087,6 +1099,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         # code_wasted>0）的 sample_weight=0：它们 adv=0 不贡献 pg_term，
                         # 但 KL 仍活跃 → sample_mean 归一化会稀释 pg 梯度。sample_weight
                         # 让 compute_loss 只在有效样本上归一化。
+                        # 【2026-10-01 F1 对齐】advantage 侧的组统计排除口径自本日起
+                        # 也是 trunc OR code_wasted（retool_score_flat）——此前只有
+                        # trunc 进 sample_mask，废码样本 adv≠0 却在此 sw=0，两头矛盾。
                         "sw": torch.tensor(
                             [0.0 if (s["trunc_final"] or s.get("code_wasted", 0))
                              else 1.0 for s in code_stats[i * n:(i + 1) * n]],
