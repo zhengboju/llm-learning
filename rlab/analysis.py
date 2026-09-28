@@ -3,13 +3,17 @@
 
 功能：
   1. 汇总 eval_v_*.json -> Markdown 对比表（含与 BASE 的差值、与噪声地板 ±2pp 的判定）；
-  2. 解析 rlab record.jsonl -> 训练中 acc/format 正确率随上传批次的曲线数据。
+  2. 解析 rlab record.jsonl -> 训练中 acc/format 正确率随上传批次的曲线数据；
+  3. 无 boxed 归因分解（--no-boxed-breakdown）：把"终局没给 boxed"的样本按分族 ×
+     机理拆开，给出零梯度占比——判"该加单轮额度、还是该治啰嗦、还是该动提示层"。
 
 用法：
     python -m rlab.analysis --eval-json eval_vllm_all.json [--base BASE]
     python -m rlab.analysis --record rlab_out/record.jsonl
+    python -m rlab.analysis --no-boxed-breakdown rlab_out/record.jsonl
 """
 import argparse
+import collections
 import glob
 import json
 import math
@@ -576,21 +580,26 @@ def record_family_of(rec: dict) -> str:
     return "ok" if qs == "ok" else "dropped"
 
 
-def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
-    """按 upload 批次滑动平均 acc/fmt(code/code_ok/trunc) 率与完成长度（retool 诊断用）。
+def read_record(path: str) -> dict:
+    """读 record.jsonl → 逐样本扁平数组 + 会话切分（纯函数，CPU 可测）。
 
-    clen_cap: None = 从 record 同目录的 run_info.json 推导（见 record_clen_cap，
-    = max_context_tokens − max_prompt_length）；显式传值则覆盖。接近上限说明轨迹
-    在撞上下文预算（会被整组丢弃或标签被截断）。**注意这条线是"全轨迹预算"，
-    末段被单轮上限切断是另一回事，看 trunc 列（retool_trunc 签名）。**
+    【为什么提成独立函数】`summarize_record`（曲线/分族表）与
+    `summarize_no_boxed`（无 boxed 归因分解）**必须逐位同源**地切会话——切会话
+    判据本身是踩过两次真机坑的（见下），两份实现一旦分叉，"会话A"在两张某表里
+    就是不同样本区间，跨表对照全部失效。这里返回**原始**计数，布尔化口径由调用
+    方决定（acc/fmt 是 ±1 奖励，必须 `>0`；code_used/code_wasted 是计数，不能布尔化）。
 
-    window 以**样本**计（1 条 record = num_pre_Q=8 样本 = 1 组 = 1 micro-step）。
-    【2026-09-17 改默认 20→160】旧默认 20 样本 = 2.5 组，20 样本的二项噪声就有
-    ±11pp：真机 bg1 的相邻窗口在 10% 与 70% 之间跳，趋势被噪声完全淹没（且极易
-    被读成"崩了又好了"）。160 样本 = 20 组，与 docs/05 的"200 组窗口"同一量级。
-
-    【会话拆分 2026-09-08 / 2026-09-17 加固】record.jsonl 以追加模式写入，多次
-    训练（重启/新 run）会写进同一文件，且每次会话 pushes 计数归零。
+    返回键（全部按**样本**下标对齐，长度 = 落盘样本总数）：
+      accs/fmts/codes/oks: list[bool]   —— 已按 `>0` 布尔化（±1 奖励口径）
+      trs/cws/invs/ctxfs/cus: list[int] —— trunc_final / code_wasted /
+                                           invalid_final / ctx_full / code_used
+      clens: list[int]                  —— 整条轨迹 completion 全长
+      fams: list[str]                   —— "ok"/"dropped"（record_family_of）
+      stales: list[int|None]            —— opt-step 陈旧度；丢弃族 = None 占位，
+                                           无 gen_version 的文件 = 空表
+      sess_ids: list[int]               —— 会话号（0 起）
+      sess_span / sess_gv: dict         —— 会话 → [首, 末] 墙钟 / gen_version
+      n_sess: int
 
     **切会话判据分档**（2026-09-17 真机定案）：
       · 有 `gen_version`（新协议）→ **只看 gen_version 回退**（新 run 从 0 重新
@@ -599,30 +608,13 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         4 条记录时间戳完全相同**（4 题一次性上传），attempt 之间隔 ~3min →
         120s 判据把一次 106 组的 run 切成 **31 个"会话"**，逐会话表彻底失去意义
         （真机 bg1 的原始读数就是这个形态）。
-      · 无 `gen_version`（旧协议）→ 沿用 120s 时间判据。"""
-    if clen_cap is None:
-        clen_cap, _cap_src = record_clen_cap(path)
-    else:
-        _cap_src = f"显式传入{clen_cap}"
-    # 【2026-09-24 盲窗可见性】推导本 record 目录下训练存档点：内嵌评测结果
-    # step_N/eval_test.json 缺失或为超时哨兵（acc=None）的 checkpoint 在曲线表上
-    # 标 "盲"，把"没评测"摆到明处（p10 8 路全 TIMEOUT 的盲窗教训）。
-    _dir = os.path.dirname(os.path.abspath(path))
-    _ckpt_steps = []
-    try:
-        _save = None
-        with open(os.path.join(_dir, "run_info.json"), encoding="utf-8") as _f:
-            _ri = json.load(_f)
-        _save = _ri.get("save_steps")
-        if _save and int(_save) > 0:
-            _all = int(_ri.get("all_steps", 0) or 0) or _save
-            _ckpt_steps = sorted({s for s in range(int(_save), _all + 1, int(_save))})
-    except (OSError, ValueError, TypeError):
-        _ckpt_steps = []
+      · 无 `gen_version`（旧协议）→ 沿用 120s 时间判据。
+    """
     accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
     cws = []             # 每样本末轮浪费的代码调用次数（2026-09-20）
     invs = []            # 每样本原生协议 invalid_final（围栏档恒 0；2026-09-28 接入）
     ctxfs = []           # 每样本 ctx_full（observation 装不下而终局；同上）
+    cus = []             # 每样本 code_used（原始计数；2026-09-29 供无 boxed 分解用）
     fams = []            # 每样本所属族（ok/dropped，见 record_family_of；2026-09-28）
     stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
     _ok_seen = 0         # 已上传（ok 族）样本累计——staleness 的 micro-step 基准
@@ -670,7 +662,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
             # 修法：基准只数 ok 族样本（=真正上传的），与 train.py 的 step 同量纲。
             _fam = record_family_of(rec)
             if isinstance(gv, int):
-                _gas = 4                                    # 与 config 一致（见函数尾注释）
+                _gas = 4                                    # 与 config 一致
                 for _i in range(n):
                     if _fam != "ok":
                         # 丢弃组不占 train step，它的"micro-step"无定义 → 记 None
@@ -699,6 +691,13 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
             ctxfs.extend(int(x) for x in _cx)
             if len(_cx) < n:
                 ctxfs.extend([0] * (n - len(_cx)))
+            # 【2026-09-29 无 boxed 分解接入】code_used 原始计数：分解表要区分
+            # "被切断但全程没调用过工具"（纯散文，提示/预算问题）与"调用前被切断"
+            # ——旧表只存布尔化的 code 率（`codes`），该区分在表上不可见。
+            _cu = rec.get("code_used") or []
+            cus.extend(int(x) for x in _cu)
+            if len(_cu) < n:
+                cus.extend([0] * (n - len(_cu)))
             fams.extend([_fam] * n)
             # 末轮写代码 = 结构性无 boxed 且 trunc_final 记不到（2026-09-20）；
             # 旧 record 无该键 → 补 0，列会显示 0.0% 而不是崩
@@ -711,6 +710,218 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
             if ph:
                 phases.extend([ph] * n)
             sess_ids.extend([sess] * n)
+    return {"accs": accs, "fmts": fmts, "codes": codes, "oks": oks, "trs": trs,
+            "clens": clens, "cws": cws, "invs": invs, "ctxfs": ctxfs, "cus": cus,
+            "fams": fams, "stales": stales, "sess_ids": sess_ids, "phases": phases,
+            "sess_span": sess_span, "sess_gv": sess_gv, "n_sess": sess + 1}
+
+
+# 无 boxed 归因桶。**元组顺序 = 判定优先级 = 表列顺序**（三者必须一致，否则读表
+# 的人会按列序误推优先级）。名字沿用诊断脚本里的既有叫法，便于与历史记录对照。
+NO_BOXED_BUCKETS = (
+    ("A_cut_mid_call", "轮长切断，且已写出调用开标记（在调用块里被截）"),
+    ("C_wasted", "终局轮写了完整调用，按协议不执行（末轮废码）"),
+    ("F_ctx_full", "observation 装不进预算而终局（ctx_full）"),
+    ("B_cut_mid_prose", "轮长切断，且**没写出**任何调用（在散文里被截）"),
+    ("D_invalid_other", "调用形态非法，但不是被切断（非截断的 invalid）"),
+    ("E_clean_no_box", "干净收尾但没给 boxed（提示层/收尾问题）"),
+)
+
+
+def no_boxed_bucket(fmt_ok: bool, trunc: int, wasted: int, invalid: int,
+                    ctx_full: int, code_used: int) -> str:
+    """单个**无 boxed** 样本的失败机理归类（纯函数，CPU 可测）；有 boxed 返回 ""。
+
+    【为什么必须有显式优先级】这些标志在数据里**会重叠**：
+      · `trunc ∩ invalid` 是**主要**重叠：`trunc_final=1` 的样本里有相当一部分同时
+        `invalid_final=1`（调用块写到一半被单轮上限切断——"有开标记但形态不完整"
+        正是 parse_assistant 判 invalid 的判据，protocol.py 的 docstring 明说了）。
+        手工统计若按朴素顺序取首个命中，**这部分会被 trunc 整额吞掉**，于是
+        "在调用里被截"与"在散文里被截"这两类**处置完全不同**的样本（前者要加单轮
+        额度，后者要治啰嗦）在数据里同形。
+      · `trunc ∩ wasted` 是退化情形（末段被 length 切断、但切断点恰好落在
+        `</tool_call>` 之后，于是仍解析成一个完整调用）。此处 **wasted 优先于
+        trunc-only**：该样本确实产出了完整调用，"末轮不该调用"才是它的签名；若让
+        trunc-only 先判，样本会落进 B，而 B 的定义是"**没写出任何调用**"——自相矛盾。
+      · `wasted ∩ invalid` 在数据流里**不可能**同时为真：rollout 的终局分支是
+        `if invalid: ... elif tool: code_wasted += 1`，两者互斥且都会终止该样本。
+
+    ctx_full 单列成 F 而不是并进 E：它是**预算**失败（observation 进不去），与
+    "干净收尾但没给框"（提示/收尾）是两回事。
+
+    code_used 只用于子计数（B2 = 全程没调用过工具的纯散文样本），不改变桶归属。
+    返回的桶名 + "B2" 由调用方各自累加（见 no_boxed_breakdown）。"""
+    if fmt_ok:
+        return ""
+    if trunc and invalid:
+        return "A_cut_mid_call"
+    if wasted:
+        return "C_wasted"
+    if ctx_full:
+        return "F_ctx_full"
+    if trunc:
+        return "B_cut_mid_prose"
+    if invalid:
+        return "D_invalid_other"
+    return "E_clean_no_box"
+
+
+def no_boxed_breakdown(path: str) -> dict:
+    """无 boxed 样本的**分族 × 机理**分解（纯函数，CPU 可测）。
+
+    返回：{n_samples, n_nobox, families: {族: {n, nobox, buckets: {桶: 计数},
+                                             B2_pure_prose, zero_grad}},
+           n_nobox_total, zero_grad_total}
+
+    `zero_grad` = 该族里 `trunc_final or code_wasted` 的样本数（**不看有没有
+    boxed**）——这是 F1（commit 0ffec5e）之后 sample_weight=0 的人群，即"既不贡献
+    策略梯度、也不进组基线"的零梯度算力。它与"无 boxed"不是一回事：一条轨迹可以
+    既有 boxed 又在末段被切断（则它有梯度但不完整），两部分在表上分开给。
+
+    【为什么值得单列成命令】native_p3 的实测（576 样本 / 332 无 boxed）：
+      ok 族 99 条无 boxed 里 C_wasted 占 71.7%（差一点的轨迹输在"末轮又调工具"），
+      dropped 族 233 条里 A_cut_mid_call 41.6% + C_wasted 40.8%（硬题两头顶死），
+      全局 E_clean_no_box 只有 1.3%——**"模型不会收尾"这一整类假设被这一个数否掉**
+      （此前按"无 boxed ≈ 截断 + ≤6.9pp"估的残余 ~17pp 高了约 7 倍）。
+    这类判读以前每次都靠临时 heredoc 重算，既慢又踩过上面的重叠陷阱（首版脚本把
+    trunc∩invalid 全算进 trunc），故固化成子命令 + 测试。"""
+    R = read_record(path)
+    n_tot = len(R["accs"])
+    fams = R["fams"]
+    res = {"n_samples": n_tot, "n_nobox": 0, "n_nobox_total": 0,
+           "zero_grad_total": 0, "families": {}}
+    for fam in ("ok", "dropped"):
+        idx = [i for i, v in enumerate(fams) if v == fam]
+        if not idx:
+            continue
+        buckets = collections.Counter()
+        b2 = 0
+        nobox = 0
+        zg = 0
+        for i in idx:
+            _tr, _wa = R["trs"][i], R["cws"][i]
+            _iv, _cx = R["invs"][i], R["ctxfs"][i]
+            if _tr or _wa:
+                zg += 1
+            bk = no_boxed_bucket(R["fmts"][i], _tr, _wa, _iv, _cx, R["cus"][i])
+            if not bk:
+                continue
+            nobox += 1
+            buckets[bk] += 1
+            if bk == "B_cut_mid_prose" and R["cus"][i] == 0:
+                b2 += 1
+        res["families"][fam] = {"n": len(idx), "nobox": nobox,
+                                "buckets": dict(buckets),
+                                "B2_pure_prose": b2, "zero_grad": zg}
+        res["n_nobox_total"] += nobox
+        res["zero_grad_total"] += zg
+    res["n_nobox"] = res["n_nobox_total"]
+    return res
+
+
+def summarize_no_boxed(path: str) -> str:
+    """`no_boxed_breakdown` 的 Markdown 渲染（分族 × 机理表 + 判据图例）。
+
+    【读数纪律】分母是**落盘**样本；overlong 整组不落盘（幸存者偏差），故"无 boxed
+    占比"不是全部轨迹的无 boxed 率——含超长的真值看生成端 `[rollout] 采样统计` 行。
+    各桶占比的分母是**该族无 boxed 条数**（不是该族全部样本），因为问题是"失败的那
+    些是怎么死的"。zero_grad 单独一行，分母是该族全部样本（sw=0 判定与有无 boxed
+    无关）。"""
+    B = no_boxed_breakdown(path)
+    if not B["n_samples"]:
+        return f"> {path} 里没有可统计的 record 行（acc 为空或文件不存在）。"
+    names = [k for k, _ in NO_BOXED_BUCKETS]
+    out = ["== 无 boxed 归因分解（分族 × 机理）==",
+           f"> 分母 = 落盘样本 {B['n_samples']}（ok 族 + 丢弃族）；overlong 整组"
+           f"**不落盘**（幸存者偏差），非全部轨迹的无 boxed 率。",
+           f"> 桶判定按优先级 {'→'.join(n[0] for n in NO_BOXED_BUCKETS)}，"
+           f"同一格只进一个桶（**trunc ∩ invalid 归 A**，不重复计数——"
+           f"朴素顺序会让 A 全被 B 吞掉）。",
+           "",
+           "| 族 | 样本 | 无boxed | 占比 | " + " | ".join(names) + " |",
+           "|---" * (4 + len(names)) + "|"]
+    for fam, label in (("ok", "ok（已上传）"), ("dropped", "dropped（丢弃）")):
+        f = B["families"].get(fam)
+        if not f:
+            continue
+        nb = f["nobox"]
+        cells = []
+        for k in names:
+            c = f["buckets"].get(k, 0)
+            cells.append(f"{c}（{c / nb * 100:.0f}%）" if nb else "0")
+        out.append(f"| {label} | {f['n']} | {nb} | {nb / f['n'] * 100:.0f}% | "
+                   + " | ".join(cells) + " |")
+    out.append("")
+    out.append("| 族 | 零梯度占比（trunc ∪ 末轮废码 → sw=0） | 其中 B2 纯散文"
+               "（被切断且全程没调用过工具） |")
+    out.append("|---|---|---|")
+    for fam, label in (("ok", "ok（已上传）"), ("dropped", "dropped（丢弃）")):
+        f = B["families"].get(fam)
+        if not f:
+            continue
+        out.append(f"| {label} | {f['zero_grad']}/{f['n']} "
+                   f"（{f['zero_grad'] / f['n'] * 100:.0f}%） | {f['B2_pure_prose']} |")
+    out.append("")
+    out.append("桶含义（A/B 之分是「处置不同」：A 要加**单轮额度**，"
+               "B 要治**啰嗦**）：")
+    for k, desc in NO_BOXED_BUCKETS:
+        out.append(f"  · `{k}` — {desc}")
+    out.append("  · `B2` — B 的子集：全程 `code_used==0`，即从没调用过工具"
+               "（纯散文一路写到底被截，与工具协议无关）。")
+    return "\n".join(out)
+
+
+def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
+    """按 upload 批次滑动平均 acc/fmt(code/code_ok/trunc) 率与完成长度（retool 诊断用）。
+
+    clen_cap: None = 从 record 同目录的 run_info.json 推导（见 record_clen_cap，
+    = max_context_tokens − max_prompt_length）；显式传值则覆盖。接近上限说明轨迹
+    在撞上下文预算（会被整组丢弃或标签被截断）。**注意这条线是"全轨迹预算"，
+    末段被单轮上限切断是另一回事，看 trunc 列（retool_trunc 签名）。**
+
+    window 以**样本**计（1 条 record = num_pre_Q=8 样本 = 1 组 = 1 micro-step）。
+    【2026-09-17 改默认 20→160】旧默认 20 样本 = 2.5 组，20 样本的二项噪声就有
+    ±11pp：真机 bg1 的相邻窗口在 10% 与 70% 之间跳，趋势被噪声完全淹没（且极易
+    被读成"崩了又好了"）。160 样本 = 20 组，与 docs/05 的"200 组窗口"同一量级。
+
+    【会话拆分 2026-09-08 / 2026-09-17 加固】record.jsonl 以追加模式写入，多次
+    训练（重启/新 run）会写进同一文件，且每次会话 pushes 计数归零。
+
+    **切会话判据分档**（2026-09-17 真机定案）：
+      · 有 `gen_version`（新协议）→ **只看 gen_version 回退**（新 run 从 0 重新
+        计数），时间阈值放宽到 SESS_GAP_GV_S(30min) 只兜"真重启"。
+        为什么不能沿用 120s：`gen_questions_per_attempt=4` 时**一次 attempt 的
+        4 条记录时间戳完全相同**（4 题一次性上传），attempt 之间隔 ~3min →
+        120s 判据把一次 106 组的 run 切成 **31 个"会话"**，逐会话表彻底失去意义
+        （真机 bg1 的原始读数就是这个形态）。
+      · 无 `gen_version`（旧协议）→ 沿用 120s 时间判据。"""
+    if clen_cap is None:
+        clen_cap, _cap_src = record_clen_cap(path)
+    else:
+        _cap_src = f"显式传入{clen_cap}"
+    # 【2026-09-24 盲窗可见性】推导本 record 目录下训练存档点：内嵌评测结果
+    # step_N/eval_test.json 缺失或为超时哨兵（acc=None）的 checkpoint 在曲线表上
+    # 标 "盲"，把"没评测"摆到明处（p10 8 路全 TIMEOUT 的盲窗教训）。
+    _dir = os.path.dirname(os.path.abspath(path))
+    _ckpt_steps = []
+    try:
+        _save = None
+        with open(os.path.join(_dir, "run_info.json"), encoding="utf-8") as _f:
+            _ri = json.load(_f)
+        _save = _ri.get("save_steps")
+        if _save and int(_save) > 0:
+            _all = int(_ri.get("all_steps", 0) or 0) or _save
+            _ckpt_steps = sorted({s for s in range(int(_save), _all + 1, int(_save))})
+    except (OSError, ValueError, TypeError):
+        _ckpt_steps = []
+    # 【2026-09-29 读数与分解同源】解析与切会话提为 read_record（纯函数）：无 boxed
+    # 分解表必须与本表的"会话A"逐位落在同一批样本上，两份实现分叉 = 跨表对照失效。
+    _R = read_record(path)
+    accs, fmts, codes, oks = _R["accs"], _R["fmts"], _R["codes"], _R["oks"]
+    trs, clens, phases, sess_ids = _R["trs"], _R["clens"], _R["phases"], _R["sess_ids"]
+    cws, invs, ctxfs = _R["cws"], _R["invs"], _R["ctxfs"]
+    fams, stales = _R["fams"], _R["stales"]
+    sess_span, sess_gv = _R["sess_span"], _R["sess_gv"]
     sess_lines = []
     if sess_ids:
         for s in sorted(set(sess_ids)):
@@ -871,6 +1082,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval-json", default=None)
     ap.add_argument("--record", default=None)
+    ap.add_argument("--no-boxed-breakdown", default=None, metavar="RECORD",
+                    help="无 boxed 归因分解：按 ok/dropped 分族，把『终局无 boxed』的样本"
+                         "拆成 被截在调用里(A)/被截在散文里(B,含全程没调用过的 B2)/"
+                         "预算装不下(F)/末轮废码(C)/形态非法(D)/干净收尾未给框(E)，"
+                         "并给出零梯度占比（trunc ∪ 末轮废码 → sw=0）。"
+                         "填 record.jsonl 路径（与 --record 同一个文件）")
     ap.add_argument("--code-layer", default=None,
                     help="代码分层分析：跨存档点按 code_used 分层 acc + 与 BASE 同层配对")
     ap.add_argument("--code-migration", default=None,
@@ -902,7 +1119,10 @@ if __name__ == "__main__":
         print(summarize_code_migration(args.code_migration, args.base))
     if args.record:
         print(summarize_record(args.record, window=args.window))
-    if not args.eval_json and not args.record and not args.code_layer and not args.pair_json:
+    if args.no_boxed_breakdown:
+        print(summarize_no_boxed(args.no_boxed_breakdown))
+    if (not args.eval_json and not args.record and not args.code_layer
+            and not args.pair_json and not args.no_boxed_breakdown):
         cands = sorted(glob.glob("eval_vllm_all*.json"))
         if cands:
             print(summarize_eval(cands[-1], args.base))

@@ -130,8 +130,14 @@ ATTN_IMPL=flash_attention_2 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B 
     --no-eval_during_training \
     --len_penalty_w 0.1 --len_penalty_quantile 50 --len_penalty_gate 0.25 \
     --code_attempt_w 0.05 --code_w 0.05 \
+    --max_rounds 5 --round_gen_tokens 1536 --max_context_tokens 12288 \
     --out_dir rlab_out/native_p4_smoke
 ```
+
+> **预算三件套必填**（2026-09-29 补齐）：原生协议下这三个键有 `NATIVE_PROTOCOL_DEFAULTS`
+> 兜底（5×1024/8192），**不显式传就等于跑默认档**，签名会是 `-r5x1024 … -c8192`，
+> 与本表要求的 `-r5x1536 -c12288` 不符——单变量当场被换掉而日志不报警。启动自证：
+> 签名须含 `-r5x1536` 且 `-c12288`，协议自报行须印 `5 轮 × 1536 / ctx 12288 ｜ 前 4 轮可执行代码`。
 
 判据（对照 native_p3 基线：dropped 60%、丢弃组 invalid 59.5%、丢弃组 trunc 70.7%）：
 
@@ -142,6 +148,13 @@ ATTN_IMPL=flash_attention_2 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B 
 | 丢弃组 trunc 率 | 显著低于 70.7%（目标 < 40%） |
 | ok 组 acc 率 | ≥ 40%（不应回退） |
 | 签名自证 | `-tpnative`、`-nsc1`、`-r5x1536`、`-c12288` |
+
+> **判据修订（2026-09-29，据 §4.5 实测）**：`dropped` 族的 `invalid` 与 `trunc` **高度
+> 重叠**（都是 `A_cut_mid_call`：调用块写到一半被单轮上限切断），两者不能当独立指标
+> 读。20 步闸门的**主读数改为 `--no-boxed-breakdown` 的两行分布**，预期形态：
+> `A`（要加单轮额度）与 `C`（末轮废码，要末轮禁调用）是主导桶，`E_clean_no_box` 应
+> 仍在个位数百分比——**若闸门后 `E` 显著上升，说明提示层的收尾指令被削弱了**
+> （这是 6×2048/16384 实测里唯一没被证伪的提示层职责）。
 
 ### 第 4 步：探 native 难度表（F2 入口投入使用）
 
@@ -174,6 +187,44 @@ python3 -m rlab.probe_difficulty --model_path /root/Qwen3.5-4B --k 8 \
 
 ---
 
+## 4.5 新增诊断子命令：`--no-boxed-breakdown`（2026-09-29）
+
+```bash
+python -m rlab.analysis --no-boxed-breakdown rlab_out/native_p3/record.jsonl
+```
+
+按 **ok/dropped 分族 × 失败机理**拆开"终局没给 boxed"的样本，并给出零梯度占比。桶判定按优先级（写死在 `analysis.NO_BOXED_BUCKETS`，同名表头）：
+
+| 桶 | 含义 | 该动哪个旋钮 |
+|---|---|---|
+| `A_cut_mid_call` | 轮长切断，且已写出调用开标记（`trunc ∩ invalid`） | **加单轮额度**（`round_gen_tokens`） |
+| `C_wasted` | 终局轮写了完整调用、按协议不执行（末轮废码） | **末轮禁调用**（末轮 SP 加 `bad_words`） |
+| `F_ctx_full` | observation 装不进 `max_context_tokens` 而终局 | 加大 `max_context_tokens` |
+| `B_cut_mid_prose` | 轮长切断，且**没写出**任何调用（含子计数 `B2` = 全程 `code_used==0`） | **治啰嗦**（提示层减长度） |
+| `D_invalid_other` | 调用形态非法，但不是被切断 | 协议/采样形态 |
+| `E_clean_no_box` | 干净收尾但没给 boxed | 提示层收尾指令 |
+
+**为什么必须固化**：这些标志**会重叠**，朴素顺序（trunc→wasted→invalid）会把 `trunc ∩ invalid` 整额归进"散文里被截"，而它与"调用里被截"**处置相反**（一个要加额度、一个要治啰嗦）。首版手写脚本正是这么错的。判据与优先级已用测试钉死（`test_smoke_cpu.py` G3 组 22 项）。
+
+### 实测（native_p3，6 轮 ×2048/16384，576 样本 / 332 无 boxed）
+
+```
+| 族       | 样本 | 无boxed | A_cut_mid_call | C_wasted | B_cut_mid_prose | D | E_clean_no_box |
+| ok       | 336  | 99 (29%)| 12 (12%)       | 71 (72%) |  9 ( 9%)        | 3 |  4 ( 4%)       |
+| dropped  | 240  |233 (97%)| 97 (42%)       | 95 (41%) | 35 (15%)        | 2 |  4 ( 2%)       |
+零梯度（trunc ∪ 末轮废码 → sw=0）：ok 92/336 (27%)、dropped 227/240 (95%)
+```
+
+三条结论（**推翻此前两项估计**）：
+
+1. **`E_clean_no_box` 全局只有 1.3%（4+4/576）** ⇒ "模型不会收尾/提示层治不收尾"这一整类假设**作废**（此前按"无 boxed ≈ 截断 + ≤6.9pp"估的残余 ~17pp 高了约 7 倍）。`条件精度` 高不是巧合：只要能走到答题轮，模型几乎一定给框。
+2. **两族失败方向相反** ⇒ 不可能被同一个旋钮治好：ok 族 = `C_wasted` 主导（差一点，输在末轮又调工具）；dropped 族 = `A`(42%) + `C`(41%) 两头顶死（硬题既烧轮次又浪费末轮）。
+3. **`max_rounds` 5→6 实测无收益**（6×2048/16384 vs 5×2048/14336）：零方差丢弃占已落盘组 45%→**50%**、dropped 族 invalid 38.3%→43.1%、trunc 51.7%→55.6%，末轮废码率 ~31%→~30% **不动**。机制：`code_wasted` 度量的是"**每轮调用倾向**"（`max_code_calls = max_rounds−1`，末轮恒为答题轮而模型不知道自己在末轮），加轮数只是平移边界，不改变该倾向。**"继续加轮数"这条路已封**。
+
+**零梯度算力 ≈ 27%（ok 族）/ 95%（dropped 族）**：F1（`0ffec5e`）把 `trunc_final OR code_wasted` 同时从 `adv` 与 `sample_weight` 排除（统计口径正确），副作用是"末轮该收尾"这个决策**结构性拿不到任何梯度**——所以它永远不会自己学会。这也解释了为何"加轮数"无效而必须改协议。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
 - **`--native_stop_at_call` 默认值应视为过期**：docs/09 把它当"invalid 高才开"的兜底，native_p3 实锤 base 4B 在 1024/round、无 stop 下 invalid ~60%——它是**主协议部件**，native 路线默认应开。
@@ -182,4 +233,4 @@ python3 -m rlab.probe_difficulty --model_path /root/Qwen3.5-4B --k 8 \
 - **record 幸存者偏差**：overlong 整组不落盘，训练期曲线系统性偏乐观；"record 涨 eval 不涨"优先怀疑这里。
 - **内嵌评测与 gen_gpu_mem 0.6 互斥**：若恢复 `--eval_during_training`，GPU0 需 ~19G 给 eval，先把 gen_gpu_mem 降到 0.30–0.45。
 - **未提交文件**：`docs/13-agentic-rl-survey.md`、`docs/p9-diagnosis.md` 为工作区残留，非本次交接内容，未纳入提交。
-- **待办**：pod 上 `git pull` 后跑全量 pytest（本机缺 transformers/safetensors，8 个相关测试未验）；native_p4_smoke 的 20 步 record 用 `rlab.analysis --record` + 分族统计脚本复核。
+- **待办**：pod 上 `git pull` 后跑全量 pytest（本机缺 transformers/safetensors，8 个相关测试未验）；native_p4_smoke 的 20 步 record 用 `rlab.analysis --record` + `--no-boxed-breakdown`（§4.5）复核。

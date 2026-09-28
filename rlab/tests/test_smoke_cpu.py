@@ -692,6 +692,145 @@ def test_eval_stats_and_signature():
     check("无 dropped 族时不输出分族表（旧 record 表体逐位不变）",
           "分族统计" not in _no_fam)
 
+    # 【2026-09-29 H2】无 boxed 归因分解（--no-boxed-breakdown）
+    # 背景（native_p3 真机 576 样本 / 332 无 boxed）：ok 族 99 条里 C_wasted 占 72%
+    # （差一点的轨迹输在"末轮又调工具"），dropped 族 233 条里 A_cut_mid_call 42% +
+    # C_wasted 41%（硬题两头顶死），全局 E_clean_no_box 只有 1.3%——"模型不会收尾"
+    # 这一整类假设被这一个数否掉。这类判读以前每次靠临时 heredoc 重算，首版脚本还
+    # 踩了 trunc∩invalid 的重叠陷阱（把 A 全算进 B），故固化成子命令 + 测试。
+    print("[G3] 无 boxed 归因分解（2026-09-29）")
+    from rlab.analysis import (no_boxed_bucket, no_boxed_breakdown,
+                               summarize_no_boxed, NO_BOXED_BUCKETS)
+    # ① 优先级判据（尤其 trunc∩invalid 必须归 A，否则"调用里被截"与"散文里被截"
+    #    这两类处置完全不同的样本在数据里同形）
+    _bcases = [
+        ((True, 1, 0, 1, 0, 3), "", "有 boxed 不进任何桶（哪怕被截）"),
+        ((False, 1, 0, 1, 0, 3), "A_cut_mid_call",
+         "trunc∩invalid → A（调用块里被截；朴素顺序会误归 B）"),
+        ((False, 1, 0, 0, 0, 2), "B_cut_mid_prose", "trunc-only → B（散文里被截）"),
+        ((False, 1, 1, 0, 0, 2), "C_wasted",
+         "trunc∩wasted → C（完整调用已产出，落 B 会与 B 的定义自相矛盾）"),
+        ((False, 0, 0, 0, 1, 2), "F_ctx_full", "ctx_full → F（预算失败，不是 E）"),
+        ((False, 0, 1, 0, 0, 2), "C_wasted", "wasted → C"),
+        ((False, 0, 0, 1, 0, 1), "D_invalid_other", "非截断 invalid → D"),
+        ((False, 0, 0, 0, 0, 2), "E_clean_no_box", "干净收尾未给框 → E"),
+        ((False, 1, 1, 1, 1, 3), "A_cut_mid_call", "全重叠 → A（最高优先级）"),
+    ]
+    for _args, _want, _why in _bcases:
+        check(f"no_boxed_bucket：{_why}", no_boxed_bucket(*_args) == _want)
+    # 每个桶都必须有非空说明（表尾图例靠它，漏写会静默少一行）
+    check("NO_BOXED_BUCKETS 六桶齐备且各有说明",
+          len(NO_BOXED_BUCKETS) == 6
+          and all(isinstance(k, str) and k and isinstance(d, str) and d
+                  for k, d in NO_BOXED_BUCKETS))
+    # ② 端到端：构造与 native_p3 同形（ok 336 / dropped 240，无 boxed 99/233）的
+    #    record，逐格核对分解数与占比——同时锁"分母是**该族无 boxed**条数"。
+    _spec = {
+        "ok": {"n": 336, "B2": 4, "buk": {"C_wasted": 71, "A_cut_mid_call": 12,
+                                          "B_cut_mid_prose": 9, "E_clean_no_box": 4,
+                                          "D_invalid_other": 3}},
+        "dropped": {"n": 240, "B2": 17, "buk": {"A_cut_mid_call": 97, "C_wasted": 95,
+                                                "B_cut_mid_prose": 35,
+                                                "E_clean_no_box": 4,
+                                                "D_invalid_other": 2}},
+    }
+    _rec_nb = os.path.join(_dir, "record_nobox.jsonl")
+    with open(_rec_nb, "w", encoding="utf-8") as f:
+        for _fam, _sp in _spec.items():
+            _rows, _b2 = [], 0
+            for _bk, _cnt in _sp["buk"].items():
+                for _ in range(_cnt):
+                    _tr = _wa = _iv = _cx = 0
+                    _cu = 1
+                    if _bk == "A_cut_mid_call":
+                        _tr, _iv, _cu = 1, 1, 3
+                    elif _bk == "B_cut_mid_prose":
+                        _tr, _cu = 1, 2
+                    elif _bk == "C_wasted":
+                        _wa, _cu = 1, 2
+                    elif _bk == "D_invalid_other":
+                        _iv, _cu = 1, 1
+                    elif _bk == "E_clean_no_box":
+                        _cu = 2
+                    _rows.append((False, _tr, _wa, _iv, _cx, _cu))
+            # B2 由"部分 B 样本 code_used==0"独立控制（若让所有 B 都 code_used=0，
+            # 则 B2≡B，断言恒真而测不出东西——本测试首版正是这么写废的）
+            _out = []
+            for (_mk, _tr, _wa, _iv, _cx, _cu) in _rows:
+                if (not _mk and _tr and not _wa and not _iv and not _cx
+                        and _b2 < _sp["B2"]):
+                    _b2 += 1
+                    _cu = 0
+                _out.append((_mk, _tr, _wa, _iv, _cx, _cu))
+            assert _b2 == _sp["B2"], f"fixture B2 配额未用满：{_b2} != {_sp['B2']}"
+            _rows = _out
+            while len(_rows) < _sp["n"]:                 # 其余样本有 boxed
+                _rows.append((True, 0, 0, 0, 0, 1))
+            for _i in range(0, len(_rows), 8):
+                _ch = _rows[_i:_i + 8]
+                f.write(_json.dumps({
+                    "t": 1000.0 + _i,
+                    "acc": [1.0 if c[0] else 0.0 for c in _ch],
+                    "fmt": [1.0 if c[0] else 0.0 for c in _ch],
+                    "clen": [2000] * len(_ch), "code_used": [c[5] for c in _ch],
+                    "code_ok": [0] * len(_ch), "trunc_final": [c[1] for c in _ch],
+                    "invalid_final": [c[3] for c in _ch],
+                    "ctx_full": [c[4] for c in _ch],
+                    "code_wasted": [c[2] for c in _ch],
+                    "q_status": "ok" if _fam == "ok" else "uniform",
+                    "gen_version": 0, "phase": "cold",
+                }, ensure_ascii=False) + "\n")
+    _B = no_boxed_breakdown(_rec_nb)
+    check("分解：样本总数与无 boxed 总数正确（576 / 332）",
+          _B["n_samples"] == 576 and _B["n_nobox_total"] == 332)
+    _okb, _drb = _B["families"]["ok"], _B["families"]["dropped"]
+    check("分解：ok 族 336 条 / 无 boxed 99 / C_wasted=71（真机头号机理）",
+          _okb["n"] == 336 and _okb["nobox"] == 99
+          and _okb["buckets"]["C_wasted"] == 71
+          and _okb["buckets"]["A_cut_mid_call"] == 12)
+    check("分解：dropped 族 240 条 / 无 boxed 233（A=97 / C=95 两头顶死）",
+          _drb["n"] == 240 and _drb["nobox"] == 233
+          and _drb["buckets"]["A_cut_mid_call"] == 97
+          and _drb["buckets"]["C_wasted"] == 95)
+    check("分解：各桶计数之和 == 该族无 boxed 条数（不重复计数）",
+          sum(_okb["buckets"].values()) == _okb["nobox"]
+          and sum(_drb["buckets"].values()) == _drb["nobox"])
+    check("分解：B2 独立于 B（4 / 17，不是 B 的全量 9 / 35）",
+          _okb["B2_pure_prose"] == 4 and _drb["B2_pure_prose"] == 17
+          and _okb["B2_pure_prose"] < _okb["buckets"]["B_cut_mid_prose"])
+    # ③ 零梯度口径 = trunc ∪ 末轮废码（**不看有没有 boxed**，与 sw 构造同人群）
+    check("分解：零梯度占比按 trunc ∪ code_wasted 计（ok 92/336、dropped 227/240）",
+          _okb["zero_grad"] == 92 and _drb["zero_grad"] == 227
+          and _B["zero_grad_total"] == 319)
+    _nb_tbl = summarize_no_boxed(_rec_nb)
+    check("分解表：分族两行 + 各桶占比（分母=该族无 boxed 条数）",
+          "| ok（已上传） | 336 | 99 | 29% |" in _nb_tbl
+          and "71（72%）" in _nb_tbl and "97（42%）" in _nb_tbl)
+    check("分解表：桶优先级写进表头（防读者按列序误推优先级）",
+          "trunc ∩ invalid 归 A" in _nb_tbl)
+    check("分解表：存活偏差声明（overlong 整组不落盘，非全部轨迹的无 boxed 率）",
+          "不落盘" in _nb_tbl and "幸存者偏差" in _nb_tbl)
+    check("分解表：零梯度行 + 六桶图例齐备",
+          "零梯度占比" in _nb_tbl and "B2 纯散文" in _nb_tbl
+          and all(f"`{k}`" in _nb_tbl for k, _ in NO_BOXED_BUCKETS))
+    # 空文件 / 只有 ok 族：不得崩，且不输出不存在的族
+    _rec_empty = os.path.join(_dir, "record_nobox_empty.jsonl")
+    with open(_rec_empty, "w", encoding="utf-8") as f:
+        f.write("")
+    check("分解：空 record 不崩，给出可读提示",
+          "没有可统计" in summarize_no_boxed(_rec_empty)
+          and no_boxed_breakdown(_rec_empty)["n_samples"] == 0)
+    # ④ 同源契约：分解表与曲线表必须切出**同一个**会话区间（两份实现分叉 = 跨表
+    #    对照失效，这正是把它提成 read_record 的原因）
+    from rlab.analysis import read_record
+    _R = read_record(_rec_nb)
+    check("read_record：会话切分与扁平数组逐位对齐（下标 i 处各族/标志同源）",
+          len(_R["accs"]) == len(_R["fams"]) == len(_R["trs"]) == len(_R["clens"])
+          == len(_R["sess_ids"]) == 576
+          and sum(1 for v in _R["fams"] if v == "ok") == 336)
+    check("read_record：code_used 保持原始计数（未布尔化，供 B2 判定）",
+          max(_R["cus"]) == 3 and min(_R["cus"]) == 0)
+
 
 if __name__ == "__main__":
     test_advantages()
