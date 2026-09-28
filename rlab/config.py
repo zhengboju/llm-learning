@@ -589,6 +589,26 @@ def validate_retool_budget(cfg: dict) -> int:
             f"  改法（三选一）：round_gen_tokens ≤ {per_round_max}"
             f"（会加剧末段截断，trunc_final 上升）；或降 max_rounds；"
             f"或抬高 max_context_tokens ≥ {need}（T 进入所有显存公式，需重算峰值）。")
+    # 【2026-09-28 并发契约提示·只在真偏离时报】并采题数调大而 sandbox_workers
+    # 没跟上时，多轮 rollout 的一轮里会有代码执行排队等线程——生成端刚从
+    # "vLLM 欠利用"换成"沙箱成新瓶颈"。
+    # 【为什么必须比对 preset 基线而不是直接比 并发>workers】preset 本身就是
+    # `gq=4 × num_pre_Q=8 = 32 > sandbox_workers=8`——那是**有意的**（不是每条
+    # 轨迹都写代码，单次沙箱 0.1~5s 远小于轮长）。直接比大小会让提示在 shipped
+    # preset 上每次都喊（实测一套测试刷 44 行），正好复现 health.retool_trunc
+    # 的教训：**检测器对已知基线叫狼来了，真信号就被"忽略习惯"淹掉**。
+    # 现在只在"用户把并采题数抬到 preset 之上、沙箱却仍停在 preset 及以下"时报，
+    # 即真正的"调大并发忘调沙箱"。
+    _preset = ALGO_DEFAULTS.get(cfg.get("algo"), {}) or {}
+    _gq = int(cfg.get("gen_questions_per_attempt", 1) or 1)
+    _gq0 = int(_preset.get("gen_questions_per_attempt", BASE.get("gen_questions_per_attempt", 1)) or 1)
+    _sw = int(cfg.get("sandbox_workers", 0) or 0)
+    _sw0 = int(_preset.get("sandbox_workers", BASE.get("sandbox_workers", 0)) or 0)
+    _conc = _gq * int(cfg.get("num_pre_Q", 1) or 1)
+    if _sw and _gq > _gq0 and _conc > _sw and _sw <= _sw0:
+        print(f"[config][提示] 并采题数已从 {_gq0} 抬到 {_gq}（并发 {_conc} 条），"
+              f"但 sandbox_workers 仍是 {_sw} → 有代码的轮次里沙箱执行会排队，"
+              f"可能成为新瓶颈；若生成端吞吐仍不达标，把它抬到 ≥{_conc} 再测。")
     return reserve
 
 

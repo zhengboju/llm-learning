@@ -169,7 +169,13 @@ def run_signature(cfg: dict) -> str:
                        ("max_context_tokens", "c"), ("seed", "sd"),
                        ("top_k", "tk"), ("top_p", "tp"),
                        ("q_skip_streak", "qs"), ("q_pool_reset_floor", "qf"),
-                       ("overlong_buffer", "ob")):
+                       ("overlong_buffer", "ob"),
+                       # 【2026-09-28 吞吐杠杆进签名】gen_questions_per_attempt 是
+                       # **生成端行为级**变量：它决定一次 attempt 并采几题、进而决定
+                       # vLLM 并发数与"同题插队重试"的时序，两条 run 的轨迹分布不同
+                       # （seed 盐按 题数×num_pre_Q 消耗，采样序列随之错位）。
+                       # 不进签名则不同并发数的 run 撞同一 out_dir → step_N 静默覆盖。
+                       ("gen_questions_per_attempt", "gq")):
         _cur = cfg.get(_key)
         _dflt = _preset.get(_key, BASE.get(_key))
         if _cur != _dflt:
@@ -237,7 +243,11 @@ def _ckpt_signature(ckpt_dir: str):
 # 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
 _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      "tk", "tp", "qs", "qf", "ob",
-                     "cw", "qt", "lp", "lq", "lg")
+                     "cw", "qt", "lp", "lq", "lg",
+                     # 【2026-09-28】并采题数（吞吐杠杆）也走 _opt_tag，必须登记，
+                     # 否则"改了并发数的 run 中途重启"会被 guard_ckpt_collision
+                     # 判成外来签名而拒跑（_is_opt_suffix 认不出 -gq8）。
+                     "gq")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -846,6 +856,21 @@ def main():
                     help="题目拉黑 TTL：拉黑后再采 ttl 轮题自动释放重新入场"
                          "（修'训练分布单调变易'：难题随模型变强重新可学）。"
                          "0=关闭（旧行为：streak 永久累计直到 floor 全量重置）")
+    # 【2026-09-28 吞吐杠杆·补 CLI 缺口】并采题数此前只能改 config 源码。
+    # 它是"不动训练端契约"的**唯一**并发放大杆：自 2026-09-10 的按题拆分后，
+    # 每题各自构成 num_pre_Q 行上传批，训练端 micro_batch/DeepSpeed/GAS/有效
+    # batch 全部零改动 —— 调大它只影响 vLLM 并发数（题数×num_pre_Q）与沙箱
+    # 待执行条数。收益来自填补 vLLM 在"轮边界 + 沙箱 + 打分"期间的空泡；
+    # 若 vLLM 本已饱和则无收益（必须实测，勿假定线性）。
+    # 代价：KV 池需求与 sandbox 并发按比例上升（KV 显存不够会启动即失败）。
+    ap.add_argument("--gen_questions_per_attempt", type=int, default=None,
+                    help="每次 attempt 并采的题数（vLLM 并发 = 该值×num_pre_Q；"
+                         "retool_math preset=4 → 并发 32）。调大只提生成吞吐，"
+                         "训练端批大小零变化；需同步调大 --sandbox_workers；"
+                         "同时确认 KV 显存够（gen_gpu_mem）")
+    ap.add_argument("--sandbox_workers", type=int, default=None,
+                    help="代码沙箱线程池并发（应 ≥ 并采题数×num_pre_Q，否则"
+                         "多轮 rollout 的代码执行会排队成新瓶颈；preset=8）")
     ap.add_argument("--len_penalty_w", type=float, default=None,
                     help="【MiMo Eq.4 组相对长度惩罚】对通过轨迹的长度分位数起坡、"
                          "只在通过率超阈值的组生效、只罚未通过轨迹——与 trunc_shaping"
@@ -1021,6 +1046,11 @@ def main():
     # 【2026-09-23 开发项接线】分档奖励 / 黑名单 TTL / 组相对长度惩罚
     if args.code_w is not None: overrides["code_w"] = args.code_w
     if args.q_blacklist_ttl is not None: overrides["q_blacklist_ttl"] = args.q_blacklist_ttl
+    # 【2026-09-28 吞吐杠杆接线】并采题数/沙箱并发（见 add_argument 处的说明）
+    if args.gen_questions_per_attempt is not None:
+        overrides["gen_questions_per_attempt"] = args.gen_questions_per_attempt
+    if args.sandbox_workers is not None:
+        overrides["sandbox_workers"] = args.sandbox_workers
     if args.len_penalty_w is not None: overrides["len_penalty_w"] = args.len_penalty_w
     if args.len_penalty_quantile is not None:
         overrides["len_penalty_quantile"] = args.len_penalty_quantile

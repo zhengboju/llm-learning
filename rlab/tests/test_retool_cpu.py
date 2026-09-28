@@ -255,6 +255,49 @@ def test_config_retool_math():
     check("BASE 默认并采 1 题 + 沙箱并发 4（GSM8K 家族协议不变）",
           get_config("retool", use_wandb=False)["gen_questions_per_attempt"] == 1
           and get_config("retool", use_wandb=False)["sandbox_workers"] == 4)
+    # 【2026-09-28 吞吐杠杆接线锁】gen_questions_per_attempt 是"不动训练端契约"的
+    # 唯一并发放大杆（每題各自构成 num_pre_Q 行批 → micro_batch/DS/GAS/有效 batch
+    # 零改动），此前**只能改 config 源码**（train.py 的 parse_args 下直接报错）
+    # 且**不进 run_signature**（不同并发数的 run 撞同一 out_dir → step_N 静默覆盖）。
+    # 两处都是"传了等于没传 / 覆盖了不知道"的历史高频 bug 形态，钉死。
+    _tsrc = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
+    check("吞吐杠杆①：train.py 暴露 --gen_questions_per_attempt 并接线",
+          '"--gen_questions_per_attempt"' in _tsrc
+          and 'overrides["gen_questions_per_attempt"] = args.gen_questions_per_attempt' in _tsrc)
+    check("吞吐杠杆①：train.py 暴露 --sandbox_workers 并接线",
+          '"--sandbox_workers"' in _tsrc
+          and 'overrides["sandbox_workers"] = args.sandbox_workers' in _tsrc)
+    from rlab.train import run_signature as _rs2, _OPT_TAG_PREFIXES as _OPT2
+    from rlab.train import _is_opt_suffix as _ios
+    from rlab.config import validate_retool_budget as _vrb
+    _g4 = get_config("retool_math", use_wandb=False)
+    _g8 = get_config("retool_math", use_wandb=False, gen_questions_per_attempt=8)
+    check("吞吐杠杆②：并采题数进签名（不同并发数的 run 不撞 out_dir）",
+          "-gq" not in _rs2(_g4) and "-gq8" in _rs2(_g8) and _rs2(_g4) != _rs2(_g8))
+    check("吞吐杠杆②：gq 段被 _is_opt_suffix 认作优化器段（改了并发数的 run 可续跑）",
+          _ios("-gq8") and "gq" in _OPT2)
+    # 并发契约提示：只在**真偏离 preset** 时报（preset 自身 gq=4×8=32>8 是有意
+    # 设计，直接比大小会让提示在 shipped preset 上每次都喊——即 health 的
+    # "检测器对已知基线叫狼来了"教训）。
+    import io as _io
+    import contextlib as _cl
+    _buf_base = _io.StringIO()
+    with _cl.redirect_stdout(_buf_base):
+        _vrb(get_config("retool_math", use_wandb=False))
+    check("吞吐杠杆③：preset 本身不触发提示（8 workers/32 并发是有意设计）",
+          "并采题数已从" not in _buf_base.getvalue())
+    _buf_c = _io.StringIO()
+    with _cl.redirect_stdout(_buf_c):
+        _vrb(get_config("retool_math", use_wandb=False, gen_questions_per_attempt=8))
+    check("吞吐杠杆③：抬并发但沙箱没跟上 → 启动提示",
+          "并采题数已从 4 抬到 8" in _buf_c.getvalue())
+    _buf_ok = _io.StringIO()
+    with _cl.redirect_stdout(_buf_ok):
+        _vrb(get_config("retool_math", use_wandb=False,
+                        gen_questions_per_attempt=8, sandbox_workers=64))
+    check("吞吐杠杆③：并发与沙箱同步抬起 → 静默",
+          "并采题数已从" not in _buf_ok.getvalue())
     # 联动锁：num_pre_Q=8 必须配 group_mean（两处一起改，缺一即错）
     from rlab.losses import compute_advantages
     from rlab.rollout import group_ok
