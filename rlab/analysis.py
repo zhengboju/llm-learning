@@ -558,6 +558,24 @@ def record_clen_cap(path: str, default: int = 1800) -> tuple:
     return default, f"默认{default}（无 run_info，口径存疑）"
 
 
+def record_family_of(rec: dict) -> str:
+    """record 单行归属族：\"ok\"（已上传训练）/\"dropped\"（零方差丢弃）。纯函数。
+
+    【2026-09-28 为什么需要】自 2026-09-23 起 uniform（全对/全错，组内归一化后
+    adv 恒 0）组**也落盘**（rollout.py 的 q_status 字段）。于是 record.jsonl 里的
+    acc/fmt/trunc 是**两个分布混在一起**的：丢弃组结构性全错（reward -1、无 boxed），
+    它的 acc≈0、invalid/trunc 高发，会把 OK 组的真实读数一路拖低。native_p3 实测：
+    混合口径 acc=18.5% / fmt=20.0%，反推 ok 组是 acc≈60% / fmt≈65%——混读会把
+    "ok 组质量正常"误读成"模型学不会"（交接文档 §3 头号判据就是分族对比）。
+
+    旧 record（2026-09-23 前）没有 q_status 字段——当年丢弃组不落盘，**每一行
+    都是上传组**，故缺字段按 "ok" 计：本函数对旧文件的分类与旧行为逐位一致。"""
+    qs = rec.get("q_status")
+    if qs is None:
+        return "ok"
+    return "ok" if qs == "ok" else "dropped"
+
+
 def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
     """按 upload 批次滑动平均 acc/fmt(code/code_ok/trunc) 率与完成长度（retool 诊断用）。
 
@@ -603,7 +621,11 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         _ckpt_steps = []
     accs, fmts, codes, oks, trs, clens, phases, sess_ids = [], [], [], [], [], [], [], []
     cws = []             # 每样本末轮浪费的代码调用次数（2026-09-20）
+    invs = []            # 每样本原生协议 invalid_final（围栏档恒 0；2026-09-28 接入）
+    ctxfs = []           # 每样本 ctx_full（observation 装不下而终局；同上）
+    fams = []            # 每样本所属族（ok/dropped，见 record_family_of；2026-09-28）
     stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
+    _ok_seen = 0         # 已上传（ok 族）样本累计——staleness 的 micro-step 基准
     sess_span = {}   # sess -> [first_t, last_t]（墙钟，便于对 Shell 历史核对是哪次 run）
     sess_gv = {}     # sess -> [first_genver, last_genver]
     has_gv = False
@@ -634,19 +656,50 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
                 sess_gv.setdefault(sess, [gv, gv])[1] = gv
             # 【2026-09-18 staleness 可观测】每样本的陈旧度（opt-step 口径，与
             # train.py [train][口径] 行同公式）。1 record = 8 样本 = 1 micro-step；
-            # 本批第 i 个样本的 micro-step = (累计样本数 + i)//8。gen_version 是
-            # 生成该批时权重对应的 micro-step。staleness 过高 = 训练在吃太旧的
-            # 策略数据（off-policy，框架监控建议②）。
+            # 本批第 i 个样本的 micro-step = (累计**已上传**样本数 + i)//8。
+            # gen_version 是生成该批时权重对应的 micro-step。staleness 过高 =
+            # 训练在吃太旧的策略数据（off-policy，框架监控建议②）。
+            #
+            # 【2026-09-28 伪影修复·必读】旧版这里用 `len(accs)`（**全部**已读样本）
+            # 当 micro-step 基准，隐含假设"每条落盘记录都上传到训练端"。该假设被
+            # 2026-09-23 的"uniform 组也落盘"**作废**：丢弃组不占 train step 却照样
+            # 累加 → 基准被虚高 1/(1−丢弃率) 倍。native_p3 实锤：公式给
+            # floor(7648/8/4) − floor(296/4) = 239 − 74 = **165**，与表里 max 165
+            # 逐位吻合——而训练总共只推进 74 个 opt-step，**落后 165 不可能**。
+            # 整列因此是伪影（真值要看训练日志的 [train][口径] 行）。
+            # 修法：基准只数 ok 族样本（=真正上传的），与 train.py 的 step 同量纲。
+            _fam = record_family_of(rec)
             if isinstance(gv, int):
                 _gas = 4                                    # 与 config 一致（见函数尾注释）
                 for _i in range(n):
-                    _m = (len(accs) + _i) // 8              # 本样本的 micro-step
+                    if _fam != "ok":
+                        # 丢弃组不占 train step，它的"micro-step"无定义 → 记 None
+                        # 占位（**必须**保持与样本下标对齐：会话行与窗口列都按
+                        # 全局样本下标取切片，只给 ok 族追加会让下标整体错位）
+                        stales.append(None)
+                        continue
+                    _m = (_ok_seen + _i) // 8               # 本样本的 micro-step
                     stales.append((_m // _gas) - (gv // _gas))
+            if _fam == "ok":
+                _ok_seen += n
             accs.extend(a > 0 for a in rec["acc"])
             fmts.extend(v > 0 for v in rec["fmt"])
             codes.extend(u > 0 for u in rec.get("code_used", []))
             oks.extend(k > 0 for k in rec.get("code_ok", []))
             trs.extend(int(x) for x in rec.get("trunc_final", []))
+            # 【2026-09-28 原生协议诊断列接入】invalid_final / ctx_full 自 2026-09-25
+            # 起就落盘，但 summarize_record 一直没读——于是交接文档的头号判据
+            # （native_p3 的 invalid ≈60%）在 `--record` 表上**完全隐形**，只能手工
+            # 写脚本统计。围栏档 / 旧 record 无该键 → 补 0（列显示 0.0% 而不是崩）。
+            _iv = rec.get("invalid_final") or []
+            invs.extend(int(x) for x in _iv)
+            if len(_iv) < n:
+                invs.extend([0] * (n - len(_iv)))
+            _cx = rec.get("ctx_full") or []
+            ctxfs.extend(int(x) for x in _cx)
+            if len(_cx) < n:
+                ctxfs.extend([0] * (n - len(_cx)))
+            fams.extend([_fam] * n)
             # 末轮写代码 = 结构性无 boxed 且 trunc_final 记不到（2026-09-20）；
             # 旧 record 无该键 → 补 0，列会显示 0.0% 而不是崩
             _cw = rec.get("code_wasted") or []
@@ -677,19 +730,31 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
             gv_col = f" gen_ver={gvr[0]}..{gvr[1]}" if gvr else ""
             st_col = ""
             if stales:
-                _ss = [stales[i] for i in idx if i < len(stales)]
+                # None = 丢弃组占位（无 micro-step 语义），统计时必须剔除
+                _ss = [stales[i] for i in idx if i < len(stales) and stales[i] is not None]
                 if _ss:
                     st_col = f" staleness均值={sum(_ss) / len(_ss):.1f}(max {max(_ss)})"
+            # 【2026-09-28】该会话的 ok 族单独读数：acc/fmt 混合口径会被丢弃组
+            # （结构性全错）拖低，判"模型学得怎么样"必须看 ok 族。无丢弃组的
+            # 会话（旧协议 / 丢弃不落盘时代）不追加，会话行逐字不变。
+            ok_col_s = ""
+            _iok = [i for i in idx if fams and i < len(fams) and fams[i] == "ok"]
+            if _iok and len(_iok) < len(idx):
+                _oa = sum(accs[i] for i in _iok) / len(_iok) * 100
+                _of = sum(fmts[i] for i in _iok) / len(_iok) * 100
+                _oc = f"{_oa / _of * 100:.1f}%" if _of > 0 else "—"
+                ok_col_s = (f" ｜ok族({len(_iok)}条): acc={_oa:.1f}% fmt={_of:.1f}%"
+                            f" 条件精度={_oc}")
             sess_lines.append(
                 f"会话{_sess_label(s)}(#{s}): 样本{lo}~{hi}（{len(idx)}条 ≈{len(idx)/8:.0f}组）"
                 f" acc={a:.1f}% fmt={ff:.1f}% 条件精度={cond} code_ok={k:.1f}% trunc={tr:.1f}%"
-                f"{gv_col}{st_col}{when}")
+                f"{gv_col}{st_col}{ok_col_s}{when}")
     out = [f"> clen 上限口径: {_cap_src} → cap={clen_cap}，"
            f"「≥{int(0.9 * clen_cap)}」列 = 接近**全轨迹**预算（撞它会被整组丢弃）；"
            f"末段被单轮上限切断请看 trunc 列。",
            "",
-           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | 末轮废码率 | avg_clen | staleness | 阶段 | 会话 | 评测 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | invalid率 | ctx满率 | 末轮废码率 | avg_clen | staleness | 阶段 | 会话 | 评测 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
         out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
                       f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
@@ -702,11 +767,17 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         chunk_a, chunk_f, chunk_c = accs[i:j], fmts[i:j], codes[i:j]
         chunk_k, chunk_t, chunk_l = oks[i:j], trs[i:j], clens[i:j]
         chunk_w = cws[i:j]
+        chunk_i, chunk_x = invs[i:j], ctxfs[i:j]
         if not chunk_a:
             continue
         code_col = f"{sum(chunk_c) / len(chunk_c) * 100:.1f}%" if chunk_c else "—"
         ok_col = f"{sum(chunk_k) / len(chunk_k) * 100:.1f}%" if chunk_k else "—"
         tr_col = f"{sum(chunk_t) / len(chunk_t) * 100:.1f}%" if chunk_t else "—"
+        # 【2026-09-28】原生协议两列：invalid = 有 <tool_call> 但形态不认识/调用后
+        # 还跟内容；ctx满 = observation 放不下预算而终局。两者都是"终局无 boxed"
+        # 的可归因入口，且与"啰嗦跑飞"在 acc/code 两列里完全同形——不单列就分不开。
+        inv_col = f"{sum(chunk_i) / len(chunk_i) * 100:.1f}%" if chunk_i else "—"
+        ctx_col = f"{sum(chunk_x) / len(chunk_x) * 100:.1f}%" if chunk_x else "—"
         # 末轮浪费代码率：与 trunc 互补，两者相加≈"没产出 boxed"的可归因部分
         wst_col = (f"{sum(1 for x in chunk_w if x > 0) / len(chunk_w) * 100:.1f}%"
                    if chunk_w else "—")
@@ -720,7 +791,9 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         # >0 表示窗口内有样本吃到比推送周期更旧的策略（off-policy）；无 gen_version
         # 的旧 record 显示 "—"。均值反映"典型吃多旧"，最大反映"最坏吃多旧"。
         if stales and i < len(stales):
-            _ch_s = stales[i:j]
+            # 窗口内剔除丢弃组占位（None）：它们的 micro-step 无定义，混进来会把
+            # 均值拉向"看起来更旧"（2026-09-28 伪影修复，见读取处注释）
+            _ch_s = [v for v in stales[i:j] if v is not None]
             stal_col = f"{sum(_ch_s) / len(_ch_s):.1f}（max {max(_ch_s)}）" if _ch_s else "—"
         else:
             stal_col = "—"
@@ -754,8 +827,39 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
         out.append(f"| {i}~{j} | {i // 8}~{j // 8} "
                    f"| {_a_rate * 100:.1f}% "
                    f"| {_f_rate * 100:.1f}% | {cond_col} | {code_col} "
-                   f"| {ok_col} | {tr_col} | {wst_col} | {len_col} | {stal_col} "
+                   f"| {ok_col} | {tr_col} | {inv_col} | {ctx_col} | {wst_col} "
+                   f"| {len_col} | {stal_col} "
                    f"| {ph_col} | {sess_col} | {_bl} |")
+    # 【2026-09-28 分族统计】上表的每一列都是 ok+dropped **混合**的（丢弃组结构性
+    # 全错，会把 ok 组读数一路拖低）。分族是唯一能读出"模型到底学得怎么样"的口径，
+    # 也是交接文档 §3 头号判据（ok 组 acc 53.8% vs 丢弃组 2.7%）的自动化落地。
+    # 只在真有 dropped 族时输出，旧 record（丢弃组不落盘）表体逐位不变。
+    if fams and "dropped" in fams:
+        _idx_ok = [k for k, fm in enumerate(fams) if fm == "ok"]
+        _idx_dr = [k for k, fm in enumerate(fams) if fm == "dropped"]
+        out.append("")
+        out.append("== 分族统计（ok=已上传训练 / dropped=零方差丢弃；混读会把 ok 组读数拖低）==")
+        out.append("| 族 | 条数 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | invalid率 | ctx满率 |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for _nm, _ix in (("ok", _idx_ok), ("dropped", _idx_dr)):
+            if not _ix:
+                continue
+            _f = lambda _lst: (sum(_lst[k] for k in _ix) / len(_ix) * 100)
+            _a = _f(accs); _fm = _f(fmts)
+            _cond = f"{_a / _fm * 100:.1f}%" if _fm > 0 else "—"
+            out.append(f"| {_nm} | {len(_ix)} | {len(_ix) / 8:.0f} | {_a:.1f}% "
+                       f"| {_fm:.1f}% | {_cond} | {_f(codes):.1f}% | {_f(oks):.1f}% "
+                       f"| {_f(trs):.1f}% | {_f(invs):.1f}% | {_f(ctxfs):.1f}% |")
+        # 丢弃率（组口径）：ok 组数 / 总组数。overlong 整组不落盘（幸存者偏差），
+        # 故此值 = "零方差丢弃占已落盘组"的比例，不是全部丢弃率（真值看生成端日志
+        # 的 [rollout] 采样统计行）。
+        _n_tot = len(_idx_ok) + len(_idx_dr)
+        if _n_tot:
+            out.append("")
+            out.append(f"> 零方差丢弃占已落盘组 **{len(_idx_dr) / _n_tot * 100:.0f}%**"
+                       f"（{len(_idx_dr)}/{_n_tot} 组）——注意 overlong 整组**不落盘**，"
+                       f"故这不是全部丢弃率；含超长的真值看生成端 `[rollout] 采样统计` 行。"
+                       f"ok 组数 ≈ 训练 micro-step 数，可与日志 step 数交叉核对。")
     if sess_lines:
         out.append("")
         out.append(f"== 会话拆分（新协议=gen_version 回退；旧协议=>{SESS_GAP_S:.0f}s 间隔）==")

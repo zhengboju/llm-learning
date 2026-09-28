@@ -325,6 +325,7 @@ def test_eval_stats_and_signature():
     以及 run 偏离签名：让"这轮和参考差了哪几维"成为可 grep 的事实而非考古结论。"""
     import json as _json
     import os
+    import re as _re
     import tempfile
 
     from rlab.analysis import (ci95, diff_ci95, mcnemar_exact, paired_counts,
@@ -600,6 +601,96 @@ def test_eval_stats_and_signature():
     check("staleness 列存在且数值正确（gv=0 首条=0；gv=32 超前=-8）",
           "staleness" in _rtbl_st and "0.0（max 0）" in _rtbl_st
           and "-8.0（max -8）" in _rtbl_st)
+
+    # 【2026-09-28 H】分族统计 + invalid/ctx 两列 + staleness 伪影修复
+    # 背景（native_p3 真机）：2026-09-23 起 uniform（零方差丢弃）组也落盘，于是
+    # ①record 的 acc/fmt 变成"ok 组 + 丢弃组"两个分布的混合——丢弃组结构性全错，
+    # 会把 ok 组读数一路拖低，混读得出"模型学不会"的错误结论；
+    # ②staleness 旧公式用 `len(accs)`（全部已读样本）当 micro-step 基准，丢弃组
+    # 不占 train step 却累加 → 基准虚高 1/(1−丢弃率) 倍。native_p3 实锤：公式给
+    # floor(7648/8/4)−floor(296/4)=239−74=165，而训练只推进 74 个 opt-step。
+    # ③invalid_final/ctx_full 自 2026-09-25 就落盘，summarize_record 一直没读 →
+    # 交接文档头号判据（invalid ~60%）在表上完全隐形。
+    print("[G2] 分族统计 / invalid列 / staleness 伪影（2026-09-28）")
+    from rlab.analysis import record_family_of
+    check("record_family_of：q_status=ok → ok",
+          record_family_of({"q_status": "ok"}) == "ok")
+    check("record_family_of：q_status=uniform → dropped",
+          record_family_of({"q_status": "uniform"}) == "dropped")
+    check("record_family_of：无 q_status（旧 record，丢弃不落盘）→ ok（逐位同旧）",
+          record_family_of({}) == "ok"
+          and record_family_of({"acc": [1.0]}) == "ok")
+    _rec_fam = os.path.join(_dir, "record_family.jsonl")
+    with open(_rec_fam, "w", encoding="utf-8") as f:
+        # 24 组 ok + 48 组 dropped（丢弃率 67%，与 native_p3 同量级）。
+        # gen_version 语义 = 最近一次权重推送对应的 train micro-step（每 8 步推一次），
+        # 故 gv = (ok序号//8)*8 —— ok 组序号即 micro-step 基准。真实文件里 ok 组
+        # 数 ≈ train step 数（native_p3: ok≈296 组、gv 末尾=296）。
+        _ok_n, _dr_n = 24, 48
+        _ok_seen, _dr_seen = 0, 0
+        for _i in range(_ok_n + _dr_n):
+            _is_ok = (_i % 3 == 0 and _ok_seen < _ok_n) or _dr_seen >= _dr_n
+            if _is_ok:
+                _gv = (_ok_seen // 8) * 8
+                _ok_seen += 1
+            else:
+                _gv = (_ok_seen // 8) * 8
+                _dr_seen += 1
+            f.write(_json.dumps({
+                "t": 1000.0 + _i, "algo": "retool_math",
+                "acc": ([1.0] * 6 + [0.0] * 2) if _is_ok else [0.0] * 8,
+                "fmt": [1.0] * 8 if _is_ok else [0.0] * 8,
+                "clen": [2000] * 8, "code_used": [1] * 8,
+                "code_ok": [1] * 8 if _is_ok else [0] * 8,
+                "trunc_final": [0] * 8 if _is_ok else [1] * 8,
+                "invalid_final": [0] * 8 if _is_ok else [1] * 8,
+                "ctx_full": [0] * 8,
+                "code_wasted": [0] * 8 if _is_ok else [1] * 8,
+                "q_status": "ok" if _is_ok else "uniform",
+                "gen_version": _gv, "phase": "cold" if _is_ok else "dropped",
+            }, ensure_ascii=False) + "\n")
+    _rtbl_fam = summarize_record(_rec_fam, window=160)
+    check("分族统计出表（ok / dropped 两行）",
+          "分族统计" in _rtbl_fam and "| ok |" in _rtbl_fam
+          and "| dropped |" in _rtbl_fam)
+    check("ok 族读数不被丢弃组拖低（ok 族 acc=75.0% / fmt=100.0%）",
+          "| ok | 192 | 24 | 75.0% | 100.0% | 75.0%" in _rtbl_fam)
+    check("dropped 族读数如实（acc=0% / fmt=0% / trunc=100% / invalid=100%）",
+          "| dropped | 384 | 48 | 0.0% | 0.0% | — |" in _rtbl_fam)
+    check("窗口表新增 invalid率 / ctx满率 两列",
+          "invalid率" in _rtbl_fam and "ctx满率" in _rtbl_fam)
+    check("零方差丢弃占比显式给出，且声明 overlong 不落盘（不是全部丢弃率）",
+          "零方差丢弃占已落盘组 **67%**" in _rtbl_fam
+          and "不落盘" in _rtbl_fam and "采样统计" in _rtbl_fam)
+    check("会话行给 ok 族单独读数（混合口径会误导）",
+          "｜ok族(192条): acc=75.0% fmt=100.0% 条件精度=75.0%" in _rtbl_fam)
+    # 【staleness 伪影的性质断言】修复的核心不是"某个具体数值"，而是
+    # **丢弃组不得抬高 staleness**。旧公式用 len(accs)（ok+dropped）当 micro-step
+    # 基准：本 fixture 的 48 组丢弃相当于把基准虚高 3 倍（24→72 组）→ 旧公式会把
+    # 末尾窗口报成约 (72*8/8/4)−(16/4)=18−4=14 的"落后 14 个 opt-step"，
+    # 而真实落后恒 ≤1（推送周期 8 步/micro-step，4 micro=1 opt）。
+    # native_p3 真机即此形态：旧公式报 max 165，而训练总共只推进 74 个 opt-step。
+    # 表列序：样本窗口|≈组|acc率|fmt率|条件精度|code率|code_ok率|trunc率|invalid率|
+    #         ctx满率|末轮废码率|avg_clen|staleness|阶段|会话|评测 → staleness = 下标 12
+    _st_vals = []
+    for _ln in _rtbl_fam.splitlines():
+        if not _ln.startswith("| ") or "staleness" in _ln:
+            continue
+        _cells = [c.strip() for c in _ln.strip("|").split("|")]
+        if len(_cells) < 16:
+            continue
+        _m = _re.match(r"(-?\d+(?:\.\d+)?)", _cells[12])
+        if _m:
+            _st_vals.append(float(_m.group(1)))
+    check(f"staleness 修复后窗口值有界（丢弃组不抬高基准；≤1 opt-step，实测 {_st_vals}）",
+          bool(_st_vals) and max(_st_vals) <= 1.0)
+    # 反证：同一份文件按旧口径（基准数全部样本）算出的大值是"不可能"的
+    _old_last = ((_ok_n + _dr_n) * 8 // 8 // 4) - (((_ok_n - 1) // 8 * 8) // 4)
+    check(f"反证：旧口径在本 fixture 上会报 ≥10 opt-step 的伪影（旧口径末窗≈{_old_last}）",
+          _old_last >= 10)
+    _no_fam = summarize_record(_rec_st, window=8)
+    check("无 dropped 族时不输出分族表（旧 record 表体逐位不变）",
+          "分族统计" not in _no_fam)
 
 
 if __name__ == "__main__":
