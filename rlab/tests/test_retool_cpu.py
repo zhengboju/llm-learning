@@ -4672,6 +4672,334 @@ def test_health_code_collapse():
 #      （含它自己 → 递归），于是别的测试一旦抛异常，就伪装成这个测试挂掉：
 #      test_attempt_shaping_and_err_tier 的 TypeError 正是这样显示成两个失败的。
 # 现在移到模块级并加 guard：pytest 只收集函数（不执行本块），直接跑才逐个执行。
+def test_token_budget_mode():
+    """【2026-09-29 token 预算档】轮数上限 → token 预算 + 模型自主终止。
+
+    本组锁死新档的四条行为差异（以及"关闭时逐位同旧"这个前提）：
+
+      ① **预算判据取代末轮判据**：旧档末轮写调用 → code_wasted；新档只要剩余预算
+         够（obs + answer_reserve 都装得下）就执行——"末轮"这个人造截止消失。
+      ② **切断改为续写**：finish_reason="length" 且累积文本尚未构成完整调用时，
+         同一轮继续生成并合成**一个** assistant 段（旧档这里 trunc_final=1 且剩余
+         轮数整段作废——A/B 桶高发的结构性原因）。
+      ③ **已完成调用不续写**：若模型写完了调用块才撞上限，续写会把后续文字接在
+         调用块后面 → parse_assistant 判 invalid，把一个合法调用毁掉。故续写条件
+         是"累积文本尚不构成完整调用"。
+      ④ **回包注入剩余额度**：把"还剩多少"写进工具回包（模型此前看不到这个量）。
+
+    纯函数部分（group_eff_bonus / reward_code_attempt once / 新不变量）单测；
+    循环部分用 FakeGen 端到端断言段结构与 code_stats。
+    """
+    print("[AO] token 预算档：预算判据 / 续写 / 已完成调用不续写 / 预算提示")
+    import torch as _t
+    from rlab.config import get_config, validate_retool_budget
+    from rlab.reward import (group_eff_bonus, reward_code_attempt, reward_code,
+                             overlong_ref_tokens)
+    from rlab.train import run_signature
+    from rlab.rollout import multi_turn_rollout_group
+
+    # ---------- 1. group_eff_bonus（效率激励）纯函数 ----------
+    # 通过轨迹 [1000, 2000, 3000]，另两条未通过
+    R = [1.0, 1.0, 1.0, -1.0, -1.0]
+    L = [1000, 2000, 3000, 4000, 5000]
+    B = group_eff_bonus(R, L, weight=0.2)
+    check("效率项：w=0 → 逐位同旧", group_eff_bonus(R, L, weight=0.0) == R)
+    # 通过者中位数 = 2000；最短的 1000 → 0.2×(2000/1000−1) = +0.2
+    check("效率项：最短的通过轨迹拿最高分（+0.2）", abs(B[0] - 1.2) < 1e-9)
+    check("效率项：等于 ref 的通过轨迹不变", abs(B[1] - 1.0) < 1e-9)
+    check("效率项：比 ref 长的通过轨迹不变（只奖更短，不罚更长）",
+          abs(B[2] - 1.0) < 1e-9)
+    check("效率项：未通过轨迹分文不动（长度问题归 len_penalty 管）",
+          abs(B[3] - (-1.0)) < 1e-9 and abs(B[4] - (-1.0)) < 1e-9)
+    # cap：10 token 蒙对 → ref/len-1 = 199，必须被 cap 截住，否则淹没 ±1 主信号
+    _cap = group_eff_bonus([1.0, 1.0], [10, 1000], weight=0.2, cap=1.0)
+    check("效率项：cap 截住短答案套利（ref/len−1 不发散）",
+          abs(_cap[0] - 1.2) < 1e-9)
+    check("效率项：组内只有 1 条通过 → 相对无定义，返回原值",
+          group_eff_bonus([1.0, -1.0], [10, 1000], weight=0.2) == [1.0, -1.0])
+    check("效率项：组内无通过轨迹 → 返回原值",
+          group_eff_bonus([-1.0, -1.0], [10, 1000], weight=0.2) == [-1.0, -1.0])
+    # 【关键性质】组内**全部**变短不改变任何分量（无捷径）：相对化后平移无效
+    _a = group_eff_bonus([1.0, 1.0, -1.0], [100, 200, 300], weight=0.2)
+    _b = group_eff_bonus([1.0, 1.0, -1.0], [10, 20, 30], weight=0.2)
+    check("效率项：全组等比变短 → 完全相同（相对化，无'集体缩短'捷径）",
+          all(abs(x - y) < 1e-9 for x, y in zip(_a, _b)))
+
+    # ---------- 2. 反激励修正（once） ----------
+    check("once=False 旧口径：线性累加（答对+4次=+0.4）",
+          abs(reward_code_attempt(4, 0.1, max_rounds=8) - 0.4) < 1e-9)
+    check("once=True：写过就给固定分，不随次数增长（4 次 = 1 次）",
+          abs(reward_code_attempt(4, 0.1, max_rounds=8, once=True)
+              - reward_code_attempt(1, 0.1, max_rounds=8, once=True)) < 1e-9)
+    check("once=True：code_used=0 → 仍是 0（没写不给分）",
+          reward_code_attempt(0, 0.1, once=True) == 0.0)
+    check("reward_code once=True：成功多次 = 成功一次",
+          abs(reward_code(3, 0.05, once=True) - reward_code(1, 0.05, once=True)) < 1e-9)
+
+    # ---------- 3. token 预算档不变量 + 签名 ----------
+    _base = dict(get_config("retool_math", use_wandb=False, tool_protocol="native"))
+    r = validate_retool_budget({**_base, "max_traj_tokens": 8192,
+                                "max_context_tokens": 9216, "max_prompt_length": 1024})
+    check("token 档不变量：8192 + 1024 = 9216 ≤ 9216 通过", r >= 0)
+    try:
+        validate_retool_budget({**_base, "max_traj_tokens": 8192,
+                                "max_context_tokens": 8192, "max_prompt_length": 1024})
+        check("token 档不变量：8192 + 1024 > 8192 必须 FAIL", False)
+    except ValueError as e:
+        check("token 档不变量：8192 + 1024 > 8192 必须 FAIL（报 token 档口径）",
+              "token 预算不自洽" in str(e) and "9216" in str(e))
+    _tc = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                     max_traj_tokens=8192, max_context_tokens=9216,
+                     max_prompt_length=1024, len_eff_w=0.1, answer_reserve=1024,
+                     budget_hint=True, code_shaping_once=True, overlong_ref=4096)
+    _sig = run_signature(_tc)
+    check("签名带 token 档五件套（mtj/ar/lew/olr/cs/bh）",
+          "-mtj8192-ar1024" in _sig and "-lew0.1" in _sig and "-olr4096" in _sig
+          and "-cs1" in _sig and "-bh1" in _sig)
+    check("token 档下 overlong_ref 显式覆盖生效（死开关修复）",
+          overlong_ref_tokens(_tc) == 4096)
+    _tc2 = dict(_tc); _tc2["overlong_ref"] = 0
+    check("token 档下未覆盖时 ref = max_traj_tokens（不再是乘积上限）",
+          overlong_ref_tokens(_tc2) == 8192)
+    # 历史档签名逐字不变（前缀兼容是 ckpt 护栏的前提）
+    _old = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                      native_stop_at_call=True, max_rounds=5, round_gen_tokens=2048,
+                      max_context_tokens=14336, code_attempt_w=0.05, code_w=0.05,
+                      len_penalty_w=0.1)
+    check("关闭新档 → 签名里一个新标记都没有（历史签名逐字不变）",
+          not any(x in run_signature(_old)
+                  for x in ("-mtj", "-lew", "-olr", "-cs1", "-bh1")))
+    # token 档只在原生协议下实现（fail-fast 而非静默降级）
+    _fn = get_config("retool_math", use_wandb=False, max_traj_tokens=4096,
+                     max_context_tokens=5120)
+    _fn["max_traj_tokens"] = 4096
+
+    class _NoGen:
+        def generate(self, prompts, sps, use_tqdm=False):
+            raise AssertionError("不该走到生成")
+
+    try:
+        multi_turn_rollout_group(_NoGen(), None, None, ["P"], _fn)
+        check("围栏档 + max_traj_tokens → ValueError（不静默降级）", False)
+    except ValueError as e:
+        check("围栏档 + max_traj_tokens → ValueError（不静默降级）",
+              "只在原生协议下实现" in str(e))
+
+    # ---------- 4. FakeGen：预算判据 / 续写 / 已完成调用不续写 / budget_hint ----------
+    from rlab.tests.test_native_protocol import (MockTok, _json_form, _SPStub,
+                                                 _TOOL_OPEN, _TOOL_CLOSE)
+    t = MockTok()
+    from rlab.rollout import prompt_messages_for
+    from rlab.protocol import NATIVE_BAD_WORDS
+
+    def fake_run(code, timeout=None, mem_mb=None, max_chars=None):
+        return {"ok": True, "display": "42", "error_type": None}
+
+    class _C:
+        def __init__(self, text, fr="stop"):
+            self.text = text
+            self.token_ids = t.encode(text)
+            self.finish_reason = fr
+
+    class _O:
+        def __init__(self, text, fr="stop"):
+            self.outputs = [_C(text, fr)]
+
+    class FakeGen:
+        """回放 (text, finish_reason) 二元组；记录每轮收到的 prompt_token_ids。"""
+        def __init__(self, rounds):
+            self.rounds, self.r, self.seen = rounds, 0, []
+
+        def generate(self, prompts, sps, use_tqdm=False):
+            self.seen.append([list(p["prompt_token_ids"]) for p in prompts])
+            # 回放表用完则重复最后一轮（续写/长预算场景的轮数由被测逻辑决定，
+            # 事先数不准则让测试脆化；这里只关心"哪一轮收到几条"）
+            texts = self.rounds[min(self.r, len(self.rounds) - 1)]
+            self.r += 1
+            assert len(texts) == len(prompts), \
+                f"第{self.r}轮：回放 {len(texts)} 条但收到 {len(prompts)} 个 prompt"
+            return [_O(*x) if isinstance(x, tuple) else _O(x) for x in texts]
+
+    def _T(text, fr="stop"):
+        """回放条目：元组 = (text, finish_reason)；字符串 = 自然停。"""
+        return (text, fr)
+
+    def mk_cfg(**kw):
+        c = {"max_rounds": 5, "max_context_tokens": 8192, "round_gen_tokens": 64,
+             "sandbox_timeout": 1.0, "sandbox_mem_mb": 64,
+             "tool_result_max_chars": 200, "tool_protocol": "native",
+             "native_tool_style": "auto", "sandbox_workers": 1,
+             "system_prompt": "SYS"}
+        c.update(kw)
+        return c
+
+    # (a) 旧档（无 max_traj_tokens）：末轮写调用 → code_wasted（回归锁）
+    # max_rounds=3 让"第 3 轮"就是末轮（mk_cfg 默认 5 会让它继续执行到第 4 轮）
+    _cfg_old = mk_cfg(max_rounds=3)
+    _call = "think\n" + _json_form("print(6*7)")
+    fg = FakeGen([[_call, _call, _call], [_call, _call, _call],
+                  [_call, _call, _call]])
+    _segs, _full, _cs = multi_turn_rollout_group(
+        fg, [_SPStub(list(NATIVE_BAD_WORDS))] * 3, t, ["P"] * 3, _cfg_old,
+        code_runner=fake_run, prompts_messages=prompt_messages_for(
+            [{"Q": "Q1"}], _cfg_old) * 3)
+    check("旧档回归：末轮（第3轮）调用不执行 → code_wasted=1",
+          _cs[0]["code_wasted"] == 1 and _cs[0]["code_used"] == 2)
+
+    # (b) token 档：同样的三次调用，但预算充足 → 全部执行，code_wasted=0
+    _cfg_tok = mk_cfg(max_traj_tokens=100000, answer_reserve=10, budget_hint=False)
+    fg2 = FakeGen([[_call, _call, _call], [_call, _call, _call],
+                   [_call, _call, _call],
+                   ["ok \\boxed{42}", "ok \\boxed{42}", "ok \\boxed{42}"]])
+    _segs2, _f2, _cs2 = multi_turn_rollout_group(
+        fg2, [_SPStub(list(NATIVE_BAD_WORDS))] * 3, t, ["P"] * 3, _cfg_tok,
+        code_runner=fake_run, prompts_messages=prompt_messages_for(
+            [{"Q": "Q1"}], _cfg_tok) * 3)
+    check("token 档：预算充足时第 3 次调用照常执行（『末轮截止』消失）",
+          _cs2[0]["code_used"] == 3 and _cs2[0]["code_wasted"] == 0)
+    check("token 档：末轮答完 → trunc_final=0（预算没用完）",
+          all(c["trunc_final"] == 0 for c in _cs2))
+    check("token 档：段序列 = [a,tool]×3 + [a]（每次调用都回填）",
+          [s["kind"] for s in _segs2[0]]
+          == ["assistant", "tool"] * 3 + ["assistant"])
+
+    # (c) 续写：第 1 轮被切断（finish_reason="length"）→ 同一轮继续写，
+    #     合成**一个** assistant 段。这正是旧档 A/B 桶（散文/调用被切在半句）的
+    #     活路：旧档这里 trunc_final=1 且剩余轮数整段作废。
+    _cfg_c = mk_cfg(max_traj_tokens=100000, answer_reserve=10)
+    _cut1 = "I need to think about this problem very carefully and then"
+    _cut2 = " continue thinking and finally give the answer \\boxed{42}"
+    fg3 = FakeGen([[_T(_cut1, "length")] * 3, [_cut2] * 3])
+    _segs3, _f3, _cs3 = multi_turn_rollout_group(
+        fg3, [_SPStub(list(NATIVE_BAD_WORDS))] * 3, t, ["P"] * 3, _cfg_c,
+        code_runner=fake_run, prompts_messages=prompt_messages_for(
+            [{"Q": "Q1"}], _cfg_c) * 3)
+    check("续写：第 2 轮仍收到 3 条（切断不是终局，样本未被淘汰）",
+          len(fg3.seen) >= 2 and len(fg3.seen[1]) == 3)
+    check("续写：两段合成为**一个** assistant 段（不是两个）",
+          [s["kind"] for s in _segs3[0]] == ["assistant"])
+    check("续写：ids 逐 token 拼接（= 两轮采样 token 之和）",
+          _segs3[0][0]["ids"] == t.encode(_cut1) + t.encode(_cut2))
+    check("续写：合并文本可用于打分（boxed 被看见）",
+          "\\boxed{42}" in _segs3[0][0]["text"])
+    check("续写后预算没用完 → trunc_final=0（旧档这里是 1）",
+          all(c["trunc_final"] == 0 for c in _cs3))
+
+    # (d) 已完成调用不续写：调用块写完整了才撞上限 → 不续写、正常解析为 tool
+    #     （若续写，后续文字会接在调用块后 → parse_assistant 判 invalid，
+    #       一个合法调用被续写毁掉——这是续写逻辑最危险的边界）
+    _done_call = "think\n" + _json_form("print(6*7)")
+    fg4 = FakeGen([[_T(_done_call, "length")] * 3, ["\\boxed{42}"] * 3])
+    _segs4, _f4, _cs4 = multi_turn_rollout_group(
+        fg4, [_SPStub(list(NATIVE_BAD_WORDS))] * 3, t, ["P"] * 3,
+        mk_cfg(max_traj_tokens=100000, answer_reserve=10), code_runner=fake_run,
+        prompts_messages=prompt_messages_for([{"Q": "Q1"}], _cfg_c) * 3)
+    check("已完成调用 + length：不续写（否则会被续写文本毁成 invalid）",
+          _cs4[0]["invalid_final"] == 0 and _cs4[0]["code_used"] >= 1)
+
+    # (e) budget_hint：回包里出现剩余额度行，且不含就完全不出现
+    def _gen_with_captured_obs(cfg):
+        seen_obs = []
+
+        def cap_run(code, timeout=None, mem_mb=None, max_chars=None):
+            return {"ok": True, "display": "42", "error_type": None}
+        _c = mk_cfg(**cfg)
+        _fg = FakeGen([[_call, _call], ["\\boxed{42}", "\\boxed{42}"]])
+        multi_turn_rollout_group(
+            _fg, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _c,
+            code_runner=cap_run,
+            prompts_messages=prompt_messages_for([{"Q": "Q1"}], _c) * 2)
+        # 工具段的 decode 文本即回包内容
+        return _fg
+
+    # hint 开关直接影响 tool 段文本：直接比较同一轨迹在开/关下的 tool 段
+    def _tool_text(hint):
+        _c = mk_cfg(max_traj_tokens=100000, answer_reserve=10, budget_hint=hint)
+        _fg = FakeGen([[_call, _call], ["\\boxed{42}", "\\boxed{42}"]])
+        _sg, _ff, _cc = multi_turn_rollout_group(
+            _fg, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _c,
+            code_runner=fake_run,
+            prompts_messages=prompt_messages_for([{"Q": "Q1"}], _c) * 2)
+        return "".join(s["text"] for s in _sg[0] if s["kind"] == "tool")
+
+    check("budget_hint=True：工具回包带剩余额度行（模型能看见预算）",
+          "[budget]" in _tool_text(True) and "tokens left" in _tool_text(True))
+    check("budget_hint=False：回包不含额度行（默认关，逐位同旧）",
+          "[budget]" not in _tool_text(False))
+
+    # (f) 预算耗尽：最后一次生成被切断 → 缓冲必须落段（否则 token 凭空丢失）
+    #     回放一律 finish_reason="length"（持续续写直到 8 token 预算耗尽）
+    _cfg_tight = mk_cfg(max_traj_tokens=8, answer_reserve=1, budget_hint=False)
+    fg5 = FakeGen([[_T("aaaa", "length")] * 2, [_T("bbbb", "length")] * 2,
+                   [_T("cccc", "length")] * 2, [_T("dddd", "length")] * 2])
+    _segs5, _f5, _cs5 = multi_turn_rollout_group(
+        fg5, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _cfg_tight,
+        code_runner=fake_run, prompts_messages=prompt_messages_for(
+            [{"Q": "Q1"}], _cfg_tight) * 2)
+    check("预算耗尽 → trunc_final=1（token 档下这是唯一的截断口径）",
+          all(c["trunc_final"] == 1 for c in _cs5))
+    check("预算耗尽时续写缓冲已落段（模型采样过的 token 不丢）",
+          any(s["kind"] == "assistant" for s in _segs5[0]))
+    check("预算耗尽 → 每轮 max_tokens 被夹到剩余预算（不越界）",
+          len(_segs5[0][0]["ids"]) <= 8)
+
+    # (g) 循环内每轮夹 max_tokens（用桩记录被改写的值）
+    _sp_stub = _SPStub(list(NATIVE_BAD_WORDS))
+    _sp_stub.max_tokens = 64
+    _c_span = mk_cfg(max_traj_tokens=10, round_gen_tokens=64, answer_reserve=1)
+    _fg6 = FakeGen([[_T("aa", "length")] * 2, [_T("bb", "length")] * 2,
+                    [_T("cc", "length")] * 2])
+    multi_turn_rollout_group(
+        _fg6, [_sp_stub, _sp_stub], t, ["P"] * 2, _c_span, code_runner=fake_run,
+        prompts_messages=prompt_messages_for([{"Q": "Q1"}], _c_span) * 2)
+    check("每轮 max_tokens ≤ round_gen_tokens 且 ≤ 剩余预算（不越过 traj 预算）",
+          _sp_stub.max_tokens <= 10)
+
+    # (h) 预存在 bug 回归锁（HEAD 即在，非本次改动引入）：整组某轮无人调用工具时，
+    #     旧版 `active = next_active` 在 `if exec_jobs:` 块内 → active 不更新 →
+    #     已终局的样本被反复重新生成到 max_rounds（段数 = max_rounds，打分文本是
+    #     答案的重复拼接）。这条断言在修复前必失败。
+    _cfg_fix = mk_cfg(max_rounds=4)
+    _ans = "the answer is \\boxed{42}"
+    fg7 = FakeGen([[_ans] * 2])
+    _sg7, _f7, _cs7 = multi_turn_rollout_group(
+        fg7, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _cfg_fix,
+        code_runner=fake_run,
+        prompts_messages=prompt_messages_for([{"Q": "Q1"}], _cfg_fix) * 2)
+    check("终局样本不再被重复生成（段数=1，不是 max_rounds=4）",
+          [len(s) for s in _sg7] == [1, 1])
+    check("终局后不再调用生成端（只 1 轮请求，旧版 4 轮）", len(fg7.seen) == 1)
+
+    # ---------- 5. 效率项接线：rollout 真的要吃它 ----------
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    tr = open(os.path.join(root, "rlab", "train.py"), encoding="utf-8").read()
+    check("retool_score_flat 在 advantage 之前应用效率项（相对项才进得去）",
+          "_eff_w > 0.0" in ro and "group_eff_bonus" in ro
+          and ro.index("group_eff_bonus") < ro.index("excl = [1 if (tf or wf)"))
+    check("completion_lens 的取用条件覆盖效率项（否则静默无效）",
+          "_lp_w > 0.0 or _eff_w0 > 0.0" in ro)
+    check("code_shaping_once 贯通到 reward 调用",
+          "code_shaping_once=cfg.get(\"code_shaping_once\"" in ro
+          or "code_shaping_once=" in ro)
+    check("CLI 有五个新开关", all(x in tr for x in
+          ('"--max_traj_tokens"', '"--answer_reserve"', '"--budget_hint"',
+           '"--len_eff_w"', '"--code_shaping_once"', '"--overlong_ref"')))
+    check("run_info 落 max_traj_tokens（eval 端能回读同档）",
+          '"max_traj_tokens": cfg.get("max_traj_tokens")' in tr)
+    # 【eval 端同档】终止结构是协议的一部分：不传这三键，eval 就会用"轮数档"的
+    # 终止结构去评一个 token 档训出来的 ckpt（轨迹/终止点/截断率全不同）。
+    _ev = open(os.path.join(root, "eval_vllm_one.py"), encoding="utf-8").read()
+    check("eval 把 token 档三键传进 mt_cfg（否则测的是另一套终止结构）",
+          '"max_traj_tokens": _mtj_eval' in _ev
+          and '"answer_reserve": int(_rcfg.get("answer_reserve", 0) or 0)' in _ev
+          and '"budget_hint": bool(_rcfg.get("budget_hint"))' in _ev)
+    check("eval 的剔题预算按 token 档取（max_traj_tokens，不是轮数乘积）",
+          "_mtj_eval + 512 if (is_retool_family and _mtj_eval > 0)" in _ev)
+    check("eval 打印预算档（自证采的是哪套终止结构）",
+          "预算档={_budget_src}" in _ev)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -4724,6 +5052,7 @@ if __name__ == "__main__":
     test_overlong_filter()
     test_attempt_shaping_and_err_tier()
     test_health_code_collapse()
+    test_token_budget_mode()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

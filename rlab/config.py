@@ -324,6 +324,32 @@ BASE = dict(
     # 合法轨迹再也不会被丢，shaping 成为**唯一**的长度控制 → 打开它。
     overlong_shaping=False,
     overlong_buffer=64,      # DAPO 软悬崖缓冲区宽度
+    # 【2026-09-29 长度控制修复·死开关】overlong 参考系的**显式覆盖**
+    # （0 = 用 overlong_ref_tokens() 的自动值 = max_rounds×round_gen_tokens）。
+    #
+    # 【为什么必须能覆盖】自动值在"预算给满"的档下**必然够不着**：native_p3 实测
+    # overlong_ref=10240（触发线 9984）而 avg_clen≈2811 —— 差 7000 token，长度压力
+    # 实际为零（整个 reward 里没有任何一项作用于"啰嗦但不截断"的轨迹）。
+    # 修法不是改公式（公式在预算自洽时是对的上限），而是把参考系从**物理上限**
+    # 改成**目标长度**：>0 时直接作为起坡点，让 shaping 对啰嗦真正可达。
+    # 只在 overlong_shaping=True 时有行为意义；进签名（改 reward 值域）。
+    overlong_ref=0,
+    # 【2026-09-29 效率激励·补正向】通过轨迹内部的**组内相对**长度奖励权重
+    # （0 = 关闭 = 旧行为逐位相同）。
+    #
+    # 【为什么需要】旧 reward 对"最短答对"零激励、且方向相反：len_penalty 只罚
+    # **未通过**轨迹（reward.py:265-269），overlong 在预算档够不着，而
+    # code_attempt_w/code_w 随调用次数**单调递增** → 实测答对时 0 次调用 +1.00
+    # < 4 次调用 +1.40 —— 梯度指向"多烧 token"。本项补齐正向：组内**通过**轨迹
+    # 按长度中位数起坡，短于中位数的拿正分。
+    # **必须组内相对**：绝对长度惩罚是 run2"表面收尾"事故的根因
+    # （模型学会草草收尾骗过惩罚），见 group_length_penalty 的 docstring。
+    len_eff_w=0.0,
+    # 【2026-09-29 反激励修正】code_attempt_w/code_w 由"每次调用累加"改"一次性"
+    # （用过就给固定小分，不随调用次数增长）。保留对冲"代码压灭"的作用
+    # （p6 实测 code% 50→3），去掉"多调用多拿分"的方向性错误。
+    # False = 旧行为逐位相同（A/B 对照位）。
+    code_shaping_once=False,
     # 【2026-09-21 DAPO overlong filtering】截断样本（末段被轮长上限切断）从
     # advantage 和组统计中移除：组均值只算非截断、截断样本 adv=0。
     # DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
@@ -409,6 +435,25 @@ BASE = dict(
     # 保证是 final 答案轮——末轮代码执行结果无人消费，2026-09-09 审查修复：
     # 旧版末轮执行 code_ok 还记分，模型却永远没机会读结果作答）。
     max_rounds=3,            # = 2 次代码-执行-续写 + 1 次 final 生成
+    # ---- 【2026-09-29 token 预算模式】轮数上限 → token 预算 + 模型自主终止 ----
+    # 0 = 关闭（缺省，历史档逐位不变）。>0 时三条语义同时切换（原生协议）：
+    #   ① 能否执行一次调用由**剩余 token 预算**判定，不再由"是不是末轮"判定
+    #      → code_wasted 不再由"轮数用完"制造（仍会在**预算真耗尽**时发生，
+    #      但那已是"确实没空间了"的真实信号，不是结构性的人为截止）；
+    #   ② 被单轮上限切断（finish_reason=length）**不再是终局**，续写同一轮
+    #      → A 桶（调用写到一半被切）与 B 桶（散文写到一半被切）有机会活到收尾；
+    #   ③ 每次工具回包追加一行剩余额度（budget_hint）→ 模型能"看见"预算，
+    #      C 桶（额度耗尽还在调用）从不可学的悬崖变成可学的判断。
+    # 【为什么轮数不是预算】实测 5 轮→6 轮在固定单轮额度下几乎无改变（丢弃率
+    # 45%→50%、末轮废码率 ~31%→~30% 持平），因为 answer/invalid 是**终局**，
+    # 剩余轮数被整段作废——轮数从来不是"可用预算"，只是循环次数。
+    # 预算不变量随之改为 max_traj_tokens + max_prompt_length ≤ max_context_tokens。
+    max_traj_tokens=0,
+    # 必须留在预算内、留给"最终作答"的 token 数：判定"这次调用还执行得起吗"。
+    # 执行一次调用要花掉 工具回包 + 之后一轮答案 两笔，两者都装得下才执行。
+    answer_reserve=0,
+    # True = 工具回包追加一行剩余 token 额度（只在 max_traj_tokens>0 时有意义）
+    budget_hint=False,
     # ---- 工具协议档位（docs/09-native-tool-protocol.md）----
     # "fence"（缺省）= 自造围栏 + [TOOL RESULT] 文本（p1–p11 逐位可复现）；
     # "native"       = Qwen 原生 <tool_call>（方案 A 主线，参考实现 +23.89pp 的形态）。
@@ -571,12 +616,38 @@ def validate_retool_budget(cfg: dict) -> int:
         return 0
     rounds = int(cfg.get("max_rounds", 1) or 1)
     per_round = int(cfg.get("round_gen_tokens", 0) or 0)
+    reserve = (max(0, rounds - 1)
+               * (int(cfg.get("tool_result_max_chars", 0) or 0) // 2 + 16))
+    # 【2026-09-29 token 预算模式】不变量换成"整条轨迹的 token 预算 + 最长 prompt
+    # ≤ 全轨迹保险丝"。此时 round_gen_tokens 退化成**单轮上限**（防一轮写飞），
+    # 不再参与"轮数 × 单轮"的乘积预算——乘积口径要求"每轮都写满"，而真实轨迹
+    # 远短于此（native_p3 实测 avg_clen 2811 vs 乘积 10240），那个乘积只是假想
+    # 上限，用它当预算既高估了需求也掩盖了"轮数不是预算"这一事实。
+    _mtj = int(cfg.get("max_traj_tokens", 0) or 0)
+    if _mtj > 0:
+        ctx_t = int(cfg.get("max_context_tokens", 0) or 0)
+        if ctx_t <= 0:
+            return 0
+        _plen_t = int(cfg.get("max_prompt_length", 0) or 0)
+        _need_t = _mtj + _plen_t
+        if _need_t > ctx_t:
+            raise ValueError(
+                f"[config] retool token 预算不自洽（max_traj_tokens>0 档）："
+                f"max_traj_tokens({_mtj}) + max_prompt_length({_plen_t})"
+                f" = {_need_t} > max_context_tokens({ctx_t})。\n"
+                f"  后果：合法用满预算的轨迹会被 retool_context_overlong 整组丢弃"
+                f"（2026-09-12 事故：丢弃率 90%、采样空转、训练端零产出）。\n"
+                f"  改法：max_context_tokens ≥ {_need_t}（= max_prompt_length + "
+                f"max_traj_tokens），或降 max_traj_tokens。\n"
+                f"  注意：token 预算档下 round_gen_tokens 只是**单轮上限**"
+                f"（当前 {per_round}），不参与本不变量。")
+        _check_concurrency_hint(cfg)
+        return reserve
     if per_round <= 0:
         return 0
     ctx = int(cfg.get("max_context_tokens", 0) or 0)
     if ctx <= 0:
         return 0
-    reserve = (rounds - 1) * (int(cfg.get("tool_result_max_chars", 0) or 0) // 2 + 16)
     need = rounds * per_round + int(cfg.get("max_prompt_length", 0) or 0) + reserve
     if need > ctx:
         per_round_max = (ctx - int(cfg.get("max_prompt_length", 0) or 0) - reserve) // rounds
@@ -588,20 +659,31 @@ def validate_retool_budget(cfg: dict) -> int:
             f"（2026-09-12 事故：丢弃率 90%、采样空转、训练端零产出）。\n"
             f"  改法（三选一）：round_gen_tokens ≤ {per_round_max}"
             f"（会加剧末段截断，trunc_final 上升）；或降 max_rounds；"
-            f"或抬高 max_context_tokens ≥ {need}（T 进入所有显存公式，需重算峰值）。")
-    # 【2026-09-28 并发契约提示·只在真偏离时报】并采题数调大而 sandbox_workers
-    # 没跟上时，多轮 rollout 的一轮里会有代码执行排队等线程——生成端刚从
-    # "vLLM 欠利用"换成"沙箱成新瓶颈"。
-    # 【为什么必须比对 preset 基线而不是直接比 并发>workers】preset 本身就是
-    # `gq=4 × num_pre_Q=8 = 32 > sandbox_workers=8`——那是**有意的**（不是每条
-    # 轨迹都写代码，单次沙箱 0.1~5s 远小于轮长）。直接比大小会让提示在 shipped
-    # preset 上每次都喊（实测一套测试刷 44 行），正好复现 health.retool_trunc
-    # 的教训：**检测器对已知基线叫狼来了，真信号就被"忽略习惯"淹掉**。
-    # 现在只在"用户把并采题数抬到 preset 之上、沙箱却仍停在 preset 及以下"时报，
-    # 即真正的"调大并发忘调沙箱"。
+            f"或抬高 max_context_tokens ≥ {need}（T 进入所有显存公式，需重算峰值）。\n"
+            f"  （或改用 token 预算档：--max_traj_tokens >0，不变量换成 "
+            f"max_traj_tokens + max_prompt_length ≤ max_context_tokens。）")
+    _check_concurrency_hint(cfg)
+    return reserve
+
+
+def _check_concurrency_hint(cfg: dict) -> None:
+    """并采题数调大而 sandbox_workers 没跟上时的提示（非致命，只在真偏离时报）。
+
+    【2026-09-28 并发契约提示】并采题数调大而 sandbox_workers 没跟上时，多轮
+    rollout 的一轮里会有代码执行排队等线程——生成端刚从"vLLM 欠利用"换成
+    "沙箱成新瓶颈"。
+    【为什么必须比对 preset 基线而不是直接比 并发>workers】preset 本身就是
+    `gq=4 × num_pre_Q=8 = 32 > sandbox_workers=8`——那是**有意的**（不是每条
+    轨迹都写代码，单次沙箱 0.1~5s 远小于轮长）。直接比大小会让提示在 shipped
+    preset 上每次都喊（实测一套测试刷 44 行），正好复现 health.retool_trunc
+    的教训：**检测器对已知基线叫狼来了，真信号就被"忽略习惯"淹掉**。
+    现在只在"用户把并采题数抬到 preset 之上、沙箱却仍停在 preset 及以下"时报，
+    即真正的"调大并发忘调沙箱"。
+    """
     _preset = ALGO_DEFAULTS.get(cfg.get("algo"), {}) or {}
     _gq = int(cfg.get("gen_questions_per_attempt", 1) or 1)
-    _gq0 = int(_preset.get("gen_questions_per_attempt", BASE.get("gen_questions_per_attempt", 1)) or 1)
+    _gq0 = int(_preset.get("gen_questions_per_attempt",
+                           BASE.get("gen_questions_per_attempt", 1)) or 1)
     _sw = int(cfg.get("sandbox_workers", 0) or 0)
     _sw0 = int(_preset.get("sandbox_workers", BASE.get("sandbox_workers", 0)) or 0)
     _conc = _gq * int(cfg.get("num_pre_Q", 1) or 1)
@@ -609,7 +691,6 @@ def validate_retool_budget(cfg: dict) -> int:
         print(f"[config][提示] 并采题数已从 {_gq0} 抬到 {_gq}（并发 {_conc} 条），"
               f"但 sandbox_workers 仍是 {_sw} → 有代码的轮次里沙箱执行会排队，"
               f"可能成为新瓶颈；若生成端吞吐仍不达标，把它抬到 ≥{_conc} 再测。")
-    return reserve
 
 
 def get_config(algo: str, **overrides) -> dict:

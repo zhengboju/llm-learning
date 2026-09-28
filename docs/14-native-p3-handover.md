@@ -225,6 +225,80 @@ python -m rlab.analysis --no-boxed-breakdown rlab_out/native_p3/record.jsonl
 
 ---
 
+## 4.6 token 预算档：轮数上限 → 整条轨迹 token 预算（2026-09-29）
+
+```bash
+--max_traj_tokens 8192 --answer_reserve 1024 --budget_hint \
+--max_context_tokens 9216 --max_prompt_length 1024 \
+--len_eff_w 0.1 --code_shaping_once --overlong_ref 4096
+```
+
+### 为什么改（4.5 的三条结论合起来指向同一个结论）
+
+4.5 表明"加轮数"这条路已封，但**没解释为什么**。真因在循环结构里：`next_active`
+只由 `exec_jobs` 填充，于是 `answer`（含散文被切）与 `invalid`（含调用被切）**都是终局**，
+剩余轮数被**整段作废**。轮数从来不是"可用预算"，只是循环次数——所以 5→6 轮平移边界而
+不改变任何倾向。
+
+### 三条语义切换（都只在 `max_traj_tokens>0` 且原生协议下生效）
+
+| # | 旧（轮数档） | 新（token 档） |
+|---|---|---|
+| ① | 能否执行调用 = `not is_final_round and code_used < max_rounds-1` | = 剩余预算装得下 `工具回包 + answer_reserve` |
+| ② | `finish_reason=="length"` → `trunc_final=1` 且**剩余轮数作废** | 累积进同一轮**续写**，直到自然收尾或预算耗尽 |
+| ③ | 模型看不到还剩多少额度 | 每次工具回包追加 `[budget] N tokens left` |
+
+`trunc_final` 的定义随之变为"**预算耗尽而未能收尾**"（不再看 `finish_reason`）。
+
+**续写的必要性边界**：若模型写完了调用块才撞上限，继续生成会把后续文字接在调用块后
+→ `parse_assistant` 判 `invalid`，**一个合法调用被续写毁掉**。故续写条件是"累积文本
+尚不构成完整调用"（有测试锁死）。
+
+### reward 侧的两处对齐
+
+1. **`code_attempt_w`/`code_w` 改一次性**（`--code_shaping_once`）。旧口径线性累加，
+   实测答对时 0 次调用 `+1.00` < 1 次 `+1.10` < 4 次 `+1.40` —— **梯度明确指向"多烧
+   token"**，与"最少 token 答最优"的目标反向。改一次性后恒为 `+1.05`（保留"敢写代码"
+   的对冲，去掉"多写多拿"）。
+2. **`--len_eff_w`：通过轨迹内部的组内相对效率奖励**。旧 reward 里**没有任何一项**
+   奖励"用更少 token 答对"：`len_penalty` 只罚**未通过**轨迹、`overlong_shaping` 是
+   死开关（见下）。新项按组内通过轨迹的长度中位数起坡，短于中位数者拿正分。
+   必须**组内相对**（绝对长度惩罚 = run2"表面收尾"事故根源），且必须**有 cap**
+   （`ref/len` 在 len→0 时发散，一条 10 token 蒙对会把 bonus 顶到 weight×99）。
+
+### 死开关修复
+
+`overlong_ref_tokens()` 的自动值 = `max_rounds × round_gen_tokens`，在"预算给满"的档下
+**必然够不着**：native_p3 实测 ref=10240（触发线 9984）而 `avg_clen≈2811`，差 7000 token
+⇒ 长度压力实际为零。`--overlong_ref` 允许直接指定**目标长度**；token 档下自动值改为
+`max_traj_tokens`（那一档声称的轨迹预算）。
+
+### 同步改动（不同步就是"测另一个模型"）
+
+- **eval**：`mt_cfg` 必须带 `max_traj_tokens/answer_reserve/budget_hint`，剔题预算按
+  `max_traj_tokens` 取，启动行打印预算档。否则用轮数档的终止结构去评 token 档的 ckpt。
+- **probe_difficulty**：新增同名入口 + `probe_meta` 加 `max_traj_tokens/answer_reserve`；
+  `data.load_difficulty_table` 的比对清单同步（旧表无这两个键 → 不告警，兼容）。
+- **health**：`max_clen` 在 token 档下取 `max_traj_tokens`（继续用轮数乘积 = 新死开关）。
+- **analysis**：`record_clen_cap` 优先读 `max_traj_tokens`。
+
+### 顺带修掉的一个预存在 bug（HEAD 即在，非本次引入）
+
+`multi_turn_rollout_group_native` 里 `active = next_active` 写在 `if exec_jobs:` **块内**：
+某一轮**全员都没调用工具**时 `exec_jobs` 为空 → `active` 不更新 → 本应终局的样本被
+**重新生成**到 `max_rounds`（`max_rounds=3` 实测段数 3、打分文本是答案的重复拼接）。
+触发面是"整组某轮无人调用工具"（base 直接作答时很常见）。围栏路径**没有**这个 bug
+（那里的 `active = next_active` 在条件块之外）。token 档下它是致命的（`_iter_cap` 是
+安全阀不是 `max_rounds`），故一并修复；回归锁见 `test_token_budget_mode` (h)。
+
+> ⚠ **触发面要说准**：只有当**整个批**（训练时 = 4 题×8 条 = 32 条）在某一轮**全员
+> 都没调用工具**时才触发。native_p3 实测调用率高（87.5%），32 条同时不调用的概率
+> 极低 ⇒ **对 native_p3 既有读数的影响很小**，不是系统性伪影。但一旦触发就是静默
+> 污染（该样本的 `clen` 被抬高、打分文本重复），且 token 档下会反复重采到安全阀，
+> 所以必须修。已落盘的 native_p3 读数无需重跑，与 token 档对比时知道有这一层即可。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
 - **`--native_stop_at_call` 默认值应视为过期**：docs/09 把它当"invalid 高才开"的兜底，native_p3 实锤 base 4B 在 1024/round、无 stop 下 invalid ~60%——它是**主协议部件**，native 路线默认应开。

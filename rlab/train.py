@@ -149,6 +149,20 @@ def run_signature(cfg: dict) -> str:
         _lpq = int(cfg.get("len_penalty_quantile", 50) or 50)
         _lpg = float(cfg.get("len_penalty_gate", 0.25) or 0.25)
         lp_tag = f"-lp{_lpw:g}-lq{_lpq}-lg{_lpg:g}"
+    # 【2026-09-29】token 预算档 + 效率激励 + overlong 参考系覆盖进签名。
+    # 三者都是**行为级**变量：预算档换掉终止结构与 code_wasted 语义（同一组预算
+    # 参数下轨迹长度/终止点/梯度流向全变）；len_eff_w 改 reward 值域；
+    # overlong_ref 改长度压力起坡点。不进签名则新档与旧档撞同一 out_dir →
+    # step_N 静默覆盖（P1 事故的同类盲区）。
+    # 约定同 stop_tag/of_tag：只在开启/偏离时追加，历史签名串逐字不变。
+    _mtj = int(cfg.get("max_traj_tokens", 0) or 0)
+    mtj_tag = f"-mtj{_mtj}-ar{int(cfg.get('answer_reserve', 0) or 0)}" if _mtj > 0 else ""
+    _lew = float(cfg.get("len_eff_w", 0.0) or 0.0)
+    lew_tag = f"-lew{_lew:g}" if _lew > 0.0 else ""
+    _olr = int(cfg.get("overlong_ref", 0) or 0)
+    olr_tag = f"-olr{_olr}" if _olr > 0 else ""
+    once_tag = "-cs1" if cfg.get("code_shaping_once") else ""
+    hint_tag = "-bh1" if (cfg.get("budget_hint") and _mtj > 0) else ""
     # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
     # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
     # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
@@ -186,7 +200,8 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{qt_tag}{lp_tag}{_opt_tag}")
+            f"{caw_tag}{cw_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{olr_tag}"
+            f"{once_tag}{hint_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -201,6 +216,12 @@ def write_run_info(path: str, cfg: dict) -> None:
             "reward_switch_step": cfg.get("reward_switch_step"),
             "round_gen_tokens": cfg.get("round_gen_tokens"),
             "max_rounds": cfg.get("max_rounds"),
+            # 【2026-09-29 token 预算档】eval 端（--proto_from）要回读它才能用同一
+            # 终止结构采轨迹——否则原生档训练的 ckpt 会被"轮数预算档"评（轨迹
+            # 长度/终止点不同 → 测的是另一套协议下的模型）。
+            "max_traj_tokens": cfg.get("max_traj_tokens"),
+            "answer_reserve": cfg.get("answer_reserve"),
+            "budget_hint": cfg.get("budget_hint"),
             # 【2026-09-25 原生协议】协议档位与解析形态落进 run_info：eval 端
             # （--proto_from）必须能回读到"评测该用哪条协议"，否则原生档训练的
             # ckpt 会被围栏档协议评（序列/终止结构完全不同 → 测的是另一个模型）。
@@ -795,6 +816,40 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    # 【2026-09-29 token 预算档】轮数上限 → 整条轨迹的 token 预算。
+    # 与"轮数×单轮"档互斥的**不变量**：max_traj_tokens + max_prompt_length
+    # ≤ max_context_tokens（validate_retool_budget 强制）。
+    ap.add_argument("--max_traj_tokens", type=int, default=None,
+                    help="整条轨迹的生成 token 预算（0=关闭，用 max_rounds×"
+                         "round_gen_tokens 的旧口径）。>0 时长出三条行为：能否执行"
+                         "调用由**剩余预算**判定（人为的末轮截止消失）、单轮被切断"
+                         "改为**续写**（不再当终局）、回包注入剩余额度"
+                         "（--budget_hint）。只在 --tool_protocol native 下实现。"
+                         "建议值：8192（实测 avg_clen≈2811 的 2.9 倍余量）")
+    ap.add_argument("--answer_reserve", type=int, default=None,
+                    help="token 预算档下必须留给最终作答的 token 数（默认 1024）："
+                         "判定'这次调用还执行得起吗'的第二笔开销——执行一次调用要"
+                         "同时装下工具回包与之后一轮作答，两者够才执行")
+    ap.add_argument("--budget_hint", action=argparse.BooleanOptionalAction, default=None,
+                    help="token 预算档下把剩余额度写进每次工具回包（默认开）——"
+                         "C 桶（额度耗尽还在调用）占 ok 族无 boxed 的 70%，本质是"
+                         "信息不对称：模型看不到'还剩多少'")
+    ap.add_argument("--len_eff_w", type=float, default=None,
+                    help="通过轨迹内部的组内相对效率奖励权重（0=关闭）。与 "
+                         "len_penalty（只罚未通过）互补：本项让**更短地答对**拿正分，"
+                         "直接对齐'最少 token 答最优'的目标。必须组内相对（绝对长度"
+                         "惩罚是 run2 表面收尾事故的根源），且有 cap 防短答案套利")
+    ap.add_argument("--code_shaping_once", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="把 code_attempt_w/code_w 从'每次调用累加'改成'一次性'："
+                         "旧口径下答对时 0 次调用 +1.00 < 4 次调用 +1.40，梯度指向"
+                         "多烧 token，与效率目标反向；本开关去掉该方向性错误，"
+                         "保留'敢写代码'的对冲作用")
+    ap.add_argument("--overlong_ref", type=int, default=None,
+                    help="overlong shaping 的长度参考系显式覆盖（0=自动= "
+                         "max_rounds×round_gen_tokens）。自动值在预算给满的档下"
+                         "远高于真实用量（实测 10240 vs 2811）→ shaping 是死开关；"
+                         "本开关把它改成**目标长度**，让长度压力真正可达")
     ap.add_argument("--retool_stop", action=argparse.BooleanOptionalAction, default=None,
                     help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
                          "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
@@ -1026,6 +1081,17 @@ def main():
     if args.round_gen_tokens is not None: overrides["round_gen_tokens"] = args.round_gen_tokens
     if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
+    # 【2026-09-29 token 预算档】在 tool_protocol 之前落 override（与预算档同属
+    # "配置几何"，get_config 的校验按最终 cfg 判，顺序不影响正确性，但先写更清楚）
+    if args.max_traj_tokens is not None:
+        overrides["max_traj_tokens"] = args.max_traj_tokens
+    if args.answer_reserve is not None:
+        overrides["answer_reserve"] = args.answer_reserve
+    if args.budget_hint is not None: overrides["budget_hint"] = args.budget_hint
+    if args.len_eff_w is not None: overrides["len_eff_w"] = args.len_eff_w
+    if args.code_shaping_once is not None:
+        overrides["code_shaping_once"] = args.code_shaping_once
+    if args.overlong_ref is not None: overrides["overlong_ref"] = args.overlong_ref
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     # 【2026-09-25 原生工具协议】tool_protocol 必须先落进 overrides——get_config
     # 靠它决定要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感）。
@@ -1102,12 +1168,18 @@ def main():
     # 预算/提示），与 p1–p11 **不可同表对照**（docs/09 §8）。这一行让"这次到底
     # 跑的哪条协议"在日志第一屏就能看到，不必回读 run_info.json。
     if (cfg.get("tool_protocol") or "fence") != "fence":
+        _mtj_b = int(cfg.get("max_traj_tokens", 0) or 0)
+        _bg = (f"token档：轨迹 {_mtj_b}tok + 作答预留 "
+               f"{int(cfg.get('answer_reserve', 0) or 0)}tok（预算判据取代末轮判据、"
+               f"切断改续写、额度提示{'开' if cfg.get('budget_hint') else '关'}）"
+               if _mtj_b > 0 else
+               f"轮数档：{cfg.get('max_rounds')}轮×{cfg.get('round_gen_tokens')}tok"
+               f"（前 {max(0, int(cfg.get('max_rounds', 1)) - 1)} 轮可执行代码）")
         print(f"[train] ⚠ 工具协议 = {cfg['tool_protocol']}（原生 <tool_call>，docs/09）"
               f"｜解析形态={cfg.get('native_tool_style')}"
               f"｜调用边界硬停={'开' if cfg.get('native_stop_at_call') else '关'}"
-              f"｜预算 {cfg.get('max_rounds')}轮×{cfg.get('round_gen_tokens')}tok"
-              f"/ctx {cfg.get('max_context_tokens')}"
-              f"（前 {max(0, int(cfg.get('max_rounds', 1)) - 1)} 轮可执行代码）\n"
+              f"｜预算档 {_bg}"
+              f"/ctx {cfg.get('max_context_tokens')}\n"
               f"        与 p1–p11 的围栏协议**不可同表对照**（刻意）："
               f"out_dir 必须是新的，评测需 --proto_from 回读本档。")
     # 【2026-09-20 剂量口径自证】`all_steps` 计的是 **micro-batch 拉取次数**，不是

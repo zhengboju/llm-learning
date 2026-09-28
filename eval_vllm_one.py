@@ -190,10 +190,17 @@ if _sp_sig and _sp_sha != _sp_sig:
           f"  （eval 用 {_sp_src}；若训练是 --system_prompt_file 且文件已变，请核对）")
 
 # ---- 评测协议来源自证（预算/提示/采样）----
+# 【2026-09-29 token 预算档】档位必须打印：它换的是**终止结构**（预算判据取代末轮
+# 判据、切断改续写、回包注入额度），不是普通数值——与 gpu_mem/协议档同级。
+_budget_src = (f"token档(轨迹{int(_rcfg.get('max_traj_tokens', 0) or 0)}tok"
+               f"+作答预留{int(_rcfg.get('answer_reserve', 0) or 0)})"
+               if int(_rcfg.get("max_traj_tokens", 0) or 0) > 0
+               else f"轮数档({args.max_rounds}轮×{args.round_tokens}tok)")
 print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认）'} "
       f"(src={_proto_src}) | "
       f"algo={args.algo} eval_task={args.eval_task} | "
       f"round_tokens={args.round_tokens} max_len={args.max_len} max_rounds={args.max_rounds} | "
+      f"预算档={_budget_src} | "
       f"system_prompt={_sp_src} sp_sha={_sp_sha} | gpu_mem={args.gpu_mem}")
 # 【2026-09-25 gpu_mem 错档告警】gpu_mem 决定 gpu_memory_utilization → KV 池块数
 # → chunked prefill 分块边界 → bf16 归约顺序 → near-tie token 翻转。真机 A/B
@@ -387,8 +394,13 @@ if _ctkw and _ctkw.get("enable_thinking") is False \
 # 现在两条线都判：先按训练端的 max_prompt_length（同源回读），再保留 max_len 兜底
 # （防撞 vLLM max_model_len 崩进程）。
 _max_plen = int(_rcfg.get("max_prompt_length") or 0)
-_gen_budget = (args.max_rounds * args.round_tokens + 512) if is_retool_family \
-    else (args.max_tokens + 64)
+# 【2026-09-29 token 预算档】预算口径必须与训练同源：token 档下整条轨迹的上限是
+# max_traj_tokens（不是 max_rounds×round_tokens），用错口径会让剔题线偏紧/偏松
+# → 评的题集与训练分布不一致（本文件已有两次同类事故的注释）。
+_mtj_eval = int(_rcfg.get("max_traj_tokens", 0) or 0)
+_gen_budget = (_mtj_eval + 512 if (is_retool_family and _mtj_eval > 0)
+               else (args.max_rounds * args.round_tokens + 512)
+               if is_retool_family else (args.max_tokens + 64))
 # 【2026-09-25 原生档长度口径】原生档 prompt 由 apply_chat_template(tokenize=True)
 # 直接产出 ids（tools 声明段 + 特殊 token）；把渲染文本再 tokenize 一遍**不保证**
 # 回到同一串 id（特殊 token 的文本形态往返是有损的——本项目"文本往返 0/6 相等"
@@ -630,7 +642,15 @@ if is_retool_family:
               "native_tool_style": _rcfg.get("native_tool_style") or "auto",
               "native_stop_at_call": bool(_rcfg.get("native_stop_at_call")),
               "max_context_tokens": _rcfg.get("max_context_tokens", 8192),
-              "chat_template_kwargs": _ctkw}
+              "chat_template_kwargs": _ctkw,
+              # 【2026-09-29 token 预算档】终止结构是协议的一半：token 档下
+              # "能否执行调用"由剩余预算判、"单轮切断改为续写"、"回包注入额度"。
+              # 不传这三键 → eval 用轮数档的终止结构去评一个 token 档训出来的
+              # ckpt（轨迹长度/终止点/答案截断率全不同）＝测的是另一套协议下的模型。
+              # 这正是 docs/09 §8 那条"改档必须同步"的纪律在新档上的延续。
+              "max_traj_tokens": _mtj_eval,
+              "answer_reserve": int(_rcfg.get("answer_reserve", 0) or 0),
+              "budget_hint": bool(_rcfg.get("budget_hint"))}
     _probe_prompts = [p for p in prompts for _ in range(args.val_n)] if _sampling else prompts
     if _native:
         # 原生档：多轮 messages 是唯一真源（prompt 文本只是渲染结果，续写从

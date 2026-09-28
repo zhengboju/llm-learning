@@ -442,8 +442,12 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
                     # 【2026-09-25】新增 tool_protocol：围栏档与原生档的通过率是
                     # 两个分布（同模型同提示下 base 调用率 87.5% vs ~48%），换协议
                     # 续跑同一 --out 会静默混表——这是"预算/提示"同类的协议级偏离。
+                    # 【2026-09-29】新增 max_traj_tokens/answer_reserve：预算档换的是
+                    # **终止结构**（末轮截止 vs 预算判据、切断即终局 vs 续写），同模型
+                    # 同协议下两档的通过率也是两个分布。旧表无这两个键 → `_rv is None`
+                    # → 不告警（旧表兼容，与新键加入前行为一致）。
                     for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
-                                "tool_protocol"):
+                                "tool_protocol", "max_traj_tokens", "answer_reserve"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

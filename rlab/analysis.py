@@ -553,6 +553,12 @@ def record_clen_cap(path: str, default: int = 1800) -> tuple:
     try:
         with open(info_path, encoding="utf-8") as f:
             cfg = (json.load(f) or {}).get("config") or {}
+        # 【2026-09-29 token 预算档】该档下轨迹的物理上限是 max_traj_tokens（循环内
+        # 逐样本夹 max_tokens + 预算耗尽即出局），比 ctx−plen 更紧也更准；用它读
+        # "≥0.9×cap" 那一列才不会把"预算刚好用满"误读成"还没到丢弃线"。
+        mtj = int(cfg.get("max_traj_tokens") or 0)
+        if mtj > 0:
+            return mtj, f"run_info(max_traj_tokens={mtj})"
         ctx = int(cfg.get("max_context_tokens") or 0)
         plen = int(cfg.get("max_prompt_length") or 0)
         if ctx > 0 and ctx - plen > 0:

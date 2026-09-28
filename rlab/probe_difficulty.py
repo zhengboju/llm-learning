@@ -215,6 +215,17 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset；参考实现 6 轮）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    # 【2026-09-29 token 预算档】探针与训练**同档**是铁律（表的语义是"模型×提示×
+    # 预算×协议"的联合产物）：token 档换的是终止结构，用它探的表描述的是另一套
+    # 轨迹分布。不补这个入口 → native run 的难度表是轮数档探的。
+    ap.add_argument("--max_traj_tokens", type=int, default=None,
+                    help="token 预算档：整条轨迹的生成 token 预算（0/None=轮数档）。"
+                         "**必须与训练同档**，否则表描述的是另一套终止结构")
+    ap.add_argument("--answer_reserve", type=int, default=None,
+                    help="token 预算档下留给最终作答的 token 数（须与训练同档）")
+    ap.add_argument("--budget_hint", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="token 预算档下把剩余额度写进工具回包（须与训练同档）")
     # 【2026-09-28 原生协议入口】此前本脚本没有 --tool_protocol：get_config 恒得
     # fence，采样循环里的 _nat 原生分支从 CLI 不可达——任何产物表都是**围栏档**
     # 探的，而训练端 load_difficulty_table 对协议指纹不符只告警不拦截（data.py），
@@ -274,6 +285,12 @@ def main():
         cfg["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None:
         cfg["max_context_tokens"] = args.max_context_tokens
+    if args.max_traj_tokens is not None:
+        cfg["max_traj_tokens"] = args.max_traj_tokens
+    if args.answer_reserve is not None:
+        cfg["answer_reserve"] = args.answer_reserve
+    if args.budget_hint is not None:
+        cfg["budget_hint"] = args.budget_hint
     if args.system_prompt_file:
         # 提示是协议的一半：本探针出的表只对"同提示 + 同预算 + 同模型"的训练有效。
         # 打印指纹，便于与训练启动行的 `signature=...-sp<hash6>` 逐字对上。
@@ -326,9 +343,20 @@ def main():
     # 原生档的通过率是两个分布（原生档 base 调用率 87.5% vs 围栏档 ~48%）——
     # 表不自证协议，训练端就会把围栏表当原生档的难度表用。
     _tp = cfg.get("tool_protocol") or "fence"
+    # 【2026-09-29 token 预算档】预算档同样是"协议"的一部分：轮数档与 token 档的
+    # 终止结构不同（末轮截止 vs 预算判据、切断即终局 vs 续写）→ 同一模型同一提示
+    # 下的通过率是两个分布。指纹必须自证，否则换档续跑同一 --out 静默混表。
+    _mtj = int(cfg.get("max_traj_tokens", 0) or 0)
+    _budget_desc = (f"轨迹 {_mtj}tok + 作答预留 {int(cfg.get('answer_reserve', 0) or 0)}tok"
+                    if _mtj > 0 else
+                    f"{cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok")
     print(f"[probe] 模型 {args.model_path} | k={args.k} | temp={cfg['temperature']} "
-          f"| 协议 {_tp} | 预算 {cfg['max_rounds']}轮×{cfg['round_gen_tokens']}tok"
-          f"(ctx {cfg['max_context_tokens']}) | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
+          f"| 协议 {_tp} | 预算档 {'token' if _mtj > 0 else '轮数'}"
+          f"（{_budget_desc}，ctx {cfg['max_context_tokens']}）"
+          f" | 本轮探 {len(todo)} 题（全池 {len(QAs)}）")
+    if _mtj > 0:
+        print("[probe] ⚠ token 预算档：终止结构 = 预算判据 + 单轮切断续写 + 回包"
+              "注入额度；本表只对**同档**训练有效（指纹含 max_traj_tokens）")
     if _tp != "fence":
         print(f"[probe] ⚠ 工具协议 = {_tp}（原生 <tool_call>）：本表只对同档训练有效"
               f"（表指纹含协议档）")
@@ -345,6 +373,10 @@ def main():
         # 【2026-09-25】协议档（围栏/原生）——同模型同提示下两档的通过率是两个
         # 分布，行必须自证，否则换档续跑同一 --out 会静默混表。
         "tool_protocol": _tp,
+        # 【2026-09-29】预算档（轮数 / token）——同协议同模型下两档的通过率分布不同
+        # （终止结构不同），换档续跑同一 --out 会静默混表。
+        "max_traj_tokens": _mtj,
+        "answer_reserve": int(cfg.get("answer_reserve", 0) or 0),
     }
     if not todo:
         print("[probe] 无剩余题，直接输出统计")

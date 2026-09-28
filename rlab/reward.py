@@ -162,10 +162,29 @@ def overlong_ref_tokens(cfg: dict) -> int:
     retool_context_overlong 先把样本丢了，trigger 永远够不着 = 死开关。
     根因（预算不自洽）已由 config.validate_retool_budget() fail-fast 拦死，
     这里再加 min() 兜底，让"shaping 永远可达"成为结构性保证。
+
+    【2026-09-29 显式覆盖·死开关修复】cfg["overlong_ref"]>0 时直接采用它，绕过
+    下面全部推导。理由见 config.BASE 的同名注释：在"预算给满"的档下，自动值
+    必然远高于真实用量（native_p3 实测 ref=10240 vs avg_clen 2811），shaping
+    梯度为零 = 死开关。参考系应当表达**目标长度**而非物理上限。
+    在 token 预算档（max_traj_tokens>0）下，未显式覆盖时用 max_traj_tokens ——
+    那正是这一档声称的"整条轨迹预算"，比 max_rounds×round_gen_tokens 更贴切
+    （后者在该档下已退化为单轮上限，乘积无预算含义）。
     """
+    _ovr = int(cfg.get("overlong_ref", 0) or 0)
+    if _ovr > 0:
+        return _ovr
     rounds = cfg.get("max_rounds", 1)
     per_round = cfg.get("round_gen_tokens")
     if cfg.get("algo", "").startswith("retool") and per_round:
+        _mtj = int(cfg.get("max_traj_tokens", 0) or 0)
+        if _mtj > 0:
+            ctx_b = cfg.get("max_context_tokens")
+            if ctx_b:
+                usable_b = ctx_b - int(cfg.get("max_prompt_length", 0) or 0)
+                if usable_b > 0:
+                    return min(_mtj, usable_b)
+            return _mtj
         cap = rounds * per_round
         ctx = cfg.get("max_context_tokens")
         if ctx:
@@ -197,12 +216,15 @@ def trunc_penalty(trunc_final: int, weight: float = 0.0) -> float:
 # 代码可用率小权重：执行成功的代码块数 * code_w（失败/超时不加分）。
 # Auto_Program 原口径 call_python = (python_cnt - error_cnt) * 0.1，
 # 在我们的统计里 = code_ok * 0.1（成功执行次数），cap(max_rounds) 内。
-def reward_code(code_ok: int, code_w: float = 0.1) -> float:
+def reward_code(code_ok: int, code_w: float = 0.1, once: bool = False) -> float:
+    """代码成功执行的 shaping（一次性开关见 once，语义同 reward_code_attempt）。"""
+    if once:
+        return code_w if int(code_ok) > 0 else 0.0
     return code_ok * code_w
 
 
 def reward_code_attempt(code_used: int, attempt_w: float = 0.0,
-                        max_rounds: int = 8) -> float:
+                        max_rounds: int = 8, once: bool = False) -> float:
     """尝试级 shaping（纯函数）：只要真的写出了可执行的代码块就给小分，
     不依赖执行成败（code_ok）。
 
@@ -215,10 +237,18 @@ def reward_code_attempt(code_used: int, attempt_w: float = 0.0,
     成败交给 outcome 与 code_w 去区分。权重为 0 时本项完全不存在
     （行为与旧版逐位相同，单变量 A/B 的对照位）。
 
+    【2026-09-29 once=True：去掉"多调用多拿分"的方向性错误】线性形式
+    `min(code_used, max_rounds) × attempt_w` 让 reward 随调用次数**单调递增**，
+    实测答对时 0 次 +1.00 < 1 次 +1.10 < 4 次 +1.40 —— 与"最少 token/最少轮数"
+    的训练目标直接反向。once=True 时退化为**一次性**：写过代码就给固定
+    attempt_w，不随次数增长。对冲"代码压灭"的作用（敢写就加分）完整保留，
+    只是不再奖励"多写几次"——那部分交给 code_w（按成功次数）与效率项去区分。
+
     cap 在 max_rounds 内（防御：传入值异常大时不让 shaping 项爆炸）。"""
     if attempt_w <= 0.0:
         return 0.0
-    return min(int(code_used), max(1, int(max_rounds))) * attempt_w
+    k = min(int(code_used), max(1, int(max_rounds)))
+    return (attempt_w if k > 0 else 0.0) if once else k * attempt_w
 
 
 def reward_phase(steps_elapsed: int, switch_step: int) -> str:
@@ -317,6 +347,57 @@ def total_reward(ground_truth: str, answer: str, *, w_acc: float = 2.0,
 
 
 # ---- 方案1：DAPO-Math / AIME outcome-only（对齐 agentic-rl-lab/05-retool） ----
+def group_eff_bonus(group_rewards: list, group_lens: list,
+                    weight: float = 0.0, quantile: int = 50,
+                    cap: float = 1.0) -> list:
+    """**通过轨迹内部**的组内相对效率奖励（纯函数）。
+
+    【为什么需要它——目标与激励目前反向】训练目标是"最少 token + 最少轮数给出
+    最优回答"，但旧 reward 里没有任何一项奖励"用更少 token 答对"：
+      · `len_penalty`（group_length_penalty）只罚**未通过**轨迹——它教的是
+        "答不出来时别烧 token"，完全没教"答对了还能更省"；
+      · `overlong_shaping` 在预算给满的档下够不着（ref 10240 vs 实测 2811）；
+      · `code_attempt_w`/`code_w` 随调用次数**单调递增** → 实测答对时
+        0 次调用 +1.00 < 4 次调用 +1.40，梯度明确指向"多调用、多烧 token"。
+    本函数补齐这个缺口：在通过轨迹内部按长度分位数起坡，短于参考者拿正分。
+
+    【形态】ref = quantile_{B/100}(len[通过])（默认中位数）
+        bonus_i = weight × min(ref/len_i − 1, cap)，**只对 r_i>0 且 len_i<ref**
+    未通过轨迹分文不动（它们的长度问题由 len_penalty 管，各管一半、不重叠）。
+
+    【为什么必须组内相对】绝对长度奖励是 run2"表面收尾"事故的根源——模型学会
+    草草收尾换取奖励。相对化后"全组都变短"不改变任何 advantage（组均值已被
+    compute_advantages 减掉）：只有**比同组其他通过轨迹更短**才拿分，而那正是
+    要教的行为。
+
+    【cap 是必须的】ref/len 在 len→0 时发散：一条 10 token 的"蒙对"会把 bonus
+    顶到 weight×99。cap 把它截在 weight×cap（默认 +weight），使效率项在任何
+    情况下都不淹没 ±1 的 outcome 主信号。
+
+    【门槛 len(passed)<2 返回原值】组内只有一条通过轨迹时"相对"无定义（ref 就是
+    它自己，bonus 恒 0）——直接跳过，省一次排序。
+    weight=0 时返回与输入逐位相同的副本（旧行为，单变量 A/B 对照位）。"""
+    n = len(group_rewards)
+    if weight <= 0.0 or n == 0 or n != len(group_lens):
+        return list(group_rewards)
+    passed = [l for l, r in zip(group_lens, group_rewards) if r > 0.0]
+    if len(passed) < 2:
+        return list(group_rewards)
+    passed.sort()
+    B = min(max(int(quantile), 1), 100) / 100.0
+    k = int(math.ceil(B * (len(passed) - 1)))
+    ref = passed[k]
+    if ref <= 0:
+        return list(group_rewards)
+    out = []
+    for r, l in zip(group_rewards, group_lens):
+        if r > 0.0 and 0 < l < ref:
+            out.append(float(r) + weight * min(ref / l - 1.0, float(cap)))
+        else:
+            out.append(float(r))
+    return out
+
+
 def total_reward_math(ground_truth: str, answer: str, *,
                       completion_len: int = 0, max_gen_tokens: int = 8192,
                       overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
@@ -337,7 +418,8 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
                              overlong_buffer: int = 64, overlong_shaping: bool = False,
                              trunc_final: int = 0, trunc_shaping: float = 0.0,
                              code_used: int = 0, code_attempt_w: float = 0.0,
-                             code_w: float = 0.0, max_rounds: int = 8) -> dict:
+                             code_w: float = 0.0, max_rounds: int = 8,
+                             code_shaping_once: bool = False) -> dict:
     """retool-math outcome-only：与 total_reward_math 同 reward（±1），
     工具使用完全靠结果涌现，不额外奖励 code_ok。code 仅作监控记录。
 
@@ -371,14 +453,15 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
     if tp:
         base["reward"] = base["reward"] - tp
     base["trunc_penalty"] = tp
-    attp = reward_code_attempt(code_used, code_attempt_w, max_rounds)
+    attp = reward_code_attempt(code_used, code_attempt_w, max_rounds,
+                               once=bool(code_shaping_once))
     if attp:
         base["reward"] = base["reward"] + attp
     base["attempt_penalty"] = 0.0  # 命名对称：这是奖励不是罚，但 record 列对齐
     base["code_attempt"] = attp
     # code 字段随 code_w 联动（record 监控列语义：code = code_ok×code_w）
     _cw = float(code_w or 0.0)
-    base["code"] = reward_code(code_ok, _cw)
+    base["code"] = reward_code(code_ok, _cw, once=bool(code_shaping_once))
     if _cw > 0.0 and code_ok > 0:
         base["reward"] = base["reward"] + base["code"]
     base["code_ok"] = code_ok

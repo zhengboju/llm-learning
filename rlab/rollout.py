@@ -55,6 +55,7 @@ from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            sanitize_tool_text, segment_mask_from_spans,
                            tensor_to_bytes, tool_message)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
+                         group_eff_bonus,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math, group_length_penalty)
 from rlab.sandbox import run_code
@@ -65,6 +66,10 @@ from rlab.sync import need_text_to_mm_remap, remap_text_to_multimodal, sync_weig
 #   "native" = Qwen 原生 <tool_call> 工具协议（方案 A 主线）
 TOOL_PROTOCOL_FENCE = "fence"
 TOOL_PROTOCOL_NATIVE = "native"
+
+# 效率项"开了开关却没接线"的告警去重标志（与 protocol._RENDER_TOLERANCE_WARNED
+# 同一约定：这类提示只报一次，否则每组合刷一行、真信号被淹掉）。
+_EFF_WARNED = [False]
 
 # 清除分布式环境变量（gen worker 进程内 vLLM 不允许看到 DeepSpeed 的 WORLD_SIZE 等）
 _DEEPSPEED_ENV_KEYS = [
@@ -513,42 +518,157 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     budget = int(cfg.get("max_context_tokens", 8192))
     max_rounds = int(cfg.get("max_rounds", 5))
     max_code_calls = max(0, max_rounds - 1)      # 末轮不许执行代码（发现3）
+    # 【2026-09-29 token 预算档】max_traj_tokens>0 时三条语义同时切换（见 config.BASE
+    # 同名注释）：预算判据取代末轮判据、单轮切断改为续写、回包注入剩余额度。
+    # 缺省 0 → tok_mode=False，本函数对历史档逐位不变（A/B 对照位）。
+    traj_budget = int(cfg.get("max_traj_tokens", 0) or 0)
+    tok_mode = traj_budget > 0
+    _hint = bool(cfg.get("budget_hint", False)) and tok_mode
     # 每样本状态：messages（协议用）/ prompt_ids（生成端喂 vLLM 的真实序列）/ 调用数
     msgs = [list(m) for m in prompts_messages]
     ctx_ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
     segs = [[] for _ in range(n)]
     code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0,
-                   "invalid_final": 0, "ctx_full": 0, "err_types": []}
+                   "invalid_final": 0, "ctx_full": 0, "trunc_final": 0, "err_types": []}
                   for _ in range(n)]
+    # 【2026-09-29 token 预算档·续写缓冲】"一次生成"与"一个 assistant 轮"在这一档
+    # 下解耦：被单轮上限切断（finish_reason=length）时该轮**没有结束**，累积进
+    # open_ids 继续写，直到自然收尾或预算耗尽才落成一个 assistant 段。
+    #
+    # 三个上下文的职责必须分清（搞混会产生"序列重复计入"或"校验① 判不同源"）：
+    #   ctx_ids  = 当前**完整**上下文（含本轮已生成部分），下一轮生成喂它；
+    #   turn_ctx = 本轮**起点**上下文（轮内不变）——build_next_prompt 的 prev 必须是
+    #              它，传 ctx_ids 会把本轮 comp_ids 重复计入序列；
+    #   open_ids = 本轮至今累积的生成 token（跨续写块）。
+    # 非 tok_mode 档下 open_ids 每轮清空、turn_ctx 恒等于轮结束时的 ctx_ids →
+    # 每轮恰好落一段，与旧版逐位相同（历史档可复现的保证）。
+    open_ids = [[] for _ in range(n)]
+    open_raw = ["" for _ in range(n)]
+    open_lps = [[] for _ in range(n)]
+    turn_ctx = [list(c) for c in ctx_ids]
+    p0 = [len(c) for c in ctx_ids]      # 各样本真实 prompt 长（逐条构造，无 pad）
+
+    def _used_tokens(i):
+        """本样本已消耗的轨迹预算（prompt 之外的全部：assistant + 工具段）。"""
+        return len(ctx_ids[i]) - p0[i]
+
+    # 【循环上限只是安全阀】真正的约束是 max_traj_tokens。轮数不该再当预算用——
+    # 5 轮→6 轮实测无收益的真因是 answer/invalid 为**终局**、剩余轮数被整段作废
+    # （不是轮数本身不够）。上限只防"每轮只花 1 token"的病态循环。
+    _iter_cap = max(8, max_rounds * 4) if tok_mode else max_rounds
     active = list(range(n))
-    for _rnd in range(max_rounds):
+    for _rnd in range(_iter_cap):
         if not active:
             break
-        is_final_round = (_rnd == max_rounds - 1)
+        if tok_mode:
+            # 预算耗尽的样本先出局，并打上 trunc_final——这正是 token 预算档下
+            # trunc_final 的正确定义："预算用尽而未能收尾"（单轮上限被切断已改为
+            # 续写，不再是终局，故旧的 finish_reason 口径在这一档不再适用）。
+            _still = []
+            for i in active:
+                if _used_tokens(i) < traj_budget:
+                    _still.append(i)
+                    continue
+                code_stats[i]["trunc_final"] = 1
+                # 【必须先把续写缓冲落段】预算耗尽的典型路径正是"最后一次生成被
+                # 单轮上限切断"——此时 open_ids 里的 token 是模型真实采样过的输出，
+                # 不落段就会凭空丢失（打分看不到可能已经写出的 boxed → 恒 -1，
+                # 且与生成端实际序列不符）。
+                if open_ids[i]:
+                    _s = {"kind": "assistant", "text": open_raw[i],
+                          "ids": list(open_ids[i]), "finish_reason": "length"}
+                    if collect_logps:
+                        _s["logps"] = list(open_lps[i])
+                    segs[i].append(_s)
+                    open_ids[i], open_raw[i], open_lps[i] = [], "", []
+            active = _still
+            if not active:
+                break
+        is_final_round = (_rnd == max_rounds - 1) and not tok_mode
         if isinstance(sampling_params, list):
             sps = [sampling_params[i] for i in active]
+            if tok_mode:
+                # 把本轮生成长度夹到剩余预算：不夹的话模型能越过 max_traj_tokens，
+                # 让整题撞 retool_context_overlong 被丢弃（白跑一整题）。
+                for _sp, _i in zip(sps, active):
+                    _sp.max_tokens = max(1, min(
+                        int(cfg.get("round_gen_tokens", 400) or 400),
+                        traj_budget - _used_tokens(_i)))
         else:
             sps = sampling_params
+            if tok_mode:
+                # 单对象档（eval 贪心）：无法逐样本夹，用"整体预算"作静态上界。
+                # 训练档恒为列表（逐样本 seed），走上面的精确夹取。
+                sps.max_tokens = max(1, min(
+                    int(cfg.get("round_gen_tokens", 400) or 400), traj_budget))
         outs = vllm_gen.generate([{"prompt_token_ids": ctx_ids[i]} for i in active],
                                  sps, use_tqdm=False)
         exec_jobs = []
+        # 本轮"仍在续写中"的样本（被单轮上限切断 → 同一轮继续写）。它们既不执行
+        # 工具也不终局，必须与 exec_jobs 一起构成下一轮的 active——否则会被下面
+        # 的 round-end 记账当成"已终局"而提前淘汰（token 档实测：续写样本在第 2 轮
+        # 凭空消失）。
+        _continuing = []
         for i, o in zip(active, outs):
             new_ids = list(o.outputs[0].token_ids)
             new_text = o.outputs[0].text
             fin = getattr(o.outputs[0], "finish_reason", None)
+            open_ids[i].extend(new_ids)
+            if tok_mode:
+                open_raw[i] += (new_text or "")
+                if collect_logps:
+                    open_lps[i].extend(sampled_logps_from_output(o.outputs[0], new_ids))
+                # 序列推进：ctx_ids = 轮起点 + 本轮累积（下一块从这个位置续生成）
+                ctx_ids[i] = [*turn_ctx[i], *open_ids[i]]
+                if fin == "length" and parse_assistant(
+                        open_raw[i].strip(), style=style).kind != "tool":
+                    # 被单轮上限切断 → 同一轮继续写（不落段、不解析、不终局）。
+                    # 这是本档与旧版最本质的差别：旧版这里 trunc_final=1 且剩余
+                    # 轮数整段作废（A/B 桶高发的结构性原因）。
+                    #
+                    # 【为什么必须排除"已构成完整调用"】若模型写完了调用块才撞上限，
+                    # 继续生成会把后续文字接在调用块后面 → parse_assistant 见到
+                    # "开标记之后还有别的文本" 判 **invalid**，一个本来合法的调用被
+                    # 续写毁掉。故续写的条件是"累积文本**尚不构成**完整调用"。
+                    _continuing.append(i)
+                    continue
+            elif collect_logps:
+                open_lps[i] = sampled_logps_from_output(o.outputs[0], new_ids)
+            ids_full = list(open_ids[i])
+            raw_text = open_raw[i] if tok_mode else new_text
+            lps_full = list(open_lps[i]) if collect_logps else None
+            open_ids[i], open_raw[i], open_lps[i] = [], "", []
             # 与参考实现一致：chat template 会 strip assistant 内容，解析与结束
             # 边界计算都用 strip 后的文本，否则 canonical 位置对不上。
-            asst_text = (new_text or "").strip()
+            asst_text = raw_text.strip()
             parsed = parse_assistant(asst_text, style=style)
-            seg = {"kind": "assistant", "text": new_text, "ids": new_ids,
+            # 整轮落成**一个** assistant 段（续写的多块合成一段）：mask 只认
+            # assistant 区间，一段或几块等价；合成一段让"生成序列 == 训练序列"
+            # 的逐 token 断言仍成立（工具段由 build_next_prompt 从轮起点追加）。
+            seg = {"kind": "assistant", "text": raw_text, "ids": ids_full,
                    "finish_reason": fin}
             if collect_logps:
-                seg["logps"] = sampled_logps_from_output(o.outputs[0], new_ids)
+                seg["logps"] = lps_full
             segs[i].append(seg)
-            if parsed.kind == "tool" and not is_final_round \
-                    and code_stats[i]["code_used"] < max_code_calls:
+            # 注意：turn_ctx[i] 在此**保持为本轮起点**（不含本轮 assistant 内容），
+            # 因为 build_next_prompt 的 prev 参数要的正是"本轮 assistant 之前"的
+            # 序列（它内部会追加 comp_ids 与 observation）。轮起点的推进发生在
+            # 工具回填成功之后（见下方 turn_ctx[i] = nxt）。
+            # 【token 预算档·预算判据】能否执行调用改由**剩余 token 预算**决定，
+            # 不再由"是不是末轮"决定 —— 人为的"末轮截止"消失，code_wasted 从此
+            # 只在**预算真耗尽**时发生（那是"确实没空间了"的真实信号）。
+            # 执行一次调用要花掉两笔：工具回包（obs）+ 之后作答的空间
+            # （answer_reserve），两者都装得下才执行。
+            if tok_mode:
+                _obs = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
+                _res = max(1, int(cfg.get("answer_reserve", 0) or 0))
+                _can = (traj_budget - _used_tokens(i) - _obs) >= _res
+            else:
+                _can = (not is_final_round
+                        and code_stats[i]["code_used"] < max_code_calls)
+            if parsed.kind == "tool" and _can:
                 code_stats[i]["code_used"] += 1
-                exec_jobs.append((i, parsed.code, list(msgs[i]), new_ids, asst_text))
+                exec_jobs.append((i, parsed.code, list(msgs[i]), ids_full, asst_text))
             else:
                 # 终局：answer / invalid / 末轮写了调用 / 超出 max_code_calls。
                 # invalid 单列计数——它是原生协议**唯一**的结构性负奖励入口
@@ -584,10 +704,20 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                 body = sanitize_tool_text(res["display"])
                 if not res["ok"] and etype != "ok":
                     body = f"[{etype}] " + body
+                if _hint:
+                    # 【2026-09-29 可观测性】把剩余额度写进工具回包。C 桶（额度耗尽
+                    # 还在调用）占 ok 族无 boxed 的 70%、dropped 族 40%，本质是**信息
+                    # 不对称**——模型看得到全部历史，却看不到"还剩多少额度"。
+                    # 回包是环境插入的、不进 loss、不参与打分（见 retool_score_flat），
+                    # 加一行零成本；它把 C 从"不可学的悬崖"变成"可学的判断"。
+                    # 剩余额度按**当前 ctx_ids** 算（本样本此刻的真实占用）。
+                    _left = max(0, traj_budget - (len(ctx_ids[i]) - p0[i]) - len(body) // 2)
+                    body += (f"\n[budget] {_left} tokens left in this trajectory. "
+                             f"Finish with your final answer when you have enough.")
                 call_id = make_call_id(0, i, code_stats[i]["code_used"])
                 obs_msg = tool_message(call_id, body)
                 try:
-                    nxt = build_next_prompt(tokenizer, msgs_before, ctx_ids[i],
+                    nxt = build_next_prompt(tokenizer, msgs_before, turn_ctx[i],
                                             comp_ids, obs_msg, ctkw)
                 except ValueError as e:
                     # 【不静默降级】模板行为异常是协议级问题，继续跑会产出成批错位
@@ -606,23 +736,58 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     # 会让"预算够不够"这个单变量失去可读数。
                     code_stats[i]["ctx_full"] += 1
                     msgs[i].append({"role": "assistant", "content": asst_text})
+                    if tok_mode:
+                        # token 预算档下这是**预算**终止（obs 装不下）→ trunc_final
+                        code_stats[i]["trunc_final"] = 1
                     continue
-                tool_ids = nxt[len(ctx_ids[i]) + len(comp_ids):]
+                tool_ids = nxt[len(turn_ctx[i]) + len(comp_ids):]
                 # 只有 assistant 段进 loss；工具段 ids 是"结束符+observation"增量
                 segs[i].append({"kind": "tool", "ids": tool_ids,
                                 "text": tokenizer.decode(tool_ids,
                                                          skip_special_tokens=False)})
                 msgs[i] = [*msgs_before, {"role": "assistant", "content": asst_text},
                            obs_msg]
+                turn_ctx[i] = nxt
                 ctx_ids[i] = nxt
                 next_active.append(i)
-            active = next_active
+            # 下一轮 active = 执行了工具并成功回填的样本 ∪ 仍在同一轮续写的样本。
+            # 【2026-09-29 修复·预存在 bug（HEAD 即在，非本次改动引入）】旧版把
+            # `active = next_active` 写在 `if exec_jobs:` **块内**：某一轮全员都没有
+            # 工具调用时 exec_jobs 为空 → active 永不被更新 → 本应终局（answer/
+            # invalid）的样本被**重新生成**到 max_rounds。后果：segs[i] 累计多段
+            # assistant（max_rounds=3 时 3 段）、打分文本成了答案的重复拼接、
+            # merged 序列是"prompt+答+答+答"——纯粹是循环记账错误，与模型行为无关。
+            # 触发面：**整组**某轮无人调用工具（原生档 base 直接作答时很常见）。
+            # token 预算档下这个 bug 是致命的：_iter_cap 是安全阀而非 max_rounds，
+            # 样本会被反复重采直到撞上它。围栏路径没有这个 bug（那里的
+            # `active = next_active` 在条件块之外，见 multi_turn_rollout_group）。
+            active = sorted(set(next_active) | set(_continuing))
+        else:
+            active = list(_continuing)
 
     full_text = ["".join(s["text"] for s in segs_i) for segs_i in segs]
-    for i in range(n):
-        last_a = next((s for s in reversed(segs[i]) if s["kind"] == "assistant"), None)
-        code_stats[i]["trunc_final"] = int(bool(last_a)
-                                           and last_a.get("finish_reason") == "length")
+    if tok_mode:
+        # 【循环安全阀耗尽时的兜底】_iter_cap 只防"每轮花 1 token"的病态循环；
+        # 真撞上它时缓冲里还压着模型真实采样过的 token，必须落段并记 trunc_final
+        # （理由同循环内的 flush：不落段 = 凭证丢失 = 打分与生成序列不符）。
+        for i in range(n):
+            if open_ids[i]:
+                _s = {"kind": "assistant", "text": open_raw[i],
+                      "ids": list(open_ids[i]), "finish_reason": "length"}
+                if collect_logps:
+                    _s["logps"] = list(open_lps[i])
+                segs[i].append(_s)
+                open_ids[i], open_raw[i], open_lps[i] = [], "", []
+                code_stats[i]["trunc_final"] = 1
+        full_text = ["".join(s["text"] for s in segs_i) for segs_i in segs]
+    else:
+        # 旧口径：末段被单轮上限切断即 trunc_final。token 预算档下该口径由循环内的
+        # "预算耗尽"判定接管——续写之后 finish_reason=length 不再等于失败。
+        for i in range(n):
+            last_a = next((s for s in reversed(segs[i])
+                           if s["kind"] == "assistant"), None)
+            code_stats[i]["trunc_final"] = int(
+                bool(last_a) and last_a.get("finish_reason") == "length")
     return segs, full_text, code_stats
 
 
@@ -680,6 +845,17 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                    code_wasted = 末轮写了代码但不会被执行的次数——该轨迹
                    结构性无 boxed，且 retool_stop 下 trunc_final 也记不到它）
     """
+    if int(cfg.get("max_traj_tokens", 0) or 0) > 0 and not is_native_protocol(cfg):
+        # 【为什么不给围栏档也开】围栏档的轮结构里"代码块闭合即停"（retool_stop）
+        # 与 [TOOL RESULT] 文本回填是一套独立机制，改它要重新核对生成/训练同序列
+        # 契约与 stop 语义——而本档要解决的三件事（末轮废码、切断即终局、额度不可
+        # 见）在原生档才是实测出来的痛点（native_p3）。fail-fast 而不是静默降级：
+        # 静默忽略会让"我开了 token 预算档"变成一句空话，正是本项目最贵的 bug 类型。
+        raise ValueError(
+            "[rollout] max_traj_tokens>0（token 预算档）目前只在原生协议下实现，"
+            f"当前 tool_protocol={cfg.get('tool_protocol')!r}。\n"
+            "  处置：加 --tool_protocol native 走原生档，或去掉 --max_traj_tokens "
+            "回到轮数预算档（max_rounds × round_gen_tokens）。")
     if is_native_protocol(cfg):
         if prompts_messages is None:
             raise ValueError(
@@ -901,6 +1077,10 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # 【2026-09-23 分档奖励】code_w>0：答对且代码执行成功叠加 code_ok×code_w
     # （ReTool 官方 per-success 口径，打通此前硬编码 0 的死代码字段）
     _code_w = float(cfg.get("code_w", 0.0) or 0.0)
+    # 【2026-09-29 反激励修正】True 时 code_attempt/code_w 由"每次调用累加"改
+    # "一次性"——去掉"多调用多拿分"（答对时 0 次 +1.00 < 4 次 +1.40，与
+    # "最少 token"目标反向）。保留"敢写代码"的对冲作用。
+    _once = bool(cfg.get("code_shaping_once", False))
     for i, inp in enumerate(inputs):
         for j in range(n):
             idx = i * n + j
@@ -918,7 +1098,8 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     code_used=code_stats[idx]["code_used"],
                     code_attempt_w=_att_w,
                     code_w=_code_w,
-                    max_rounds=_max_rounds)
+                    max_rounds=_max_rounds,
+                    code_shaping_once=_once)
             else:
                 sc = total_reward_retool(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
@@ -939,14 +1120,31 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # 与 trunc_shaping（绝对惩罚，run2 表面收尾事故根源）本质不同：相对化后
     # "组内都变短"不改变任何 advantage，无捷径可钻。weight=0 完全跳过（逐位同旧）。
     _lp_w = float(cfg.get("len_penalty_w", 0.0) or 0.0)
+    _eff_w0 = float(cfg.get("len_eff_w", 0.0) or 0.0)
+    # 两项都吃 completion_lens：任一开启就取（否则效率项静默无效）
     _lp_clens = ([int(x) for x in (completion_lens if completion_lens is not None else [])]
-                 if _lp_w > 0.0 else [])
+                 if (_lp_w > 0.0 or _eff_w0 > 0.0) else [])
     if _lp_w > 0.0 and len(_lp_clens) == len(rewards):
         _pen = group_length_penalty(rewards.tolist(), _lp_clens,
                                     weight=_lp_w,
                                     quantile=int(cfg.get("len_penalty_quantile", 50)),
                                     pass_gate=float(cfg.get("len_penalty_gate", 0.25)))
         rewards = torch.tensor(_pen, dtype=torch.float32)
+    # 【2026-09-29 效率激励】通过轨迹内部的组内相对长度奖励（与上面的惩罚互补：
+    # 惩罚管未通过、奖励管通过；两项都不改 ±1 的正负号）。必须在 advantage
+    # 之前应用——组均值会减掉平移，绝对长度项无效，只有相对项能进 advantage。
+    # 前置条件与 len_penalty 相同（要 completion_lens）；不满足则跳过并告警一次，
+    # 因为"开了开关却没接线"正是本项目最贵的一类静默失败。
+    _eff_w = _eff_w0
+    if _eff_w > 0.0:
+        if len(_lp_clens) == len(rewards):
+            rewards = torch.tensor(
+                group_eff_bonus(rewards.tolist(), _lp_clens, weight=_eff_w),
+                dtype=torch.float32)
+        elif not _EFF_WARNED[0]:
+            _EFF_WARNED[0] = True
+            print("[rollout][提示] len_eff_w>0 但本组没拿到 completion_lens → "
+                  "效率项静默无效（检查调用点是否传了 completion_lens）。", flush=True)
     # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除：
     # 组均值只算非截断 → 截断样本 adv=0 → 不贡献 pg_term。
     # 杀 NeMo-RL bug：全错组+混合截断不再因 trunc_shaping 产生假方差通过 group_ok。
@@ -1485,6 +1683,11 @@ def gen_worker(Q, cfg: dict):
             # 【2026-09-25】协议档也进比对：表是"模型×提示×预算×**协议**"的联合
             # 产物（两档的 base 通过率是两个分布），不比对就会把围栏表当原生档用。
             "tool_protocol": cfg.get("tool_protocol") or "fence",
+            # 【2026-09-29】预算档也进比对：轮数档与 token 档的终止结构不同（末轮
+            # 截止 vs 预算判据），同模型同提示下的通过率是两个分布——不比对就会把
+            # 轮数档探的表当 token 档的难度表用（与协议档同一类静默混表）。
+            "max_traj_tokens": int(cfg.get("max_traj_tokens", 0) or 0),
+            "answer_reserve": int(cfg.get("answer_reserve", 0) or 0),
         }
         _table = load_difficulty_table(cfg["difficulty_path"], expected_meta=_expected_meta)
         _lo, _hi = cfg.get("difficulty_band", (0.0, 1.0))
@@ -1960,10 +2163,13 @@ def gen_worker(Q, cfg: dict):
         # max_context_tokens-max_prompt_length（8192-1024=7168），而轨迹实际上限
         # ≈3×1024+工具段，永远摸不到 0.95×上限，trunc 签名形同虚设
         # （2026-09-09 审查发现6；真正的截断签名另见 trunc_final/retool_trunc）
+        # 【2026-09-29 token 预算档】上限换成 max_traj_tokens（那一档的真实轨迹
+        # 预算）；继续用轮数乘积会把阈值放到一个该档下摸不到的位置 → 又变死开关。
+        _health_cap = (int(cfg.get("max_traj_tokens", 0) or 0)
+                       or (cfg["max_rounds"] * cfg.get("round_gen_tokens", 400)))
         health.maybe_check(
             retool=is_retool,
-            max_clen=(cfg["max_rounds"] * cfg.get("round_gen_tokens", 400))
-            if is_retool else cfg["max_gen_tokens"])
+            max_clen=_health_cap if is_retool else cfg["max_gen_tokens"])
 
 
 def main():
