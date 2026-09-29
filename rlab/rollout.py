@@ -1688,6 +1688,10 @@ def gen_worker(Q, cfg: dict):
             # 轮数档探的表当 token 档的难度表用（与协议档同一类静默混表）。
             "max_traj_tokens": int(cfg.get("max_traj_tokens", 0) or 0),
             "answer_reserve": int(cfg.get("answer_reserve", 0) or 0),
+            # 【2026-09-29 budget 第四件套】prompt 上限也进比对：它决定哪些题被
+            # 跳组（plen 超限不采）且进 overlong 参考系（ctx − plen），换它探的
+            # 表与当前训练分布不符（与预算档/协议档同一类静默混表）。
+            "max_prompt_length": int(cfg.get("max_prompt_length", 0) or 0),
         }
         _table = load_difficulty_table(cfg["difficulty_path"], expected_meta=_expected_meta)
         _lo, _hi = cfg.get("difficulty_band", (0.0, 1.0))

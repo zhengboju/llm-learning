@@ -598,6 +598,34 @@ def default_system_prompt(algo: str, tool_protocol: str = "fence") -> str:
     return BASE["system_prompt"]
 
 
+def validate_max_prompt_length(cfg: dict) -> None:
+    """max_prompt_length 必须是正整数（fail-fast，纯函数，CPU 可测）。
+
+    【2026-09-29 为什么必须查】它自本轮起可从 CLI 覆盖（此前只能改 config 源码），
+    而它是**所有算法**共用的硬跳组线：rollout 采样循环里
+    `if plen > cfg["max_prompt_length"]: continue` —— 池内题目的 prompt 全部超限时，
+    这个 continue 会把每次 attempt 都吞掉，外层只剩"丢弃率慢慢爬"，训练端表现为
+    **零产出空转**（2026-09-12 丢弃率 90% 事故的非崩溃形态：不报错、不崩，只是
+    5 小时什么都没采到）。0/负数更糟：0 让每一题都被判超限。这里 fail-fast，把
+    "跑了半天才发现一题没采"变成第 0 秒的错。
+
+    上界**不设硬线**：长 prompt 该不该采是用户对数据的判断（由
+    validate_retool_budget 的不变量与实测 plen 分布去约束），这里只管"能不能工作"。
+
+    【为什么提成独立函数】get_config 之后仍有人直接改 cfg：probe_difficulty 在
+    CLI 覆盖后重跑预算校验就是这个形态。校验若只写在 get_config 里，探针路径会
+    绕过它 → 两条路径的"合法配置"定义漂移（本项目同类 bug 的常见形态）。
+    """
+    _mpl = cfg.get("max_prompt_length")
+    if not isinstance(_mpl, int) or isinstance(_mpl, bool) or _mpl <= 0:
+        raise ValueError(
+            f"[config] max_prompt_length 必须是正整数，收到 {_mpl!r}。\n"
+            f"  后果：它是采样循环的跳组线（plen > 该值即 continue 不采），0 会让"
+            f"**每一题**都超限 → 采样空转、训练端零产出（不报错、不崩）。\n"
+            f"  改法：GSM8K 家族用 400（BASE 默认）、retool_math 用 1024（preset）；"
+            f"调小到库内多数题之下同样会空转，需配合实测的 plen 分布。")
+
+
 def validate_retool_budget(cfg: dict) -> int:
     """多轮预算自洽校验（纯函数，CPU 可测）。返回工具段预留 token 数。
 
@@ -808,6 +836,9 @@ def get_config(algo: str, **overrides) -> dict:
             f"静默改变（--num_pre_Q 4 这类回退位最易踩）。\n"
             f"  改法：不要显式传 train_micro_batch_size_per_gpu，让它由 "
             f"Q_batch_size×num_pre_Q 推导。")
+    # 【2026-09-29 prompt 上限校验·防采样空转】见 validate_max_prompt_length 的
+    # 事故说明（0/负数 → 每题都跳组 → 训练端零产出空转）。
+    validate_max_prompt_length(cfg)
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
     # 【2026-09-18 H2 护栏】vllm_gen_logps 档位：N=0 是 docs/07 实锤的坏路径

@@ -189,7 +189,13 @@ def run_signature(cfg: dict) -> str:
                        # vLLM 并发数与"同题插队重试"的时序，两条 run 的轨迹分布不同
                        # （seed 盐按 题数×num_pre_Q 消耗，采样序列随之错位）。
                        # 不进签名则不同并发数的 run 撞同一 out_dir → step_N 静默覆盖。
-                       ("gen_questions_per_attempt", "gq")):
+                       ("gen_questions_per_attempt", "gq"),
+                       # 【2026-09-29 budget 第四件套进签名】max_prompt_length 此前
+                       # 只能改 config 源码，改它**一个签名字符都不变** → 两个不同
+                       # prompt 上限的 run 撞同一 out_dir，step_N 静默覆盖（P1 事故
+                       # 同类）。它是行为级变量：跳组线（plen 超限即不采）、预算
+                       # 不变量加数、overlong 参考系 ctx−plen 三处都随它变。
+                       ("max_prompt_length", "mp")):
         _cur = cfg.get(_key)
         _dflt = _preset.get(_key, BASE.get(_key))
         if _cur != _dflt:
@@ -268,7 +274,10 @@ _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      # 【2026-09-28】并采题数（吞吐杠杆）也走 _opt_tag，必须登记，
                      # 否则"改了并发数的 run 中途重启"会被 guard_ckpt_collision
                      # 判成外来签名而拒跑（_is_opt_suffix 认不出 -gq8）。
-                     "gq")
+                     "gq",
+                     # 【2026-09-29】prompt 上限（budget 第四件套）同属优化器段：
+                     # 不登记则 CLI 改过它的 run 中途重启会被自己的护栏拦死。
+                     "mp")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -816,6 +825,23 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    # 【2026-09-29 CLI 缺口·budget 第四件套】max_prompt_length 此前**只能改 config
+    # 源码**：docs/14 的 token 档命令把它当 flag 写在命令行里 → argparse 直接
+    # "unrecognized arguments" 拒跑（第一次照抄就踩）。而它同时出现在三个**行为级**
+    # 位置：①预算不变量（validate_retool_budget：token 档 max_traj_tokens + plen
+    # ≤ ctx；轮数档 rounds×per_round + plen + 预留 ≤ ctx）；②长度参考系
+    # （overlong_ref_tokens 的 ctx − plen）；③跳组线（rollout：plen > plen 上限即
+    # `continue` 不采）。改它却不进签名 = CLI 改的 run 与旧 ckpt 撞同一 out_dir
+    # （--num_pre_Q 4 静默腰斩 lr 的同类盲区），故本次连同签名一起接线。
+    # 注意**语义方向**：调大它 = 放行更长 prompt（同时压缩轨迹可用预算，可能触发
+    # 上面的不变量 fail-fast）；调小它 = 更严跳组，调到库内多数题之下会让采样循环
+    # 空转（2026-09-12"丢弃率 90%、训练端零输出"的形态），故配 plen>0 校验。
+    ap.add_argument("--max_prompt_length", type=int, default=None,
+                    help="覆盖 prompt 长度上限（默认取 preset：GSM8K 家族 400、"
+                         "retool_math 1024）。超限的题在采样循环里直接跳组不采，"
+                         "且它是预算不变量的加数（token 档 max_traj_tokens+该值"
+                         "≤max_context_tokens）与 overlong 参考系（ctx−该值）的一半。"
+                         "调小到多数题之下会让采样空转，谨慎单变量实验")
     # 【2026-09-29 token 预算档】轮数上限 → 整条轨迹的 token 预算。
     # 与"轮数×单轮"档互斥的**不变量**：max_traj_tokens + max_prompt_length
     # ≤ max_context_tokens（validate_retool_budget 强制）。
@@ -1084,6 +1110,10 @@ def main():
     if args.round_gen_tokens is not None: overrides["round_gen_tokens"] = args.round_gen_tokens
     if args.max_rounds is not None: overrides["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None: overrides["max_context_tokens"] = args.max_context_tokens
+    # 【2026-09-29】prompt 上限（budget 第四件套）——与上面三件套同一段落 override：
+    # 它是预算不变量与 overlong 参考系的加数，必须在 validate_retool_budget 之前到位。
+    if args.max_prompt_length is not None:
+        overrides["max_prompt_length"] = args.max_prompt_length
     # 【2026-09-29 token 预算档】在 tool_protocol 之前落 override（与预算档同属
     # "配置几何"，get_config 的校验按最终 cfg 判，顺序不影响正确性，但先写更清楚）
     if args.max_traj_tokens is not None:

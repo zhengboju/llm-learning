@@ -1,24 +1,27 @@
 # 工作交接：retool_math 原生工具协议（native）路线进展与下一步计划
 
-**日期**：2026-09-28
-**范围**：从"11 版围栏协议无效定案 → 原生 `<tool_call>` 主线（docs/09）"之后，本轮完成的代码修复、native_p2/p3 两次实跑结论、以及 native_p4 的执行计划。
+**日期**：2026-09-29
+**范围**：从“11 版围栏协议无效定案 → 原生 `<tool_call>` 主线（docs/09）”之后，本轮完成的代码修复、native_p2/p3 实跑结论、token-budget 方案，以及 native_p4 当前训练进展。
 
 ---
 
 ## 0. 一句话现状
 
-**协议机器（prompt/预算/解析）已切换到 native 档，但真实数据证明 `base 4B 模型不会在 `</tool_call>` 后自然停`——native 档默认"不装 stop"的假设在长轨迹上失效，invalid 率高达 ~60%，这是当前所有"没效果"现象的头号原因。下一步必须把 `--native_stop_at_call` 从"兜底开关"升格为"必装部件"，配合档 D 预算，重跑闸门验证。**
+**native_p4 已在 token-budget 原生协议下通过 step 100 继续闸门：已上传训练样本 acc 72.6%、fmt 81.0%、invalid 0.9%、ctx 满 0%，最近 32 组平均轨迹约 2993 token、接近 8192 上限约 9.4%；生成端此前确认总丢弃 20% 且 overlong=0。当前瓶颈已从“协议不可用”转为“成功调用工具后仍在终局重复调用”，不应加预算或设置任务特化的末轮禁调用；保持参数不变跑到有效 step 200，并用 held-out 评测决定是否继续到 600。**
 
 ---
 
-## 1. 已合入并推送的代码修复（main @ 7b1d17d）
+## 1. 已合入并推送的代码修复（main @ `422a8d7`）
 
 | commit | 内容 | 文件 |
 |---|---|---|
-| `0ffec5e` fix(rollout) | **F1**：`code_wasted`（末轮废码）并入 advantage 排除口径——与 loss 侧 `sample_weight`（trunc OR wasted）同一人群。旧版只排 trunc，废码样本以 −1 污染组基线、自身又零梯度，与注释声称的"adv=0"矛盾 | [rollout.py](rlab/rollout.py)（`retool_score_flat`）、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py) `test_code_wasted_adv_exclusion`（8 项） |
+| `0ffec5e` fix(rollout) | **F1**：`code_wasted`（末轮废码）并入 advantage 排除口径——与 loss 侧 `sample_weight`（trunc OR wasted）同一人群。旧版只排 trunc，废码样本以 −1 污染组基线、自身又零梯度，与注释声称的“adv=0”矛盾 | [rollout.py](rlab/rollout.py)（`retool_score_flat`）、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py) `test_code_wasted_adv_exclusion`（8 项） |
 | `7b1d17d` feat(probe) | **F2**：`probe_difficulty` 新增 `--tool_protocol {fence,native}` / `--native_tool_style` CLI 入口。此前 get_config 恒得 fence、原生分支从 CLI 不可达 → 任何难度表都是围栏档探的，native run 静默混表。协议档先落 overrides 再进 get_config（顺序敏感，自动套 native 预算档与原生提示） | [probe_difficulty.py](rlab/probe_difficulty.py)、[test_native_protocol.py](rlab/tests/test_native_protocol.py)（+4 项接线检查） |
+| `d5b2f88` feat(rollout) | 原生协议从轮数上限切为整轨迹 token budget；加入剩余预算约束、answer reserve、预算提示、组内效率奖励、一次性代码 shaping、零梯度排除，并修正 terminal active-set bug | [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[reward.py](rlab/reward.py)、[train.py](rlab/train.py) |
+| `af33532` fix(config) | 确认并固化 `round_gen_tokens >= max_traj_tokens`：`P>=M` 时续写不可达，消除由任意 chunk 边界导致的调用解析差异；仅在未开 stop 且 `P<M` 时提示 | [config.py](rlab/config.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py) |
+| `422a8d7` fix(eval) | eval 的 `mt_cfg` 补传 `round_gen_tokens`；此前训练虽用 `P=8192`，评测会静默回落到 400-token 分块，实际测成另一套终止协议 | [eval_vllm_one.py](eval_vllm_one.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py) |
 
-本地验证：`test_native_protocol` 188 项全过；`test_retool_cpu` 本机可跑 46 个测试函数全过（8 个跳过因本机缺 transformers/safetensors，pod 上跑全量确认）。
+本地 token-budget 测试累计 **845 项检查全过**。其中 `HonestGen` 回放证明：确定性 token 流下，`P<M` 与 `P>=M` 拼出的 token ids 完全一致；`P>=M` 只需一次 generate，且耗尽 `M` 即终止。该测试证明本地序列拼接语义，不等价于真实 vLLM 跨请求 RNG 一致性；真机因此仍优先使用 `P=M=8192`。
 
 > ⚠ F1 是语义修正（改变含废码组的 advantage 数值），**修复前后 run 在含废码组上不可比**；对比应锚定 BASE。
 
@@ -152,8 +155,9 @@ ATTN_IMPL=flash_attention_2 bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B 
 > **判据修订（2026-09-29，据 §4.5 实测）**：`dropped` 族的 `invalid` 与 `trunc` **高度
 > 重叠**（都是 `A_cut_mid_call`：调用块写到一半被单轮上限切断），两者不能当独立指标
 > 读。20 步闸门的**主读数改为 `--no-boxed-breakdown` 的两行分布**，预期形态：
-> `A`（要加单轮额度）与 `C`（末轮废码，要末轮禁调用）是主导桶，`E_clean_no_box` 应
-> 仍在个位数百分比——**若闸门后 `E` 显著上升，说明提示层的收尾指令被削弱了**
+> `A`（要加单轮额度）与 `C`（旧轮数档的终局废码）是主导桶，`E_clean_no_box` 应
+> 仍在个位数百分比。此处是 native_p3 轮数档的历史判据；token-budget 档不再据此推出
+> 固定末轮禁调用，当前处置以 §4.7 为准。若闸门后 `E` 显著上升，说明提示层的收尾指令被削弱了
 > （这是 6×2048/16384 实测里唯一没被证伪的提示层职责）。
 
 ### 第 4 步：探 native 难度表（F2 入口投入使用）
@@ -198,7 +202,7 @@ python -m rlab.analysis --no-boxed-breakdown rlab_out/native_p3/record.jsonl
 | 桶 | 含义 | 该动哪个旋钮 |
 |---|---|---|
 | `A_cut_mid_call` | 轮长切断，且已写出调用开标记（`trunc ∩ invalid`） | **加单轮额度**（`round_gen_tokens`） |
-| `C_wasted` | 终局轮写了完整调用、按协议不执行（末轮废码） | **末轮禁调用**（末轮 SP 加 `bad_words`） |
+| `C_wasted` | 终局写了完整调用，但剩余预算不足以容纳回包和答案 reserve | **先按 `code_used` 拆分**：首次调用太晚 vs 已成功调用后的重复晚调用；使用通用预算/效率激励治理，不做固定末轮禁调用 |
 | `F_ctx_full` | observation 装不进 `max_context_tokens` 而终局 | 加大 `max_context_tokens` |
 | `B_cut_mid_prose` | 轮长切断，且**没写出**任何调用（含子计数 `B2` = 全程 `code_used==0`） | **治啰嗦**（提示层减长度） |
 | `D_invalid_other` | 调用形态非法，但不是被切断 | 协议/采样形态 |
@@ -221,7 +225,7 @@ python -m rlab.analysis --no-boxed-breakdown rlab_out/native_p3/record.jsonl
 2. **两族失败方向相反** ⇒ 不可能被同一个旋钮治好：ok 族 = `C_wasted` 主导（差一点，输在末轮又调工具）；dropped 族 = `A`(42%) + `C`(41%) 两头顶死（硬题既烧轮次又浪费末轮）。
 3. **`max_rounds` 5→6 实测无收益**（6×2048/16384 vs 5×2048/14336）：零方差丢弃占已落盘组 45%→**50%**、dropped 族 invalid 38.3%→43.1%、trunc 51.7%→55.6%，末轮废码率 ~31%→~30% **不动**。机制：`code_wasted` 度量的是"**每轮调用倾向**"（`max_code_calls = max_rounds−1`，末轮恒为答题轮而模型不知道自己在末轮），加轮数只是平移边界，不改变该倾向。**"继续加轮数"这条路已封**。
 
-**零梯度算力 ≈ 27%（ok 族）/ 95%（dropped 族）**：F1（`0ffec5e`）把 `trunc_final OR code_wasted` 同时从 `adv` 与 `sample_weight` 排除（统计口径正确），副作用是"末轮该收尾"这个决策**结构性拿不到任何梯度**——所以它永远不会自己学会。这也解释了为何"加轮数"无效而必须改协议。
+**零梯度算力 ≈ 27%（ok 族）/ 95%（dropped 族）**：F1（`0ffec5e`）把 `trunc_final OR code_wasted` 同时从 `adv` 与 `sample_weight` 排除（统计口径正确）。在旧轮数档里，“终局该收尾”结构性拿不到梯度，这解释了为何单纯加轮数无效。后续 token-budget 档已把执行条件改为“剩余预算能否容纳工具回包 + answer reserve”；因此本段的“末轮边界”只用于解释历史 native_p3，**不再推出固定末轮禁调用**。当前 native_p4 应按 §4.7 先区分首次晚调用与重复晚调用，再决定通用效率机制。
 
 ---
 
@@ -302,8 +306,16 @@ P<M"时打印提示（**对已知基线不叫狼来了**：开了 stop 串或 P�
 
 - **eval**：`mt_cfg` 必须带 `max_traj_tokens/answer_reserve/budget_hint`，剔题预算按
   `max_traj_tokens` 取，启动行打印预算档。否则用轮数档的终止结构去评 token 档的 ckpt。
-- **probe_difficulty**：新增同名入口 + `probe_meta` 加 `max_traj_tokens/answer_reserve`；
-  `data.load_difficulty_table` 的比对清单同步（旧表无这两个键 → 不告警，兼容）。
+- **probe_difficulty**：新增同名入口 + `probe_meta` 加 `max_traj_tokens/answer_reserve/
+  max_prompt_length`；`data.load_difficulty_table` 的比对清单同步（旧表无这些键 →
+  不告警，兼容）。
+- **`--max_prompt_length` 的 CLI（2026-09-29 补）**：上面 §4.6 的命令把它当 flag 写，
+  而它当时**只是 config 键**（BASE=400 / retool_math=1024）→ 照抄即
+  `unrecognized arguments` 拒跑。现已补成 budget 第四件套：train/probe 双入口、
+  偏离进签名（`-mp<n>`，默认值不加字符）、进 `probe_meta` 与训练端比对清单。
+  **传 preset 同值是无副作用 no-op**；它同时是预算不变量加数与 overlong 参考系
+  （`ctx − plen`）→ 调大要重核 `validate_retool_budget`，调小到库内多数题之下会让
+  采样循环空转（0/负数已在 config 层 fail-fast，非崩溃形态的静默跑废）。
 - **health**：`max_clen` 在 token 档下取 `max_traj_tokens`（继续用轮数乘积 = 新死开关）。
 - **analysis**：`record_clen_cap` 优先读 `max_traj_tokens`。
 
@@ -324,12 +336,92 @@ P<M"时打印提示（**对已知基线不叫狼来了**：开了 stop 串或 P�
 
 ---
 
+## 4.7 native_p4 当前训练进展（2026-09-29，约有效 micro-step 109）
+
+### 运行口径与数据来源
+
+本节来自 pod 上的：
+
+```bash
+python -m rlab.analysis \
+  --record rlab_new/native_p4/record.jsonl \
+  --no-boxed-breakdown rlab_new/native_p4/record.jsonl
+```
+
+快照共 `1056` 条轨迹，约 `132` 组，其中 `ok=872`（约109组）、`dropped=184`（约23组）。此前生成端已打印：累计尝试60组、有效48组、零方差12组、**overlong=0**、题目过滤4/16267；因此当时真实总丢弃率为20%，且不存在 record 未落盘的隐藏 overlong。当前快照更晚，需用最新 `[rollout] 采样统计` 再确认 overlong 仍为0。
+
+> **步数口径**：`ok≈109组` 对应约109个训练 micro-step；若 `gradient_accumulation_steps=4`，只相当于约27次 optimizer update。`gen_ver=0..96` 与此不矛盾，生成与训练之间还有队列和权重同步节奏。
+
+### 已上传训练样本（ok 族）
+
+| 指标 | native_p4 早期快照 | 当前快照 | 判读 |
+|---|---:|---:|---|
+| acc | 69.7% | **72.6%** | +2.9pp，方向健康 |
+| fmt | 77.1% | **81.0%** | +3.9pp，收尾能力改善 |
+| 条件精度（acc/fmt） | 90.4% | **89.7%** | 基本稳定；当前收益主要来自完成/格式，不是已证实的数学能力跃升 |
+| code rate | 95.8% | **97.4%** | 仍极高，工具可能过用 |
+| code_ok | 90.7% | **93.7%** | 工具调用质量改善 |
+| trunc | 6.2% | **4.7%** | -1.5pp |
+| invalid | 1.4% | **0.9%** | 协议已稳定 |
+| ctx 满 | 0.0% | **0.0%** | 上下文不是瓶颈 |
+| 零梯度 | 17.8% | **139/872 = 15.9%** | 有改善，但仍高于目标10% |
+
+`dropped` 族 `184` 条中 acc 1.6%、trunc 22.3%，`174/184=94.6%` 为零梯度，符合零方差组主要是无可学习的全错轨迹，而不是训练样本质量下降。
+
+### 最近窗口趋势：效率明显改善，但存在采样波动
+
+| 窗口（约组） | acc | fmt | trunc | 末轮废码 | avg_clen | ≥7372 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0~80 | 约54.3% | 约59.6% | 约10.8% | 约25.2% | 约4303 | 约21.5% |
+| 80~132 | 约70.0% | 约78.9% | 约3.1% | 约16.9% | **约3258** | **约10.4%** |
+| 最近32组 | 约75.0% | 约82.4% | 约3.5% | 约12.5% | **约2993** | **约9.4%** |
+
+以上窗口混合了 `ok` 与 `dropped`，只用于观察生成总体行为；训练质量判断仍以 `ok` 分族为准。全局加权 `avg_clen≈3893`，相比早期快照约4216下降；最近窗口已达到原定 step-100 目标（`avg_clen<3500`、接近预算比例约10%以内）。`800~960` 窗口 acc 80.6% 后，`960~1120` 回落到65.6%，每窗只有约20道题且同题8轨迹高度相关，先按采样波动处理，不判定退化。
+
+staleness 全局均值1.6、最大3；最近均值2.3但最大值未扩大，当前仍正常。只有均值持续升到4以上或最大值不断增加，才检查生成/训练吞吐失衡。
+
+### 当前瓶颈：成功使用工具后又在终局重复调用
+
+无 boxed 分解：
+
+| 族 | 无 boxed | `C_wasted` | `B_cut_mid_prose` | `D_invalid_other` | `E_clean_no_box` |
+|---|---:|---:|---:|---:|---:|
+| ok | 166/872（19%） | **98** | 40 | 8 | 20 |
+| dropped | 181/184（98%） | **133** | 41 | 1 | 6 |
+
+同时 `A_cut_mid_call=0`、`F_ctx_full=0`，所以可以排除“单轮额度不足”和“上下文装不下”。ok 族中只有约23条完全没执行过工具，却有98条 `C_wasted`；即使把这23条全部视为“第一次调用就太晚”，仍至少有 `75/98=76.5%` 的 `C_wasted` 来自**已经用过工具后再次晚调用**。
+
+因此若 step 200 后仍需改配方，目标应是通用的“成功调用后尽快作答/抑制无收益的重复调用”，而不是：
+
+- 增加 `max_traj_tokens` 或 `max_context_tokens`；
+- 设置只适用于本任务的固定末轮禁调用；
+- 直接把所有代码奖励归零；
+- 恢复 `P<M` 的人工续写分块。
+
+### 当前决策与下一闸门
+
+1. **当前 run 不改参数、不重启，继续到有效 step 200。** step 100 已通过协议、正确性和近期效率闸门。
+2. **保留并评测 `step_100`**。训练 record 只能证明训练分布内轨迹改善，不能代替 held-out 泛化评测。
+3. 暂不直接承诺跑满600；step 200 再决定。
+4. step 200 建议继续条件：真实总丢弃率 `<25%` 且 `overlong≈0`；最近窗口 `avg_clen<=3000~3300`；`>=7372` 比例 `<10%`；ok 零梯度 `<12%`（理想 `<10%`）；ok `C_wasted<=8~10%`；held-out 准确率不低于 step 100，且平均 token/工具轮数继续下降。
+5. 复核命令仍为：
+
+```bash
+python -m rlab.analysis \
+  --record rlab_new/native_p4/record.jsonl \
+  --no-boxed-breakdown rlab_new/native_p4/record.jsonl
+```
+
+并同时保存最新 `[rollout] 采样统计` 与 `step_N/run_info.json` 中的 `round_gen_tokens/max_traj_tokens/answer_reserve/native_stop_at_call/git_head/signature`，避免只凭文档推断 live run 配置。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
-- **`--native_stop_at_call` 默认值应视为过期**：docs/09 把它当"invalid 高才开"的兜底，native_p3 实锤 base 4B 在 1024/round、无 stop 下 invalid ~60%——它是**主协议部件**，native 路线默认应开。
-- **go/no-go 冒烟（16/16）不可外推**：短冒烟看不到真实长轨迹的 invalid 分布；判别请用第 1 步脚本或 20 步闸门的 record 分族统计。
-- **F1 修复与含废码组的旧 run 不可比**；native_p4 是新的"修复后"起点，对照一律锚定 BASE。
-- **record 幸存者偏差**：overlong 整组不落盘，训练期曲线系统性偏乐观；"record 涨 eval 不涨"优先怀疑这里。
-- **内嵌评测与 gen_gpu_mem 0.6 互斥**：若恢复 `--eval_during_training`，GPU0 需 ~19G 给 eval，先把 gen_gpu_mem 降到 0.30–0.45。
-- **未提交文件**：`docs/13-agentic-rl-survey.md`、`docs/p9-diagnosis.md` 为工作区残留，非本次交接内容，未纳入提交。
-- **待办**：pod 上 `git pull` 后跑全量 pytest（本机缺 transformers/safetensors，8 个相关测试未验）；native_p4_smoke 的 20 步 record 用 `rlab.analysis --record` + `--no-boxed-breakdown`（§4.5）复核。
+- **`--native_stop_at_call` 的历史定位**：native_p3 在轮数档、1024/round、无 stop 下 invalid ~60%，说明它对旧档是关键协议部件；token-budget 档使用 `P=M=8192` 时不存在人工续写边界，但是否启用 stop 仍必须以 live `run_info.json` 为准，不能从文档猜测。
+- **go/no-go 冒烟（16/16）不可外推**：短冒烟看不到真实长轨迹的 invalid 分布；判别请看完整 record 分族统计和 `--no-boxed-breakdown`。
+- **F1 修复与含废码组的旧 run 不可比**；native_p4 是新的“修复后”起点，对照一律锚定 BASE。
+- **record 幸存者偏差**：overlong 整组不落盘，训练期曲线系统性偏乐观；必须同时读取生成端 `[rollout] 采样统计`。native_p4 已知60次尝试快照中 overlong=0，但更晚快照仍需复核。
+- **内嵌评测与 gen_gpu_mem 0.6 互斥**：若恢复 `--eval_during_training`，GPU0 需约19G给 eval，先把 gen_gpu_mem 降到0.30–0.45。
+- **当前本地工作区有未提交代码修改**：除本文档外，[config.py](rlab/config.py)、[data.py](rlab/data.py)、[probe_difficulty.py](rlab/probe_difficulty.py)、[rollout.py](rlab/rollout.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[train.py](rlab/train.py) 均为 modified；后续提交前必须先审 diff，不能把它们当成本次文档更新的一部分。
+- **下一动作**：当前 run 原参数继续到有效 step 200；保留并评测 step 100；step 200 同时采集 analysis、生成端采样统计、held-out 评测和 `run_info.json`，按 §4.7 的闸门决定继续到600还是调整重复工具调用激励。

@@ -215,6 +215,11 @@ def main():
                     help="覆盖工具轮数上限（默认取 preset；参考实现 6 轮）")
     ap.add_argument("--max_context_tokens", type=int, default=None,
                     help="覆盖总上下文上限（默认取 preset）")
+    # 【2026-09-29 budget 第四件套】max_prompt_length 同属"探针与训练同档"铁律：
+    # 它进预算不变量、进 overlong 参考系（ctx − plen，探针打分用它），也决定训练
+    # 端哪些题根本采不到（plen 超限跳组）。探针不传 → 表描述的是另一个预算几何。
+    ap.add_argument("--max_prompt_length", type=int, default=None,
+                    help="覆盖 prompt 长度上限（默认取 preset；**必须与训练同档**）")
     # 【2026-09-29 token 预算档】探针与训练**同档**是铁律（表的语义是"模型×提示×
     # 预算×协议"的联合产物）：token 档换的是终止结构，用它探的表描述的是另一套
     # 轨迹分布。不补这个入口 → native run 的难度表是轮数档探的。
@@ -261,7 +266,8 @@ def main():
                     help="显式 attention backend（如 FLASH_ATTN）；确定性档必需")
     args = ap.parse_args()
 
-    from rlab.config import get_config, validate_retool_budget
+    from rlab.config import (get_config, validate_max_prompt_length,
+                             validate_retool_budget)
     # 【2026-09-28 原生协议入口】协议档必须先落进 overrides——get_config 靠它决定
     # 要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感，与 train.py 同一约定）；
     # preset 系统提示也随档切换（native → system_prompt_retool_math_native，
@@ -285,6 +291,10 @@ def main():
         cfg["max_rounds"] = args.max_rounds
     if args.max_context_tokens is not None:
         cfg["max_context_tokens"] = args.max_context_tokens
+    # 【2026-09-29】prompt 上限（budget 第四件套）：必须在 validate_retool_budget
+    # 之前落 cfg（它是不变量的加数），且与训练同档是铁律。
+    if args.max_prompt_length is not None:
+        cfg["max_prompt_length"] = args.max_prompt_length
     if args.max_traj_tokens is not None:
         cfg["max_traj_tokens"] = args.max_traj_tokens
     if args.answer_reserve is not None:
@@ -307,6 +317,9 @@ def main():
     # 【2026-09-12】CLI 覆盖后必须重跑预算校验：探针的价值就在于"描述训练时的
     # 采样分布"，若探针预算几何与训练不一致（或不自洽），整张难度表都是另一个
     # 分布下的产物。get_config 里的校验发生在 override 之前，拦不住这里。
+    # 【2026-09-29】plen 校验同源复用（不只写在 get_config 里）：否则探针路径的
+    # "合法配置"定义与训练漂移——本文件正是 get_config 之后直接改 cfg 的形态。
+    validate_max_prompt_length(cfg)
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
 
     from rlab.data import load_qas, load_difficulty_table
@@ -368,6 +381,10 @@ def main():
         "k": args.k,
         "rounds": cfg["max_rounds"], "round_tokens": cfg["round_gen_tokens"],
         "ctx": cfg["max_context_tokens"], "temp": cfg["temperature"],
+        # 【2026-09-29 budget 第四件套】prompt 上限进指纹：它进预算不变量、进
+        # overlong 参考系（ctx − plen，本探针打分即用），也决定训练端哪些题根本
+        # 采不到（plen 超限跳组）——换它续跑同一 --out 会静默混两个分布的表。
+        "max_prompt_length": int(cfg.get("max_prompt_length", 0) or 0),
         "sp": _sp_sha,   # 提示指纹（-sp<hash6> 同源）
         "seed": args.seed,
         # 【2026-09-25】协议档（围栏/原生）——同模型同提示下两档的通过率是两个

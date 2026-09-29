@@ -446,8 +446,13 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
                     # **终止结构**（末轮截止 vs 预算判据、切断即终局 vs 续写），同模型
                     # 同协议下两档的通过率也是两个分布。旧表无这两个键 → `_rv is None`
                     # → 不告警（旧表兼容，与新键加入前行为一致）。
+                    # 【2026-09-29】新增 max_prompt_length：它决定训练端哪些题被
+                    # 跳组（plen 超限不采）且进 overlong 参考系（ctx − plen），换它
+                    # 探的表与当前训练分布不符。旧表无该键 → `_rv is None` → 不告警
+                    # （旧表兼容，与新键加入前行为一致）。
                     for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
-                                "tool_protocol", "max_traj_tokens", "answer_reserve"):
+                                "tool_protocol", "max_traj_tokens", "answer_reserve",
+                                "max_prompt_length"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

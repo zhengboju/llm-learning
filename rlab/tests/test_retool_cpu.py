@@ -5099,6 +5099,144 @@ def test_token_budget_mode():
           '"round_gen_tokens": args.round_tokens}' in _ev)
 
 
+def test_max_prompt_length_cli():
+    """[AP] budget 第四件套：max_prompt_length 的 CLI 缺口（2026-09-29 交接文档踩坑）。
+
+    【为什么必须补】docs/14 §4.6 的 token 档命令把 `--max_prompt_length 1024` 当
+    flag 写在命令行里，而它**从来不是任何脚本的 add_argument** —— 只是 config 键
+    （BASE=400 / retool_math=1024）。照抄那条命令 = argparse 直接
+    `unrecognized arguments` 拒跑（交接文档是"照着敲就能跑"的最后一环，命令错=
+    交接失败）。它同时出现在三个行为级位置：①预算不变量加数；②overlong 参考系
+    ctx−plen；③采样跳组线（plen 超限即 continue 不采）。故不能只补 flag，还要
+    进签名（否则 CLI 改的 run 撞旧 ckpt 的 out_dir）+ 进探针/表的协议指纹
+    （否则换 plen 探的表与训练分布不符——"探针与训练同档"铁律）。
+    """
+    print("[AP] max_prompt_length CLI 缺口（budget 第四件套）")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _tr = open(os.path.join(root, "rlab", "train.py"), encoding="utf-8").read()
+    _pb = open(os.path.join(root, "rlab", "probe_difficulty.py"), encoding="utf-8").read()
+    _ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    _dt = open(os.path.join(root, "rlab", "data.py"), encoding="utf-8").read()
+
+    # ---- 1. CLI 入口 + overrides 接线（三处：train / probe）----
+    check("train.py 暴露 --max_prompt_length 并接线 overrides",
+          'add_argument("--max_prompt_length"' in _tr
+          and 'overrides["max_prompt_length"] = args.max_prompt_length' in _tr)
+    check("probe_difficulty.py 暴露 --max_prompt_length（探针与训练同档铁律）",
+          'add_argument("--max_prompt_length"' in _pb
+          and 'cfg["max_prompt_length"] = args.max_prompt_length' in _pb)
+    # probe 的覆盖必须**在** validate_retool_budget 之前（它是不变量加数）
+    check("probe 的 plen 覆盖在预算校验之前（否则校验用的是旧值）",
+          _pb.index('cfg["max_prompt_length"] = args.max_prompt_length')
+          < _pb.index("validate_retool_budget(cfg)"))
+    # 校验提成独立函数并由**两条路径**同源调用：probe 是在 get_config 之后直接改
+    # cfg 的形态，校验只写在 get_config 里会被绕过（两条路径的"合法配置"定义漂移）
+    check("校验是独立纯函数且 train 路径经 get_config 走到它",
+          "def validate_max_prompt_length" in open(
+              os.path.join(root, "rlab", "config.py"), encoding="utf-8").read())
+    check("probe_difficulty 在同源复用该校验（不是自己另写一份）",
+          "from rlab.config import" in _pb
+          and "validate_max_prompt_length" in _pb.split("from rlab.config import")[1]
+          and "validate_max_prompt_length(cfg)" in _pb)
+
+    # ---- 2. 真实复现：docs/14 §4.6 的命令必须被 argparse 接受 ----
+    # 这是本组存在的理由——修复前这一行就是 `unrecognized arguments`。
+    import io as _io
+    import contextlib as _cl
+    import rlab.train as _T
+    _cap = {}
+    _orig = _T.run_training
+    _T.run_training = lambda cfg, args: _cap.update(cfg=cfg) or (_ for _ in ()).throw(
+        SystemExit(0))
+    _argv = list(sys.argv)
+    try:
+        sys.argv = ["train.py", "--algo", "retool_math",
+                    "--model_path", "/root/Qwen3.5-4B",
+                    "--tool_protocol", "native", "--native_tool_style", "function",
+                    "--max_traj_tokens", "8192", "--answer_reserve", "1024",
+                    "--budget_hint", "--max_context_tokens", "9216",
+                    "--max_prompt_length", "1024",
+                    "--len_eff_w", "0.1", "--code_shaping_once",
+                    "--overlong_ref", "4096", "--no-log",
+                    "--steps", "20", "--save_steps", "5",
+                    "--out_dir", os.path.join(tempfile.gettempdir(), "_ap_probe")]
+        with _cl.redirect_stdout(_io.StringIO()):
+            _T.main()
+        _parsed = True
+    except SystemExit as _e:
+        _parsed = (_e.code == 0)
+    except Exception:
+        _parsed = False
+    finally:
+        sys.argv = _argv
+        _T.run_training = _orig
+    check("docs/14 §4.6 的 token 档命令被 argparse 接受（修复前 unrecognized）",
+          _parsed and "cfg" in _cap)
+    check("命令里的 --max_prompt_length 1024 真落到 cfg（不是被忽略）",
+          _cap.get("cfg", {}).get("max_prompt_length") == 1024)
+
+    # ---- 3. 进签名 + 迁移兼容（否则 CLI 改的 run 撞 out_dir）----
+    from rlab.train import run_signature as _rs, _is_opt_suffix as _ios2
+    from rlab.train import _OPT_TAG_PREFIXES as _OTP
+    _b = get_config("retool_math", use_wandb=False)
+    check("默认 plen 不加签名字符（历史签名逐字不变，旧 ckpt 护栏不受影响）",
+          "-mp" not in _rs(_b))
+    for _v in (1500, 512):
+        _s = _rs(get_config("retool_math", use_wandb=False, max_prompt_length=_v))
+        check(f"plen={_v} 偏离进签名（-mp{_v}）", f"-mp{_v}" in _s)
+        check(f"plen={_v} 段被 _is_opt_suffix 认作优化器段（改了它的 run 可续跑）",
+              _ios2(_s[len(_rs(_b)):]))
+    check("mp 已登记进 _OPT_TAG_PREFIXES（护栏能识别该段）",
+          "mp" in _OTP)
+
+    # ---- 4. 非法值 fail-fast（防采样空转这一非崩溃形态）----
+    for _bad in (0, -1):
+        try:
+            get_config("retool_math", use_wandb=False, max_prompt_length=_bad)
+            check(f"plen={_bad} 必须 fail-fast", False)
+        except ValueError as _e:
+            check(f"plen={_bad} fail-fast（0 会让每一题都超限→采样空转）",
+                  "max_prompt_length" in str(_e) and "空转" in str(_e))
+    # 单轮路径（GSM8K 家族）同样受管：它是所有算法共用的跳组线
+    try:
+        get_config("dapo", use_wandb=False, max_prompt_length=0)
+        check("单轮路径（dapo）的 plen=0 也必须 fail-fast", False)
+    except ValueError:
+        check("单轮路径（dapo）的 plen=0 也必须 fail-fast", True)
+
+    # ---- 5. 协议指纹三处同源（探针写出 / 训练比对 / 表加载比对）----
+    check("probe_meta 写 max_prompt_length（表自证协议几何）",
+          '"max_prompt_length": int(cfg.get("max_prompt_length", 0) or 0)' in _pb)
+    check("训练端 expected_meta 含 max_prompt_length（同源比对）",
+          '"max_prompt_length": int(cfg.get("max_prompt_length", 0) or 0)' in _ro)
+    check("data.py 比对清单含 max_prompt_length（否则换了 plen 探的表被静默复用）",
+          '"max_prompt_length"' in _dt.split("for _fk in (")[1].split("):")[0])
+    # 旧表无该键 → 不告警（兼容性：与新键加入前行为一致）；真偏离仍必须告警
+    from rlab.data import load_difficulty_table as _ldt
+    with tempfile.TemporaryDirectory() as _td:
+        _p = os.path.join(_td, "old.jsonl")
+        _m = {"ctx": 8192, "temp": 1.0}
+        with open(_p, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"Q": "q", "k": 4, "n_correct": 2,
+                                "probe_meta": _m}) + "\n")
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            _t = _ldt(_p, expected_meta={**_m, "max_prompt_length": 1024})
+        check("旧表无 max_prompt_length → 照常加载且不告警（向后兼容）",
+              set(_t) == {"q"} and "警告" not in _buf.getvalue())
+        # 表里有该键且与当前不同 → 必须告警（否则护栏被削弱成装饰）
+        _p2 = os.path.join(_td, "new.jsonl")
+        with open(_p2, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"Q": "q", "k": 4, "n_correct": 2,
+                                "probe_meta": {**_m, "max_prompt_length": 400}}) + "\n")
+        _buf2 = _io.StringIO()
+        with _cl.redirect_stdout(_buf2):
+            _t2 = _ldt(_p2, expected_meta={**_m, "max_prompt_length": 1024})
+        check("表 plen=400 ≠ 当前 1024 → 告警（换了 plen 探的表不被静默复用）",
+              set(_t2) == {"q"} and "max_prompt_length" in _buf2.getvalue())
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -5152,6 +5290,7 @@ if __name__ == "__main__":
     test_attempt_shaping_and_err_tier()
     test_health_code_collapse()
     test_token_budget_mode()
+    test_max_prompt_length_cli()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
