@@ -228,7 +228,7 @@ python -m rlab.analysis --no-boxed-breakdown rlab_out/native_p3/record.jsonl
 ## 4.6 token 预算档：轮数上限 → 整条轨迹 token 预算（2026-09-29）
 
 ```bash
---max_traj_tokens 8192 --answer_reserve 1024 --budget_hint \
+--max_traj_tokens 8192 --round_gen_tokens 8192 --answer_reserve 1024 --budget_hint \
 --max_context_tokens 9216 --max_prompt_length 1024 \
 --len_eff_w 0.1 --code_shaping_once --overlong_ref 4096
 ```
@@ -250,9 +250,34 @@ python -m rlab.analysis --no-boxed-breakdown rlab_out/native_p3/record.jsonl
 
 `trunc_final` 的定义随之变为"**预算耗尽而未能收尾**"（不再看 `finish_reason`）。
 
-**续写的必要性边界**：若模型写完了调用块才撞上限，继续生成会把后续文字接在调用块后
-→ `parse_assistant` 判 `invalid`，**一个合法调用被续写毁掉**。故续写条件是"累积文本
-尚不构成完整调用"（有测试锁死）。
+### ⚠ 单轮上限该设多少：**设为 ≥ 轨迹预算**（2026-09-29 修正，推翻初版推荐）
+
+每轮实际额度是 `max_tokens = max(1, min(round_gen_tokens, max_traj_tokens − used))`。
+**`round_gen_tokens ≥ max_traj_tokens` 时 min 恒取 `mtj − used`**：撞 `length`
+⇔ 预算恰好用尽 → 下一轮循环顶部即判 `trunc_final=1` 出局 → **续写分支不可达**。
+此时"单轮上限"与"轨迹预算"是同一个数，`round_gen_tokens` 不再是独立旋钮。
+
+初版推荐写的是 `--round_gen_tokens 2048` + `--max_traj_tokens 8192`（P<M），
+那会让续写**每轮都触发**（一轮拆成 4 块）而**没有任何语义收益**：续写是逐 token
+完全等价的（FakeGen 对拍：P=8/16/20/24 与 P=8192 产出的 ids **逐位相同**——
+上下文、采样参数、RNG 都没变，只是把一次 generate 拆成几次）。唯一后果是
+generate 调用次数变多（每次重算 prefix、可观测性变差）。
+
+**一个实测出来的、不稳定的边界**（**不要依赖它**）：`parse_assistant` 对"调用块
+之后还有文本"判 invalid。模型写出"调用+尾随散文"时，M=600、调用块 90 token、
+流 145 token 下实测——
+
+```
+P=10 → 执行了调用    P=20 → invalid    P=30 → 执行了调用
+P=40 → invalid       P=80 → invalid    P=200/600 → invalid
+```
+
+即 P<M 是否"救回"这次调用**取决于 chunk 边界与调用块末尾是否巧合对齐**。
+（初版注释曾断言"续写恰好救回 tool"——被这条实测证伪，已改。）
+读法：**P<M 使 `invalid` 率依赖一个纯实现参数，P≥M 是确定性的。**
+若确要 P<M，必须开 `--native_stop_at_call`（在 `</tool_call>` 处停，尾随文本根本
+不产生，两取值行为一致）。`config._check_round_budget_hint` 在"未开 stop 串且
+P<M"时打印提示（**对已知基线不叫狼来了**：开了 stop 串或 P≥M 都静默）。
 
 ### reward 侧的两处对齐
 

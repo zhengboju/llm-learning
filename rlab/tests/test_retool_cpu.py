@@ -4970,6 +4970,76 @@ def test_token_budget_mode():
           [len(s) for s in _sg7] == [1, 1])
     check("终局后不再调用生成端（只 1 轮请求，旧版 4 轮）", len(fg7.seen) == 1)
 
+    # ---------- 4.5 【P≥M ⇒ 续写不可达】单轮上限对齐轨迹预算 ----------
+    # 【为什么单列一条】用户提问："为什么不直接把单轮上限对齐总上限，这样就不用
+    # 续写了"——这是对的，且实现上**恰好**成立：每轮额度是
+    # max(1, min(P, M − used))，P≥M 时 min 恒取 M−used → 撞 length ⇔ 预算用尽
+    # → 下一轮循环顶部判 trunc_final 出局 → _continuing 永不进入。
+    #
+    # 【必须用"合规"生成器】上面那个 FakeGen 无视 sps.max_tokens（永远回放整段
+    # 罐头文本），拿它测"P<M 与 P≥M 是否等价"会测出**替身的不合规行为**而不是
+    # 被测逻辑。故这里另写一个严格按 max_tokens 截断、撞上限报 length 的替身。
+    class HonestGen:
+        """合规替身：按 sps.max_tokens 线性吐一条固定流，撞上限报 'length'。"""
+        def __init__(self, stream):
+            self.stream, self.pos, self.seen, self.mts = stream, 0, [], []
+
+        def generate(self, prompts, sps, use_tqdm=False):
+            mt = sps[0].max_tokens
+            self.seen.append([list(p["prompt_token_ids"]) for p in prompts])
+            self.mts.append(mt)
+            chunk = self.stream[self.pos:self.pos + mt]
+            self.pos += len(chunk)
+            fr = "stop" if self.pos >= len(self.stream) else "length"
+            return [_O(chunk, fr) for _ in prompts]
+
+    _M = 300
+    _stream = "x" * (_M + 40)      # 比预算长：只能靠预算耗尽结束，永不自发收尾
+
+    def _run_ps(M, P):
+        _c = mk_cfg(max_traj_tokens=M, round_gen_tokens=P, answer_reserve=20,
+                    budget_hint=False)
+        _g = HonestGen(_stream)
+        _s, _fu, _cs = multi_turn_rollout_group(
+            _g, [_SPStub(list(NATIVE_BAD_WORDS))], t, ["P"], _c,
+            code_runner=fake_run,
+            prompts_messages=prompt_messages_for([{"Q": "Q1"}], _c))
+        _ids = [i for s in _s[0] if s["kind"] == "assistant" for i in s["ids"]]
+        return _g, _s, _cs, _ids
+
+    _gpm, _sgpm, _cspm, _ids_pm = _run_ps(_M, 1000)     # P ≥ M
+    _glt, _sglt, _cslt, _ids_lt = _run_ps(_M, 50)       # P < M（主动切成 6 块）
+    check("P≥M：单轮即用满预算，只调用生成端 1 次（续写不可达）",
+          len(_gpm.mts) == 1 and _gpm.mts == [_M])
+    check("P≥M：仍只落 1 个 assistant 段（不是多个续写块）",
+          [s["kind"] for s in _sgpm[0]] == ["assistant"])
+    check("P≥M：该段 token 数 = 轨迹预算（used 恰好触顶）",
+          len(_ids_pm) == _M)
+    check("P≥M：撞 length = 预算用尽 → trunc_final=1（唯一的截断来源）",
+          _cspm[0]["trunc_final"] == 1)
+    check("P<M：确实发生了多次 generate（否则下一条断言没意义）",
+          len(_glt.mts) > 1 and sum(_glt.mts) == _M)
+    check("P<M 与 P≥M **逐 token 完全相同**（续写只是把一次 generate 拆成几次）",
+          _ids_pm == _ids_lt and len(_ids_lt) == _M)
+    check("P<M 的逐轮 max_tokens 都不超过剩余预算（防单轮越过预算被整题丢弃）",
+          all(m <= _M for m in _glt.mts) and _glt.mts[0] == 50)
+    # 未开 stop 串时的提示（非致命）：P<M 会让 invalid 率依赖 chunk 边界对齐
+    from rlab.config import _check_round_budget_hint
+    import io as _io
+    import contextlib as _cl
+    _buf = _io.StringIO()
+    with _cl.redirect_stdout(_buf):
+        _check_round_budget_hint({"native_stop_at_call": False}, 8192, 1024)
+    check("P<M 且未开 stop 串 → 打印提示（含建议值）",
+          "round_gen_tokens(1024)" in _buf.getvalue()
+          and "8192" in _buf.getvalue())
+    _buf2 = _io.StringIO()
+    with _cl.redirect_stdout(_buf2):
+        _check_round_budget_hint({"native_stop_at_call": True}, 8192, 1024)
+        _check_round_budget_hint({"native_stop_at_call": False}, 8192, 8192)
+    check("开了 stop 串 或 P≥M → 不提示（检测器对已知基线不叫狼来了）",
+          _buf2.getvalue() == "")
+
     # ---------- 5. 效率项接线：rollout 真的要吃它 ----------
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()

@@ -829,7 +829,10 @@ def main():
     ap.add_argument("--answer_reserve", type=int, default=None,
                     help="token 预算档下必须留给最终作答的 token 数（默认 1024）："
                          "判定'这次调用还执行得起吗'的第二笔开销——执行一次调用要"
-                         "同时装下工具回包与之后一轮作答，两者够才执行")
+                         "同时装下工具回包与之后一轮作答，两者够才执行。"
+                         "注意：round_gen_tokens 应设为 ≥ max_traj_tokens——"
+                         "每轮额度 = min(round_gen_tokens, 剩余预算)，P≥M 时"
+                         "撞轮长上限即预算用尽，续写分支不可达（二者同数）。")
     ap.add_argument("--budget_hint", action=argparse.BooleanOptionalAction, default=None,
                     help="token 预算档下把剩余额度写进每次工具回包（默认开）——"
                          "C 桶（额度耗尽还在调用）占 ok 族无 boxed 的 70%，本质是"

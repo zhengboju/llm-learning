@@ -642,6 +642,7 @@ def validate_retool_budget(cfg: dict) -> int:
                 f"  注意：token 预算档下 round_gen_tokens 只是**单轮上限**"
                 f"（当前 {per_round}），不参与本不变量。")
         _check_concurrency_hint(cfg)
+        _check_round_budget_hint(cfg, _mtj, per_round)
         return reserve
     if per_round <= 0:
         return 0
@@ -691,6 +692,43 @@ def _check_concurrency_hint(cfg: dict) -> None:
         print(f"[config][提示] 并采题数已从 {_gq0} 抬到 {_gq}（并发 {_conc} 条），"
               f"但 sandbox_workers 仍是 {_sw} → 有代码的轮次里沙箱执行会排队，"
               f"可能成为新瓶颈；若生成端吞吐仍不达标，把它抬到 ≥{_conc} 再测。")
+
+
+def _check_round_budget_hint(cfg: dict, mtj: int, per_round: int) -> None:
+    """单轮上限小于轨迹预算时的提示（非致命）。
+
+    【2026-09-29 为什么要有这条】token 预算档下每轮实际额度是
+    `max_tokens = max(1, min(round_gen_tokens, max_traj_tokens − used))`。
+
+    `round_gen_tokens ≥ max_traj_tokens` 时 min 恒取 `mtj − used`：撞 length 就
+    意味着预算恰好用尽 → 下一轮循环顶部即判 `trunc_final=1` 出局 → **续写分支
+    不可达**（`_iter_cap` 也不再是 `max_rounds`）。此时"单轮上限"与"轨迹预算"
+    是同一个数，`round_gen_tokens` 不再是一个独立旋钮。
+
+    `round_gen_tokens < max_traj_tokens` 时单轮会被切断一次、由循环续写拼接。
+    已用 FakeGen 对拍：**逐 token 完全等价**（P=8/16/20/24 与 P=M 产出的 ids
+    逐位相同）——上下文、采样参数、RNG 都没变，只是把一次 generate 拆成几次。
+    代价仅为 generate 调用次数变多（每次重算 prefix、可观测性变差）。
+
+    【边界情形：实测是**不稳定**的，不要依赖它】`parse_assistant` 对"调用块之后
+    还有文本"判 invalid。模型写出"调用+尾随散文"时，实测（M=600，调用块 90
+    token，流长 145）：
+        P=10 → 执行了调用（chunk 边界恰好落在调用块末尾）
+        P=20 → invalid ；P=30 → 执行了调用 ；P=40/80/200/600 → invalid
+    即 P<M 是否"救回"这次调用**取决于 chunk 边界与调用块末尾是否巧合对齐**，
+    不是可依赖的性质（本函数初版曾断言"续写恰好救回 tool"——实测证伪）。
+    故正确读法是：P<M 会让 `invalid` 率**依赖于一个纯实现参数**，而 P≥M 是
+    确定性的。推荐 P≥M；若确实要 P<M，必须开 `--native_stop_at_call`
+    （在 </tool_call> 处停，尾随文本根本不产生，两取值行为一致）。
+    """
+    if not cfg.get("native_stop_at_call", False) and per_round and mtj > 0:
+        if per_round < mtj:
+            print(f"[config][提示] token 预算档下 round_gen_tokens({per_round}) < "
+                  f"max_traj_tokens({mtj})，且未开 --native_stop_at_call：单轮会被"
+                  f"切断并由循环续写（逐 token 等价，但 generate 次数变多；且"
+                  f"invalid 率会依赖 chunk 边界对齐，行为不确定）。"
+                  f"建议把 round_gen_tokens 设为 ≥ {mtj}（单轮即用满预算，续写不可达），"
+                  f"或至少开 --native_stop_at_call。")
 
 
 def get_config(algo: str, **overrides) -> dict:
