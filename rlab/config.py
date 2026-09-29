@@ -725,7 +725,7 @@ def _check_round_budget_hint(cfg: dict, mtj: int, per_round: int) -> None:
         if per_round < mtj:
             print(f"[config][提示] token 预算档下 round_gen_tokens({per_round}) < "
                   f"max_traj_tokens({mtj})，且未开 --native_stop_at_call：单轮会被"
-                  f"切断并由循环续写（逐 token 等价，但 generate 次数变多；且"
+                  f"切断并由循环续写（逐 token 等价，但 generate 次数变多；且 "
                   f"invalid 率会依赖 chunk 边界对齐，行为不确定）。"
                   f"建议把 round_gen_tokens 设为 ≥ {mtj}（单轮即用满预算，续写不可达），"
                   f"或至少开 --native_stop_at_call。")

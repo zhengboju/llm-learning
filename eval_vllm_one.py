@@ -650,7 +650,16 @@ if is_retool_family:
               # 这正是 docs/09 §8 那条"改档必须同步"的纪律在新档上的延续。
               "max_traj_tokens": _mtj_eval,
               "answer_reserve": int(_rcfg.get("answer_reserve", 0) or 0),
-              "budget_hint": bool(_rcfg.get("budget_hint"))}
+              "budget_hint": bool(_rcfg.get("budget_hint")),
+              # 【2026-09-29 单轮上限必须一起传】token 档下每轮额度是
+              # max(1, min(round_gen_tokens, traj_budget − used))。mt_cfg 缺这个键
+              # 时 get 落回默认 **400** → eval 会按 400/轮 把一条长轨迹切成十几块
+              # （实测：P=8192/M=5000 传对是 [5000]；缺键变 [400]×12+[200]），
+              # 而训练侧用的是 round_gen_tokens=8192 —— 同一 ckpt 两边测的轨迹
+              # 结构完全不同，截断率/轮数与训练期读数不可比。
+              # 取 args.round_tokens（= 回读 run_info.round_gen_tokens，两者的
+              # 单一来源）而不是硬编码，保证 sp_mt 的 max_tokens 与请求额度一致。
+              "round_gen_tokens": args.round_tokens}
     _probe_prompts = [p for p in prompts for _ in range(args.val_n)] if _sampling else prompts
     if _native:
         # 原生档：多轮 messages 是唯一真源（prompt 文本只是渲染结果，续写从

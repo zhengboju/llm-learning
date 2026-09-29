@@ -5040,6 +5040,29 @@ def test_token_budget_mode():
     check("开了 stop 串 或 P≥M → 不提示（检测器对已知基线不叫狼来了）",
           _buf2.getvalue() == "")
 
+    # ---------- 4.6 mt_cfg 缺 round_gen_tokens ⇒ 单轮额度静默落回 400 ----------
+    # 【实测出来的真实缺口】token 档下每轮额度 = max(1, min(round_gen_tokens,
+    # traj_budget − used))。mt_cfg 里漏了这个键时 rollout 的 get 默认 400：
+    # P=8192/M=5000 传对 → [5000]；缺键 → [400]×12 + [200]（一条轨迹被切成 13 块）。
+    # eval 与训练就变成"同一 ckpt、两套轨迹结构"，截断率/轮数都不可比。
+    _gmis = HonestGen("z" * 9000)
+    _cmis = mk_cfg(max_traj_tokens=5000)          # 故意不写 round_gen_tokens
+    _cmis.pop("round_gen_tokens")                 # mk_cfg 有默认 64，必须真删掉
+    _smis, _fmis, _csmis = multi_turn_rollout_group(
+        _gmis, [_SPStub(list(NATIVE_BAD_WORDS))], t, ["P"], _cmis,
+        code_runner=fake_run,
+        prompts_messages=prompt_messages_for([{"Q": "Q1"}], _cmis))
+    check("mt_cfg 缺 round_gen_tokens → 每轮额度落回默认 400（缺口本身）",
+          _gmis.mts[0] == 400 and len(_gmis.mts) > 10)
+    _gok = HonestGen("z" * 9000)
+    _cok = mk_cfg(max_traj_tokens=5000, round_gen_tokens=5000)
+    _sok, _fok, _csok = multi_turn_rollout_group(
+        _gok, [_SPStub(list(NATIVE_BAD_WORDS))], t, ["P"], _cok,
+        code_runner=fake_run,
+        prompts_messages=prompt_messages_for([{"Q": "Q1"}], _cok))
+    check("mt_cfg 有 round_gen_tokens=P → 单轮用满预算（一次 generate）",
+          _gok.mts == [5000] and len(_gok.mts) == 1)
+
     # ---------- 5. 效率项接线：rollout 真的要吃它 ----------
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
@@ -5068,6 +5091,12 @@ def test_token_budget_mode():
           "_mtj_eval + 512 if (is_retool_family and _mtj_eval > 0)" in _ev)
     check("eval 打印预算档（自证采的是哪套终止结构）",
           "预算档={_budget_src}" in _ev)
+    # 【2026-09-29 实测缺口】token 档下每轮额度 = max(1, min(round_gen_tokens,
+    # traj_budget − used))。eval 的 mt_cfg 漏这个键时 get 默认 400 → 一条长轨迹
+    # 被切成十几块（实测 P=8192/M=5000 传对=[5000]，缺键=[400]×12+[200]），
+    # 与训练侧轨迹结构不同 → 截断率/轮数不可比。上面 4.6 段已用 FakeGen 锁住缺口本身。
+    check("eval 的 mt_cfg 显式传 round_gen_tokens（否则静默变 400/轮）",
+          '"round_gen_tokens": args.round_tokens}' in _ev)
 
 
 if __name__ == "__main__":
