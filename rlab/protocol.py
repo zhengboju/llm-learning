@@ -7,7 +7,9 @@
                     （阶段0/1 单轮批的 prompt 段含左 pad；阶段2 retool 逐题用
                     rollout.strip_left_pad 剥掉左 pad 后建批，plen=本题真实 prompt
                     长——左 pad 会同时污染注意力键与位置编码，见 docs/02）
-  [2] advantages  : (B,) 已在生成端按 adv_mode 归一化（或 (B,T) per-token，RF++）
+  [2] advantages  : (B,) 已在生成端按 adv_mode 归一化；开启工具信用分配时为
+                    (B,T) per-token（序列任务优势 + 对应调用轮动作成本；RF++同样
+                    使用(B,T)，但由ref_server计算）
   [3] refs        : (B, T) ref 模型 per-token logps（ref_server 补充）
   [4] gen_logps   : (B, T) 生成时 policy 的 per-token logps（torch 副本算）
   [5] acc_scores  : (B,) 正确性原始分（仅记录/监控用，不进 loss）

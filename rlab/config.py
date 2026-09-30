@@ -117,6 +117,11 @@ ALGO_DEFAULTS = {
                         # 剂量参考：轨迹 ±1 域内 0.05×3次=+0.15，足以翻转
                         # "写代码期望净收益为负"的算术但不淹没 outcome 主信号。
                         code_attempt_w=0.0,
+                        # 【2026-09-30 工具信用分配】标准成本敏感 agent RL：任务结果
+                        # 仍是主奖励；每个实际执行的工具调用轮扣小成本，预算不足却
+                        # 继续调用的轮只对该轮施加局部负优势。0.02/0.10 均远小于
+                        # outcome ±1，先保正确性，再在同等解法中压缩调用/token。
+                        tool_call_cost=0.02, tool_waste_penalty=0.10,
                         # 训练内嵌评测：每个 checkpoint 自动跑 test+train
                         eval_during_training=True,
                         # 【2026-09-24 p10 盲窗事故】retool 多轮采样档 n=500×4 轮
@@ -350,6 +355,11 @@ BASE = dict(
     # （p6 实测 code% 50→3），去掉"多调用多拿分"的方向性错误。
     # False = 旧行为逐位相同（A/B 对照位）。
     code_shaping_once=False,
+    # 工具动作的 turn-level process reward（仅 retool 家族有受力面）：
+    # 实际执行调用轮：A_group - tool_call_cost；预算不足的废调用轮：
+    # -tool_waste_penalty。0=关闭，其他算法与历史配置逐位不变。
+    tool_call_cost=0.0,
+    tool_waste_penalty=0.0,
     # 【2026-09-21 DAPO overlong filtering】截断样本（末段被轮长上限切断）从
     # advantage 和组统计中移除：组均值只算非截断、截断样本 adv=0。
     # DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
@@ -785,6 +795,9 @@ def get_config(algo: str, **overrides) -> dict:
             f"[config] tool_protocol='native' 只对 retool 家族有效，当前 algo="
             f"{algo!r} 走单轮路径（从不读该键）→ 传了等于没传。\n"
             f"  要跑原生工具协议：--algo retool_math（或 retool）。")
+    for _key in ("tool_call_cost", "tool_waste_penalty"):
+        if float(cfg.get(_key, 0.0) or 0.0) < 0.0:
+            raise ValueError(f"[config] {_key} 必须 >= 0，收到 {cfg.get(_key)!r}")
     # 原生协议预算档（docs/09 §5.1 档 A）。显式 override 优先（CLI 单变量微调位）。
     if cfg.get("tool_protocol") == "native":
         for _k, _v in NATIVE_PROTOCOL_DEFAULTS.items():

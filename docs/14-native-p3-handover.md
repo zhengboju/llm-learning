@@ -414,6 +414,84 @@ python -m rlab.analysis \
 
 并同时保存最新 `[rollout] 采样统计` 与 `step_N/run_info.json` 中的 `round_gen_tokens/max_traj_tokens/answer_reserve/native_stop_at_call/git_head/signature`，避免只凭文档推断 live run 配置。
 
+## 4.8 下一阶段：成本敏感工具信用分配（2026-09-30）
+
+### 背景与决策
+
+native_p4 的 held-out 评测显示 `step400` 相对 BASE 为 `+7.4pp`，McNemar
+`p=0.007`，因此旧 run 的最佳模型是 `step400`。训练进程停止后，当前骨架没有
+DeepSpeed `engine.save_checkpoint/load_checkpoint`，`step400` 只保留模型权重，不含
+AdamW8bit 状态、梯度累积状态或随机数状态；后续实验必须标为 **step400 warm-start**，
+不能称为旧 run 的 step500/600 续训。
+
+训练 record 中 `ok` 族 `C_wasted≈11.25%` 在约109到390个有效 micro-step间几乎不动，
+根因是旧实现把 `trunc OR code_wasted` 同时设为 `adv=0` 与 `sample_weight=0`：模型产生
+预算不足的工具调用，却无法从该动作获得任何梯度。
+
+### 已实现的通用方案
+
+新增配置（retool_math preset默认开启，其他算法默认关闭）：
+
+```text
+--tool_call_cost 0.02
+--tool_waste_penalty 0.10
+```
+
+语义是成本敏感的 turn-level process reward，不是固定末轮禁调用：
+
+- 正常assistant轮保持组内任务优势；
+- 已执行工具调用轮收取一次 `tool_call_cost`；
+- 预算不足仍调用的assistant轮覆盖为一次 `tool_waste_penalty` 局部负优势；
+- 之前成功的推理/工具轮不连坐；工具回包始终 `mask=0`，不进loss；
+- `sample_mean`下按该样本assistant token数归一化，保证成本按“每次动作”计，不随代码段长度稀释；
+- 启用成本时，废调用样本重新进入loss；关闭成本时保持历史 `trunc OR code_wasted`整行过滤；
+- 逐token advantage直接复用现有协议 `(B,T)` 和 loss 广播逻辑，生成端真实token ids标记段边界，不重新tokenize；
+- 二维process reward只要存在非零可学习token就上传，即使整组都做了同一种浪费动作也不会被零方差过滤。
+
+同时修复了 `micro_rows` 路径对 `sample_weight` 未按chunk切片的问题；新增配置会进入
+run signature（`-tcc...-twp...`）与 `run_info`，防止新旧配方混用checkpoint目录。
+`analysis --no-boxed-breakdown` 会根据 `run_info.tool_waste_penalty` 区分“截断零梯度”
+和“废调用已有局部信用”。
+
+### 验证结果
+
+- `python -m rlab.tests.test_retool_cpu`：**895项通过**；
+- `python -m rlab.tests.test_smoke_cpu`：**134项通过**；
+- Python编译、`git diff --check`、pyflakes未定义名检查通过（仅有既存 unused 警告）；
+- 梯度探针确认：工具回包梯度严格为0；浪费调用轮梯度方向为降低其概率；此前有效调用/推理仍按任务优势训练。
+
+### 新实验启动方式与验收
+
+不能在旧 `rlab_new/native_p4` 目录复用。建议从 `step400` 权重启动新目录，例如：
+
+```bash
+bash rlab/run_gsm8k.sh retool_math /path/to/native_p4/step_400 \
+  --tool_protocol native \
+  --max_traj_tokens 8192 --round_gen_tokens 8192 \
+  --answer_reserve 1024 --max_context_tokens 9216 \
+  --tool_call_cost 0.02 --tool_waste_penalty 0.10 \
+  --steps 200 --save_steps 50 \
+  --out_dir rlab_new/native_p4_credit
+```
+
+实际 pod 命令必须继续沿用 native_p4 的真实模型路径、Qwen3.5 `enable_thinking=false`、
+vLLM backend/显存/分裂加载参数；上面只展示信用分配和新输出目录，不代表可直接省略
+原run的硬件参数。`step400` 是初始化权重，不是可恢复的optimizer checkpoint。
+
+首轮先观察32~64个有效组，再决定是否扩大到200 micro-step。验收优先级：
+
+```text
+主指标：held-out acc 不低于 step400 的统计波动范围
+C_wasted：11.25% → 目标 <7%
+ok 零梯度：16.3% → 目标 <10%
+avg token / 平均工具调用轮数：下降
+invalid、ctx_full、真实丢弃率：不得明显恶化
+```
+
+若 `C_wasted`下降但held-out acc下降，降低 `tool_waste_penalty`；若准确率稳定且
+`C_wasted`不动，再单独调整 `tool_call_cost`。不要同时改变预算、温度、组大小或提示，
+否则无法判断信用分配是否有效。
+
 ---
 
 ## 5. 交接备注（避免重复踩坑）
@@ -423,5 +501,5 @@ python -m rlab.analysis \
 - **F1 修复与含废码组的旧 run 不可比**；native_p4 是新的“修复后”起点，对照一律锚定 BASE。
 - **record 幸存者偏差**：overlong 整组不落盘，训练期曲线系统性偏乐观；必须同时读取生成端 `[rollout] 采样统计`。native_p4 已知60次尝试快照中 overlong=0，但更晚快照仍需复核。
 - **内嵌评测与 gen_gpu_mem 0.6 互斥**：若恢复 `--eval_during_training`，GPU0 需约19G给 eval，先把 gen_gpu_mem 降到0.30–0.45。
-- **当前本地工作区有未提交代码修改**：除本文档外，[config.py](rlab/config.py)、[data.py](rlab/data.py)、[probe_difficulty.py](rlab/probe_difficulty.py)、[rollout.py](rlab/rollout.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[train.py](rlab/train.py) 均为 modified；后续提交前必须先审 diff，不能把它们当成本次文档更新的一部分。
-- **下一动作**：当前 run 原参数继续到有效 step 200；保留并评测 step 100；step 200 同时采集 analysis、生成端采样统计、held-out 评测和 `run_info.json`，按 §4.7 的闸门决定继续到600还是调整重复工具调用激励。
+- **当前下一动作**：旧 native_p4 已停止，保留 `step400`；新实验必须使用独立 `out_dir` 从 `step400` warm-start，先观察32~64个有效组，再按 §4.8 指标决定是否扩大训练。
+- **当前本地工作区有未提交代码修改**：本次实现涉及 [analysis.py](rlab/analysis.py)、[config.py](rlab/config.py)、[protocol.py](rlab/protocol.py)、[rollout.py](rlab/rollout.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[train.py](rlab/train.py) 与本文档；提交前必须审 diff，不能把其他并行修改误并入本次提交。

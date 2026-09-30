@@ -1463,23 +1463,23 @@ def test_vllm_gen_kwargs():
     # 追加 -stop1（在 -vk 段之后）。
     # 【2026-09-21 overlong filtering】retool_math preset 默认 overlong_filter=True
     # → -stop1 之后再追加 -of1。vk 断言相应改为含 -stop1-of1 后缀。
+    _tail = "-stop1-of1-tcc0.02-twp0.1"
     sig0 = run_signature(cfg)
     check("默认档带 triton：签名含 -vkgdn_prefill_backend=triton（不静默换档）",
-          "-vkgdn_prefill_backend=triton" in sig0 and sig0.endswith("-stop1-of1"))
+          "-vkgdn_prefill_backend=triton" in sig0 and sig0.endswith(_tail))
     sig_none = run_signature({**cfg, "vllm_gen_kwargs": None})
-    # vk 段排在 stop/of 段之前：vk 开关会移动其后所有段，原"全串 startswith"
-    # 语义失效——改为比较去掉 -stop1-of1 尾巴后的前缀关系（验证力不变）。
-    _tail = "-stop1-of1"
+    # vk段在stop与信用剂量之前；显式关掉后其余协议尾缀保持不变。
     _s0, _sn = sig0[:-len(_tail)], sig_none[:-len(_tail)]
-    check("显式关掉该键：签名无 vk 段（去掉 -stop1-of1 后历史串逐字不变 -> 旧 ckpt 同签名）",
-          "-vk" not in sig_none and _s0.startswith(_sn) and sig_none.endswith("-stop1-of1"))
+    check("显式关掉该键：签名无vk段，其余stop/信用剂量口径相同",
+          "-vk" not in sig_none and _s0.startswith(_sn)
+          and sig_none.endswith(_tail))
     sig_vk = run_signature({**cfg, "vllm_gen_kwargs": {"gdn_prefill_backend": "flashinfer"}})
-    check("换档 -> 签名尾部追加 -vk<键=值>（纯追加，前缀不变）",
-          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer-stop1-of1")
+    check("换档 -> 签名含新kernel且保留信用剂量后缀",
+          sig_vk.endswith("-vkgdn_prefill_backend=flashinfer" + _tail)
           and sig_vk[:-len(_tail)].startswith(_sn))
-    check("多个键按 key 排序（同配方两次 run 签名逐字可比）",
+    check("多个键按key排序（同配方两次run签名逐字可比）",
           run_signature({**cfg, "vllm_gen_kwargs": {"b": 1, "a": 2}})
-          .endswith("-vka=2,b=1-stop1-of1"))
+          .endswith("-vka=2,b=1" + _tail))
 
     # 接线（无 GPU 的机器上唯一能验的部分：真机构造路径由源码断言兜住）
     rollout_src = open("rlab/rollout.py", encoding="utf-8").read()
@@ -4294,7 +4294,8 @@ def test_overlong_filter():
     check("_is_opt_suffix 识别 -of1 段（迁移兼容）",
           _is_opt_suffix("-of1"))
     check("迁移兼容：旧签名是新签名前缀 + of 段 → 放行",
-          sig.startswith(sig_off) and _is_opt_suffix(sig[len(sig_off):]))
+          sig.replace("-of1", "") == sig_off
+          and _is_opt_suffix("-of1"))
 
     # ---- 9. CLI 透传 ----
     _tr = open(os.path.join(os.path.dirname(os.path.dirname(
@@ -4369,8 +4370,9 @@ def test_code_wasted_adv_exclusion():
         os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
     check("F1：advantage 侧排除 = trunc OR wasted",
           "for tf, wf in zip(trunc_finals, wasted_flags)" in _ro)
-    check("F1：loss 侧 sw 排除 = trunc OR wasted（两侧同一人群）",
-          '0.0 if (s["trunc_final"] or s.get("code_wasted", 0))' in _ro)
+    check("F1：loss侧关闭新信用时仍排除 trunc OR wasted；开启后废调用重新入loss",
+          's.get("code_wasted", 0) and _waste_pen <= 0.0' in _ro
+          and 's["trunc_final"] or' in _ro)
 
 
 def test_attempt_shaping_and_err_tier():
@@ -4458,8 +4460,9 @@ def test_attempt_shaping_and_err_tier():
     check("签名无 -caw（关闭时不加字符）", "-caw" not in sig_off)
     sig_on = run_signature({**cfg_off, "code_attempt_w": 0.05})
     check("签名含 -caw0.05（开启时进签名）", "-caw0.05" in sig_on)
-    check("迁移兼容：关签名是开签名前缀 + caw 段为 opt 后缀",
-          sig_on.startswith(sig_off) and _is_opt_suffix(sig_on[len(sig_off):]))
+    check("迁移兼容：关闭签名去掉caw段后等于开启签名",
+          sig_on.replace("-caw0.05", "") == sig_off
+          and _is_opt_suffix("-caw0.05"))
     _tr = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
     check("CLI: --code_attempt_w 存在且透传 overrides",
@@ -4485,15 +4488,18 @@ def test_attempt_shaping_and_err_tier():
     # 默认值下新键不加字符（历史签名前缀兼容）
     for frag in ("-tk", "-tp", "-qs", "-qf", "-ob"):
         check(f"默认 {frag} 不进签名（历史签名不变）", frag not in sig_base)
-    # 每个新键偏离时都进签名，且旧→新满足前缀兼容判据（_is_opt_suffix）
+    _tool_sig = "-tcc0.02-twp0.1"
+    _legacy_sig = lambda s: s.replace(_tool_sig, "")
+    # 每个新键偏离时都进签名，且旧→新满足前缀兼容判据（_is_opt_suffix）。
     for key, val, frag in (("top_k", 50, "-tk50"), ("top_p", 0.95, "-tp0.95"),
                            ("q_skip_streak", 3, "-qs3"),
                            ("q_pool_reset_floor", 128, "-qf128"),
                            ("overlong_buffer", 128, "-ob128")):
         sig_v = run_signature({**_base_cfg, key: val})
         check(f"偏离 {key}={val} 进签名（{frag}）", frag in sig_v)
+        _lv, _lb = _legacy_sig(sig_v), _legacy_sig(sig_base)
         check(f"{key} 偏离段满足前缀兼容（_is_opt_suffix 认得）",
-              sig_v.startswith(sig_base) and _is_opt_suffix(sig_v[len(sig_base):]))
+              _lv.startswith(_lb) and _is_opt_suffix(_lv[len(_lb):]))
     # temperature 偏离走既有 "T" 键（回归：别把原有键改坏）
     sig_T = run_signature({**_base_cfg, "temperature": 0.8})
     check("temperature 偏离进签名（既有 -T 键不回归）", "-T0.8" in sig_T)
@@ -4527,8 +4533,9 @@ def test_attempt_shaping_and_err_tier():
                            ("len_penalty_w", 0.3, "-lp0.3-lq50-lg0.25")):
         sig_v = run_signature({**_base_cfg, key: val})
         check(f"5c 偏离 {key}={val} 进签名（{frag}）", frag in sig_v)
+        _lv, _lb = _legacy_sig(sig_v), _legacy_sig(sig_base)
         check(f"5c {key} 偏离段满足前缀兼容",
-              sig_v.startswith(sig_base) and _is_opt_suffix(sig_v[len(sig_base):]))
+              _lv.startswith(_lb) and _is_opt_suffix(_lv[len(_lb):]))
     # 【2026-09-25 修复·断言本身是坏的】旧写法括号错位：
     #   all(f in _tr for f in ('a','b','c') and all(k in _tr for k in (...)))
     # `('a','b','c') and all(...)` 先求值 → 非空 tuple 为真 → 整个 and 表达式取右操作数
@@ -5276,6 +5283,83 @@ def test_sampling_discard_stats():
     print()
 
 
+def test_tool_credit_assignment():
+    """[AR] 通用工具成本 + 废调用局部信用：只惩罚产生动作的assistant轮。"""
+    print("[AR] turn-level 工具成本与 code_wasted 局部信用")
+    from rlab.rollout import tool_credit_advantages
+    from rlab.train import run_signature, _is_opt_suffix
+
+    segs = [[
+        {"kind": "assistant", "ids": [1, 2], "tool_action": "executed"},
+        {"kind": "tool", "ids": [3, 4, 5]},
+        {"kind": "assistant", "ids": [6]},
+        {"kind": "assistant", "ids": [7, 8], "tool_action": "wasted"},
+    ], [
+        {"kind": "assistant", "ids": [9, 10, 11]},
+    ]]
+    base = torch.tensor([0.6, -0.4])
+    adv = tool_credit_advantages(base, segs, 8, call_cost=0.02,
+                                 waste_penalty=0.10)
+    check("已执行调用轮：按assistant长度归一化（0.6-0.02×5/2=0.55）",
+          torch.allclose(adv[0, :2], torch.full((2,), 0.55)))
+    check("工具回包保持0（环境token无策略梯度）",
+          bool((adv[0, 2:5] == 0).all()))
+    check("普通推理/答案轮保持任务优势",
+          adv[0, 5].item() == torch.tensor(0.6).item()
+          and torch.allclose(adv[1, :3], torch.full((3,), -0.4)))
+    check("浪费调用轮：按assistant长度归一化（-0.10×5/2=-0.25）",
+          torch.allclose(adv[0, 6:8], torch.full((2,), -0.25)))
+    from rlab.rollout import group_ok
+    check("二维process reward：全组同类非零成本仍是可学习信号",
+          group_ok(torch.tensor([[0.1, 0.0], [0.1, 0.0]])))
+    check("二维process reward：全零才丢弃",
+          not group_ok(torch.zeros((2, 3))))
+    mask = torch.tensor([[1, 1, 0, 0, 0, 1, 1, 1]], dtype=torch.float32)
+    pol = torch.zeros((1, 8), requires_grad=True)
+    gen = torch.zeros((1, 8))
+    cfg_loss = get_config("retool_math", use_wandb=False, beta=0.0)
+    loss, _ = compute_loss("retool_math", pol, gen, adv[:1], mask, cfg_loss,
+                           ref_logps=gen, sample_weight=torch.ones(1))
+    loss.backward()
+    check("梯度：工具回包严格为0", bool((pol.grad[0, 2:5] == 0).all()))
+    check("梯度：浪费调用轮方向为降低其概率（局部负adv→正梯度）",
+          bool((pol.grad[0, 6:8] > 0).all()))
+    check("梯度：此前有效调用/推理仍按正任务优势强化，不被连坐",
+          bool((pol.grad[0, :2] < 0).all()) and pol.grad[0, 5].item() < 0)
+
+    # 关闭开关：普通assistant逐位等于序列adv，工具/pad仍0（历史行为）。
+    adv_off = tool_credit_advantages(base, segs, 8, 0.0, 0.0)
+    check("关闭成本时assistant逐位退化为原序列adv",
+          torch.allclose(adv_off[0, :2], torch.full((2,), 0.6))
+          and adv_off[0, 5].item() == torch.tensor(0.6).item()
+          and bool((adv_off[0, 2:5] == 0).all()))
+
+    cfg = get_config("retool_math", use_wandb=False)
+    check("retool_math推荐工具信用剂量=0.02/0.10",
+          cfg["tool_call_cost"] == 0.02 and cfg["tool_waste_penalty"] == 0.10)
+    check("非工具算法默认关闭", get_config("grpo", use_wandb=False)["tool_call_cost"] == 0.0)
+    for key in ("tool_call_cost", "tool_waste_penalty"):
+        try:
+            get_config("retool_math", use_wandb=False, **{key: -0.1})
+            check(f"{key}<0必须fail-fast", False)
+        except ValueError:
+            check(f"{key}<0必须fail-fast", True)
+
+    sig = run_signature(cfg)
+    check("工具信用剂量进入签名", "-tcc0.02-twp0.1" in sig)
+    check("签名兼容器识别工具信用段", _is_opt_suffix("-tcc0.02-twp0.1"))
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
+    check("CLI两项存在并透传", 'add_argument("--tool_call_cost"' in src
+          and 'add_argument("--tool_waste_penalty"' in src
+          and 'overrides["tool_call_cost"]' in src
+          and 'overrides["tool_waste_penalty"]' in src)
+    check("micro_rows路径同步切片sample_weight（防单行chunk广播整批权重）",
+          '_sw_chunk = _sw_chunk[sl]' in src
+          and 'sample_weight=_sw_chunk' in src)
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -5331,6 +5415,7 @@ if __name__ == "__main__":
     test_token_budget_mode()
     test_max_prompt_length_cli()
     test_sampling_discard_stats()
+    test_tool_credit_assignment()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

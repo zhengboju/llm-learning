@@ -138,6 +138,11 @@ def run_signature(cfg: dict) -> str:
     # 【2026-09-23 分档奖励进签名】code_w>0 时 reward 值域改变，必须进签名
     _cw = float(cfg.get("code_w", 0.0) or 0.0)
     cw_tag = f"-cw{_cw:g}" if _cw > 0.0 else ""
+    # turn-level 工具信用分配：两项直接改变逐token advantage，必须进签名。
+    _tcc = float(cfg.get("tool_call_cost", 0.0) or 0.0)
+    _twp = float(cfg.get("tool_waste_penalty", 0.0) or 0.0)
+    tool_credit_tag = ((f"-tcc{_tcc:g}" if _tcc > 0.0 else "")
+                       + (f"-twp{_twp:g}" if _twp > 0.0 else ""))
     # 【2026-09-23 黑名单 TTL 进签名】>0 时题目调度行为改变（难题会重新入场）
     _qt = int(cfg.get("q_blacklist_ttl", 0) or 0)
     qt_tag = f"-qt{_qt}" if _qt > 0 else ""
@@ -206,7 +211,7 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{olr_tag}"
+            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{olr_tag}"
             f"{once_tag}{hint_tag}{_opt_tag}")
 
 
@@ -238,6 +243,8 @@ def write_run_info(path: str, cfg: dict) -> None:
             "overlong_shaping": cfg.get("overlong_shaping"),
             "overlong_filter": cfg.get("overlong_filter"),
             "code_attempt_w": cfg.get("code_attempt_w"),
+            "tool_call_cost": cfg.get("tool_call_cost"),
+            "tool_waste_penalty": cfg.get("tool_waste_penalty"),
             # 【2026-09-23 开发项】分档奖励/黑名单TTL/组相对长度惩罚（eval 端
             # 回读采样档对齐时也能看到这些）
             "code_w": cfg.get("code_w"),
@@ -270,7 +277,7 @@ def _ckpt_signature(ckpt_dir: str):
 # 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
 _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      "tk", "tp", "qs", "qf", "ob",
-                     "cw", "qt", "lp", "lq", "lg",
+                     "cw", "tcc", "twp", "qt", "lp", "lq", "lg",
                      # 【2026-09-28】并采题数（吞吐杠杆）也走 _opt_tag，必须登记，
                      # 否则"改了并发数的 run 中途重启"会被 guard_ckpt_collision
                      # 判成外来签名而拒跑（_is_opt_suffix 认不出 -gq8）。
@@ -630,10 +637,13 @@ def run_training(cfg, args):
                 chunk_logps = forward_per_token_logps(
                     _mmod, inputs[sl], batch_chunk=_fbc,
                     use_checkpoint=True)[:, plen - 1:]
+                _sw_chunk = batch.get("sample_weight")
+                if _sw_chunk is not None:
+                    _sw_chunk = _sw_chunk[sl]
                 chunk_loss, chunk_stats = compute_loss(
                     cfg["algo"], chunk_logps, gen_logps[sl], advantages[sl],
                     mask[sl], cfg, ref_logps=ref_logps[sl],
-                    sample_weight=batch.get("sample_weight"))
+                    sample_weight=_sw_chunk)
                 engine.backward(chunk_loss * (sl.stop - sl.start) / R)
                 loss_total += float(chunk_loss.item()) * (sl.stop - sl.start) / R
                 stats_list.append(chunk_stats)
@@ -874,6 +884,12 @@ def main():
                          "旧口径下答对时 0 次调用 +1.00 < 4 次调用 +1.40，梯度指向"
                          "多烧 token，与效率目标反向；本开关去掉该方向性错误，"
                          "保留'敢写代码'的对冲作用")
+    ap.add_argument("--tool_call_cost", type=float, default=None,
+                    help="每个实际执行的工具调用轮的局部成本（retool_math推荐0.02；"
+                         "远小于outcome ±1）。只作用于产生调用的assistant轮，0=关闭")
+    ap.add_argument("--tool_waste_penalty", type=float, default=None,
+                    help="预算不足仍调用工具时，只对该assistant轮施加的负优势"
+                         "（retool_math推荐0.10）；此前有效推理不连坐，0=旧版整行零梯度")
     ap.add_argument("--overlong_ref", type=int, default=None,
                     help="overlong shaping 的长度参考系显式覆盖（0=自动= "
                          "max_rounds×round_gen_tokens）。自动值在预算给满的档下"
@@ -1124,6 +1140,10 @@ def main():
     if args.len_eff_w is not None: overrides["len_eff_w"] = args.len_eff_w
     if args.code_shaping_once is not None:
         overrides["code_shaping_once"] = args.code_shaping_once
+    if args.tool_call_cost is not None:
+        overrides["tool_call_cost"] = args.tool_call_cost
+    if args.tool_waste_penalty is not None:
+        overrides["tool_waste_penalty"] = args.tool_waste_penalty
     if args.overlong_ref is not None: overrides["overlong_ref"] = args.overlong_ref
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     # 【2026-09-25 原生工具协议】tool_protocol 必须先落进 overrides——get_config

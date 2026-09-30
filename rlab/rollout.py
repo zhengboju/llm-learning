@@ -162,8 +162,14 @@ def build_prompt_batch(inputs, cfg: dict, tokenizer, prompts_messages=None):
 
 
 def group_ok(scores: torch.Tensor) -> bool:
-    """组内有区分度才可用于训练（全同组 advantage 恒 0，白占训练配额）。"""
-    return (scores.max() - scores.min()).item() >= 1e-4
+    """序列级要求组间有方差；逐tokenprocess reward只要存在非零梯度即上传。"""
+    if scores.dim() == 1:
+        return (scores.max() - scores.min()).item() >= 1e-4
+    if scores.dim() == 2:
+        # (B,T) 含绝对的工具动作成本，不应再被组均值规则抵消：即使整组都做了
+        # 同一种浪费调用，也有“降低该动作概率”的有效process-reward梯度。
+        return scores.abs().max().item() >= 1e-4
+    raise ValueError(f"组分数必须是(B,)或(B,T)，收到 {tuple(scores.shape)}")
 
 
 def sampling_discard_counts(attempts: int, uploaded: int, uniform: int,
@@ -692,6 +698,7 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                         and code_stats[i]["code_used"] < max_code_calls)
             if parsed.kind == "tool" and _can:
                 code_stats[i]["code_used"] += 1
+                seg["tool_action"] = "executed"
                 exec_jobs.append((i, parsed.code, list(msgs[i]), ids_full, asst_text))
             else:
                 # 终局：answer / invalid / 末轮写了调用 / 超出 max_code_calls。
@@ -701,6 +708,7 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     code_stats[i]["invalid_final"] += 1
                 elif parsed.kind == "tool":
                     code_stats[i]["code_wasted"] += 1
+                    seg["tool_action"] = "wasted"
                 msgs[i].append({"role": "assistant", "content": asst_text})
 
         # 沙箱并行执行（与围栏版同一提速策略）
@@ -938,8 +946,10 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                 # 而 code% 正是长度/代码轴的判据之一。故**单列新计数**：既有口径
                 # 逐位不变，末轮废码从此可见。
                 code_stats[i]["code_wasted"] += 1
+                seg["tool_action"] = "wasted"
                 continue
             code_stats[i]["code_used"] += 1
+            seg["tool_action"] = "executed"
             code = blocks[-1]          # 执行最后一个完整代码块（最新计算意图；
                                         # Auto_Program 原版取第一个——并非一致，是有意改进）
             exec_jobs.append((i, code))
@@ -1044,6 +1054,53 @@ def strip_left_pad(prompt_ids: torch.Tensor, pad_token_id: int) -> torch.Tensor:
     return prompt_ids[:, prompt_ids.shape[1] - keep:]
 
 
+def tool_credit_advantages(base_adv: torch.Tensor, segs, total_len: int,
+                           call_cost: float = 0.0,
+                           waste_penalty: float = 0.0) -> torch.Tensor:
+    """序列级任务优势 + turn-level 工具动作成本 -> (B,T) per-token advantage。
+
+    普通 assistant 轮继承组内任务优势；已执行工具调用轮减 call_cost；预算不足仍
+    调用的浪费轮覆盖为 -waste_penalty。工具回包/pad 保持 0；调用成本在构造时按
+    该样本有效 assistant token 数归一化，抵达 sample_mean 后是固定的每次动作成本。
+    """
+    if base_adv.dim() != 1 or len(base_adv) != len(segs):
+        raise ValueError(
+            f"tool credit 需要 base_adv(B,) 与 segs(B) 对齐，收到 "
+            f"{tuple(base_adv.shape)} / {len(segs)}")
+    if call_cost < 0.0 or waste_penalty < 0.0:
+        raise ValueError("tool_call_cost/tool_waste_penalty 必须 >= 0")
+    out = torch.zeros((len(segs), int(total_len)), dtype=base_adv.dtype,
+                      device=base_adv.device)
+    for i, segs_i in enumerate(segs):
+        pos = 0
+        assistant_len = sum(len(seg["ids"]) for seg in segs_i
+                            if seg["kind"] == "assistant")
+        if assistant_len <= 0:
+            continue
+        for seg in segs_i:
+            end = pos + len(seg["ids"])
+            if end > total_len:
+                raise ValueError(
+                    f"tool credit 段长越界: sample={i} end={end} total={total_len}")
+            if seg["kind"] == "assistant":
+                action = seg.get("tool_action")
+                m = len(seg["ids"])
+                if m <= 0:
+                    pos = end
+                    continue
+                if action == "wasted":
+                    # 预算已不足却继续调用是当前动作本身的坏结果：覆盖任务优势，
+                    # 只给固定的局部负信用；此前正确推理不被连坐。
+                    val = -float(waste_penalty) * assistant_len / m
+                elif action == "executed":
+                    val = float(base_adv[i]) - float(call_cost) * assistant_len / m
+                else:
+                    val = float(base_adv[i])
+                out[i, pos:end] = val
+            pos = end
+    return out
+
+
 def retool_context_overlong(per_sample_ids, plen, max_context_tokens):
     """逐样本全长 token 预算检查（模块级纯函数，CPU 可测）。任一样本超限即超。
 
@@ -1081,8 +1138,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     phase = reward_phase(steps_elapsed, cfg["reward_switch_step"])
     rewards, acc_s, fmt_s, cu, ck = [], [], [], [], []
     trunc_finals = []  # overlong filtering: 1=末段被截断 → 从 advantage/组统计中移除
-    # 【2026-09-28 F1】code_wasted（末轮写了调用但不执行）与截断同语义：结构性
-    # 无 boxed 的 -1 轨迹。必须与截断**同一排除口径**（见下方 advantage 段注释）。
+    # code_wasted 的失败 reward 不进入任务基线：否则无 boxed 的 -1 会系统性抬高
+    # 同组其他样本优势。开启 tool_waste_penalty 后，它仍在这里得到 base_adv=0，随后
+    # collect_retool_group 只给浪费调用轮注入局部负优势；此前有效推理不会被连坐。
     wasted_flags = []
     n = cfg["num_pre_Q"]
     assert len(asst_texts) == len(inputs) * n, \
@@ -1207,7 +1265,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
       独立 seed；拆出来是为了让本函数不依赖 vllm import，FakeGen 可直接测）。
 
     返回 per-question list，每项 {"status": "ok"|"uniform"|"overlong"}；
-    ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen
+    ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen。
+    adv 通常为 (B,) 序列级；启用 tool_call_cost/tool_waste_penalty 后为 (B,T)
+    逐token任务优势+工具动作成本（losses._adv_broadcast 原生支持）。
     （plen = **本题** prompt 的真实长度——每道题先剥掉左 pad 再建批，见
     strip_left_pad：带 pad 会让打分序列与 vLLM 生成序列在位置编码与注意力键上
     双重分叉。上传 meta 与 gen_logps/训练前向共用同一基准）。"""
@@ -1265,7 +1325,14 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             [inputs[i]], asst_texts[i * n:(i + 1) * n],
             code_stats[i * n:(i + 1) * n], cfg, steps_elapsed=steps_elapsed,
             completion_lens=clen_i)
-        _trunc_i = [int(s["trunc_final"]) for s in code_stats[i * n:(i + 1) * n]]
+        _stats_i = code_stats[i * n:(i + 1) * n]
+        _trunc_i = [int(s["trunc_final"]) for s in _stats_i]
+        _call_cost = float(cfg.get("tool_call_cost", 0.0) or 0.0)
+        _waste_pen = float(cfg.get("tool_waste_penalty", 0.0) or 0.0)
+        if _call_cost > 0.0 or _waste_pen > 0.0:
+            adv_i = tool_credit_advantages(
+                adv_i, segs_i, mask_i.shape[1],
+                call_cost=_call_cost, waste_penalty=_waste_pen)
         # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
         # 与超长分流；2026-09-10 起不再连坐同批其他题）
         if not group_ok(adv_i):
@@ -1317,16 +1384,14 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                                 for s in code_stats[i * n:(i + 1) * n]],
                         "ctxf": [int(s.get("ctx_full", 0))
                                  for s in code_stats[i * n:(i + 1) * n]],
-                        # 【2026-09-21 overlong_filter】截断样本（trunc_final=1 或
-                        # code_wasted>0）的 sample_weight=0：它们 adv=0 不贡献 pg_term，
-                        # 但 KL 仍活跃 → sample_mean 归一化会稀释 pg 梯度。sample_weight
-                        # 让 compute_loss 只在有效样本上归一化。
-                        # 【2026-09-28 F1 对齐】advantage 侧的组统计排除口径自本日起
-                        # 也是 trunc OR code_wasted（retool_score_flat）——此前只有
-                        # trunc 进 sample_mask，废码样本 adv≠0 却在此 sw=0，两头矛盾。
+                        # sample_weight 只做整条轨迹过滤。截断轨迹仍整行排除；废调用
+                        # 在 tool_waste_penalty>0 时已得到逐token局部负优势，必须重新
+                        # 纳入 loss，否则又回到“判失败但零梯度”。关闭新机制时保持
+                        # 历史口径：trunc OR code_wasted 都整行清零。
                         "sw": torch.tensor(
-                            [0.0 if (s["trunc_final"] or s.get("code_wasted", 0))
-                             else 1.0 for s in code_stats[i * n:(i + 1) * n]],
+                            [0.0 if (s["trunc_final"] or
+                                     (s.get("code_wasted", 0) and _waste_pen <= 0.0))
+                             else 1.0 for s in _stats_i],
                             dtype=torch.float32),
                         "plen": plen_i})
     return results
