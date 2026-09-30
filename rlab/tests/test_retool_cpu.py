@@ -5237,6 +5237,45 @@ def test_max_prompt_length_cli():
     print()
 
 
+def test_sampling_discard_stats():
+    """[AQ] 采样真实丢弃率：prompt 超限不能从总账里消失。"""
+    print("[AQ] 采样真实丢弃率 + prompt 超限归因")
+    from rlab.rollout import sampling_discard_counts
+
+    # native_p4 真机复现：旧日志只算 76/464=16.4%，漏了20次 prompt 超限；
+    # 真实丢弃是 attempts-uploaded=96/464=20.7%。
+    discarded, other = sampling_discard_counts(464, 368, 76, 0, 20)
+    check("真机账目：真实丢弃=attempts-uploaded=96（不是 uniform+overlong=76）",
+          discarded == 96)
+    check("真机账目：20次 prompt 超限补齐后无未归因丢弃", other == 0)
+    check("真机账目：真实丢弃率=20.7%（旧日志低报16.4%）",
+          abs(discarded / 464 - 0.20689655) < 1e-7)
+
+    # 总数永远取 attempts-uploaded；新增分支即使尚未接入归因，也必须在 other 可见。
+    discarded2, other2 = sampling_discard_counts(100, 80, 12, 3, 2)
+    check("未知新丢弃路径不丢总账：20次真实丢弃", discarded2 == 20)
+    check("未知新丢弃路径进入 other（20-12-3-2=3）", other2 == 3)
+
+    for args in ((10, 11, 0, 0, 0), (10, 8, 2, 1, 0),
+                 (10, 8, -1, 0, 0)):
+        try:
+            sampling_discard_counts(*args)
+            check(f"不自洽账目 {args} 必须 fail-fast", False)
+        except ValueError:
+            check(f"不自洽账目 {args} 必须 fail-fast", True)
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    check("prompt 超限分支按 attempts 同单位累计 prompt_overlong",
+          'samp_stats["prompt_overlong"] += attempt_units' in src)
+    check("累计与窗口口径都调用统一真实丢弃函数",
+          src.count("sampling_discard_counts(") >= 2
+          and '_dd = _discarded - _mark["d"]' in src)
+    check("日志显式区分轨迹超长 / prompt超限 / 其他",
+          "轨迹超长" in src and "prompt超限" in src and "其他 {_other}" in src)
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -5291,6 +5330,7 @@ if __name__ == "__main__":
     test_health_code_collapse()
     test_token_budget_mode()
     test_max_prompt_length_cli()
+    test_sampling_discard_stats()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

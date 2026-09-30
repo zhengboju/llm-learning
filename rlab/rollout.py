@@ -166,6 +166,30 @@ def group_ok(scores: torch.Tensor) -> bool:
     return (scores.max() - scores.min()).item() >= 1e-4
 
 
+def sampling_discard_counts(attempts: int, uploaded: int, uniform: int,
+                            overlong: int, prompt_overlong: int):
+    """返回（真实丢弃数，未归因丢弃数），统一采样统计与熔断口径。
+
+    真实丢弃必须按 attempts-uploaded 算；只加已知原因会漏掉新分支。2026-09-30
+    native_p4 实测 464 attempts / 368 uploaded / 76 uniform / 0 overlong，旧日志
+    报 16%，实际还有 20 次 prompt 超限，真实丢弃率是 96/464=20.7%。
+    """
+    vals = tuple(int(x) for x in
+                 (attempts, uploaded, uniform, overlong, prompt_overlong))
+    if any(x < 0 for x in vals):
+        raise ValueError(f"sampling stats 不能为负数: {vals}")
+    attempts, uploaded, uniform, overlong, prompt_overlong = vals
+    discarded = attempts - uploaded
+    attributed = uniform + overlong + prompt_overlong
+    if discarded < 0 or attributed > discarded:
+        raise ValueError(
+            "sampling stats 账目不自洽: "
+            f"attempts={attempts} uploaded={uploaded} discarded={discarded} "
+            f"uniform={uniform} trajectory_overlong={overlong} "
+            f"prompt_overlong={prompt_overlong}")
+    return discarded, discarded - attributed
+
+
 def filter_question_pool(QAs, q_stat: dict, streak_max: int, floor: int):
     """题目级动态采样（2026-09-09 丢弃率 81% 根因修复，纯函数 CPU 可测）。
 
@@ -1905,7 +1929,8 @@ def gen_worker(Q, cfg: dict):
     uploaded_total = 0
     is_retool = cfg["algo"] in ("retool", "retool_math")
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
-    samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0}
+    samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0,
+                  "prompt_overlong": 0}
     _pad_logged = [False]   # 剥左 pad 的可见性只打一次（见 retool 分支）
     # 题目级调度两条路径（2026-09-10 重构）：
     # - 队列路径（gen_questions_per_attempt>1，当前仅 retool_math）：QuestionScheduler
@@ -1942,9 +1967,11 @@ def gen_worker(Q, cfg: dict):
                 inputs = sched.draw(multi_q)
                 if not inputs:
                     break
-                attempts += len(inputs)
+                attempt_units = len(inputs)
+                attempts += attempt_units
             else:
-                attempts += 1
+                attempt_units = 1
+                attempts += attempt_units
                 if is_retool and cfg.get("q_skip_streak"):
                     cand, _reset = filter_question_pool(
                         QAs, q_stat, cfg["q_skip_streak"], cfg["q_pool_reset_floor"])
@@ -1960,6 +1987,10 @@ def gen_worker(Q, cfg: dict):
             prompts_text, prompt_ids, plen = build_prompt_batch(
                 inputs, cfg, tokenizer, prompts_messages=_pmsgs)
             if plen > cfg["max_prompt_length"]:
+                # attempts 按题计数；整批 prompt 超限时每道题都已消费一次 attempt，
+                # 但尚未进入 uniform/trajectory-overlong 分支。旧版直接 continue，
+                # 导致累计/窗口丢弃率少算这批题（native_p4 实测低报约 4pp）。
+                samp_stats["prompt_overlong"] += attempt_units
                 continue
             if is_retool:
                 # 阶段2：多轮代码交织（并采 multi_q 题，vLLM 并发 = 题数×num_pre_Q）
@@ -2116,13 +2147,17 @@ def gen_worker(Q, cfg: dict):
             zero_yield += 1
             print(f"[rollout] 本轮零产出（{zero_yield}/{_zy_limit or '∞'}）"
                   f"：attempts={attempts} 全部被丢弃"
-                  f"（uniform={samp_stats['uniform']} overlong={samp_stats['overlong']}）",
+                  f"（uniform={samp_stats['uniform']} "
+                  f"trajectory_overlong={samp_stats['overlong']} "
+                  f"prompt_overlong={samp_stats['prompt_overlong']}）",
                   flush=True)
             if _zy_limit and zero_yield >= _zy_limit:
                 raise RuntimeError(
                     f"[rollout] 连续 {zero_yield} 轮零产出 → 采样已死锁，fail-fast。\n"
                     f"  累计 attempts={samp_stats['attempts']} "
-                    f"uniform={samp_stats['uniform']} overlong={samp_stats['overlong']}"
+                    f"uniform={samp_stats['uniform']} "
+                    f"trajectory_overlong={samp_stats['overlong']} "
+                    f"prompt_overlong={samp_stats['prompt_overlong']}"
                     f" uploaded={uploaded_total}\n"
                     f"  最常见根因：预算不自洽/模型长度膨胀 → overlong 全丢"
                     f"（查 config.validate_retool_budget、record 的 clen/trunc_final 分布）；"
@@ -2134,34 +2169,42 @@ def gen_worker(Q, cfg: dict):
         if uploaded_total and uploaded_total % 16 == 0:
             _a = samp_stats["attempts"]
             _u, _o = samp_stats["uniform"], samp_stats["overlong"]
+            _po = samp_stats["prompt_overlong"]
+            # 总丢弃以 attempts-uploaded 为唯一真值；原因项只负责归因。旧版用
+            # uniform+overlong 当总数，native_p4 因 prompt 超限 20 次把 20.7% 低报成
+            # 16.4%。other 始终打印，未来增加新丢弃分支时不会再静默少算。
+            _discarded, _other = sampling_discard_counts(
+                _a, uploaded_total, _u, _o, _po)
             # "被跳过"口径：队列路径 = 已拉黑题（streak 达标，未来不会再采）；
             # 旧路径 = 出现过 uniform 的题（旧语义保留）
             _skipped = (sched.blacklisted_count() if sched is not None
                         else sum(1 for v in q_stat.values() if v > 0))
             print(f"[rollout] 采样统计: 累计尝试 {_a} 次 / 有效上传 {uploaded_total} 组"
-                  f"（丢弃率 {(_u + _o) / max(1, _a) * 100:.0f}% = 零方差 {_u} + 超长 {_o}；"
+                  f"（真实丢弃率 {_discarded / max(1, _a) * 100:.0f}% = "
+                  f"零方差 {_u} + 轨迹超长 {_o} + prompt超限 {_po} + 其他 {_other}；"
                   f"题目过滤中 {_skipped}/{len(QAs)} 题被跳过）",
                   flush=True)
             # 【2026-09-12 反压②：窗口丢弃率告警/熔断】累计率会被开局的正常波动
-            # 永久污染，所以按"上次打点以来的增量"算窗口率。旧版健康检查只有
-            # acc 平坦/退化/截断/代码缺失四种签名，**唯独没有丢弃率**——真机 run
-            # 丢弃率 20%→90% 全程零告警，是最该报的信号。
-            _da = _a - _mark["a"]; _dd = (_u + _o) - _mark["d"]
-            _mark["a"], _mark["d"] = _a, (_u + _o)
+            # 永久污染，所以按"上次打点以来的增量"算窗口率。总数同样必须取
+            # attempts-uploaded，不能把已知原因相加冒充总数。
+            _da = _a - _mark["a"]; _dd = _discarded - _mark["d"]
+            _mark["a"], _mark["d"] = _a, _discarded
             if _da > 0:
                 _rate = _dd / _da
                 if _disc_alert and _rate >= _disc_alert and "discard" not in _disc_fired:
                     _disc_fired.add("discard")
-                    print(f"\n[健康检查] 窗口丢弃率 {_rate * 100:.0f}% ≥ "
+                    print(f"\n[健康检查] 窗口真实丢弃率 {_rate * 100:.0f}% ≥ "
                           f"{_disc_alert * 100:.0f}%（{_dd}/{_da}）→ 采集端在大量白跑。"
-                          f"判别：超长占多 = 预算/长度失控（查 clen/trunc_final）；"
-                          f"零方差占多 = 难度带过窄或温度过低。\n", flush=True)
+                          f"判别：轨迹超长占多 = 预算/长度失控；prompt超限占多 = "
+                          f"max_prompt_length/题面长度不匹配；零方差占多 = "
+                          f"难度带过窄或温度过低。\n", flush=True)
                 if _disc_abort and _rate >= _disc_abort:
                     raise RuntimeError(
-                        f"[rollout] 窗口丢弃率 {_rate * 100:.0f}% ≥ 熔断线 "
+                        f"[rollout] 窗口真实丢弃率 {_rate * 100:.0f}% ≥ 熔断线 "
                         f"{_disc_abort * 100:.0f}%（{_dd}/{_da}）→ 采集端已无有效产能，"
-                        f"fail-fast 而非继续烧 GPU。累计：uniform={_u} overlong={_o} "
-                        f"uploaded={uploaded_total}。")
+                        f"fail-fast 而非继续烧 GPU。累计：uniform={_u} "
+                        f"trajectory_overlong={_o} prompt_overlong={_po} "
+                        f"other={_other} uploaded={uploaded_total}。")
         # 训练期健康检查：窗口签名告警（fmt 恒定/没有学习/退化/截断/长度膨胀/代码缺失）
         # retool 家族的 clen 上限按"轮数×每轮预算"计——旧版用
         # max_context_tokens-max_prompt_length（8192-1024=7168），而轨迹实际上限
