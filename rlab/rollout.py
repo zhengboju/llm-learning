@@ -1056,19 +1056,31 @@ def strip_left_pad(prompt_ids: torch.Tensor, pad_token_id: int) -> torch.Tensor:
 
 def tool_credit_advantages(base_adv: torch.Tensor, segs, total_len: int,
                            call_cost: float = 0.0,
-                           waste_penalty: float = 0.0) -> torch.Tensor:
+                           waste_penalty: float = 0.0,
+                           trunc_flags=None,
+                           trunc_tail_penalty: float = 0.0) -> torch.Tensor:
     """序列级任务优势 + turn-level 工具动作成本 -> (B,T) per-token advantage。
 
     普通 assistant 轮继承组内任务优势；已执行工具调用轮减 call_cost；预算不足仍
-    调用的浪费轮覆盖为 -waste_penalty。工具回包/pad 保持 0；调用成本在构造时按
+    调用的浪费轮覆盖为 -waste_penalty；截断轨迹（trunc_flags[i] 为真）的**最后一个
+    assistant 段**覆盖为 -trunc_tail_penalty。工具回包/pad 保持 0；成本在构造时按
     该样本有效 assistant token 数归一化，抵达 sample_mean 后是固定的每次动作成本。
+
+    【2026-10-01 截断末段信用】trunc_final 轨迹的任务结果不可信（预算耗尽时可能
+    还没作答），故其 base_adv 恒为 0（retool_score_flat 的 sample_mask 已把它排除
+    出组均值），此前有效推理/工具轮不连坐；但"把预算烧光"这个**末段动作本身**
+    获得直接负信用 —— 这正是旧口径（sw=0 整行过滤）唯一缺失的反向信号。
     """
     if base_adv.dim() != 1 or len(base_adv) != len(segs):
         raise ValueError(
             f"tool credit 需要 base_adv(B,) 与 segs(B) 对齐，收到 "
             f"{tuple(base_adv.shape)} / {len(segs)}")
-    if call_cost < 0.0 or waste_penalty < 0.0:
-        raise ValueError("tool_call_cost/tool_waste_penalty 必须 >= 0")
+    if call_cost < 0.0 or waste_penalty < 0.0 or trunc_tail_penalty < 0.0:
+        raise ValueError(
+            "tool_call_cost/tool_waste_penalty/trunc_tail_penalty 必须 >= 0")
+    if trunc_flags is not None and len(trunc_flags) != len(segs):
+        raise ValueError(
+            f"trunc_flags 必须与 segs 等长，收到 {len(trunc_flags)} / {len(segs)}")
     out = torch.zeros((len(segs), int(total_len)), dtype=base_adv.dtype,
                       device=base_adv.device)
     for i, segs_i in enumerate(segs):
@@ -1077,7 +1089,16 @@ def tool_credit_advantages(base_adv: torch.Tensor, segs, total_len: int,
                             if seg["kind"] == "assistant")
         if assistant_len <= 0:
             continue
-        for seg in segs_i:
+        # 末段下标：只对截断轨迹找（预算耗尽 ⇒ 末尾必是被切断的 assistant 段）。
+        # penalty=0 时不计算，保持关闭档与历史行为逐位相同。
+        tail_idx = -1
+        if (trunc_flags is not None and int(trunc_flags[i])
+                and trunc_tail_penalty > 0.0):
+            for _k in range(len(segs_i) - 1, -1, -1):
+                if segs_i[_k]["kind"] == "assistant":
+                    tail_idx = _k
+                    break
+        for _k, seg in enumerate(segs_i):
             end = pos + len(seg["ids"])
             if end > total_len:
                 raise ValueError(
@@ -1092,6 +1113,10 @@ def tool_credit_advantages(base_adv: torch.Tensor, segs, total_len: int,
                     # 预算已不足却继续调用是当前动作本身的坏结果：覆盖任务优势，
                     # 只给固定的局部负信用；此前正确推理不被连坐。
                     val = -float(waste_penalty) * assistant_len / m
+                elif _k == tail_idx:
+                    # 预算耗尽（trunc_final）：同样只罚末段动作，整条轨迹的未知
+                    # 任务结果不参与（base_adv 已被 sample_mask 置 0）。
+                    val = -float(trunc_tail_penalty) * assistant_len / m
                 elif action == "executed":
                     val = float(base_adv[i]) - float(call_cost) * assistant_len / m
                 else:
@@ -1329,10 +1354,12 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
         _trunc_i = [int(s["trunc_final"]) for s in _stats_i]
         _call_cost = float(cfg.get("tool_call_cost", 0.0) or 0.0)
         _waste_pen = float(cfg.get("tool_waste_penalty", 0.0) or 0.0)
-        if _call_cost > 0.0 or _waste_pen > 0.0:
+        _trunc_tail = float(cfg.get("trunc_tail_penalty", 0.0) or 0.0)
+        if _call_cost > 0.0 or _waste_pen > 0.0 or _trunc_tail > 0.0:
             adv_i = tool_credit_advantages(
                 adv_i, segs_i, mask_i.shape[1],
-                call_cost=_call_cost, waste_penalty=_waste_pen)
+                call_cost=_call_cost, waste_penalty=_waste_pen,
+                trunc_flags=_trunc_i, trunc_tail_penalty=_trunc_tail)
         # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
         # 与超长分流；2026-09-10 起不再连坐同批其他题）
         if not group_ok(adv_i):
@@ -1384,12 +1411,13 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                                 for s in code_stats[i * n:(i + 1) * n]],
                         "ctxf": [int(s.get("ctx_full", 0))
                                  for s in code_stats[i * n:(i + 1) * n]],
-                        # sample_weight 只做整条轨迹过滤。截断轨迹仍整行排除；废调用
-                        # 在 tool_waste_penalty>0 时已得到逐token局部负优势，必须重新
-                        # 纳入 loss，否则又回到“判失败但零梯度”。关闭新机制时保持
-                        # 历史口径：trunc OR code_wasted 都整行清零。
+                        # sample_weight 只做整条轨迹过滤。两类结构性失败在拿到
+                        # 逐token局部负优势后必须重新纳入 loss，否则又回到
+                        # “判失败但零梯度”：废调用（tool_waste_penalty>0）与
+                        # 截断末段（trunc_tail_penalty>0）。关闭新机制时保持历史
+                        # 口径：trunc OR code_wasted 都整行清零。
                         "sw": torch.tensor(
-                            [0.0 if (s["trunc_final"] or
+                            [0.0 if ((s["trunc_final"] and _trunc_tail <= 0.0) or
                                      (s.get("code_wasted", 0) and _waste_pen <= 0.0))
                              else 1.0 for s in _stats_i],
                             dtype=torch.float32),

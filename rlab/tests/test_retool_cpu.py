@@ -1463,7 +1463,7 @@ def test_vllm_gen_kwargs():
     # 追加 -stop1（在 -vk 段之后）。
     # 【2026-09-21 overlong filtering】retool_math preset 默认 overlong_filter=True
     # → -stop1 之后再追加 -of1。vk 断言相应改为含 -stop1-of1 后缀。
-    _tail = "-stop1-of1-tcc0.02-twp0.1"
+    _tail = "-stop1-of1-tcc0.02-twp0.1-ttp0.1"
     sig0 = run_signature(cfg)
     check("默认档带 triton：签名含 -vkgdn_prefill_backend=triton（不静默换档）",
           "-vkgdn_prefill_backend=triton" in sig0 and sig0.endswith(_tail))
@@ -4370,9 +4370,9 @@ def test_code_wasted_adv_exclusion():
         os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
     check("F1：advantage 侧排除 = trunc OR wasted",
           "for tf, wf in zip(trunc_finals, wasted_flags)" in _ro)
-    check("F1：loss侧关闭新信用时仍排除 trunc OR wasted；开启后废调用重新入loss",
+    check("F1：loss侧关闭新信用时仍排除 trunc OR wasted；开启后废调用/截断重新入loss",
           's.get("code_wasted", 0) and _waste_pen <= 0.0' in _ro
-          and 's["trunc_final"] or' in _ro)
+          and '(s["trunc_final"] and _trunc_tail <= 0.0)' in _ro)
 
 
 def test_attempt_shaping_and_err_tier():
@@ -4488,7 +4488,7 @@ def test_attempt_shaping_and_err_tier():
     # 默认值下新键不加字符（历史签名前缀兼容）
     for frag in ("-tk", "-tp", "-qs", "-qf", "-ob"):
         check(f"默认 {frag} 不进签名（历史签名不变）", frag not in sig_base)
-    _tool_sig = "-tcc0.02-twp0.1"
+    _tool_sig = "-tcc0.02-twp0.1-ttp0.1"
     _legacy_sig = lambda s: s.replace(_tool_sig, "")
     # 每个新键偏离时都进签名，且旧→新满足前缀兼容判据（_is_opt_suffix）。
     for key, val, frag in (("top_k", 50, "-tk50"), ("top_p", 0.95, "-tp0.95"),
@@ -5357,6 +5357,81 @@ def test_tool_credit_assignment():
     check("micro_rows路径同步切片sample_weight（防单行chunk广播整批权重）",
           '_sw_chunk = _sw_chunk[sl]' in src
           and 'sample_weight=_sw_chunk' in src)
+
+    # ---- 【2026-10-01】截断末段信用（trunc_tail_penalty）----
+    # 与废调用惩罚同构：截断轨迹的 base_adv 已被 sample_mask 置 0（任务结果不可信），
+    # 末段必须拿到局部负信用，此前已执行的调用轮不连坐，工具回包保持 0。
+    segs_t = [[
+        {"kind": "assistant", "ids": [1, 2]},
+        {"kind": "tool", "ids": [3, 4, 5]},
+        {"kind": "assistant", "ids": [6, 7, 8], "tool_action": "executed"},
+        {"kind": "assistant", "ids": [9, 10]},
+    ]]
+    base_t = torch.tensor([0.0])
+    # assistant 总长 = 2+3+2 = 7；末段 m=2 → -0.10×7/2 = -0.35
+    adv_t = tool_credit_advantages(base_t, segs_t, 10, call_cost=0.02,
+                                   trunc_flags=[1], trunc_tail_penalty=0.10)
+    check("截断末段：最后一个assistant段按assistant总长归一化（-0.10×7/2）",
+          torch.allclose(adv_t[0, 8:10], torch.full((2,), -0.35)))
+    check("截断末段：此前已执行调用轮只扣调用成本，不被末段惩罚连坐",
+          torch.allclose(adv_t[0, 5:8], torch.full((3,), -0.02 * 7 / 3)))
+    check("截断末段：更早的普通推理轮保持0",
+          bool((adv_t[0, :2] == 0).all()))
+    check("截断末段：工具回包严格0", bool((adv_t[0, 2:5] == 0).all()))
+    check("截断轨迹拿到局部负优势后不再是零方差丢弃组", group_ok(adv_t))
+    check("未截断样本（trunc_flags=0）不受末段惩罚影响",
+          torch.allclose(tool_credit_advantages(
+              base_t, segs_t, 10, call_cost=0.02, trunc_flags=[0],
+              trunc_tail_penalty=0.10)[0, 8:10], torch.zeros(2)))
+    check("关闭截断信用（0.0）时逐位退化为历史行为（全0）",
+          bool((tool_credit_advantages(base_t, segs_t, 10, trunc_flags=[1],
+                                       trunc_tail_penalty=0.0)[0] == 0).all()))
+    try:
+        tool_credit_advantages(base_t, segs_t, 10, trunc_flags=[1, 0],
+                               trunc_tail_penalty=0.1)
+        check("trunc_flags 与 segs 不等长必须 fail-fast", False)
+    except ValueError:
+        check("trunc_flags 与 segs 不等长必须 fail-fast", True)
+    try:
+        tool_credit_advantages(base_t, segs_t, 10, trunc_tail_penalty=-0.1)
+        check("trunc_tail_penalty<0 必须 fail-fast", False)
+    except ValueError:
+        check("trunc_tail_penalty<0 必须 fail-fast", True)
+
+    mask_t = torch.tensor([[1, 1, 0, 0, 0, 1, 1, 1, 1, 1]], dtype=torch.float32)
+    pol_t = torch.zeros((1, 10), requires_grad=True)
+    gen_t = torch.zeros((1, 10))
+    loss_t, _ = compute_loss("retool_math", pol_t, gen_t, adv_t, mask_t, cfg_loss,
+                             ref_logps=gen_t, sample_weight=torch.ones(1))
+    loss_t.backward()
+    check("梯度：截断末段方向为降低其概率（负adv→正梯度）",
+          bool((pol_t.grad[0, 8:10] > 0).all()))
+    check("梯度：截断轨迹的工具回包仍严格0梯度",
+          bool((pol_t.grad[0, 2:5] == 0).all()))
+    check("梯度：截断轨迹此前已执行调用轮仍按调用成本被轻微抑制",
+          bool((pol_t.grad[0, 5:8] > 0).all()))
+
+    check("retool_math 推荐截断末段剂量=0.10", cfg["trunc_tail_penalty"] == 0.10)
+    check("非工具算法默认关闭截断信用",
+          get_config("grpo", use_wandb=False)["trunc_tail_penalty"] == 0.0)
+    try:
+        get_config("retool_math", use_wandb=False, trunc_tail_penalty=-0.1)
+        check("trunc_tail_penalty<0 在 config 层必须 fail-fast", False)
+    except ValueError:
+        check("trunc_tail_penalty<0 在 config 层必须 fail-fast", True)
+    check("截断信用剂量进入签名", "-ttp0.1" in sig)
+    check("签名兼容器识别截断信用段", _is_opt_suffix("-ttp0.1"))
+    check("CLI 存在并透传", 'add_argument("--trunc_tail_penalty"' in src
+          and 'overrides["trunc_tail_penalty"]' in src)
+    ro_src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
+    check("启用截断信用时 sw 不再整行清零截断轨迹",
+          '(s["trunc_final"] and _trunc_tail <= 0.0)' in ro_src)
+    an_src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "analysis.py"), encoding="utf-8").read()
+    check("analysis 按 run_info 分档判定截断零梯度",
+          "_credit_enabled" in an_src and "trunc_credit" in an_src
+          and 'cfg.get("trunc_tail_penalty"' in an_src)
     print()
 
 

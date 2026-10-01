@@ -386,7 +386,7 @@ def test_eval_stats_and_signature():
     _sig_sp = run_signature({**_sp_default, "system_prompt": _sp_new})
     # 【2026-09-18】-sp<hash6> 后可能还跟着 -stop1/-of1 尾巴（stop/of 段在 sp 段之后），
     # 断言改为取 split 后首 6 位（hash 本体）。
-    _sig_tail = "-stop1-of1-tcc0.02-twp0.1"
+    _sig_tail = "-stop1-of1-tcc0.02-twp0.1-ttp0.1"
     check("提示偏离 → 追加 -sp<hash6>",
           "-sp" in _sig_sp and len(_sig_sp.split("-sp")[1][:6]) == 6
           and len(_sig_sp.split("-sp")[1]) in (6, 6 + len(_sig_tail)))

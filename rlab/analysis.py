@@ -772,15 +772,21 @@ def no_boxed_bucket(fmt_ok: bool, trunc: int, wasted: int, invalid: int,
     return "E_clean_no_box"
 
 
-def _waste_credit_enabled(path: str) -> bool:
-    """该 record 对应 run 是否启用了废调用局部负优势（旧 run 缺键=False）。"""
+def _credit_enabled(path: str) -> tuple:
+    """该 record 对应 run 启用了哪几项局部负优势：返回 (waste_credit, trunc_credit)。
+
+    旧 run 缺键 → 都是 False（历史口径：trunc OR code_wasted 整行 sw=0）。
+    【2026-10-01】trunc_tail_penalty>0 后截断轨迹重新进 loss，零梯度人群随之缩小，
+    判读必须按 run_info 分档，否则会把"已有局部信用"记成"零梯度算力"。
+    """
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(path)),
                                "run_info.json"), encoding="utf-8") as f:
             cfg = (json.load(f) or {}).get("config") or {}
-        return float(cfg.get("tool_waste_penalty", 0.0) or 0.0) > 0.0
+        return (float(cfg.get("tool_waste_penalty", 0.0) or 0.0) > 0.0,
+                float(cfg.get("trunc_tail_penalty", 0.0) or 0.0) > 0.0)
     except (OSError, ValueError, TypeError):
-        return False
+        return (False, False)
 
 
 def no_boxed_breakdown(path: str) -> dict:
@@ -803,11 +809,12 @@ def no_boxed_breakdown(path: str) -> dict:
     这类判读以前每次都靠临时 heredoc 重算，既慢又踩过上面的重叠陷阱（首版脚本把
     trunc∩invalid 全算进 trunc），故固化成子命令 + 测试。"""
     R = read_record(path)
-    waste_credit = _waste_credit_enabled(path)
+    waste_credit, trunc_credit = _credit_enabled(path)
     n_tot = len(R["accs"])
     fams = R["fams"]
     res = {"n_samples": n_tot, "n_nobox": 0, "n_nobox_total": 0,
-           "zero_grad_total": 0, "waste_credit": waste_credit, "families": {}}
+           "zero_grad_total": 0, "waste_credit": waste_credit,
+           "trunc_credit": trunc_credit, "families": {}}
     for fam in ("ok", "dropped"):
         idx = [i for i, v in enumerate(fams) if v == fam]
         if not idx:
@@ -819,7 +826,7 @@ def no_boxed_breakdown(path: str) -> dict:
         for i in idx:
             _tr, _wa = R["trs"][i], R["cws"][i]
             _iv, _cx = R["invs"][i], R["ctxfs"][i]
-            if _tr or (_wa and not waste_credit):
+            if (_tr and not trunc_credit) or (_wa and not waste_credit):
                 zg += 1
             bk = no_boxed_bucket(R["fmts"][i], _tr, _wa, _iv, _cx, R["cus"][i])
             if not bk:
@@ -870,8 +877,14 @@ def summarize_no_boxed(path: str) -> str:
         out.append(f"| {label} | {f['n']} | {nb} | {nb / f['n'] * 100:.0f}% | "
                    + " | ".join(cells) + " |")
     out.append("")
-    _zg_rule = ("trunc → sw=0；废调用已有局部负优势" if B.get("waste_credit")
-                else "trunc ∪ 末轮废码 → sw=0")
+    if B.get("trunc_credit") and B.get("waste_credit"):
+        _zg_rule = "trunc/废调用都已有局部负优势"
+    elif B.get("trunc_credit"):
+        _zg_rule = "trunc 已有末段局部负优势；末轮废码 → sw=0"
+    elif B.get("waste_credit"):
+        _zg_rule = "trunc → sw=0；废调用已有局部负优势"
+    else:
+        _zg_rule = "trunc ∪ 末轮废码 → sw=0"
     out.append(f"| 族 | 零梯度占比（{_zg_rule}） | 其中 B2 纯散文"
                "（被切断且全程没调用过工具） |")
     out.append("|---|---|---|")

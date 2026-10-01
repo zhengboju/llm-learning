@@ -122,6 +122,11 @@ ALGO_DEFAULTS = {
                         # 继续调用的轮只对该轮施加局部负优势。0.02/0.10 均远小于
                         # outcome ±1，先保正确性，再在同等解法中压缩调用/token。
                         tool_call_cost=0.02, tool_waste_penalty=0.10,
+                        # 【2026-10-01 截断末段信用】实测零梯度 10%→12.6%、
+                        # ``B_cut_mid_prose`` 占无boxed 43%：废调用已有局部负信用，
+                        # 而"写散文到预算耗尽"仍整行 sw=0 → 唯一没有反向信号的长度
+                        # 失控形态。与废调用惩罚同值起步（0.10，远小于 outcome ±1）。
+                        trunc_tail_penalty=0.10,
                         # 训练内嵌评测：每个 checkpoint 自动跑 test+train
                         eval_during_training=True,
                         # 【2026-09-24 p10 盲窗事故】retool 多轮采样档 n=500×4 轮
@@ -360,6 +365,12 @@ BASE = dict(
     # -tool_waste_penalty。0=关闭，其他算法与历史配置逐位不变。
     tool_call_cost=0.0,
     tool_waste_penalty=0.0,
+    # 【2026-10-01 截断末段信用】trunc_final 轨迹此前整行 sw=0（零梯度）——模型
+    # 学不到"把预算烧光"这件事本身是坏的。本项与 tool_waste_penalty 同构：给
+    # **最后一个 assistant 段**注入固定局部负优势。任务结果仍不可信（截断前可能
+    # 还没作答）故继续用 sample_mask 排除出组均值，但动作本身拿到直接信用，
+    # 此前有效推理/工具轮不连坐。0=关闭=历史口径（trunc 整行过滤）。
+    trunc_tail_penalty=0.0,
     # 【2026-09-21 DAPO overlong filtering】截断样本（末段被轮长上限切断）从
     # advantage 和组统计中移除：组均值只算非截断、截断样本 adv=0。
     # DAPO 消融：overlong filtering +6 分（最稳定的长度控制组件）。
@@ -795,7 +806,7 @@ def get_config(algo: str, **overrides) -> dict:
             f"[config] tool_protocol='native' 只对 retool 家族有效，当前 algo="
             f"{algo!r} 走单轮路径（从不读该键）→ 传了等于没传。\n"
             f"  要跑原生工具协议：--algo retool_math（或 retool）。")
-    for _key in ("tool_call_cost", "tool_waste_penalty"):
+    for _key in ("tool_call_cost", "tool_waste_penalty", "trunc_tail_penalty"):
         if float(cfg.get(_key, 0.0) or 0.0) < 0.0:
             raise ValueError(f"[config] {_key} 必须 >= 0，收到 {cfg.get(_key)!r}")
     # 原生协议预算档（docs/09 §5.1 档 A）。显式 override 优先（CLI 单变量微调位）。

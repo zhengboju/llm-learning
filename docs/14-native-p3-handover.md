@@ -7,7 +7,7 @@
 
 ## 0. 一句话现状
 
-**成本敏感工具信用新版正在 `rlab_new/native_p4_credit` 从基础模型从头训练（不是 step400 warm-start）：当前640条已上传轨迹、约80组，累计 acc 61.7%、fmt 69.1%、条件精度89.4%、trunc 10.0%、`C_wasted` 19.2%，staleness均值1.4/max2。链路健康，工具执行质量改善，但正确率、长度、截断和废调用总体停滞；最后20组长尾恶化尚未连续确认。保持配方跑到step100并做held-out评测，同时必须补生成端真实丢弃/overlong统计。**
+**成本敏感工具信用第一轮（`rlab_new/native_p4_credit`，从基础模型从头训练）已完成约436组：`C_wasted` 19.2%→14.2% 证明废调用局部信用有效，但失败模式迁移成散文截断（trunc 10.0%→12.6%、`B_cut_mid_prose` 占无boxed 43%），acc/fmt 未形成持续上升。已实现并验证 `trunc_tail_penalty=0.10`（截断轨迹末段局部负信用，任务结果仍不进组均值），签名新增 `-ttp0.1`；下一轮换 `out_dir` 单变量验证，本轮刻意不动 overlong 平台区。**
 
 ---
 
@@ -538,6 +538,111 @@ invalid、ctx_full、真实丢弃率：不得明显恶化
 
 ---
 
+## 4.9 截断末段信用：补齐失败模式迁移（2026-10-01）
+
+### 触发数据：约436组快照
+
+```bash
+python -m rlab.analysis --record rlab_new/native_p4_credit/record.jsonl \
+    --no-boxed-breakdown rlab_new/native_p4_credit/record.jsonl
+```
+
+| 指标 | 前80组 | 当前累计（3488条 ≈436组） |
+|---|---:|---:|
+| acc | 61.7% | 64.3% |
+| fmt | 69.1% | 72.0% |
+| 条件精度 | 89.4% | 89.3% |
+| code_ok | 87.3% | 88.4% |
+| trunc | 10.0% | **12.6%** |
+| `C_wasted` | 19.2% | **14.2%** |
+| `B_cut_mid_prose` | 9.5% | **11.9%** |
+| 真正零梯度 | 10.0% | **12.6%** |
+| invalid | ≈0.5% | 0.86% |
+| ctx_full | 0% | 0% |
+
+**判读**：`C_wasted` 19.2%→14.2% 证明废调用局部信用**真的有效**（降幅超出窗口波动）；
+但失败模式发生迁移 —— 省下的废调用变成"继续写散文直到预算耗尽"
+（`B_cut_mid_prose` 占无 boxed 的 43%、trunc 升至 12.6%），而任务准确率没有形成持续
+上升。最后约76组（360~436组）trunc≈16.5%、avg_clen≈4170，说明长度问题不是单窗口尖峰。
+
+### 机制：与废调用惩罚同构的末段局部负信用
+
+诊断到改动的映射（三项均为已确认事实，不是推断）：
+
+| 观察 | 机制 |
+|---|---|
+| `C_wasted` 有局部负信用 → 确实下降 | `tool_waste_penalty=0.10`（保留） |
+| trunc 轨迹 `sw=0` 整行零梯度 | `trunc_final` 是**唯一**没有反向信号的长度失控形态 |
+| 截断 = 预算耗尽，末段必是 assistant 段 | 可定位"导致失败的那个动作" |
+
+新增 `trunc_tail_penalty`（`retool_math` preset 默认 `0.10`）：
+
+| 项 | 语义 |
+|---|---|
+| 作用对象 | `trunc_final=1` 轨迹的**最后一个 assistant 段** |
+| 该段优势 | 覆盖为 `-trunc_tail_penalty`（按 assistant 总长归一化，每次动作固定成本） |
+| 之前的推理/工具轮 | 保持 `0`，不连坐 |
+| 是否进组均值 | **否**（继续用 `sample_mask` 排除，任务结果不可信） |
+| 是否整条 `sw=0` | **否**，改为只训练末段 |
+| 工具 observation | 仍 `mask=0` |
+
+关键性质：**任务结果未知所以不建基线，但"把预算烧光"这个动作拿到直接信用。**
+与"整条给 -1/-2/-3 绝对惩罚"的本质区别是不惩罚未知的正确性，因此不会复现
+run2"表面收尾"式的捷径。
+
+实现复用现有 `(B,T)` 协议，无新机制面：`tool_credit_advantages(base_adv, segs,
+total_len, call_cost, waste_penalty, trunc_flags, trunc_tail_penalty)`；`sw` 构造改为
+"启用时不清零截断"；签名新增 `-ttp0.1`；`run_info` 新增 `trunc_tail_penalty`；
+`analysis._credit_enabled` 按 run_info 分档判定零梯度人群。
+
+### 本轮刻意不改 overlong
+
+`overlong_ref=6144`/`buffer=256` 使绝对长度惩罚在 6144 封顶，6144~8192 边际成本为 0；
+`--overlong_ref 8192 --overlong_buffer 2048` 可消除该平台区，但**不与本项同批上线**：
+两者受力面重叠，同开会无法归因；且平台区目前只有二阶证据，而零梯度 12.6% 是一阶、
+连续可见的问题。若下一轮 trunc 仍不降，再单独调它。
+
+### 验证
+
+- `test_retool_cpu.test_tool_credit_assignment` 新增 20 项：按 assistant 总长归一化、
+  未截断样本不受影响、关闭时逐位退化、参数 fail-fast、梯度方向、observation 严格 0 梯度、
+  签名与 CLI 接线；
+- `test_smoke_cpu` 全套通过（三处固定签名后缀同步为
+  `-stop1-of1-tcc0.02-twp0.1-ttp0.1`）；
+- `analysis` 功能验证：同一条 record 在 `trunc_tail_penalty=0.0` 下 `zero_grad=4`、
+  `=0.1` 下 `zero_grad=0`（分档判定生效）。
+
+### 下一轮实验
+
+签名新增 `-ttp0.1`，**必须换 out_dir**：
+
+```bash
+bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
+  --tool_protocol native --native_tool_style function \
+  --max_traj_tokens 8192 --round_gen_tokens 8192 \
+  --answer_reserve 1024 --max_context_tokens 9216 \
+  --tool_call_cost 0.02 --tool_waste_penalty 0.10 --trunc_tail_penalty 0.10 \
+  --out_dir rlab_new/native_p4_trunc
+```
+
+（其余硬件/vLLM/显存参数照抄当前 run；上表只列奖励与预算项。）
+
+验收标准（对照当前 436 组）：
+
+| 指标 | 当前 | 目标 |
+|---|---:|---:|
+| 真正零梯度 | 12.6% | `<8%` |
+| `B_cut_mid_prose` | 11.9% | `<8%` |
+| trunc | 12.6% | `<10%` |
+| `C_wasted` | 14.2% | 保持或继续降 |
+| avg_clen | ≈3797 | 不上升 |
+| acc / fmt | 64.3% / 72.0% | 不得下降 |
+| invalid / ctx_full | 0.86% / 0 | 不恶化 |
+
+同时必须补生成端 `[rollout] 采样统计`：overlong 整组不落 record，上表不能证明真实丢弃率。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
 - **`--native_stop_at_call` 的历史定位**：native_p3 在轮数档、1024/round、无 stop 下 invalid ~60%，说明它对旧档是关键协议部件；token-budget 档使用 `P=M=8192` 时不存在人工续写边界，但是否启用 stop 仍必须以 live `run_info.json` 为准，不能从文档猜测。
@@ -545,5 +650,5 @@ invalid、ctx_full、真实丢弃率：不得明显恶化
 - **F1 修复与含废码组的旧 run 不可比**；native_p4 是新的“修复后”起点，对照一律锚定 BASE。
 - **record 幸存者偏差**：overlong 整组不落盘，训练期曲线系统性偏乐观；必须同时读取生成端 `[rollout] 采样统计`。native_p4 已知60次尝试快照中 overlong=0，但更晚快照仍需复核。
 - **内嵌评测与 gen_gpu_mem 0.6 互斥**：若恢复 `--eval_during_training`，GPU0 需约19G给 eval，先把 gen_gpu_mem 降到0.30–0.45。
-- **当前下一动作**：`rlab_new/native_p4_credit` 实际从基础模型从头训练，当前约80组；保持配方到step100并做held-out评测，补齐生成端真实丢弃/overlong统计。不要误称step400 warm-start，也不要在当前run中途加入截断信用。
-- **本地工作区状态**：成本信用代码已在 `c90f21f` 推送；本次仅更新本文档的训练快照。
+- **当前下一动作**：第一轮信用实验（`native_p4_credit`，~436组）已给出结论——废调用信用有效但失败模式迁移成散文截断。`trunc_tail_penalty` 已实现并验证，下一轮用 `rlab_new/native_p4_trunc` 单变量验证 §4.9 的验收标准；不要在同批同时改 overlong。
+- **本地工作区状态**：截断末段信用代码已提交推送；本轮改动涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。

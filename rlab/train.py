@@ -141,8 +141,13 @@ def run_signature(cfg: dict) -> str:
     # turn-level 工具信用分配：两项直接改变逐token advantage，必须进签名。
     _tcc = float(cfg.get("tool_call_cost", 0.0) or 0.0)
     _twp = float(cfg.get("tool_waste_penalty", 0.0) or 0.0)
+    _ttp = float(cfg.get("trunc_tail_penalty", 0.0) or 0.0)
     tool_credit_tag = ((f"-tcc{_tcc:g}" if _tcc > 0.0 else "")
-                       + (f"-twp{_twp:g}" if _twp > 0.0 else ""))
+                       + (f"-twp{_twp:g}" if _twp > 0.0 else "")
+                       # 【2026-10-01 截断末段信用】>0 时截断轨迹不再整行 sw=0，
+                       # 逐token advantage 改变 → 必须进签名（否则新档与旧档撞
+                       # 同一 out_dir，step_N 静默覆盖）。
+                       + (f"-ttp{_ttp:g}" if _ttp > 0.0 else ""))
     # 【2026-09-23 黑名单 TTL 进签名】>0 时题目调度行为改变（难题会重新入场）
     _qt = int(cfg.get("q_blacklist_ttl", 0) or 0)
     qt_tag = f"-qt{_qt}" if _qt > 0 else ""
@@ -245,6 +250,9 @@ def write_run_info(path: str, cfg: dict) -> None:
             "code_attempt_w": cfg.get("code_attempt_w"),
             "tool_call_cost": cfg.get("tool_call_cost"),
             "tool_waste_penalty": cfg.get("tool_waste_penalty"),
+            # 【2026-10-01】截断末段信用：analysis 端据此判断 trunc 轨迹是否已有
+            # 局部负优势（与 tool_waste_penalty 同一判据位）。
+            "trunc_tail_penalty": cfg.get("trunc_tail_penalty"),
             # 【2026-09-23 开发项】分档奖励/黑名单TTL/组相对长度惩罚（eval 端
             # 回读采样档对齐时也能看到这些）
             "code_w": cfg.get("code_w"),
@@ -277,7 +285,7 @@ def _ckpt_signature(ckpt_dir: str):
 # 签名的优化器段前缀（run_signature 的 _opt_tag 用的那几个），迁移兼容判据共用
 _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      "tk", "tp", "qs", "qf", "ob",
-                     "cw", "tcc", "twp", "qt", "lp", "lq", "lg",
+                     "cw", "tcc", "twp", "ttp", "qt", "lp", "lq", "lg",
                      # 【2026-09-28】并采题数（吞吐杠杆）也走 _opt_tag，必须登记，
                      # 否则"改了并发数的 run 中途重启"会被 guard_ckpt_collision
                      # 判成外来签名而拒跑（_is_opt_suffix 认不出 -gq8）。
@@ -890,6 +898,10 @@ def main():
     ap.add_argument("--tool_waste_penalty", type=float, default=None,
                     help="预算不足仍调用工具时，只对该assistant轮施加的负优势"
                          "（retool_math推荐0.10）；此前有效推理不连坐，0=旧版整行零梯度")
+    ap.add_argument("--trunc_tail_penalty", type=float, default=None,
+                    help="预算耗尽（trunc_final）轨迹的最后一个assistant段施加的"
+                         "负优势（retool_math推荐0.10）。任务结果仍不可信故不进组均值，"
+                         "但'把预算烧光'这个动作拿到直接信用；0=旧版整行过滤")
     ap.add_argument("--overlong_ref", type=int, default=None,
                     help="overlong shaping 的长度参考系显式覆盖（0=自动= "
                          "max_rounds×round_gen_tokens）。自动值在预算给满的档下"
@@ -1144,6 +1156,8 @@ def main():
         overrides["tool_call_cost"] = args.tool_call_cost
     if args.tool_waste_penalty is not None:
         overrides["tool_waste_penalty"] = args.tool_waste_penalty
+    if args.trunc_tail_penalty is not None:
+        overrides["trunc_tail_penalty"] = args.trunc_tail_penalty
     if args.overlong_ref is not None: overrides["overlong_ref"] = args.overlong_ref
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     # 【2026-09-25 原生工具协议】tool_protocol 必须先落进 overrides——get_config
