@@ -533,22 +533,31 @@ def run_training(cfg, args):
         if gen_proc is not None and not gen_proc.is_alive():
             _rc = gen_proc.exitcode
             if _rc is not None and _rc < 0:
-                _why = (f"被信号 {-_rc} 杀死（**无 traceback 是正常现象，不代表原因不明**）。"
-                        f"SIGKILL(9) 最常见来源：宿主 RAM OOM-killer（本项目已两次实锤）"
-                        f"或容器 cgroup 内存上限；SIGSEGV(11)/SIGABRT(6)= 引擎内部崩溃。"
-                        f"诊断（按序，三条都要做）："
-                        f"① `dmesg -T | grep -iE 'killed process|out of memory|segfault'"
-                        f" | tail -20` —— **必须全量 grep**：`tail -40` 会把更早的本次记录"
-                        f"挤出窗口，也容易把几天前的无关 OOM 误当成本次（2026-10-01 实测"
-                        f"就踩了这个坑）；"
-                        f"② cgroup 峰值——v2: `cat /sys/fs/cgroup/memory.peak"
-                        f" /sys/fs/cgroup/memory.max`，v1: `cat /sys/fs/cgroup/memory"
-                        f"/memory.max_usage_in_bytes /sys/fs/cgroup/memory"
-                        f"/memory.limit_in_bytes`（**本 pod 是 v1，v2 路径不存在**）；"
-                        f"③ `nvidia-smi`（崩溃后是否残留显存/进程）")
+                if -_rc == 9:
+                    _why = (
+                        "被 SIGKILL(9) 杀死——**内核直接终止，任何 handler 都拦不住**，"
+                        "所以“没有 traceback”是必然现象，不代表原因不明。最常见来源："
+                        "宿主 RAM OOM-killer（本项目已两次实锤）或容器 cgroup 内存上限。"
+                        "诊断（三条都要做）："
+                        "① `dmesg -T | grep -iE 'killed process|out of memory|segfault'"
+                        " | tail -20` —— **必须全量 grep**：`tail -40` 会把更早的本次记录"
+                        "挤出窗口，也容易把几天前的无关 OOM 误当成本次（2026-10-01 实测"
+                        "就踩了这个坑）；"
+                        "② cgroup 峰值——v2: `cat /sys/fs/cgroup/memory.peak"
+                        " /sys/fs/cgroup/memory.max`，v1: `cat /sys/fs/cgroup/memory"
+                        "/memory.max_usage_in_bytes /sys/fs/cgroup/memory"
+                        "/memory.limit_in_bytes`（**本 pod 是 v1，v2 路径不存在**）；"
+                        "③ `nvidia-smi`（崩溃后是否残留显存/进程）")
+                else:
+                    _why = (
+                        f"被信号 {-_rc} 杀死（SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL 等）"
+                        "——这类信号**已由生成端的 faulthandler 接手**，日志上方应当有它"
+                        "dump 的 Python 栈 + C 栈，优先去那里找崩溃点。若确实没有，说明"
+                        "崩在 faulthandler 安装之前（生成端启动极早期），或 stderr 未能落盘"
+                        "（用 `2>&1 | tee` 重跑）")
             elif _rc:
                 _why = (f"异常退出（exitcode={_rc}）——其 traceback 应在本日志上方，"
-                        f"先往上翻")
+                        "先往上翻")
             else:
                 _why = "以 exitcode=0 正常退出（不该发生：生成端主循环是 while True）"
             raise RuntimeError(
@@ -819,10 +828,16 @@ def run_training(cfg, args):
 def _spawn_gen(Q, cfg):
     """子进程入口：必须走模块顶层可寻址的函数（spawn pickle 约束）。
 
-    【2026-10-01 行缓冲】生成端被 SIGKILL（宿主 RAM OOM）时，块缓冲的 stdout
-    会随进程一起丢失——训练端事后只剩一句"生成端已退出"，崩溃前的最后几行
-    （做到哪一题/哪一轮/采样统计）全部蒸发，本项目已两次因此无法定位。
-    spawn 出的子进程 stdout 默认是块缓冲（非 tty），这里显式改行缓冲。
+    【2026-10-01 两处诊断加固】"生成端没有 traceback 就消失了"是本项目反复踩
+    的坑（2026-09-14 FlashInfer JIT 被 OOM-killer、2026-10-01 step 1 后消失），
+    当时都只能靠 exitcode 反推：
+      ① **行缓冲**：spawn 出的子进程 stdout 默认块缓冲（非 tty），被信号杀死时
+         缓冲区里最后几行（做到哪一题/哪一轮/采样统计）会随进程一起蒸发；
+      ② **faulthandler**：SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL 这类"没有 Python
+         traceback"的死亡其实**可以打出栈**，前提是崩溃前已装好 handler——
+         vLLM 的 CUDA/C++ 层崩溃正属于这一类。
+    ⚠ 硬限制：SIGKILL(9) 由内核直接终止，任何 handler 都拦不住；OOM-killer
+    路径仍然只会留下 `exitcode=-9`，仍需靠 dmesg/cgroup 定位。
     """
     import sys
     for _s in (sys.stdout, sys.stderr):
@@ -830,6 +845,15 @@ def _spawn_gen(Q, cfg):
             _s.reconfigure(line_buffering=True)
         except (AttributeError, ValueError):
             pass       # 非常规流（如已被替换）时不影响生成端启动
+    # 【2026-10-01 faulthandler】"没有 Python traceback 就死了"其实**不成立**：
+    # SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL 这类崩溃只要在崩溃前装好 handler，
+    # 就能 dump 出 Python 栈 + C 栈（vLLM 的 CUDA/C++ 层崩溃正属于这一类）。
+    # 本项目已两次遇到生成端静默消失（2026-09-14 FlashInfer JIT、2026-10-01
+    # step 1 后），当时都只能靠 exitcode 反推，就是因为没装它。
+    # ⚠ 硬限制：SIGKILL(9) 由内核直接终止，**任何 handler 都拦不住**——
+    # OOM-killer 路径仍然只会留下 exitcode=-9，这不是本项能解决的。
+    import faulthandler
+    faulthandler.enable()      # 崩溃时把栈写到 stderr（已行缓冲 → 实时落盘）
     from rlab.rollout import gen_worker
     gen_worker(Q, cfg)
 

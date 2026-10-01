@@ -5454,32 +5454,40 @@ def test_tool_credit_assignment():
 
 
 def test_gen_death_diagnostics():
-    """[AS] 生成端静默死亡的死因必须可判：exitcode 分档 + 日志不被缓冲吞掉。
+    """[AS] 生成端静默死亡的死因必须可判：exitcode 分档 + faulthandler + 行缓冲。
 
     2026-10-01 事故：native_p4_trunc 在 step 1 成功后生成端消失，训练端只印
-    "生成端进程已退出（见其 traceback）"—— 而 SIGKILL **本来就没有 traceback**，
-    把确定性特征读成了"原因不明"；块缓冲又让崩溃前的日志整段蒸发。
+    "生成端进程已退出（见其 traceback）"。旧版把两类故障混成一句话：
+      · SIGKILL(9) —— 内核直接终止，**任何 handler 都拦不住**，没有 traceback 是必然；
+      · SIGSEGV/SIGABRT 等 —— **可以**打出栈，前提是崩溃前装了 faulthandler。
+    块缓冲又让崩溃前的日志整段蒸发，两件事叠加成"原因不明"。
     """
-    print("[AS] 生成端死亡诊断（exitcode 分档 + 行缓冲）")
+    print("[AS] 生成端死亡诊断（exitcode 分档 + faulthandler + 行缓冲）")
     src = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "train.py"), encoding="utf-8").read()
     check("死亡时报 exitcode 而非笼统的'见其 traceback'",
           "gen_proc.exitcode" in src)
     check("区分被信号杀死（exitcode<0）与异常退出（exitcode>0）",
           "_rc < 0" in src and "_rc is not None and _rc < 0" in src)
-    check("被信号杀死时给出 dmesg/cgroup 诊断命令（可当场定位 OOM）",
+    check("SIGKILL(9) 单独一档：明说 handler 拦不住、没有 traceback 是必然",
+          "-_rc == 9" in src and "任何 handler 都拦不住" in src)
+    check("可捕获信号另立一档：指向 faulthandler 打出的栈",
+          "已由生成端的 faulthandler 接手" in src)
+    check("SIGKILL 档给出 dmesg/cgroup 诊断命令（可当场定位 OOM）",
           "killed process" in src and "memory.peak" in src)
     check("dmesg 用全量 grep（tail -40 会把本次记录挤出窗口）",
           "grep -iE 'killed process|out of memory|segfault'" in src)
     check("cgroup 峰值同时给 v1/v2 路径（本 pod 是 v1，v2 路径不存在）",
           "memory.max_usage_in_bytes" in src and "memory.limit_in_bytes" in src)
-    check("SIGKILL 无 traceback 被显式解释为正常现象",
-          "无 traceback 是正常现象" in src)
     _sp = src.split("def _spawn_gen")[1]
-    check("生成端入口改行缓冲（SIGKILL 前最后几行日志不再蒸发）",
+    check("生成端入口改行缓冲（被信号杀死前的最后几行日志不再蒸发）",
           "line_buffering=True" in _sp)
     check("行缓冲重配置在 gen_worker 之前生效（启动期日志同样不丢）",
           _sp.index("line_buffering=True") < _sp.index("gen_worker(Q, cfg)"))
+    check("生成端启用 faulthandler（SIGSEGV/SIGABRT 可打出 Python 栈 + C 栈）",
+          "faulthandler.enable()" in _sp and "import faulthandler" in _sp)
+    check("faulthandler 在 gen_worker 之前启用（否则引擎构造期崩溃抓不到）",
+          _sp.index("faulthandler.enable()") < _sp.index("gen_worker(Q, cfg)"))
     print()
 
 
