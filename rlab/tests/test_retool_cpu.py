@@ -5469,6 +5469,10 @@ def test_gen_death_diagnostics():
           "_rc < 0" in src and "_rc is not None and _rc < 0" in src)
     check("被信号杀死时给出 dmesg/cgroup 诊断命令（可当场定位 OOM）",
           "killed process" in src and "memory.peak" in src)
+    check("dmesg 用全量 grep（tail -40 会把本次记录挤出窗口）",
+          "grep -iE 'killed process|out of memory|segfault'" in src)
+    check("cgroup 峰值同时给 v1/v2 路径（本 pod 是 v1，v2 路径不存在）",
+          "memory.max_usage_in_bytes" in src and "memory.limit_in_bytes" in src)
     check("SIGKILL 无 traceback 被显式解释为正常现象",
           "无 traceback 是正常现象" in src)
     _sp = src.split("def _spawn_gen")[1]

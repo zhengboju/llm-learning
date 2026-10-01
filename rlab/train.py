@@ -536,8 +536,16 @@ def run_training(cfg, args):
                 _why = (f"被信号 {-_rc} 杀死（**无 traceback 是正常现象，不代表原因不明**）。"
                         f"SIGKILL(9) 最常见来源：宿主 RAM OOM-killer（本项目已两次实锤）"
                         f"或容器 cgroup 内存上限；SIGSEGV(11)/SIGABRT(6)= 引擎内部崩溃。"
-                        f"诊断：`dmesg -T | tail -40 | grep -i 'killed process'`；"
-                        f"`cat /sys/fs/cgroup/memory.peak`；`nvidia-smi`")
+                        f"诊断（按序，三条都要做）："
+                        f"① `dmesg -T | grep -iE 'killed process|out of memory|segfault'"
+                        f" | tail -20` —— **必须全量 grep**：`tail -40` 会把更早的本次记录"
+                        f"挤出窗口，也容易把几天前的无关 OOM 误当成本次（2026-10-01 实测"
+                        f"就踩了这个坑）；"
+                        f"② cgroup 峰值——v2: `cat /sys/fs/cgroup/memory.peak"
+                        f" /sys/fs/cgroup/memory.max`，v1: `cat /sys/fs/cgroup/memory"
+                        f"/memory.max_usage_in_bytes /sys/fs/cgroup/memory"
+                        f"/memory.limit_in_bytes`（**本 pod 是 v1，v2 路径不存在**）；"
+                        f"③ `nvidia-smi`（崩溃后是否残留显存/进程）")
             elif _rc:
                 _why = (f"异常退出（exitcode={_rc}）——其 traceback 应在本日志上方，"
                         f"先往上翻")
