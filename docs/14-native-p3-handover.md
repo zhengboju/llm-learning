@@ -7,7 +7,7 @@
 
 ## 0. 一句话现状
 
-**成本敏感工具信用第一轮（`rlab_new/native_p4_credit`，从基础模型从头训练）已完成约436组：`C_wasted` 19.2%→14.2% 证明废调用局部信用有效，但失败模式迁移成散文截断（trunc 10.0%→12.6%、`B_cut_mid_prose` 占无boxed 43%），acc/fmt 未形成持续上升。已实现并验证 `trunc_tail_penalty=0.10`（截断轨迹末段局部负信用，任务结果仍不进组均值），签名新增 `-ttp0.1`；下一轮换 `out_dir` 单变量验证，本轮刻意不动 overlong 平台区。**
+**成本敏感工具信用第一轮（`rlab_new/native_p4_credit`，从基础模型从头训练，约436组）held-out 评测确认有效：step100/200/300/400 **全部显著**优于 BASE（Δacc `+7.0/+9.7/+9.7/+7.4pp`，McNemar `p=0.017/0.001/0.002/0.013`，N=298），其中 step200 与 step300 并列最佳（69.8% vs BASE 60.1%），也是唯一通过 Bonferroni（0.0125）的两个；step400 回落到 67.4%。训练 record 全程 acc 平坦（61.7%→64.3%）却对应 +7~+10pp 的 held-out 增益——**record 因 overlong 组不落盘而系统性失真，不能用来判断是否学到**。机制侧遗留问题是失败模式迁移：`C_wasted` 19.2%→14.2% 证明废调用信用有效，但 trunc 升到 12.6%、`B_cut_mid_prose` 占无boxed 43%，与 step400 相对 step200/300 的回落吻合。已实现并验证 `trunc_tail_penalty=0.10`（截断轨迹末段局部负信用，任务结果仍不进组均值），签名新增 `-ttp0.1`；下一轮换 `out_dir` 单变量验证。**未验证项：评测缺平均输出 token 与工具轮数，"最少 token/最少轮数"这一半目标尚未证明。**
 
 ---
 
@@ -643,6 +643,64 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 
 ---
 
+## 4.10 第一轮信用实验 held-out 评测：收益确认（2026-10-01）
+
+### 判定口径
+
+- `N=298`（配对 `n=297`）；单臂 95%CI 最坏 `≈±5.7pp`，两臂差 `≈±8.0pp`；
+- 判定规则：CI 不跨 0；有 per-item 时改用 McNemar `p<0.05`；
+- 对 4 个 checkpoint 同时检验 → Bonferroni 阈值 `0.05/4=0.0125`。
+
+### 结果
+
+| 模型 | acc%(±95%CI) | fmt% | code% | Δacc vs BASE | McNemar | p | α=0.05 | Bonferroni 0.0125 |
+|---|---:|---:|---:|---:|---|---:|---|---|
+| BASE | 60.1±5.6 | 69.5 | 92.3 | — | — | — | — | — |
+| step100 | 67.1±5.3 | 79.9 | 94.3 | +7.0pp | b=46/c=25 | 0.017 | 显著 | 不通过（临界） |
+| **step200** | **69.8±5.2** | 78.5 | 96.0 | **+9.7pp** | b=51/c=22 | **0.001** | 显著 | **通过** |
+| **step300** | **69.8±5.2** | 79.5 | 94.6 | **+9.7pp** | b=57/c=28 | **0.002** | 显著 | **通过** |
+| step400 | 67.4±5.3 | 79.2 | 91.9 | +7.4pp | b=47/c=25 | 0.013 | 显著 | 不通过（临界） |
+
+### 结论
+
+1. **四个 checkpoint 全部显著优于 BASE**，收益在 step100 就已出现并保持到 step400：本轮信用机制不是"训不动"，而是**确实学到了**。
+2. **最佳是 step200 与 step300（并列 69.8%）**，也是唯一通过 Bonferroni 的两个。step100（67.1%）与 step400（67.4%）几乎相同 → **step100 已进入平台期**，之后没有实质提升。
+3. **`step200≈step300 > step400 > step100` 的排序不可当结论**：四个 checkpoint 两两差都落在 ±8.0pp 带内；且"从 4 个相关 checkpoint 里挑最大"本身会抬高假阳性风险（此处四个都显著，故不影响"有效"结论，只影响"哪个最好"）。
+4. **step400 相对 step200/300 回落 2.4pp**，与 §4.9 训练 record 的后期劣化（trunc 升到 16.5%、avg_clen 升到 4170）方向吻合——后期长度失控是真的，但**没有吃掉整体收益**。
+5. 与旧 native_p4 相比：旧 run 四个 checkpoint 里 step100（p=0.416）、step300（p=0.657）**不显著**、曲线抖动大；本轮四个全显著、平台更稳、收益出现更早。形态上更稳定，符合"废调用获得梯度后训练更可靠"的预期。
+
+### ⚠ 与旧 native_p4 评测不可直接比较
+
+本次 BASE 读数 `60.1%`，上一轮评测 BASE 为 `62.8%`——**同一个 BASE 两次差 2.7pp**，说明协议/采样档已经变了，绝对值不可跨 campaign 比较，只能看形态。要严格证明"信用版优于旧版"，必须把旧 `native_p4/step_400` 放进**同一次评测**（同 BASE、同 seed、同 `gpu_mem`）重跑。当前**不能宣称新版模型优于旧版 step400**。
+
+### ⚠ 本轮最重要的一条纪律结论：训练 record 不能判断"是否学到"
+
+训练 record 全程 acc 在 57%~79% 之间来回跳、累计只有 61.7%→64.3%，据此判断是"整体停滞、应停训"；而同一批权重 held-out 是 **+7~+10pp、四个 checkpoint 全部显著**。
+
+根因就是分析脚本自己打印的那行警告：**overlong 整组不落 record**，叠加难度过滤，训练 record 只是"活下来的组"的条件分布。因此：
+
+> 训练 record 只能读**行为趋势与健康签名**（trunc / `C_wasted` / invalid / staleness / avg_clen），**不能读"学到了没有"**；后者一律以 held-out 为准。
+
+本次是该规则的一次实证，与 §5 既有条目同源。
+
+### 未验证项：效率目标只完成了一半
+
+评测表只有 acc/fmt/code，**缺平均输出 token 与平均工具轮数**。而本轮任务的真实目标是"**最少的输出 token + 最少的轮数 + 最优的回答**"：
+
+- "回答更优"：已证明（+7~+10pp，显著）；
+- "更省"：**未证明**。训练 record 显示 avg_clen 长期在 3.6k~4.5k 徘徊、后期还升到 4170，因此预期**效率并未改善，甚至可能倒退**。
+
+必须补这两个读数（eval 侧通常有 clen / 轮数字段），否则不能宣布目标达成；若 acc 涨而 token 也涨，本轮只是"更准"而非"更优"。
+
+### 对下一轮决策的影响
+
+1. **主模型取 step200 或 step300**（并列 69.8%，均过 Bonferroni）；step400 不作为首选。
+2. **`trunc_tail_penalty` 仍值得做**，但性质变了：不是"救训不动的 run"，而是"消除后期劣化、稳住平台并压 token"。§4.9 的验收标准保留，**追加一条 held-out 硬门槛**：acc 不得低于同评测下的 step200/300（即不得用长度收益换准确率）。
+3. **下一轮单变量的对照锚点应为 step200/300 的 held-out 读数**，而不是训练 record 数值。
+4. 若要回答"新机制 vs 旧机制"，先补做旧 `step400` 的同 campaign 评测。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
 - **`--native_stop_at_call` 的历史定位**：native_p3 在轮数档、1024/round、无 stop 下 invalid ~60%，说明它对旧档是关键协议部件；token-budget 档使用 `P=M=8192` 时不存在人工续写边界，但是否启用 stop 仍必须以 live `run_info.json` 为准，不能从文档猜测。
@@ -650,5 +708,6 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 - **F1 修复与含废码组的旧 run 不可比**；native_p4 是新的“修复后”起点，对照一律锚定 BASE。
 - **record 幸存者偏差**：overlong 整组不落盘，训练期曲线系统性偏乐观；必须同时读取生成端 `[rollout] 采样统计`。native_p4 已知60次尝试快照中 overlong=0，但更晚快照仍需复核。
 - **内嵌评测与 gen_gpu_mem 0.6 互斥**：若恢复 `--eval_during_training`，GPU0 需约19G给 eval，先把 gen_gpu_mem 降到0.30–0.45。
-- **当前下一动作**：第一轮信用实验（`native_p4_credit`，~436组）已给出结论——废调用信用有效但失败模式迁移成散文截断。`trunc_tail_penalty` 已实现并验证，下一轮用 `rlab_new/native_p4_trunc` 单变量验证 §4.9 的验收标准；不要在同批同时改 overlong。
+- **训练 record 不能判断"是否学到"（本轮实证）**：信用版 record 累计 acc 仅 61.7%→64.3% 且窗口在 57%~79% 间跳，但 held-out 是四个 checkpoint 全显著、+7~+10pp（§4.10）。record 只读行为趋势与健康签名，学到没有一律看 held-out。
+- **当前下一动作**：第一轮信用实验（`native_p4_credit`，~436组）held-out 已确认有效（step200/300 并列 69.8%，Δ+9.7pp，p=0.001/0.002）；主模型取 step200 或 step300。下一步两件事：①补评测端**平均输出 token / 工具轮数**——效率目标尚未证明；②用 `rlab_new/native_p4_trunc` 单变量验证 `trunc_tail_penalty`（§4.9 验收 + acc 不低于 step200/300 的 held-out 硬门槛），不要在同批同时改 overlong。若要对比新旧机制，先把旧 `native_p4/step_400` 放进同一评测 campaign。
 - **本地工作区状态**：截断末段信用代码已提交推送；本轮改动涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。
