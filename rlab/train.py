@@ -522,11 +522,30 @@ def run_training(cfg, args):
 
     def _ensure_gen_alive():
         """fail-fast：生成端进程死亡 = 权重/数据链路已断，继续等只会空转
-        （vLLM 启动 OOM 等故障曾表现为训练端无限 'waiting for batch'）。"""
+        （vLLM 启动 OOM 等故障曾表现为训练端无限 'waiting for batch'）。
+
+        【2026-10-01 必须报 exitcode】旧版把**两类完全不同的故障**印成同一句话：
+        被信号杀死（exitcode=-N，**本来就不该有 traceback**）与抛异常后退出
+        （exitcode=1，其 traceback 就在上方日志里）。于是"日志里没有 traceback"
+        被读成"原因不明"，而它其实正是 SIGKILL 的**确定性特征**。实测事故：
+        native_p4_trunc step 1 成功后生成端静默消失，只有这一句话，无从判因。
+        """
         if gen_proc is not None and not gen_proc.is_alive():
+            _rc = gen_proc.exitcode
+            if _rc is not None and _rc < 0:
+                _why = (f"被信号 {-_rc} 杀死（**无 traceback 是正常现象，不代表原因不明**）。"
+                        f"SIGKILL(9) 最常见来源：宿主 RAM OOM-killer（本项目已两次实锤）"
+                        f"或容器 cgroup 内存上限；SIGSEGV(11)/SIGABRT(6)= 引擎内部崩溃。"
+                        f"诊断：`dmesg -T | tail -40 | grep -i 'killed process'`；"
+                        f"`cat /sys/fs/cgroup/memory.peak`；`nvidia-smi`")
+            elif _rc:
+                _why = (f"异常退出（exitcode={_rc}）——其 traceback 应在本日志上方，"
+                        f"先往上翻")
+            else:
+                _why = "以 exitcode=0 正常退出（不该发生：生成端主循环是 while True）"
             raise RuntimeError(
-                "[train] 生成端进程已退出（见其 traceback，常见原因：显存不足/"
-                "权重同步失败）-> 训练端中止。检查 run_gsm8k.sh 的卡位与显存编排。")
+                f"[train] 生成端进程已退出：{_why}\n"
+                f"  -> 训练端中止。检查 run_gsm8k.sh 的卡位与显存/内存编排。")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
     # 加载收口到 rlab.model_loading：多模态目录可直连（5.17 自带前缀映射+解包），
@@ -790,7 +809,19 @@ def run_training(cfg, args):
 
 
 def _spawn_gen(Q, cfg):
-    """子进程入口：必须走模块顶层可寻址的函数（spawn pickle 约束）。"""
+    """子进程入口：必须走模块顶层可寻址的函数（spawn pickle 约束）。
+
+    【2026-10-01 行缓冲】生成端被 SIGKILL（宿主 RAM OOM）时，块缓冲的 stdout
+    会随进程一起丢失——训练端事后只剩一句"生成端已退出"，崩溃前的最后几行
+    （做到哪一题/哪一轮/采样统计）全部蒸发，本项目已两次因此无法定位。
+    spawn 出的子进程 stdout 默认是块缓冲（非 tty），这里显式改行缓冲。
+    """
+    import sys
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass       # 非常规流（如已被替换）时不影响生成端启动
     from rlab.rollout import gen_worker
     gen_worker(Q, cfg)
 
