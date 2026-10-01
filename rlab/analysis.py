@@ -354,8 +354,29 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
         lines.append("")
     # 旧 json 回修提示（一次性，表下方给出）
     _repaired = [k for k, v in models.items() if legacy_code_rate(v)[1]]
-    lines += [f"| 模型 | acc%(±95%CI) | fmt% | code% | Δacc vs {base_name} | 检验 | 判定 |",
-              "|---|---|---|---|---|---|---|"]
+    # 【2026-10-01 效率两列】本轮目标 = "最少输出 token + 最少轮数 + 最优回答"，而 eval
+    # 表此前只有 acc/fmt/code → 只能证明"更准"，无法回答"更省"（docs/14 §4.10）。
+    # 口径：平均token = 模型自产 token（eval_vllm_one 的 avg_ans_tokens，assistant 段）；
+    #      工具轮数 = avg_rounds（code_used 均值，与 code% 同源，非布尔化）。
+    # **绝不把缺失当 0**：旧 json 没有 avg_ans_tokens（2026-10-01 才落盘）→ 必须显示
+    # "—" 并在表下说清"效率目标无法判定"，否则一个恒 0 的列会被读成"模型不输出 token"。
+    _tok_cells, _rnd_cells, _any_tok = [], [], False
+    for _n, _r in models.items():
+        _at = _r.get("avg_ans_tokens")
+        if not isinstance(_at, (int, float)):
+            # 回退：合并 json 丢了聚合键但 per-item 还在（老 json 的 ans_len 是 0 占位，
+            # 故只在真 >0 时采用，免得把占位 0 平均成"零 token"）。
+            _iv = [it.get("ans_len") for it in (_r.get("items") or [])
+                   if isinstance(it.get("ans_len"), (int, float)) and it.get("ans_len")]
+            _at = (sum(_iv) / len(_iv)) if _iv else None
+        _ar = _r.get("avg_rounds")
+        _tok_cells.append(f"{_at:.0f}" if isinstance(_at, (int, float)) else "—")
+        _rnd_cells.append(f"{_ar:.2f}" if isinstance(_ar, (int, float)) else "—")
+        if isinstance(_at, (int, float)):
+            _any_tok = True
+    lines += [f"| 模型 | acc%(±95%CI) | fmt% | code% | 平均token | 工具轮数 | Δacc vs {base_name} | 检验 | 判定 |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    _ci = 0
     for name, r in models.items():
         n = r.get("n") or 0
         acc = r.get("acc", 0.0) * 100
@@ -383,7 +404,17 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
                 delta = f"{d:+.1f}±{h:.1f}pp"
                 test = "两比例（无 per-item）"
                 verdict = _verdict(d, h)
-        lines.append(f"| {name} | {acc_col} | {fmt_col} | {code_col} | {delta} | {test} | {verdict} |")
+        lines.append(f"| {name} | {acc_col} | {fmt_col} | {code_col} | "
+                     f"{_tok_cells[_ci]} | {_rnd_cells[_ci]} | {delta} | {test} | {verdict} |")
+        _ci += 1
+    if models and not _any_tok:
+        lines += ["",
+                  "> ⚠️ 本表**没有任何模型带 `avg_ans_tokens`**（该字段 2026-10-01 才在 "
+                  "`eval_vllm_one.py` 落盘）→ 平均token 列恒为 “—”，"
+                  "**效率目标（最少输出 token）无法判定**。两条修法："
+                  "① 用新代码重跑 eval（per-item 会带 `ans_len`/`clen`）；"
+                  "② 先看 record 表的 `avg_clen`——但它是**含工具回包**的 completion 全长，"
+                  "与模型自产 token 不是同一口径，不能直接当输出 token 用。"]
     if _repaired:
         _vn = int((models[_repaired[0]].get("eval_protocol") or {}).get("val_n", 1) or 1)
         lines += ["",
@@ -953,6 +984,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
     accs, fmts, codes, oks = _R["accs"], _R["fmts"], _R["codes"], _R["oks"]
     trs, clens, phases, sess_ids = _R["trs"], _R["clens"], _R["phases"], _R["sess_ids"]
     cws, invs, ctxfs = _R["cws"], _R["invs"], _R["ctxfs"]
+    cus = _R["cus"]          # 每样本 code_used 原始计数（2026-10-01 起用于 avg工具轮）
     fams, stales = _R["fams"], _R["stales"]
     sess_span, sess_gv = _R["sess_span"], _R["sess_gv"]
     sess_lines = []
@@ -995,10 +1027,12 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
                 f"{gv_col}{st_col}{ok_col_s}{when}")
     out = [f"> clen 上限口径: {_cap_src} → cap={clen_cap}，"
            f"「≥{int(0.9 * clen_cap)}」列 = 接近**全轨迹**预算（撞它会被整组丢弃）；"
-           f"末段被单轮上限切断请看 trunc 列。",
+           f"末段被单轮上限切断请看 trunc 列。"
+           f"注意 `avg_clen` 是**含工具回包**的 completion 全长，"
+           f"不是模型输出 token（后者看 eval 表的「平均token」）。",
            "",
-           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | invalid率 | ctx满率 | 末轮废码率 | avg_clen | staleness | 阶段 | 会话 | 评测 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| 样本窗口 | ≈组 | acc率 | fmt率 | 条件精度 | code率 | code_ok率 | trunc率 | invalid率 | ctx满率 | 末轮废码率 | avg_clen | avg工具轮 | staleness | 阶段 | 会话 | 评测 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if sess_span:
         out.insert(0, f"> record 共 {len(sess_span)} 个会话（新协议按 gen_version 回退切分，"
                       f"旧协议按 >{SESS_GAP_S:.0f}s 间隔；见函数 docstring）"
@@ -1031,6 +1065,14 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
             len_col = f"{avg_l:.0f}（{near * 100:.0f}%≥{int(0.9 * clen_cap)}）"
         else:
             len_col = "—"
+        # 【2026-10-01 平均工具轮数列】目标含"最少轮数"，而表上此前只有长度没有轮数
+        # ——"省 token 是靠少调用还是靠写短"分不开。口径 = 每样本 code_used 的算术均值
+        # （**原始计数**，不能像 code率 那样布尔化：那会丢掉"调了几次"的信息）。
+        # 旧 record 无 code_used 键 → read_record 补了 0 占位，但那是"没有该字段"而非
+        # "真的 0 次"。可算性判据与 code率 同源（chunk_c 非空 = 该窗口确实落了该键），
+        # 免得在旧 record 上打印一个"平均 0.00 轮"的假读数。
+        _ch_u = cus[i:j] if chunk_c else []
+        rnd_col = f"{sum(_ch_u) / len(_ch_u):.2f}" if _ch_u else "—"
         # 【2026-09-18 staleness 列】窗口内样本陈旧度的均值/最大（opt-step 口径）。
         # >0 表示窗口内有样本吃到比推送周期更旧的策略（off-policy）；无 gen_version
         # 的旧 record 显示 "—"。均值反映"典型吃多旧"，最大反映"最坏吃多旧"。
@@ -1072,7 +1114,7 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
                    f"| {_a_rate * 100:.1f}% "
                    f"| {_f_rate * 100:.1f}% | {cond_col} | {code_col} "
                    f"| {ok_col} | {tr_col} | {inv_col} | {ctx_col} | {wst_col} "
-                   f"| {len_col} | {stal_col} "
+                   f"| {len_col} | {rnd_col} | {stal_col} "
                    f"| {ph_col} | {sess_col} | {_bl} |")
     # 【2026-09-28 分族统计】上表的每一列都是 ok+dropped **混合**的（丢弃组结构性
     # 全错，会把 ok 组读数一路拖低）。分族是唯一能读出"模型到底学得怎么样"的口径，

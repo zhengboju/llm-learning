@@ -3440,6 +3440,24 @@ def test_val_n_metric_fixes():
           and "result[\"avg_rounds\"] = sum(code_used) / _denom" in esrc)
     check("旧除数写法（/ n_valid）已从 code 指标里消失（反证：防回归）",
           "if u > 0) / n_valid" not in esrc and "sum(code_used) / n_valid" not in esrc)
+    # ---- ④ 效率两列（2026-10-01）：平均输出 token / 平均工具轮数 ----
+    # 长度在采样档同样会被"除数=题数"虚高（与 ① 同型错误），故除数必须也是
+    # 轨迹数 len(_traj_asst)；且长度是**所有**算法/协议的目标量，不能只落在
+    # is_retool_family 分支里（单轮档也要能读到）。
+    check("平均输出 token 落盘且除数是轨迹数（不是题数，防采样档虚高）",
+          'result["avg_ans_tokens"] = (sum(_traj_asst) / len(_traj_asst))' in esrc
+          and 'result["avg_clen"] = (sum(_traj_clen) / len(_traj_clen))' in esrc
+          and "if _traj_asst else 0.0" in esrc)
+    check("token 指标不在 retool 分支内（单轮档也落盘）",
+          esrc.index('result["avg_ans_tokens"]') < esrc.index("if is_retool_family and n_valid:"))
+    check("per-item 的 ans_len 占位字段真正落值（不再恒 0）",
+          '"ans_len": _al, "clen": _cl' in esrc and '"ans_len": 0' not in esrc)
+    _asrc = open("rlab/analysis.py", encoding="utf-8").read()
+    check("analysis 读取 avg_ans_tokens / avg_rounds 并将两列接入 eval 表",
+          '"avg_ans_tokens"' in _asrc and '"avg_rounds"' in _asrc
+          and "平均token" in _asrc and "工具轮数" in _asrc)
+    check("analysis 对缺字段显示 '—' 并警告，不把缺失当 0（死列防线）",
+          "该字段 2026-10-01 才在" in _asrc and "效率目标" in _asrc)
     # p8 报表 401.5% 的来源与修复后的真值
     n_valid, val_n = 200, 8
     code_used = [0] * (n_valid * val_n)

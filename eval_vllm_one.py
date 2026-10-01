@@ -680,6 +680,17 @@ if is_retool_family:
     answers = [_strip_code_blocks(a) for a in answers]
     code_used = [s["code_used"] for s in code_stats]
     code_ok = [s["code_ok"] for s in code_stats]
+    # 【2026-10-01 效率口径落盘】平均 token / 平均工具轮数此前**一个都没进 eval json**
+    # （只有 acc/fmt/code），于是"更准 vs 更省"无法判定（docs/14 §4.10）。两条口径
+    # 必须分开记账，混起来会把工具回包算成模型输出：
+    #   _traj_asst = 模型自己写出的 token（assistant 段）＝ 目标口径"最少输出 token"
+    #   _traj_clen = 整条 completion（assistant + 工具回包段）＝ 与训练 record 的
+    #                `clen` 同源（那边也是 per_sample_ids 全长），可跨表对照
+    # 两者都取**生成时记录的段 ids**，不重新 tokenize——与训练端"逐 token 同一条
+    # 序列"的契约一致（文本往返会因 BPE 段边界合并而改变长度）。
+    _traj_asst = [sum(len(s["ids"]) for s in segs_i if s["kind"] == "assistant")
+                  for segs_i in _segs]
+    _traj_clen = [sum(len(s["ids"]) for s in segs_i) for segs_i in _segs]
     # 【2026-09-25 原生档诊断】invalid_final = 有 <tool_call> 但形态不认识 / 调用后
     # 还跟着内容。它是原生协议唯一的结构性负奖励入口，且在围栏档根本不存在这一列
     # ——不打印就看不见"模型在调用后又继续写"这种档位特有的失效模式。
@@ -698,11 +709,16 @@ else:
                                                     max_tokens=args.max_tokens,
                                                     n=args.val_n))
         answers = [o.text for out in outs for o in out.outputs]
+        _traj_asst = [len(o.token_ids) for out in outs for o in out.outputs]
         code_used = code_ok = [0] * len(answers)
     else:
         outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=args.max_tokens))
         answers = [o.outputs[0].text for o in outs]
+        _traj_asst = [len(o.outputs[0].token_ids) for o in outs]
         code_used = code_ok = [0] * len(answers)
+    # 单轮档无工具段：completion 全长 = 模型自产 token（与多轮档的 _traj_clen 对齐，
+    # 免得下游表上这一格永远是 "—"）
+    _traj_clen = list(_traj_asst)
 
 # ---------- 评分 ----------
 # 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
@@ -739,9 +755,16 @@ for i, item in enumerate(sample):
             _sl = slice(i * args.val_n, (i + 1) * args.val_n)
             _cu = sum(code_used[_sl]) / args.val_n if code_used else 0.0
             _ck = sum(code_ok[_sl]) / args.val_n if code_ok else 0.0
+            # 【2026-10-01】长度也按题聚合 val_n 条（与 acc/fmt/code_used 同口径：
+            # Average@N）。独立成 _al/_cl 而不是复用 code_used 的切片，是因为
+            # 长度的分母是**轨迹数**，与 code_rate 的除数口径无关。
+            _al = sum(_traj_asst[_sl]) / args.val_n if _traj_asst else 0.0
+            _cl = sum(_traj_clen[_sl]) / args.val_n if _traj_clen else 0.0
         else:
             _cu = float(code_used[i]) if code_used and i < len(code_used) else 0.0
             _ck = float(code_ok[i]) if code_ok and i < len(code_ok) else 0.0
+            _al = float(_traj_asst[i]) if _traj_asst and i < len(_traj_asst) else 0.0
+            _cl = float(_traj_clen[i]) if _traj_clen and i < len(_traj_clen) else 0.0
         items.append({
             # 题面指纹：跨模型对齐用（同 seed/split 下同题同 key）——McNemar 的配对键。
             # run2 缺的正是这个键，导致 +5.0pp 只能做未配对检验（p≈0.11）。
@@ -750,7 +773,8 @@ for i, item in enumerate(sample):
             # 采样档为每题均值（float）；greedy 档为 0/1 计数（int 语义不变）
             "code_used": _cu, "code_ok": _ck,
             "val_n": args.val_n,
-            "ans_len": 0, "empty": 0,
+            # ans_len = 模型自产 token（目标口径）；clen = 含工具回包的 completion 全长
+            "ans_len": _al, "clen": _cl, "empty": 0,
         })
     if i < args.show:
         print(f"  [a={a_avg:.2f} f={f_avg:.2f}]")
@@ -806,6 +830,12 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
                             "system_prompt_sha": _sp_sha}}
 if args.dump_items:
     result["items"] = items
+# 【2026-10-01 平均输出 token】与 code_rate 不同：长度是**所有**算法/协议都关心的
+# 目标量（"最少 token"），故不放在 is_retool_family 分支里——单轮档也照落。
+# 除数是**轨迹数** len(_traj_asst)（= n_valid×val_n 采样档），不是题数——p8 那类
+# "采样档虚高 val_n 倍"的错在长度上同样会犯（会把平均长度报成 n×短）。
+result["avg_ans_tokens"] = (sum(_traj_asst) / len(_traj_asst)) if _traj_asst else 0.0
+result["avg_clen"] = (sum(_traj_clen) / len(_traj_clen)) if _traj_clen else 0.0
 if is_retool_family and n_valid:
     # 【2026-09-19 修复·采样档除数】code_used 长度 = n_valid*val_n（每题 val_n 条轨迹）
     # 旧版除以 n_valid 导致 val_n=8 时显示值是真实值的 8 倍（p8: 401.5% 实为 50.2%）
@@ -815,6 +845,9 @@ if is_retool_family and n_valid:
     result["avg_rounds"] = sum(code_used) / _denom
 print(f"\n[3/3] {name}（{args.eval_task} {args.split}，N={len(sample)} algo={args.algo}）")
 print(f"{name:<16}{result['acc']*100:>9.1f}%{result['fmt']*100:>9.1f}%{result['both']*100:>9.1f}%{result['n']:>10}")
+# 效率读数与 acc/fmt 同行打印：本轮目标里"更省"这一半的唯一可见入口
+print(f"{name:<16}平均输出token {result['avg_ans_tokens']:.0f}"
+      f"  平均完成长度(含工具回包) {result['avg_clen']:.0f}")
 if is_retool_family and n_valid:
     print(f"{name:<16}代码调用率 {result['code_rate']*100:.1f}%  成功率 {result['code_ok_rate']*100:.1f}%  平均轮次 {result['avg_rounds']:.2f}")
 with open(out_path, "w", encoding="utf-8") as f:

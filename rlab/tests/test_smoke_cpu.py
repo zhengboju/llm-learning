@@ -439,6 +439,32 @@ def test_eval_stats_and_signature():
     check("无 per-item 时明确标注是两比例检验（不冒充满配检验）",
           "两比例（无 per-item）" in tbl)
 
+    print("[G] 效率两列：平均token / 工具轮数（2026-10-01）")
+    # 【2026-10-01】eval 表此前只有 acc/fmt/code，回答不了"更省"（docs/14 §4.10）。
+    # 三路都必须测：①缺字段的旧 json → "—" + 明确警告（绝不把缺失当 0）；
+    # ②新 json 有 avg_ans_tokens/avg_rounds → 数值上表；
+    # ③旧 json 无聚合键但 per-item 有真实 ans_len → 按题平均回退。
+    check("旧 json 缺 avg_ans_tokens → 列显 '—' 且明确说效率目标无法判定",
+          "平均token" in tbl and "工具轮数" in tbl
+          and "| — | — |" in tbl and "效率目标" in tbl)
+    _jtk = os.path.join(_dir, "eval_tok.json")
+    _json.dump({"BASE": {"acc": 0.466, "fmt": 0.53, "n": 500,
+                         "avg_ans_tokens": 1200.0, "avg_rounds": 1.5},
+                "m200": {"acc": 0.516, "fmt": 0.602, "n": 500,
+                         "avg_ans_tokens": 900.0, "avg_rounds": 0.9}},
+               open(_jtk, "w", encoding="utf-8"), ensure_ascii=False)
+    _tbl_tok = summarize_eval(_jtk)
+    check("新 json 的平均token/工具轮数正确上表（1200/1.50 与 900/0.90）",
+          "| 1200 | 1.50 |" in _tbl_tok and "| 900 | 0.90 |" in _tbl_tok)
+    _jfb = os.path.join(_dir, "eval_fb.json")
+    _json.dump({"BASE": {"acc": 0.4, "n": 2, "items": [
+        {"qk": "q1", "acc": 1.0, "ans_len": 100},
+        {"qk": "q2", "acc": 0.0, "ans_len": 300}]}},
+        open(_jfb, "w", encoding="utf-8"), ensure_ascii=False)
+    _tbl_fb = summarize_eval(_jfb)
+    check("缺聚合键但 per-item 有 ans_len → 回退平均（(100+300)/2=200）",
+          "| 200 |" in _tbl_fb)
+
     print("[G] 代码分层分析（code_layer / summarize_code_layer）")
     # 【2026-09-18】p5 的 step300 增益被抹平 + record code_ok 56%→10% 崩——需区分
     # H1「理性压灭」（用码样本 acc 不高 ⇒ 工具路径无优势，无解）vs H2「激励不足」
@@ -659,6 +685,11 @@ def test_eval_stats_and_signature():
           "| dropped | 384 | 48 | 0.0% | 0.0% | — |" in _rtbl_fam)
     check("窗口表新增 invalid率 / ctx满率 两列",
           "invalid率" in _rtbl_fam and "ctx满率" in _rtbl_fam)
+    check("窗口表新增 avg工具轮 列（目标含'最少轮数'）",
+          "avg工具轮" in _rtbl_fam)
+    # fixture 每条 code_used=1 → 每个窗口平均值恒 1.00；这是"平均轮数"而非代码率
+    check("avg工具轮 数值正确（本 fixture 全为 code_used=1）",
+          "| 1.00 |" in _rtbl_fam)
     check("零方差丢弃占比显式给出，且声明 overlong 不落盘（不是全部丢弃率）",
           "零方差丢弃占已落盘组 **67%**" in _rtbl_fam
           and "不落盘" in _rtbl_fam and "采样统计" in _rtbl_fam)
@@ -671,15 +702,16 @@ def test_eval_stats_and_signature():
     # 而真实落后恒 ≤1（推送周期 8 步/micro-step，4 micro=1 opt）。
     # native_p3 真机即此形态：旧公式报 max 165，而训练总共只推进 74 个 opt-step。
     # 表列序：样本窗口|≈组|acc率|fmt率|条件精度|code率|code_ok率|trunc率|invalid率|
-    #         ctx满率|末轮废码率|avg_clen|staleness|阶段|会话|评测 → staleness = 下标 12
+    #         ctx满率|末轮废码率|avg_clen|avg工具轮|staleness|阶段|会话|评测
+    #         → staleness = 下标 13（2026-10-01 起 avg工具轮 插在 avg_clen 之后）
     _st_vals = []
     for _ln in _rtbl_fam.splitlines():
         if not _ln.startswith("| ") or "staleness" in _ln:
             continue
         _cells = [c.strip() for c in _ln.strip("|").split("|")]
-        if len(_cells) < 16:
+        if len(_cells) < 17:
             continue
-        _m = _re.match(r"(-?\d+(?:\.\d+)?)", _cells[12])
+        _m = _re.match(r"(-?\d+(?:\.\d+)?)", _cells[13])
         if _m:
             _st_vals.append(float(_m.group(1)))
     check(f"staleness 修复后窗口值有界（丢弃组不抬高基准；≤1 opt-step，实测 {_st_vals}）",
