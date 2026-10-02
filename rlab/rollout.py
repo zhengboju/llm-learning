@@ -1272,10 +1272,46 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 
+def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
+                  clen=None, gen_version=None, t=None):
+    """把一条轨迹打成可落盘的一行（纯函数，CPU 可测；2026-10-02）。
+
+    **段级**而不是拼接文本：B/C 桶判读的核心问题正是"末段写了什么、有多长"，
+    拼接后 assistant/工具边界丢失就答不了。工具段的 text 取 `segs` 里那条
+    **消毒后**的回包（沙箱 stdout 是注入面，落盘版不再引入原始输出）。
+
+    `status` 三态：ok（已上传）/ uniform（零方差丢弃）/ overlong（轨迹超长丢弃）。
+    后两类整组不进 record.jsonl——dump 含它们才治得了记录口径的幸存者偏差
+    （record 只看得见"活下来的组"）。计数类与 record 同源（同一个 code_stats），
+    acc/fmt 是 ±1 奖励原值；overlong 分支没打分 → None（不写 0 冒充"全错"）。
+
+    ⚠ 阅读路径：dump 里含 `<tool_call>` 这类标签，用 read/控制台看会被渲染成
+    无括号普通词——判字节真伪要逐字符 ord 直出（AGENTS.md 标签铁律）。"""
+    _st = stats or {}
+    # seg 的长度优先用调用方**已经记录**的 token 数（`len`）：单轮档没有段结构，
+    # 只有生成时记下的 token 数——重新 tokenize 会因为 BPE 跨段边界合并而变长
+    # （本项目"生成/训练同序列"铁律的另一面）。
+    _segs = [{"kind": s.get("kind"),
+              "len": int(s["len"]) if s.get("len") is not None
+                     else len(s.get("ids") or ()),
+              "text": s.get("text") or ""} for s in segs_i]
+    return {"t": t if t is not None else time.time(), "Q": Q, "A": A, "qk": qk,
+            "status": status, "gen_version": gen_version,
+            "acc": acc, "fmt": fmt,
+            "clen": int(clen) if clen is not None else sum(s["len"] for s in _segs),
+            "code_used": int(_st.get("code_used", 0)),
+            "code_ok": int(_st.get("code_ok", 0)),
+            "trunc_final": int(_st.get("trunc_final", 0)),
+            "code_wasted": int(_st.get("code_wasted", 0)),
+            "invalid_final": int(_st.get("invalid_final", 0)),
+            "ctx_full": int(_st.get("ctx_full", 0)),
+            "n_segs": len(_segs), "segs": _segs}
+
+
 def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                          inputs, prompts_text, prompt_ids, plen,
                          sampling_params, steps_elapsed=0, verify_logps=None,
-                         prompts_messages=None):
+                         prompts_messages=None, traj_sink=None):
     """多轮 rollout → 打分 → 按题拆分的上传就绪结果（模块级，FakeGen CPU 可测）。
 
     【2026-09-10 结构修改·采样并发与按题拆分】一次调用处理 len(inputs) 道题
@@ -1293,6 +1329,10 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen
     与段长画像 segl（assistant 段长表）/tsegl（工具段长表）——两者 per-sample、
     与 acc/fmt 同下标对齐（2026-10-02）。
+
+    `traj_sink`（可选 list）：非 None 时把**每条轨迹**（含未上传的 uniform /
+    overlong）按 `traj_dump_row` 追加进去，由调用方落盘。默认 None = 零成本
+    （连字符串都不拼），故不影响任何既有调用点。
     adv 通常为 (B,) 序列级；启用 tool_call_cost/tool_waste_penalty 后为 (B,T)
     逐token任务优势+工具动作成本（losses._adv_broadcast 原生支持）。
     （plen = **本题** prompt 的真实长度——每道题先剥掉左 pad 再建批，见
@@ -1353,11 +1393,28 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                  for si in segs_i]
         _tsegl = [[len(sg["ids"]) for sg in si if sg.get("kind") == "tool"]
                   for si in segs_i]
+
+        def _sink(status, acc_list=None, fmt_list=None):
+            """轨迹落盘钩子（traj_sink=None → 零成本，见 collect_retool_group docstring）。
+
+            三个终局分支（overlong / uniform / ok）共用它——**overlong 也必须落**：
+            超长整组不进 record.jsonl，只在生成端日志留一个计数，正是记录口径
+            幸存者偏差的主体；要回答"长度失控时模型在写什么"只能靠这批轨迹。"""
+            if traj_sink is None:
+                return
+            for j in range(n):
+                traj_sink.append(traj_dump_row(
+                    segs_i[j], Q=inputs[i]["Q"], A=inputs[i]["A"], qk=_qks[i],
+                    status=status, stats=code_stats[i * n + j], clen=clen_i[j],
+                    acc=None if acc_list is None else float(acc_list[j]),
+                    fmt=None if fmt_list is None else float(fmt_list[j])))
+
         # 逐样本全长预算检查（按题：单题超长不再连坐其他题，2026-09-10）。
         # plen_i 为真实 prompt 长——旧版用批内最长（含 pad）会把 pad 宽度算进
         # 每个样本的 token 预算，单题超长判定偏严。
         if mask_i.shape[1] == 0 or retool_context_overlong(
                 per_ids_i, plen_i, cfg["max_context_tokens"]):
+            _sink("overlong")
             results.append({"status": "overlong"})
             continue
         adv_i, acc_i, fmt_i, cu_i, ck_i, phase = retool_score_flat(
@@ -1377,6 +1434,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
         # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
         # 与超长分流；2026-09-10 起不再连坐同批其他题）
         if not group_ok(adv_i):
+            # 【2026-10-02】丢弃组也进轨迹 dump——它们不进 record.jsonl，
+            # 却是"硬题是怎么死的"的唯一证据。
+            _sink("uniform", acc_i, fmt_i)
             # 【2026-09-21 健康检查选择偏差修复】丢弃组也带诊断数据（acc/fmt/clen/
             # trunc），让 health.observe 能观测到被过滤组的截断率——否则高截断组
             # 被 overlong_filter 判为 uniform 后健康检查只看存活组 → trunc_rate 被低估。
@@ -1443,6 +1503,8 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                              else 1.0 for s in _stats_i],
                             dtype=torch.float32),
                         "plen": plen_i})
+        # 【2026-10-02】上传组的轨迹 dump（与上面 overlong/uniform 同一落盘口径）
+        _sink("ok", acc_i, fmt_i)
     return results
 
 
@@ -2042,6 +2104,25 @@ def gen_worker(Q, cfg: dict):
     fout = open(cfg["record_path"], "a", encoding="utf-8")
     uploaded_total = 0
     is_retool = cfg["algo"] in ("retool", "retool_math")
+    # 【2026-10-02 轨迹全量落盘】record.jsonl 只有统计，看不到"模型写了什么"。
+    # 开启后写 <out_dir>/traj.jsonl：**含被丢弃的 attempt**（uniform/overlong）
+    # ——那两类整组不进 record，是记录口径幸存者偏差的主体。逐 attempt flush：
+    # 生成端被信号杀死时（本项目已遇两次）最后一批轨迹不随缓冲区蒸发。
+    # 只实现于 retool 家族（段结构 = 「末段写了什么」的载体）；单轮档若开，
+    # 显式告警而不是留一个空文件让人以为"dump 了但都是空"。
+    ftraj = None
+    if cfg.get("traj_dump") and not is_retool:
+        print("[rollout][警告] traj_dump 目前只实现于 retool 家族（单轮档无段结构）"
+              "→ 本 run 不会落轨迹", flush=True)
+    if cfg.get("traj_dump") and is_retool:
+        _traj_path = os.path.join(
+            os.path.dirname(os.path.abspath(cfg["record_path"])), "traj.jsonl")
+        ftraj = open(_traj_path, "a", encoding="utf-8")
+        print(f"[rollout] 轨迹全量落盘 -> {_traj_path}"
+              f"（段级文本；含被丢弃的 uniform/overlong attempt）", flush=True)
+    n_traj_rows = 0
+    n_traj_bad = 0     # 无法序列化而跳过的行（见下；绝不因此中断训练）
+    uploaded_total = 0
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
     samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0,
                   "prompt_overlong": 0}
@@ -2110,11 +2191,28 @@ def gen_worker(Q, cfg: dict):
                 # 阶段2：多轮代码交织（并采 multi_q 题，vLLM 并发 = 题数×num_pre_Q）
                 # → 按题打分/拆分 → 每题独立上传批（mask 已按段边界算好）
                 sps = make_retool_sps(len(inputs) * cfg["num_pre_Q"], rollout_seq[0])
+                _sink = [] if ftraj is not None else None
                 results = collect_retool_group(
                     vllm_gen, tokenizer, cfg, compute_gen_logps,
                     inputs, prompts_text, prompt_ids, plen, sps,
                     steps_elapsed=pushes[0] * cfg["gen_update_steps"],
-                    verify_logps=_verifier, prompts_messages=_pmsgs)
+                    verify_logps=_verifier, prompts_messages=_pmsgs,
+                    traj_sink=_sink)
+                if _sink:
+                    # gen_version 由调用方补（rollout 循环看不到权重推送计数）：
+                    # 轨迹与训练 step 的对应关系全靠它，缺了就无法按"哪版权重"分层。
+                    for _row in _sink:
+                        _row["gen_version"] = policy_version[0]
+                        try:
+                            ftraj.write(json.dumps(_row, ensure_ascii=False) + "\n")
+                        except (TypeError, ValueError, UnicodeEncodeError):
+                            # 【诊断产物绝不拖死训练】文本里万一出现无法序列化的
+                            # 东西（孤立代理项/意外类型），只跳过这一行并计数；
+                            # 让观测面把 16h 的训练 run 崩掉是本末倒置。
+                            n_traj_bad += 1
+                            continue
+                    ftraj.flush()
+                    n_traj_rows += len(_sink)
                 # 剥 pad 可见性（一次性）：本批最长 prompt token 数 vs 各题真实长度。
                 # 静默改变 token 预算是这类"口径修正"最难排查的形态，打一行自证。
                 if not _pad_logged[0]:
@@ -2302,7 +2400,12 @@ def gen_worker(Q, cfg: dict):
             print(f"[rollout] 采样统计: 累计尝试 {_a} 次 / 有效上传 {uploaded_total} 组"
                   f"（真实丢弃率 {_discarded / max(1, _a) * 100:.0f}% = "
                   f"零方差 {_u} + 轨迹超长 {_o} + prompt超限 {_po} + 其他 {_other}；"
-                  f"题目过滤中 {_skipped}/{len(QAs)} 题被跳过）",
+                  f"题目过滤中 {_skipped}/{len(QAs)} 题被跳过）"
+                  # 【2026-10-02】轨迹落盘量只在本档开启时附加（关闭时该行逐字不变，
+                  # 既有日志断言不受影响）；跳过行数非 0 = 落盘有损，必须可见。
+                  + (f"；轨迹落盘 {n_traj_rows} 条"
+                     + (f"（跳过 {n_traj_bad}）" if n_traj_bad else "")
+                     if ftraj is not None else ""),
                   flush=True)
             # 【2026-09-12 反压②：窗口丢弃率告警/熔断】累计率会被开局的正常波动
             # 永久污染，所以按"上次打点以来的增量"算窗口率。总数同样必须取

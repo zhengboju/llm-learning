@@ -1080,6 +1080,51 @@ def test_collect_retool_group_split():
           results2[0]["status"] == "ok" and results2[1]["status"] == "overlong")
     check("丢弃项不含上传字段（uniform/overlong 零上传成本）",
           "merged" not in results[1] and "merged" not in results2[1])
+    # 【2026-10-02 轨迹全量落盘】traj_sink 必须覆盖**两类被丢弃的 attempt**：
+    # uniform（零方差）与 overlong（超长）整组都不进 record.jsonl，只在生成端日志
+    # 留一个计数——"长度失控时模型在写什么"只能靠这批轨迹回答。dump 走独立 sink
+    # 而不是塞进 results（后者的 merged/mask 是 GB 级张量，混在一起就白占内存）。
+    from rlab.rollout import traj_dump_row
+    _sink_u = []
+    collect_retool_group(FakeGen([r1]), tok, cfg, fake_gl, qs, prompts_text,
+                         prompt_ids, plen, sps, steps_elapsed=0, traj_sink=_sink_u)
+    check("轨迹 dump：条数 = 题数×num_pre_Q（8），状态与 results 一致（ok4/uniform4）",
+          len(_sink_u) == 8
+          and sum(1 for r in _sink_u if r["status"] == "ok") == 4
+          and sum(1 for r in _sink_u if r["status"] == "uniform") == 4)
+    check("轨迹 dump：段级结构自洽（n_segs == len(segs) 且 段长和 == clen）",
+          all(r["n_segs"] == len(r["segs"]) for r in _sink_u)
+          and all(sum(s["len"] for s in r["segs"]) == r["clen"] for r in _sink_u))
+    check("轨迹 dump：带文本与题面（不是又存一份统计）",
+          all(any(s["text"].strip() for s in r["segs"]) for r in _sink_u)
+          and all(r["Q"] and r["A"] for r in _sink_u))
+    _sink_o = []
+    collect_retool_group(FakeGen([r1]), tok, cfg2, fake_gl, qs, prompts_text,
+                         prompt_ids, plen, sps, steps_elapsed=0, traj_sink=_sink_o)
+    check("轨迹 dump：overlong 也落（4 条），且 acc/fmt 记 None——不写 0 冒充'全错'",
+          len(_sink_o) == 8
+          and sum(1 for r in _sink_o if r["status"] == "overlong") == 4
+          and all(r["acc"] is None and r["fmt"] is None
+                  for r in _sink_o if r["status"] == "overlong")
+          and all(isinstance(r["acc"], float)
+                  for r in _sink_o if r["status"] == "ok"))
+    check("轨迹 dump 默认关：数据只走 sink，**不进 results**（否则多占 GB 级内存）",
+          "segs" not in ok and "traj_row" not in ok and "traj" not in ok)
+    # 纯函数：段长两种来源（已记录的 len 优先于 ids 长度——单轮档没有段结构，
+    # 重新 tokenize 会因 BPE 跨段边界合并而改变长度）
+    _row = traj_dump_row([{"kind": "assistant", "ids": [1, 2, 3], "text": "abc"}],
+                         Q="q", A="a", qk="k", status="eval", clen=3)
+    check("traj_dump_row：ids 长度兜底 + 统计字段齐备（缺 stats 记 0）",
+          _row["segs"] == [{"kind": "assistant", "len": 3, "text": "abc"}]
+          and _row["clen"] == 3 and _row["n_segs"] == 1
+          and _row["trunc_final"] == 0 and _row["code_used"] == 0)
+    _row2 = traj_dump_row([{"kind": "assistant", "len": 4242, "text": "x"}],
+                          Q="q", A="a", qk="k", status="eval", clen=4242)
+    check("traj_dump_row：显式 len 优先（单轮档用已记录 token 数，不重算）",
+          _row2["segs"][0]["len"] == 4242)
+    _row3 = traj_dump_row([], Q="q", A="a", qk="k", status="overlong")
+    check("traj_dump_row：空段表不崩（overlong 早退时可能没有段）",
+          _row3["n_segs"] == 0 and _row3["clen"] == 0 and _row3["segs"] == [])
 
 
 # ------------- N. 离线难度预探测过滤 + 探针聚合（2026-09-10） -------------

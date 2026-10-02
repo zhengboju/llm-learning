@@ -149,6 +149,18 @@ BASE = dict(
     data_task="gsm8k",                       # gsm8k（阶段0/1）；阶段2/3 扩展
     out_dir="./rlab_out",
     record_path="./rlab_out/record.jsonl",   # 生成数据得分记录（analysis.py 消费）
+    # 【2026-10-02 轨迹全量落盘】record.jsonl 只有**统计**（acc/clen/段长/桶标志），
+    # 看不到"模型到底写了什么"——B/C 桶判读的最后一步（末段是答题被掐还是写散文
+    # 跑飞）必须看文本。开启后生成端把**每条轨迹**写成 `<out_dir>/traj.jsonl`：
+    #   · 段级落盘（assistant/工具分段 + 每段 token 数），不是拼接文本——拼接后
+    #     段边界丢失，"末段多长/写了什么"就答不了；
+    #   · **含被丢弃的 attempt**（uniform 零方差 / overlong 超长）：这两类整组
+    #     不落 record，正是记录口径的幸存者偏差来源，只 dump 上传组等于没治；
+    #   · 工具段用**消毒后**的回包（沙箱 stdout 是注入面，落盘版不再引入原始输出）。
+    # 默认关：全量文本约 50MB/16h（含丢弃 attempt 更高），pod 盘要留空间。
+    # 不进 run_signature——它不改采样/奖励/loss 任何一个字节，只是观测面；
+    # 进签名会让"打开诊断"意外撞 guard_ckpt_collision 或让旧 ckpt 变外来签名。
+    traj_dump=False,
     # 【2026-09-10 4B 探针实锤】apply_chat_template 附加 kwargs（None=不传，Qwen2.5 行为不变）。
     # Qwen3.5 系必须 {"enable_thinking": false}：thinking 模式把单轮 1024 token 预算
     # 烧在 <think> 长链上（4B 探针实测：末段截断 98.9% / 无 boxed 99.2% / 全错 484/490，

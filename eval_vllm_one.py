@@ -45,6 +45,13 @@ parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "da
 # 无法做同题配对的 McNemar（未配对检验 p≈0.11、白丢功效），事后无法补救。
 parser.add_argument("--dump_items", action=argparse.BooleanOptionalAction, default=True,
                     help="落盘 per-item 明细（默认开，供 analysis.py 做配对检验/分层）；--no-dump_items 关闭")
+# 【2026-10-02 轨迹落盘】per-item 只有统计（acc/fmt/长度），看不到模型写了什么：
+# "末段是答题被掐还是写散文跑飞"这类判读必须看文本。开启后每**条**轨迹落一行
+# （段级：assistant/工具分段 + 每段 token 数 + 各自分数），与 eval json 并列落盘
+# （不替换）。文本量 ≈ N×val_n×clen，vLLM 评测档建议只在定向诊断时开。
+parser.add_argument("--dump_traj", action=argparse.BooleanOptionalAction, default=False,
+                    help="落盘每条轨迹的**段级文本**（默认关）：<out>.traj.jsonl，"
+                         "每行含 Q/A/qk/acc/fmt/clen 与 segs[{kind,len,text}]")
 parser.add_argument("--max_rounds", type=int, default=None, help="--retool 时最多代码-执行轮数；None=取训练配置")
 parser.add_argument("--round_tokens", type=int, default=None, help="--retool 时每轮 assistant 段生成长度上限；None=取训练配置")
 # 【2026-09-25 原生工具协议（docs/09）】协议档必须与被测 ckpt 的 run_info 一致，
@@ -719,6 +726,9 @@ else:
     # 单轮档无工具段：completion 全长 = 模型自产 token（与多轮档的 _traj_clen 对齐，
     # 免得下游表上这一格永远是 "—"）
     _traj_clen = list(_traj_asst)
+    # 【2026-10-02】单轮档没有段结构：显式置 None，让 --dump_traj 走"造一条
+    # assistant 段"的分支（否则该分支读 _segs 会 NameError）。
+    _segs = None
 
 # ---------- 评分 ----------
 # 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
@@ -727,6 +737,7 @@ else:
 # 聚合 acc = Average@N（每题 val_n 条平均），per-item 记每题平均 acc/fmt。
 acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
 items = []      # per-item 明细（--dump_items，默认开）：供 analysis.py 配对检验/分层
+_sample_scores = []   # 【2026-10-02】per-**轨迹** (a, f)：轨迹 dump 要标出"哪条死了"
 for i, item in enumerate(sample):
     n_valid += 1
     a_avg = f_avg = 0.0
@@ -745,6 +756,7 @@ for i, item in enumerate(sample):
                 f = reward_format_boxed(ans)
         a_avg += a / args.val_n
         f_avg += f / args.val_n
+        _sample_scores.append((a, f))   # 平铺序（与 answers/_traj_* 同序）
     acc += a_avg; fmt += f_avg; both += (a_avg == 1.0 and f_avg == 1.0)
     if args.dump_items:
         # 【2026-09-19 修复·采样档索引错位】code_used/code_ok 是 [题][采样] 平铺
@@ -779,8 +791,41 @@ for i, item in enumerate(sample):
     if i < args.show:
         print(f"  [a={a_avg:.2f} f={f_avg:.2f}]")
 
+# ---------- 轨迹落盘（--dump_traj，默认关）----------
+# 【2026-10-02】与 --dump_items 并列而非替换：items 是**统计**（做 McNemar/分层），
+# traj 是**文本**（回答"这条为什么死"）。段级落盘保留 assistant/工具边界——拼接后
+# "末段多长、写了什么"就答不了，而那正是 B/C 桶判读的唯一入口。
+_traj_path_out = None
+if args.dump_traj:
+    from rlab.rollout import traj_dump_row as _tdr
+    _traj_path_out = re.sub(r"\.json$", "", out_path) + ".traj.jsonl"
+    with open(_traj_path_out, "w", encoding="utf-8") as _tf:
+        for _i, _item in enumerate(sample):
+            for _k in range(args.val_n):
+                _idx = (_i * args.val_n + _k) if _sampling else _i
+                _a_t, _f_t = (_sample_scores[_idx] if _idx < len(_sample_scores)
+                              else (0.0, 0.0))
+                if _segs is not None and _idx < len(_segs):
+                    _segs_t = _segs[_idx]          # 多轮档：真实段结构（含工具回包）
+                else:
+                    # 单轮档无段结构：造一条 assistant 段，长度用**已记录**的 token 数
+                    # （不重新 tokenize：文本往返会因 BPE 段边界合并而改变长度）
+                    _segs_t = [{"kind": "assistant",
+                                "len": (_traj_asst[_idx] if _idx < len(_traj_asst) else 0),
+                                "text": answers[_idx] if _idx < len(answers) else ""}]
+                _tf.write(json.dumps(_tdr(
+                    _segs_t, Q=_item["Q"], A=_item["A"],
+                    qk=hashlib.sha1(str(_item["Q"]).encode("utf-8")).hexdigest()[:12],
+                    status="eval", acc=_a_t, fmt=_f_t,
+                    clen=(_traj_clen[_idx] if _idx < len(_traj_clen) else None)),
+                    ensure_ascii=False) + "\n")
+            _tf.flush()      # 逐题 flush：评测进程崩溃时前面的题不蒸发
+    print(f"轨迹已存 {_traj_path_out}（{len(sample) * args.val_n} 条，段级）")
+
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid,
+          # 【2026-10-02】轨迹文件出路自证（None = 本次没开 --dump_traj）
+          "traj_dump": _traj_path_out,
           # 【2026-09-19】指标口径版本：2 = code_rate/code_ok_rate/avg_rounds 以
           # **轨迹数**（n×val_n）为除数、per-item 的 code_used 按题聚合。
           # 缺此键或 =1 的旧 json 是 p8 事故档（除数=题数 → 采样档虚高 val_n 倍），

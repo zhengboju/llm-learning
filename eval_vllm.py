@@ -31,6 +31,10 @@ parser.add_argument("--mm_base", default=None,
                     help="纯文本 Qwen3.5 ckpt 的多模态骨架目录（A2 自动物化用）；"
                          "None=由 eval_vllm_one.py 从 ckpt 的 run_info.json 里取")
 parser.add_argument("--show", type=int, default=0)
+# 【2026-10-02】轨迹落盘透传：每个模型子进程写自己的 <out>.traj.jsonl
+# （与 eval_v_<name>.json 并列）。默认关——评测档文本量 ≈ N×val_n×clen。
+parser.add_argument("--dump_traj", action=argparse.BooleanOptionalAction, default=False,
+                    help="落盘每条轨迹的段级文本（默认关，透传给 eval_vllm_one.py）")
 parser.add_argument("--split", default="test", choices=["test", "train"],
                     help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
@@ -163,6 +167,8 @@ def run_one(gpu, idx, name, path):
         cmd += ["--eval_task", args.eval_task]
     if args.show:
         cmd += ["--show", str(args.show)]
+    if args.dump_traj:
+        cmd += ["--dump_traj"]
     if args.mm_base:
         cmd += ["--mm_base", args.mm_base]
     _pf = BASE_PROTO.get(name)

@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--out", default=None,
                     help="合并结果json路径（透传给底层 eval_vllm.py；None=其默认 eval_vllm_all.json。"
                          "2026-09-20 缺口修复：此前 rlab.eval 不认 --out，多模型异名结果只能用默认名覆盖）")
+    # 【2026-10-02】轨迹落盘透传（默认关）：诊断"这条为什么死"要文本，不是统计
+    ap.add_argument("--dump_traj", action=argparse.BooleanOptionalAction, default=False,
+                    help="落盘每条轨迹的段级文本（<out>.traj.jsonl，默认关）")
     args = ap.parse_args()
 
     # 兼容旧 --retool
@@ -84,6 +87,8 @@ def main():
         cmd += ["--mm_base", args.mm_base]
     if args.out:
         cmd += ["--out", args.out]
+    if args.dump_traj:
+        cmd += ["--dump_traj"]
     if args.retool:
         cmd.append("--retool")
     if algo is not None:

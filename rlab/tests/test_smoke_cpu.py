@@ -1030,6 +1030,56 @@ def test_b_prose_profile():
           and 'r["segl"]' in _src)
 
 
+def test_traj_dump():
+    """【2026-10-02】轨迹全量落盘（训练 + 评测）：接线与「不进签名」契约。
+
+    背景：record.jsonl 与 eval 的 per-item 都只有**统计**——B/C 桶判读的最后一步
+    （末段是答题被掐、还是写散文跑飞）必须看文本；且被丢弃的 attempt
+    （uniform 零方差 / overlong 超长）整组不进 record，**只 dump 上传组等于把
+    幸存者偏差原样搬进 dump 文件**。本测试钉四件事：
+      ①默认关，且开关是合法 config 键（否则 CLI 会 KeyError）；
+      ②**不进 run_signature**——打开诊断不该让旧 out_dir 变"外来签名"、也不该
+        撞 guard_ckpt_collision（它不改采样/奖励/loss 任何一个字节）；
+      ③生成端真写 <out_dir>/traj.jsonl：逐 attempt flush + 补 gen_version，
+        sink 覆盖 ok/uniform/overlong 三类；
+      ④评测侧 --dump_traj 落段级文本（.traj.jsonl，与 eval json 并列）。"""
+    import os
+
+    from rlab.config import BASE, get_config
+    from rlab.train import run_signature
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rlab/
+    _repo = os.path.dirname(_root)
+    cfg = get_config("retool_math", use_wandb=False)
+    check("traj_dump：默认关（诊断产物体积不该默认产生）",
+          cfg["traj_dump"] is False and BASE["traj_dump"] is False)
+    check("traj_dump：可经覆盖打开（否则 CLI 会 KeyError）",
+          get_config("retool_math", use_wandb=False, traj_dump=True)["traj_dump"] is True)
+    check("traj_dump：**不进 run_signature**（仅观测面）——打开它不许让旧 out_dir 变外来签名",
+          run_signature(cfg) == run_signature({**cfg, "traj_dump": True}))
+    _tr = open(os.path.join(_root, "train.py"), encoding="utf-8").read()
+    _rl = open(os.path.join(_root, "rollout.py"), encoding="utf-8").read()
+    _eo = open(os.path.join(_repo, "eval_vllm_one.py"), encoding="utf-8").read()
+    _ev = open(os.path.join(_repo, "eval_vllm.py"), encoding="utf-8").read()
+    _re_ = open(os.path.join(_root, "eval.py"), encoding="utf-8").read()
+    check("train：--traj_dump 三层接线（arg → overrides → run_info）",
+          '"--traj_dump"' in _tr and 'overrides["traj_dump"]' in _tr
+          and '"traj_dump": cfg.get("traj_dump")' in _tr)
+    check("rollout：开启后写 <out_dir>/traj.jsonl，且逐 attempt flush"
+          "（生成端被信号杀死时最后一批不蒸发）",
+          '"traj.jsonl"' in _rl and "ftraj.flush()" in _rl
+          and 'cfg.get("traj_dump")' in _rl)
+    check("rollout：落盘行补 gen_version（轨迹↔权重版本必须能对应）",
+          '_row["gen_version"] = policy_version[0]' in _rl)
+    check("rollout：sink 覆盖 ok / uniform / overlong 三类（丢弃组是幸存者偏差主体）",
+          _rl.count('_sink("ok"') == 1 and '_sink("uniform"' in _rl
+          and '_sink("overlong")' in _rl)
+    check("eval：--dump_traj 落 .traj.jsonl + 每轨迹分数 + 单轮档显式置 _segs=None",
+          '"--dump_traj"' in _eo and '.traj.jsonl"' in _eo
+          and "_sample_scores.append((a, f))" in _eo and "_segs = None" in _eo)
+    check("eval：调度器（eval_vllm）与 rlab.eval 都透传 --dump_traj",
+          'cmd += ["--dump_traj"]' in _ev and 'cmd += ["--dump_traj"]' in _re_)
+
+
 if __name__ == "__main__":
     test_advantages()
     test_losses()
@@ -1038,5 +1088,6 @@ if __name__ == "__main__":
     test_extract_selfcheck_judgement()
     test_eval_stats_and_signature()
     test_b_prose_profile()
+    test_traj_dump()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

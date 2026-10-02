@@ -238,6 +238,9 @@ def write_run_info(path: str, cfg: dict) -> None:
             "max_traj_tokens": cfg.get("max_traj_tokens"),
             "answer_reserve": cfg.get("answer_reserve"),
             "budget_hint": cfg.get("budget_hint"),
+            # 【2026-10-02】轨迹落盘开关也落 run_info：诊断产物的出处要能自证
+            # （不落它，事后看到 traj.jsonl 无法判断是哪次 run/哪版权重写的）。
+            "traj_dump": cfg.get("traj_dump"),
             # 【2026-09-25 原生协议】协议档位与解析形态落进 run_info：eval 端
             # （--proto_from）必须能回读到"评测该用哪条协议"，否则原生档训练的
             # ckpt 会被围栏档协议评（序列/终止结构完全不同 → 测的是另一个模型）。
@@ -944,6 +947,13 @@ def main():
                     help="token 预算档下把剩余额度写进每次工具回包（默认开）——"
                          "C 桶（额度耗尽还在调用）占 ok 族无 boxed 的 70%，本质是"
                          "信息不对称：模型看不到'还剩多少'")
+    ap.add_argument("--traj_dump", action=argparse.BooleanOptionalAction, default=None,
+                    help="轨迹全量落盘（默认关）：写 <out_dir>/traj.jsonl，**段级**"
+                         "文本（assistant/工具分段 + 段长），**含被丢弃的 uniform/"
+                         "overlong attempt**（它们整组不进 record.jsonl，是记录口径"
+                         "幸存者偏差的主体）。约 50MB/16h；仅观测面，不改采样/奖励/"
+                         "loss 任一字节，故**不进 run_signature**（打开诊断不该让旧 "
+                         "out_dir 变成外来签名）")
     ap.add_argument("--len_eff_w", type=float, default=None,
                     help="通过轨迹内部的组内相对效率奖励权重（0=关闭）。与 "
                          "len_penalty（只罚未通过）互补：本项让**更短地答对**拿正分，"
@@ -1212,6 +1222,7 @@ def main():
     if args.answer_reserve is not None:
         overrides["answer_reserve"] = args.answer_reserve
     if args.budget_hint is not None: overrides["budget_hint"] = args.budget_hint
+    if args.traj_dump is not None: overrides["traj_dump"] = args.traj_dump
     if args.len_eff_w is not None: overrides["len_eff_w"] = args.len_eff_w
     if args.code_shaping_once is not None:
         overrides["code_shaping_once"] = args.code_shaping_once
