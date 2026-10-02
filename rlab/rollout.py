@@ -774,7 +774,13 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     continue
                 tool_ids = nxt[len(turn_ctx[i]) + len(comp_ids):]
                 # 只有 assistant 段进 loss；工具段 ids 是"结束符+observation"增量
+                # 【2026-10-02】`text` 是**模板渲染**（含 im_end/im_start/think 等
+                # special token 与回答骨架），`body` 才是消毒后的纯回包（含 [etype]
+                # 前缀与 [budget] 额度行）。轨迹落盘必须带上 body：真机 dump 里
+                # 4898 条工具段的 `text` 全部以同一个 `‹|im_end|›‹|im_start|›user…`
+                # 开头，剥包装才能读到观察本身。
                 segs[i].append({"kind": "tool", "ids": tool_ids,
+                                "body": body,
                                 "text": tokenizer.decode(tool_ids,
                                                          skip_special_tokens=False)})
                 msgs[i] = [*msgs_before, {"role": "assistant", "content": asst_text},
@@ -983,7 +989,8 @@ def multi_turn_rollout_group(vllm_gen, sampling_params, tokenizer, prompts_text,
                     body = f"[{etype}] " + body
                 tool_text = TOOL_START + body + TOOL_END
                 tool_ids = tokenizer(tool_text, add_special_tokens=False)["input_ids"]
-                segs[i].append({"kind": "tool", "text": tool_text, "ids": tool_ids})
+                segs[i].append({"kind": "tool", "text": tool_text, "ids": tool_ids,
+                                "body": body})
                 results[i] = tool_ids
         # 下一轮：只有执行过代码的样本续写（扩展上下文）；其余样本就此定格
         next_active = [i for i in active if i in results]
@@ -1277,24 +1284,34 @@ def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
     """把一条轨迹打成可落盘的一行（纯函数，CPU 可测；2026-10-02）。
 
     **段级**而不是拼接文本：B/C 桶判读的核心问题正是"末段写了什么、有多长"，
-    拼接后 assistant/工具边界丢失就答不了。工具段的 text 取 `segs` 里那条
-    **消毒后**的回包（沙箱 stdout 是注入面，落盘版不再引入原始输出）。
+    拼接后 assistant/工具边界丢失就答不了。
+
+    ⚠ **工具段的两个文本字段不是一回事**（2026-10-02 真机实锤）：`text` 是**模板
+    渲染**（`‹|im_end|›‹|im_start|›user …‹tool_response›…` + special token + 回答
+    骨架），4898 条工具段的 `text` 全部以同一个包装开头；读观察必须用 `body`
+    ——消毒后的纯回包（含 `[etype]` 错误前缀与 `[budget]` 额度行，若开了 hint）。
+    两者都由 `len` 给出 token 数（`text` 的长度含包装，别拿它当回包大小）。
 
     `status` 三态：ok（已上传）/ uniform（零方差丢弃）/ overlong（轨迹超长丢弃）。
     后两类整组不进 record.jsonl——dump 含它们才治得了记录口径的幸存者偏差
     （record 只看得见"活下来的组"）。计数类与 record 同源（同一个 code_stats），
     acc/fmt 是 ±1 奖励原值；overlong 分支没打分 → None（不写 0 冒充"全错"）。
 
-    ⚠ 阅读路径：dump 里含 `<tool_call>` 这类标签，用 read/控制台看会被渲染成
-    无括号普通词——判字节真伪要逐字符 ord 直出（AGENTS.md 标签铁律）。"""
+    ⚠ 阅读路径：dump 里含调用标记，用 read/控制台看会被渲染成无括号普通词——
+    判字节真伪要逐字符 ord 直出（AGENTS.md 标签铁律）。"""
     _st = stats or {}
     # seg 的长度优先用调用方**已经记录**的 token 数（`len`）：单轮档没有段结构，
     # 只有生成时记下的 token 数——重新 tokenize 会因为 BPE 跨段边界合并而变长
     # （本项目"生成/训练同序列"铁律的另一面）。
-    _segs = [{"kind": s.get("kind"),
+    _segs = []
+    for s in segs_i:
+        _d = {"kind": s.get("kind"),
               "len": int(s["len"]) if s.get("len") is not None
                      else len(s.get("ids") or ()),
-              "text": s.get("text") or ""} for s in segs_i]
+              "text": s.get("text") or ""}
+        if s.get("body") is not None:
+            _d["body"] = s["body"]      # 纯回包（模板包装之外的那部分）
+        _segs.append(_d)
     return {"t": t if t is not None else time.time(), "Q": Q, "A": A, "qk": qk,
             "status": status, "gen_version": gen_version,
             "acc": acc, "fmt": fmt,

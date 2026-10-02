@@ -1076,6 +1076,18 @@ def test_traj_dump():
     check("eval：--dump_traj 落 .traj.jsonl + 每轨迹分数 + 单轮档显式置 _segs=None",
           '"--dump_traj"' in _eo and '.traj.jsonl"' in _eo
           and "_sample_scores.append((a, f))" in _eo and "_segs = None" in _eo)
+    # 【2026-10-02 dev 抓到的静默错数据】首版 eval 侧漏传 code_stats → 整份 dump 的
+    # code_used/trunc_final/code_wasted/invalid_final/code_ok/ctx_full 全是 0，桶判定
+    # 100% 落进 E_clean_no_box（假的）。两件事缺一不可：①真传 stats；②自检告警。
+    check("eval：轨迹行真传 code_stats（否则计数字段全 0，桶判定假 E）",
+          "stats=_st_t" in _eo and "_st_t = code_stats[_idx]" in _eo
+          and "code_stats = None" in _eo)
+    check("eval：落盘自检——含工具段却 code_used=0 时告警（同类接线缺口当场可见）",
+          "计数字段疑似缺失" in _eo and '_tw["cu0"]' in _eo)
+    check("eval：重复题面告警（qk 碰撞会静默合并配对、丢题）",
+          "同一题面重复" in _eo and "_dupqk" in _eo)
+    check("rollout：工具段同时带 body（纯回包）与 text（模板渲染）",
+          _rl.count('"body": body') == 2 and 'if s.get("body") is not None' in _rl)
     check("eval：调度器（eval_vllm）与 rlab.eval 都透传 --dump_traj",
           'cmd += ["--dump_traj"]' in _ev and 'cmd += ["--dump_traj"]' in _re_)
 

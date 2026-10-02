@@ -1125,6 +1125,13 @@ def test_collect_retool_group_split():
     _row3 = traj_dump_row([], Q="q", A="a", qk="k", status="overlong")
     check("traj_dump_row：空段表不崩（overlong 早退时可能没有段）",
           _row3["n_segs"] == 0 and _row3["clen"] == 0 and _row3["segs"] == [])
+    _row4 = traj_dump_row([{"kind": "tool", "len": 5, "text": "TMPL", "body": "obs"}],
+                          Q="q", A="a", qk="k", status="eval", clen=5)
+    check("traj_dump_row：工具段透传 body（旧结构无 body 时不凭空造键）",
+          _row4["segs"][0].get("body") == "obs"
+          and "body" not in traj_dump_row(
+              [{"kind": "tool", "len": 5, "text": "TMPL"}],
+              Q="q", A="a", qk="k", status="eval")["segs"][0])
 
 
 # ------------- N. 离线难度预探测过滤 + 探针聚合（2026-09-10） -------------
@@ -4941,6 +4948,15 @@ def test_token_budget_mode():
             [{"Q": "Q1"}], _cfg_tok) * 3)
     check("token 档：预算充足时第 3 次调用照常执行（『末轮截止』消失）",
           _cs2[0]["code_used"] == 3 and _cs2[0]["code_wasted"] == 0)
+    # 【2026-10-02 真机 dump 实锤】工具段必须同时带 `body`（消毒后的纯回包）与
+    # `text`（模板渲染）：真机 4898 条工具段的 `text` **全部**以同一个模板包装开头
+    # （im_end/im_start/tool_response），剥包装才能读到观察本身——只有 text 的话，
+    # 轨迹分析会被迫做字符串手术，且很容易把包装长度当回包大小。
+    _tsegs = [s for s in _segs2[0] if s["kind"] == "tool"]
+    check("工具段带 body（纯回包）且与 text（模板渲染）不同",
+          len(_tsegs) == 3 and all(isinstance(s.get("body"), str) and s["body"]
+                                   for s in _tsegs)
+          and all(s["body"] != s["text"] for s in _tsegs))
     check("token 档：末轮答完 → trunc_final=0（预算没用完）",
           all(c["trunc_final"] == 0 for c in _cs2))
     check("token 档：段序列 = [a,tool]×3 + [a]（每次调用都回填）",

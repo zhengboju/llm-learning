@@ -727,8 +727,9 @@ else:
     # 免得下游表上这一格永远是 "—"）
     _traj_clen = list(_traj_asst)
     # 【2026-10-02】单轮档没有段结构：显式置 None，让 --dump_traj 走"造一条
-    # assistant 段"的分支（否则该分支读 _segs 会 NameError）。
+    # assistant 段"的分支（否则该分支读 _segs 会 NameError）；统计表同样没有。
     _segs = None
+    code_stats = None
 
 # ---------- 评分 ----------
 # 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
@@ -795,10 +796,25 @@ for i, item in enumerate(sample):
 # 【2026-10-02】与 --dump_items 并列而非替换：items 是**统计**（做 McNemar/分层），
 # traj 是**文本**（回答"这条为什么死"）。段级落盘保留 assistant/工具边界——拼接后
 # "末段多长、写了什么"就答不了，而那正是 B/C 桶判读的唯一入口。
+# 【2026-10-02 数据自证·重复题面】同一题面在 held-out 里出现多次 → per-item 的配对
+# 键 `qk`（sha1(Q)）会**碰撞**：配对检验按 qk 建 dict，只保留最后一条、静默丢题。
+# 真机实锤（`eval_vllm_s200.traj.jsonl`）：dev 里同一道题面出现两次且**答案键不同**
+# （`-1` / `683`），8 条结构性不可能得分的轨迹进了分母，且 298 题被并成 297。
+_qk_all = [hashlib.sha1(str(_it["Q"]).encode("utf-8")).hexdigest()[:12] for _it in sample]
+_seen_qk = {}
+for _k in _qk_all:
+    _seen_qk[_k] = _seen_qk.get(_k, 0) + 1
+_dupqk = {k: v for k, v in _seen_qk.items() if v > 1}
+if _dupqk:
+    print(f"  [警告] held-out 里同一题面重复 {len(_dupqk)} 组（qk={list(_dupqk)}，"
+          f"各 {sorted(_dupqk.values())} 条）：配对检验按 qk 对齐 → 这些题被合并成 "
+          f"1 题并静默丢弃多余条目；若答案键也不同，多出的样本结构性不可能得分"
+          f"（查 dev 切分是否按 (Q,A) 去重——同题多答案会同时触发这两件事）")
 _traj_path_out = None
 if args.dump_traj:
     from rlab.rollout import traj_dump_row as _tdr
     _traj_path_out = re.sub(r"\.json$", "", out_path) + ".traj.jsonl"
+    _tw = {"tool": 0, "cu0": 0}     # 自检计数（见下方警告）
     with open(_traj_path_out, "w", encoding="utf-8") as _tf:
         for _i, _item in enumerate(sample):
             for _k in range(args.val_n):
@@ -807,20 +823,36 @@ if args.dump_traj:
                               else (0.0, 0.0))
                 if _segs is not None and _idx < len(_segs):
                     _segs_t = _segs[_idx]          # 多轮档：真实段结构（含工具回包）
+                    _st_t = code_stats[_idx] if _idx < len(code_stats) else None
                 else:
                     # 单轮档无段结构：造一条 assistant 段，长度用**已记录**的 token 数
                     # （不重新 tokenize：文本往返会因 BPE 段边界合并而改变长度）
                     _segs_t = [{"kind": "assistant",
                                 "len": (_traj_asst[_idx] if _idx < len(_traj_asst) else 0),
                                 "text": answers[_idx] if _idx < len(answers) else ""}]
-                _tf.write(json.dumps(_tdr(
+                    _st_t = None
+                _row_t = _tdr(
                     _segs_t, Q=_item["Q"], A=_item["A"],
                     qk=hashlib.sha1(str(_item["Q"]).encode("utf-8")).hexdigest()[:12],
                     status="eval", acc=_a_t, fmt=_f_t,
-                    clen=(_traj_clen[_idx] if _idx < len(_traj_clen) else None)),
-                    ensure_ascii=False) + "\n")
+                    clen=(_traj_clen[_idx] if _idx < len(_traj_clen) else None),
+                    # 【2026-10-02 修复·dev 抓到的静默错数据】统计字段必须来自
+                    # code_stats：首版漏传 → 整份 dump 的 code_used/trunc_final/
+                    # code_wasted/invalid_final/code_ok/ctx_full **全是 0**，桶判定
+                    # 100% 落进 E_clean_no_box（假的）。下方自检就是为这类接线缺口。
+                    stats=_st_t)
+                if any(s["kind"] == "tool" for s in _segs_t):
+                    _tw["tool"] += 1
+                    if not _row_t["code_used"]:
+                        _tw["cu0"] += 1
+                _tf.write(json.dumps(_row_t, ensure_ascii=False) + "\n")
             _tf.flush()      # 逐题 flush：评测进程崩溃时前面的题不蒸发
-    print(f"轨迹已存 {_traj_path_out}（{len(sample) * args.val_n} 条，段级）")
+    if _tw["cu0"]:
+        print(f"  [警告] traj dump 计数字段疑似缺失：{_tw['cu0']}/{_tw['tool']} 条"
+              f"含工具段却 code_used=0 → 桶判定/截断列不可信（2026-10-02 真机事故："
+              f"eval 侧漏传 code_stats）")
+    print(f"轨迹已存 {_traj_path_out}（{len(sample) * args.val_n} 条，段级；"
+          f"工具段读 `body`，`text` 是模板渲染）")
 
 result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_valid else 0,
           "both": both / n_valid if n_valid else 0, "n": n_valid,
