@@ -5573,9 +5573,15 @@ def test_gen_death_diagnostics():
     check("区分被信号杀死（exitcode<0）与异常退出（exitcode>0）",
           "_rc < 0" in src and "_rc is not None and _rc < 0" in src)
     check("SIGKILL(9) 单独一档：明说 handler 拦不住、没有 traceback 是必然",
-          "-_rc == 9" in src and "任何 handler 都拦不住" in src)
+          "_sig == 9" in src and "任何 handler 都拦不住" in src)
     check("可捕获信号另立一档：指向 faulthandler 打出的栈",
           "已由生成端的 faulthandler 接手" in src)
+    check("信号号→名字映射（HUP=1/TERM=15 报名字，不再裸报编号）",
+          "_SIG_NAMES" in src and '"SIGHUP"' in src and '"SIGTERM"' in src)
+    check("只有 faulthandler 覆盖的崩溃信号（SEGV/ABRT/BUS/FPE/ILL/SYS）才说'应有栈'",
+          "_FAULT_SIGNALS" in src)
+    check("非崩溃信号（HUP/TERM/INT）单独一档：明说 faulthandler 不会打栈",
+          "faulthandler 不会为它打栈" in src)
     check("SIGKILL 档给出 dmesg/cgroup 诊断命令（可当场定位 OOM）",
           "killed process" in src and "memory.peak" in src)
     check("dmesg 用全量 grep（tail -40 会把本次记录挤出窗口）",
@@ -5591,6 +5597,10 @@ def test_gen_death_diagnostics():
           "faulthandler.enable()" in _sp and "import faulthandler" in _sp)
     check("faulthandler 在 gen_worker 之前启用（否则引擎构造期崩溃抓不到）",
           _sp.index("faulthandler.enable()") < _sp.index("gen_worker(Q, cfg)"))
+    check("外部信号（HUP/TERM/INT）也挂 faulthandler：卡死时被外部杀死能 dump 全线程栈",
+          "faulthandler.register" in _sp and "chain=True" in _sp)
+    check("register 同样在 gen_worker 之前（启动期被 HUP 也留痕）",
+          _sp.index("faulthandler.register") < _sp.index("gen_worker(Q, cfg)"))
     print()
 
 

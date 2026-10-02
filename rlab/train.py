@@ -504,6 +504,17 @@ def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
     return summary
 
 
+# 【2026-10-02 SIGHUP 案】生成端 exitcode<0 时，`-exitcode` 就是杀死它的信号号。
+# 只有 faulthandler.enable() 登记的崩溃信号（Linux: SEGV/ABRT/BUS/FPE/ILL/SYS）
+# 会在死前 dump 栈；HUP/TERM/INT/KILL 等不会。旧版把所有负信号都指向"日志上方
+# 应有 faulthandler 栈"，对死于 SIGHUP 的生成端（本条即实案：version=72 推送后卡
+# ~5 分钟零产出、再被外部 HUP 带走）是实打实的误导——先分清"崩了"和"被杀"。
+_SIG_NAMES = {1: "SIGHUP", 2: "SIGINT", 4: "SIGILL", 6: "SIGABRT", 7: "SIGBUS",
+              8: "SIGFPE", 9: "SIGKILL", 10: "SIGUSR1", 11: "SIGSEGV",
+              12: "SIGUSR2", 13: "SIGPIPE", 15: "SIGTERM", 31: "SIGSYS"}
+_FAULT_SIGNALS = frozenset({4, 6, 7, 8, 11, 31})   # faulthandler.enable() 覆盖集(Linux)
+
+
 def run_training(cfg, args):
     import deepspeed
     from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
@@ -536,7 +547,9 @@ def run_training(cfg, args):
         if gen_proc is not None and not gen_proc.is_alive():
             _rc = gen_proc.exitcode
             if _rc is not None and _rc < 0:
-                if -_rc == 9:
+                _sig = -_rc
+                _sname = _SIG_NAMES.get(_sig, f"信号{_sig}")
+                if _sig == 9:
                     _why = (
                         "被 SIGKILL(9) 杀死——**内核直接终止，任何 handler 都拦不住**，"
                         "所以“没有 traceback”是必然现象，不代表原因不明。最常见来源："
@@ -551,13 +564,29 @@ def run_training(cfg, args):
                         "/memory.max_usage_in_bytes /sys/fs/cgroup/memory"
                         "/memory.limit_in_bytes`（**本 pod 是 v1，v2 路径不存在**）；"
                         "③ `nvidia-smi`（崩溃后是否残留显存/进程）")
+                elif _sig in _FAULT_SIGNALS:
+                    _why = (
+                        f"被 {_sname}({_sig}) 杀死——崩溃信号，**已由生成端的 faulthandler 接手**"
+                        "，日志上方应当有它 dump 的 Python 栈 + C 栈，"
+                        "优先去那里找崩溃点。若确实没有，说明崩在 faulthandler 安装之前"
+                        "（生成端启动极早期），或 stderr 未能落盘（用 `2>&1 | tee` 重跑）")
                 else:
                     _why = (
-                        f"被信号 {-_rc} 杀死（SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL 等）"
-                        "——这类信号**已由生成端的 faulthandler 接手**，日志上方应当有它"
-                        "dump 的 Python 栈 + C 栈，优先去那里找崩溃点。若确实没有，说明"
-                        "崩在 faulthandler 安装之前（生成端启动极早期），或 stderr 未能落盘"
-                        "（用 `2>&1 | tee` 重跑）")
+                        f"被 {_sname}({_sig}) 杀死——**非崩溃信号，faulthandler 不会为它打栈**"
+                        "（它只登记 SEGV/ABRT/BUS/FPE/ILL/SYS）。HUP/TERM/INT 这类"
+                        "信号来自进程外部：终端/会话断开（ssh、kubectl exec -it、tmux 面板"
+                        "关闭）、显式 kill、或运行环境收拾带 TTY 的会话。训练端还活着而"
+                        "生成端单独收到 = 信号是冲生成端进程来的，不是程序内部崩溃。"
+                        "真凶通常在这**之前**的停滞处：被杀前生成端往往已卡死（本次事故"
+                        "即 version=72 推送后约 5 分钟零产出）。按序查："
+                        "①这次 run 是怎么起的（kubectl exec -it/ssh/tmux/nohup？当时会话"
+                        "是否有断开、是否有 watchdog 会 kill 生成端）；"
+                        "②生成端最后一行 [rollout] 日志停在哪个调用（权重同步 apply_model / "
+                        "vLLM generate / ref_server 上传——三者都无超时，卡住即无限等）；"
+                        "③`dmesg -T | grep -iE 'killed process|out of memory|segfault' "
+                        "| tail -20` 与 cgroup 峰值（排除被杀前就有内存压力的可能）；"
+                        "④ref_server 是否还活着、其日志尾部是否同样冻结"
+                        "（`curl -s localhost:<port>/health` 一验便知）")
             elif _rc:
                 _why = (f"异常退出（exitcode={_rc}）——其 traceback 应在本日志上方，"
                         "先往上翻")
@@ -857,6 +886,18 @@ def _spawn_gen(Q, cfg):
     # OOM-killer 路径仍然只会留下 exitcode=-9，这不是本项能解决的。
     import faulthandler
     faulthandler.enable()      # 崩溃时把栈写到 stderr（已行缓冲 → 实时落盘）
+    # 【2026-10-02 SIGHUP 案】enable() 只登记崩溃信号；生成端被外部信号杀死
+    # （HUP/TERM/INT）时默认行为直接终止、一个字节都不留，训练端只看到 exitcode=-1
+    # 和一段"不知道卡在哪"的空白（本次事故=version=72 推送后卡约 5 分钟再被 HUP）。
+    # register(chain=True) 补上：收到时先 dump **全线程 Python 栈**（当场可见卡在
+    # vLLM generate / apply_model / requests.post 的哪一行），再调用注册前的处置——
+    # 进程仍按原信号终止，父端 exitcode 语义不变（HUP 仍报 -1，已本地实测验证）。
+    import signal as _signal
+    for _s in (_signal.SIGHUP, _signal.SIGTERM, _signal.SIGINT):
+        try:
+            faulthandler.register(_s, chain=True)
+        except (ValueError, OSError, RuntimeError):
+            pass       # 个别环境对非崩溃信号注册受限时，不影响生成端启动
     from rlab.rollout import gen_worker
     gen_worker(Q, cfg)
 
