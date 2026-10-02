@@ -5,7 +5,9 @@
   1. 汇总 eval_v_*.json -> Markdown 对比表（含与 BASE 的差值、与噪声地板 ±2pp 的判定）；
   2. 解析 rlab record.jsonl -> 训练中 acc/format 正确率随上传批次的曲线数据；
   3. 无 boxed 归因分解（--no-boxed-breakdown）：把"终局没给 boxed"的样本按分族 ×
-     机理拆开，给出零梯度占比——判"该加单轮额度、还是该治啰嗦、还是该动提示层"。
+     机理拆开，给出零梯度占比——判"该加单轮额度、还是该治啰嗦、还是该动提示层"；
+     并给 ok 族的**末段 assistant 长度画像**（B 桶该抬 `answer_reserve` 还是治
+     啰嗦；2026-10-02，输入是 rollout 的 segl/tsegl 字段）。
 
 用法：
     python -m rlab.analysis --eval-json eval_vllm_all.json [--base BASE]
@@ -631,6 +633,9 @@ def read_record(path: str) -> dict:
       trs/cws/invs/ctxfs/cus: list[int] —— trunc_final / code_wasted /
                                            invalid_final / ctx_full / code_used
       clens: list[int]                  —— 整条轨迹 completion 全长
+      segls/tsegls: list[list[int]|None] —— 该样本的 assistant / 工具段 token 数
+                                           （按时间序；2026-10-02 前落盘 = None，
+                                           与下标对齐，供 B 桶长度画像用）
       fams: list[str]                   —— "ok"/"dropped"（record_family_of）
       stales: list[int|None]            —— opt-step 陈旧度；丢弃族 = None 占位，
                                            无 gen_version 的文件 = 空表
@@ -652,6 +657,8 @@ def read_record(path: str) -> dict:
     invs = []            # 每样本原生协议 invalid_final（围栏档恒 0；2026-09-28 接入）
     ctxfs = []           # 每样本 ctx_full（observation 装不下而终局；同上）
     cus = []             # 每样本 code_used（原始计数；2026-09-29 供无 boxed 分解用）
+    segls = []           # 每样本 assistant 段长表（None = 该行无该字段，旧 record）
+    tsegls = []          # 每样本工具段长表（同上；2026-10-02）
     fams = []            # 每样本所属族（ok/dropped，见 record_family_of；2026-09-28）
     stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
     _ok_seen = 0         # 已上传（ok 族）样本累计——staleness 的 micro-step 基准
@@ -743,12 +750,23 @@ def read_record(path: str) -> dict:
             if len(_cw) < n:
                 cws.extend([0] * (n - len(_cw)))
             clens.extend(rec.get("clen", []))
+            # 【2026-10-02 B 桶长度画像接入】segl/tsegl 是**嵌套**列表（每样本一张
+            # 段长表），扁平化口径与 cus 等不同：这里必须保留嵌套结构（末段长度 =
+            # 内层末位），且**缺键/短表一律补 None**——补 0 会把"旧 record 无此字段"
+            # 与"该样本真没有 assistant 段"混成同一个值，画像的分母就错了。
+            for _key, _dst in (("segl", segls), ("tsegl", tsegls)):
+                _sv = rec.get(_key) or []
+                _dst.extend([list(x) if isinstance(x, (list, tuple)) else None
+                             for x in _sv])
+                if len(_sv) < n:
+                    _dst.extend([None] * (n - len(_sv)))
             ph = rec.get("phase")
             if ph:
                 phases.extend([ph] * n)
             sess_ids.extend([sess] * n)
     return {"accs": accs, "fmts": fmts, "codes": codes, "oks": oks, "trs": trs,
             "clens": clens, "cws": cws, "invs": invs, "ctxfs": ctxfs, "cus": cus,
+            "segls": segls, "tsegls": tsegls,
             "fams": fams, "stales": stales, "sess_ids": sess_ids, "phases": phases,
             "sess_span": sess_span, "sess_gv": sess_gv, "n_sess": sess + 1}
 
@@ -818,6 +836,129 @@ def _credit_enabled(path: str) -> tuple:
                 float(cfg.get("trunc_tail_penalty", 0.0) or 0.0) > 0.0)
     except (OSError, ValueError, TypeError):
         return (False, False)
+
+
+def record_run_config(path: str) -> dict:
+    """record 同目录 run_info.json 的 config（缺失/坏文件 → {}，绝不抛给调用方）。
+
+    【与 `_credit_enabled` 的分工】后者把两个信用开关判成布尔；本函数给的是原始
+    config——B 桶长度画像要用 `answer_reserve`/`max_traj_tokens` 的**数值**（把
+    "末段长度"与"作答预留"放在同一把尺子上比，正是画像的全部意义）。"""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(path)),
+                               "run_info.json"), encoding="utf-8") as f:
+            return (json.load(f) or {}).get("config") or {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+# 末段长度分箱（上界开区间；None = 无上界）。第一箱 512 与 config.BASE 的
+# round_gen_tokens 默认无关系，取的是"一次简短作答"的量级；`answer_reserve`
+# 默认 1024 恰好是第一/第二箱的分界，故 1024~2048 箱就是"预留不够一点点"的形态。
+SEG_LEN_BINS = ((0, 512), (512, 1024), (1024, 2048), (2048, None))
+SEG_LEN_BIN_LABELS = ("<512", "512~1024", "1024~2048", "≥2048")
+# 画像的行顺序 = 读表顺序：先给可控标尺（成功作答真要多少 token），再给待判桶
+B_PROSE_GROUPS = (
+    ("boxed", "有boxed（成功收尾·标尺）"),
+    ("B_tool", "B（调过工具）"),
+    ("B2", "B2（全程零调用）"),
+    ("C_wasted", "C_wasted"),
+    ("DE", "D+E（其他无boxed）"),
+)
+
+
+def _seg_pct(vals, q: float):
+    """线性插值分位（与 numpy 默认口径一致）；空表 → None。纯函数。"""
+    if not vals:
+        return None
+    s = sorted(vals)
+    if len(s) == 1:
+        return float(s[0])
+    pos = (len(s) - 1) * q
+    lo, hi = int(math.floor(pos)), int(math.ceil(pos))
+    return float(s[lo]) if lo == hi else s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def b_prose_profile(path: str) -> dict:
+    """ok 族按**末段 assistant 长度**画像（纯函数，CPU 可测；2026-10-02）。
+
+    回答 native_p4_trunc 遗留的悬案：`B_cut_mid_prose`（预算耗尽、在散文里被切）
+    该抬 `answer_reserve`，还是该治"写散文不收尾"？
+
+      · B 的末段长度集中在 reserve 附近（~1024）→ 模型最后一轮**在答题**、被预留
+        额度掐死 → 抬 reserve 是对症的；
+      · B 的末段是几千 token 的长尾（或零调用的 B2 占多数）→ 模型**在写散文**，
+        抬 reserve 只是更早撞墙：B 变 C，而两者都无 boxed、reward 同为 −1，
+        "无 boxed 率"看不出任何变化（必须看结构比）。
+
+    **对照标尺** = 有 boxed 样本的末段长度：那是"一次成功作答实际要多少 token"
+    的实测值。把 B 的 p50 与它并列，reserve 够不够就不再靠猜。
+
+    分母纪律：只算 ok 族（丢弃族结构性全错，"成功作答"标尺在它身上无定义）；
+    每条样本的 `near_cap` 判定用 `record_clen_cap`（token 档 = max_traj_tokens）
+    ——B 在 token 档下**必然** `clen≥0.9cap`（`trunc_final` 只在预算耗尽时置位），
+    该列就是这条口径的自证；另 `tool_*` 是回包的真实 token 占用（回包到底吃掉
+    多少预算，只有它给的数不是估算）。
+
+    返回 {has_segl, n_unknown_field, cap, cap_src, reserve, max_traj_tokens,
+          tool_n/tool_p50/tool_p90, groups: {键: {label,n,n_len,unknown,bins,
+          near_cap,p25,p50,p75}}}；旧 record（无 segl）= has_segl False。"""
+    R = read_record(path)
+    cfg = record_run_config(path)
+    cap, cap_src = record_clen_cap(path)
+    g = {k: {"n": 0, "lens": [], "unknown": 0, "near_cap": 0}
+         for k, _lab in B_PROSE_GROUPS}
+    tool_lens = []
+    n_unknown_field = 0
+    for i, fam in enumerate(R["fams"]):
+        if fam != "ok":
+            continue
+        sl, tl = R["segls"][i], R["tsegls"][i]
+        if tl:
+            tool_lens.extend(int(x) for x in tl)
+        if sl is None:
+            n_unknown_field += 1
+        bk = no_boxed_bucket(R["fmts"][i], R["trs"][i], R["cws"][i],
+                             R["invs"][i], R["ctxfs"][i], R["cus"][i])
+        if not bk:
+            key = "boxed"
+        elif bk == "B_cut_mid_prose":
+            key = "B2" if R["cus"][i] == 0 else "B_tool"
+        elif bk == "C_wasted":
+            key = "C_wasted"
+        else:
+            key = "DE"
+        d = g[key]
+        d["n"] += 1
+        if int(R["clens"][i]) >= 0.9 * cap:
+            d["near_cap"] += 1
+        if sl:
+            d["lens"].append(int(sl[-1]))
+        else:
+            d["unknown"] += 1
+    out = {"has_segl": any(x is not None for x in R["segls"]),
+           "n_unknown_field": n_unknown_field, "cap": cap, "cap_src": cap_src,
+           "reserve": int(cfg.get("answer_reserve", 0) or 0),
+           "max_traj_tokens": int(cfg.get("max_traj_tokens", 0) or 0),
+           "tool_n": len(tool_lens), "tool_p50": _seg_pct(tool_lens, 0.5),
+           "tool_p90": _seg_pct(tool_lens, 0.9), "groups": {}}
+    for k, label in B_PROSE_GROUPS:
+        d = g[k]
+        if not d["n"]:
+            continue
+        bins = [0] * len(SEG_LEN_BINS)
+        for v in d["lens"]:
+            for bi, (lo, hi) in enumerate(SEG_LEN_BINS):
+                if v >= lo and (hi is None or v < hi):
+                    bins[bi] += 1
+                    break
+        out["groups"][k] = {"label": label, "n": d["n"], "n_len": len(d["lens"]),
+                            "unknown": d["unknown"], "bins": bins,
+                            "near_cap": d["near_cap"],
+                            "p25": _seg_pct(d["lens"], 0.25),
+                            "p50": _seg_pct(d["lens"], 0.5),
+                            "p75": _seg_pct(d["lens"], 0.75)}
+    return out
 
 
 def no_boxed_breakdown(path: str) -> dict:
@@ -925,6 +1066,42 @@ def summarize_no_boxed(path: str) -> str:
             continue
         out.append(f"| {label} | {f['zero_grad']}/{f['n']} "
                    f"（{f['zero_grad'] / f['n'] * 100:.0f}%） | {f['B2_pure_prose']} |")
+    out.append("")
+    # 【2026-10-02】B 桶末段长度画像：把"抬 answer_reserve"与"治啰嗦"分开的唯一
+    # 读数（只有整条 clen 时，两者在数据里同形）。
+    P = b_prose_profile(path)
+    _res_txt = (f"answer_reserve={P['reserve']}" if P["reserve"]
+                else "answer_reserve 未记录")
+    out.append(f"== B 桶末段长度画像（该抬 {_res_txt}，还是该治啰嗦）==")
+    if not P["has_segl"]:
+        out.append("> 本 record 无 `segl`/`tsegl` 字段（2026-10-02 前落盘）→ 无法画像，"
+                   "只能按 clen/trunc 两列间接推断；重新 rollout 一次即有。")
+    else:
+        out.append("> 只统计 ok 族（丢弃族结构性全错，「成功作答」标尺在它身上无定义）；"
+                   "末段 = 该样本**最后一段** assistant 的 token 数。")
+        out.append("> 读法：B 行落在 `≥2048`（或 B2 零调用占多数）→ 模型是把预算写成"
+                   "散文，抬 reserve 只会把 B 换成 C（两者都无 boxed、reward 同为 −1，"
+                   "「无 boxed 率」看不出变化）；B 行集中在 reserve 附近、且与"
+                   "「有boxed」的 p50 同量级 → 作答预留确实不够，才该抬 reserve。")
+        out.append("")
+        out.append("| 组 | 样本 | 末段 p25/p50/p75 | "
+                   + " | ".join(SEG_LEN_BIN_LABELS) + " | 未知 | clen≥0.9cap |")
+        out.append("|---" * 9 + "|")
+        for k, _lab in B_PROSE_GROUPS:
+            d = P["groups"].get(k)
+            if not d:
+                continue
+            _p = ("—" if d["p50"] is None
+                  else f"{d['p25']:.0f}/{d['p50']:.0f}/{d['p75']:.0f}")
+            out.append(f"| {d['label']} | {d['n']} | {_p} | "
+                       + " | ".join(str(c) for c in d["bins"])
+                       + f" | {d['unknown']} | {d['near_cap']}/{d['n']} |")
+        if P["tool_n"]:
+            out.append("")
+            out.append(f"> 工具段（回包）实测 token：n={P['tool_n']} "
+                       f"p50={P['tool_p50']:.0f} p90={P['tool_p90']:.0f}"
+                       "（`tool_result_max_chars` 是字符口径的估算，这里是真实占用）；"
+                       f"clen 上限口径 = {P['cap_src']} = {P['cap']}。")
     out.append("")
     out.append("桶含义（A/B 之分是「处置不同」：A 要加**单轮额度**，"
                "B 要治**啰嗦**）：")

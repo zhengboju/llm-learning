@@ -866,6 +866,170 @@ def test_eval_stats_and_signature():
           max(_R["cus"]) == 3 and min(_R["cus"]) == 0)
 
 
+def test_b_prose_profile():
+    """【2026-10-02】B 桶末段长度画像：把「抬 answer_reserve」与「治啰嗦」分开。
+
+    背景（native_p4_trunc 真机）：`B_cut_mid_prose`（预算耗尽、在散文里被切）占
+    ok 族无 boxed 的 46%，而 record 此前只有整条 clen → 「最后一轮配额不够」与
+    「一路写散文不收尾」在数据里**同形**，但处置相反：前者该抬 `answer_reserve`，
+    后者抬 reserve 只会把 B 换成 C（B/C 都无 boxed、reward 同为 −1，从"无 boxed
+    率"上看不出任何变化）。故补 ①rollout 落盘 per-sample 段长（segl/tsegl）；
+    ②analysis 出末段长度画像 + "有 boxed 成功收尾"作可比标尺。
+
+    本测试钉四件事：①嵌套结构逐样本对齐（末段 = 内层末位，不是首位/总和）；
+    ②短表/缺键补 **None**（补 0 会把"旧 record 无此字段"与"真没有 assistant 段"
+    混成同一个值）；③分箱/分位/标尺数字；④旧 record 走降级路径不造假表。"""
+    import json as _json
+    import os
+    import tempfile
+
+    from rlab.analysis import (read_record, b_prose_profile, summarize_no_boxed,
+                               B_PROSE_GROUPS, SEG_LEN_BINS)
+    _dir = tempfile.mkdtemp()
+    # 每样本一行规格：(q_status, fmt, trunc, wasted, invalid, ctxf, code_used,
+    #                  segl, tsegl, clen)
+    _samples = [
+        # 有 boxed：**成功作答实际要多少 token** —— reserve 够不够的可比标尺
+        ("ok", 1, 0, 0, 0, 0, 1, [600], [220], 1000),
+        ("ok", 1, 0, 0, 0, 0, 1, [700], [220], 1000),
+        ("ok", 1, 0, 0, 0, 0, 1, [800], [220], 1000),
+        ("ok", 1, 0, 0, 0, 0, 1, [900], [220], 1000),
+        # B（调过工具）：末段几千 token 长尾 → 该治啰嗦（不是配额不够）
+        ("ok", 0, 1, 0, 0, 0, 2, [1500, 3000], [200], 8192),
+        ("ok", 0, 1, 0, 0, 0, 2, [1200, 2500], [300], 8192),
+        ("ok", 0, 1, 0, 0, 0, 2, [400], [250], 8192),
+        # B2（全程零调用）：8192 全归自己用还是被切 → 与"调用挤占"无关
+        ("ok", 0, 1, 0, 0, 0, 0, [1500], [], 8192),
+        ("ok", 0, 1, 0, 0, 0, 0, [1800], [], 8192),
+        # C_wasted（末轮写了完整调用，按协议不执行）
+        ("ok", 0, 0, 1, 0, 0, 2, [120], [240], 8192),
+        # D+E（其他无 boxed）
+        ("ok", 0, 0, 0, 1, 0, 1, [700], [210], 2000),
+        # 丢弃族：结构性全错，绝不能进画像分母（否则"成功作答"标尺被污染）
+        ("uniform", 0, 1, 0, 0, 0, 3, [8000], [250], 8192),
+        ("uniform", 0, 1, 0, 0, 0, 3, [8000], [250], 8192),
+    ]
+    _rec = os.path.join(_dir, "record_segl.jsonl")
+    with open(_rec, "w", encoding="utf-8") as f:
+        # 一行一样本：q_status/phase 是**行级**字段（真机一行 = 一组），
+        # 本 fixture 需要 ok 与 dropped 混排，故不按 8 条分组写。
+        for _i, c in enumerate(_samples):
+            f.write(_json.dumps({
+                "t": 1000.0 + _i, "algo": "retool_math",
+                "acc": [1.0 if c[1] else 0.0],
+                "fmt": [float(c[1])],
+                "clen": [c[9]],
+                "code_used": [c[6]],
+                "code_ok": [c[6]],
+                "trunc_final": [c[2]],
+                "code_wasted": [c[3]],
+                "invalid_final": [c[4]],
+                "ctx_full": [c[5]],
+                "segl": [c[7]],
+                "tsegl": [c[8]],
+                "q_status": c[0],
+                "gen_version": 0,
+                "phase": "cold" if c[0] == "ok" else "dropped",
+            }, ensure_ascii=False) + "\n")
+    with open(os.path.join(_dir, "run_info.json"), "w", encoding="utf-8") as _rf:
+        _json.dump({"config": {"max_traj_tokens": 8192, "answer_reserve": 1024,
+                               "tool_waste_penalty": 0.1,
+                               "trunc_tail_penalty": 0.1}}, _rf)
+
+    print("[G4] B 桶末段长度画像（2026-10-02）")
+    _R = read_record(_rec)
+    check("read_record：segl/tsegl 嵌套结构逐样本对齐（末位 = 末段）",
+          len(_R["segls"]) == len(_R["tsegls"]) == len(_R["accs"]) == 13
+          and _R["segls"][4] == [1500, 3000] and _R["segls"][0] == [600]
+          and _R["tsegls"][7] == [])
+    _P = b_prose_profile(_rec)
+    _g = _P["groups"]
+    check("画像：有 boxed 标尺（4 条，末段 675/750/825，全落 512~1024 箱）",
+          _g["boxed"]["n"] == 4 and _g["boxed"]["bins"] == [0, 4, 0, 0]
+          and (_g["boxed"]["p25"], _g["boxed"]["p50"], _g["boxed"]["p75"])
+          == (675, 750, 825))
+    check("画像：B（调过工具）取**内层末位**（3000/2500/400 → ≥2048 箱 2 条）",
+          _g["B_tool"]["n"] == 3 and _g["B_tool"]["bins"] == [1, 0, 0, 2]
+          and _g["B_tool"]["p50"] == 2500)
+    check("画像：B2 零调用单独成行（不与 B 混，它是'与工具协议无关'的那部分）",
+          _g["B2"]["n"] == 2 and _g["B2"]["bins"] == [0, 0, 2, 0])
+    check("画像：C_wasted / D+E 各一行且分箱正确",
+          _g["C_wasted"]["bins"] == [1, 0, 0, 0]
+          and _g["DE"]["bins"] == [0, 1, 0, 0])
+    check("画像：丢弃族不进分母（ok 族 11 条 = 4+3+2+1+1）",
+          sum(v["n"] for v in _g.values()) == 11)
+    check("画像：B 在 token 档必然 clen≥0.9cap（口径自证），有 boxed 组不是",
+          _g["B_tool"]["near_cap"] == 3 and _g["B2"]["near_cap"] == 2
+          and _g["C_wasted"]["near_cap"] == 1 and _g["boxed"]["near_cap"] == 0
+          and _P["cap"] == 8192)
+    check("画像：工具段真实 token 占用（ok 族全部回包段：n=9 p50=220 p90=260）",
+          _P["tool_n"] == 9 and _P["tool_p50"] == 220 and _P["tool_p90"] == 260)
+    check("画像：reserve 从 run_info 读入（表头读法靠它）",
+          _P["reserve"] == 1024 and _P["max_traj_tokens"] == 8192)
+    _tbl = summarize_no_boxed(_rec)
+    check("表：B 桶画像出表 + 读法写清（两种处置、以及 B↔C 互换风险）",
+          "B 桶末段长度画像" in _tbl and "answer_reserve=1024" in _tbl
+          and "只会把 B 换成 C" in _tbl)
+    check("表：B 行数值（1450/2500/2750 + 分箱 + 3/3 顶满 cap）",
+          "| B（调过工具） | 3 | 1450/2500/2750 | 1 | 0 | 0 | 2 | 0 | 3/3 |" in _tbl)
+    check("表：成功收尾标尺行（4 条 675/750/825）",
+          "| 有boxed（成功收尾·标尺） | 4 | 675/750/825 | 0 | 4 | 0 | 0 | 0 | 0/4 |"
+          in _tbl)
+    check("表：回包实测 token 占用给出（tool_result_max_chars 是字符口径估算）",
+          "工具段（回包）实测 token：n=9 p50=220 p90=260" in _tbl
+          and "tool_result_max_chars" in _tbl)
+    # 旧 record（无 segl/tsegl）：必须走降级路径，不能把"字段缺失"当 0 画假表
+    _rec_old = os.path.join(_dir, "record_nosegl.jsonl")
+    with open(_rec_old, "w", encoding="utf-8") as f:
+        f.write(_json.dumps({
+            "t": 1000.0, "algo": "retool_math",
+            "acc": [0.0] * 8, "fmt": [0.0] * 8, "clen": [2000] * 8,
+            "code_used": [1] * 8, "code_ok": [0] * 8, "trunc_final": [1] * 8,
+            "code_wasted": [0] * 8, "invalid_final": [0] * 8, "ctx_full": [0] * 8,
+            "q_status": "ok", "gen_version": 0, "phase": "cold",
+        }, ensure_ascii=False) + "\n")
+    _P_old = b_prose_profile(_rec_old)
+    check("旧 record：has_segl=False 且整桶计入'未知'（不崩、不假装有长度）",
+          _P_old["has_segl"] is False
+          and _P_old["groups"]["B_tool"]["unknown"] == 8
+          and _P_old["groups"]["B_tool"]["bins"] == [0, 0, 0, 0])
+    _tbl_old = summarize_no_boxed(_rec_old)
+    check("旧 record：表上明说无法画像，且不输出假分箱表",
+          "无法画像" in _tbl_old and "末段 p25/p50/p75" not in _tbl_old)
+    # 短表补齐：**补 None 而不是补 0**（两者必须可分，否则画像分母错）
+    _rec_short = os.path.join(_dir, "record_segl_short.jsonl")
+    with open(_rec_short, "w", encoding="utf-8") as f:
+        f.write(_json.dumps({
+            "t": 1000.0, "algo": "retool_math",
+            "acc": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            "fmt": [1.0] * 8, "clen": [1000] * 8, "code_used": [1] * 8,
+            "code_ok": [1] * 8, "trunc_final": [0] * 8, "code_wasted": [0] * 8,
+            "invalid_final": [0] * 8, "ctx_full": [0] * 8,
+            "segl": [[600], [900]], "tsegl": [[200], [210]],
+            "q_status": "ok", "gen_version": 0, "phase": "cold",
+        }, ensure_ascii=False) + "\n")
+    _R_s = read_record(_rec_short)
+    check("read_record：segl 短表补 None（长度仍 = 样本数，下标不错位）",
+          len(_R_s["segls"]) == 8 and _R_s["segls"][1] == [900]
+          and _R_s["segls"][2:] == [None] * 6
+          and len(_R_s["tsegls"]) == 8 and _R_s["tsegls"][0] == [200])
+    # 契约：桶常量与渲染行一一对应（漏写会静默少行——读表的人会当成"该桶不存在"）
+    check("SEG_LEN_BINS 四箱与标签等长，且 B_PROSE_GROUPS 覆盖全部桶",
+          len(SEG_LEN_BINS) == 4 and len(SEG_LEN_BINS) == 4
+          and [k for k, _ in B_PROSE_GROUPS]
+          == ["boxed", "B_tool", "B2", "C_wasted", "DE"])
+    # 接线核对（落盘端）：源码级断言，防"analysis 读一个永远为空的键"
+    _src = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "rollout.py"), encoding="utf-8").read()
+    check("rollout：段长画像按样本算（assistant / 工具两条，按 kind 过滤）",
+          '"segl": _segl' in _src and '"tsegl": _tsegl' in _src
+          and 'sg.get("kind") == "assistant"' in _src)
+    check("rollout：ok 组与 uniform（丢弃）组两个落盘点都写 segl/tsegl",
+          _src.count('"segl"') >= 4 and 'res.get("segl", [])' in _src
+          and 'r["segl"]' in _src)
+
+
 if __name__ == "__main__":
     test_advantages()
     test_losses()
@@ -873,5 +1037,6 @@ if __name__ == "__main__":
     test_reward_and_data()
     test_extract_selfcheck_judgement()
     test_eval_stats_and_signature()
+    test_b_prose_profile()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

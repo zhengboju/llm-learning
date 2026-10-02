@@ -1052,6 +1052,20 @@ def test_collect_retool_group_split():
     check("ok 项：gen_logps 每题独立一次（uniform 题不算，省 GPU0 前向）",
           gl_calls == [4])
     check("ok 项：plen 记入（上传 meta 用）", ok["plen"] == plen)
+    # 【2026-10-02 段长画像】落盘契约：per-sample 段长表必须与 clen **同源同序**
+    # （sum(assistant 段长) + sum(工具段长) == clen）。这是"末段长度"读数的根：
+    # 段长表若与 clen 不同序/漏段，analysis 的 B 桶画像会指向错误的段。
+    # 丢弃组（uniform）也带该画像——B 桶在丢弃族同样高发，缺它会让画像有选择偏差。
+    check("ok 项：segl/tsegl 逐样本对齐且与 clen 同源（段长和 == clen）",
+          len(ok["segl"]) == 4 and len(ok["tsegl"]) == 4
+          and all(ok["clen"][i] == sum(ok["segl"][i]) + sum(ok["tsegl"][i])
+                  for i in range(4)))
+    check("单轮作答档：1 段 assistant、0 段工具（无代码块 → 不执行工具）",
+          all(len(s) == 1 and s[0] > 0 for s in ok["segl"])
+          and all(len(t) == 0 for t in ok["tsegl"]))
+    check("丢弃组（uniform）也带段长画像（选择偏差修复）",
+          len(results[1].get("segl", [])) == 4
+          and len(results[1].get("tsegl", [])) == 4)
 
     # 按题拆分·超长不连坐：q1 轨迹更长，压低 max_context → q1 overlong、q0 照常 ok
     # （旧整批口径 = 整组丢弃，多题并采下会放大丢弃损失）

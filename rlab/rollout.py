@@ -1290,7 +1290,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
       独立 seed；拆出来是为了让本函数不依赖 vllm import，FakeGen 可直接测）。
 
     返回 per-question list，每项 {"status": "ok"|"uniform"|"overlong"}；
-    ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen。
+    ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen
+    与段长画像 segl（assistant 段长表）/tsegl（工具段长表）——两者 per-sample、
+    与 acc/fmt 同下标对齐（2026-10-02）。
     adv 通常为 (B,) 序列级；启用 tool_call_cost/tool_waste_penalty 后为 (B,T)
     逐token任务优势+工具动作成本（losses._adv_broadcast 原生支持）。
     （plen = **本题** prompt 的真实长度——每道题先剥掉左 pad 再建批，见
@@ -1339,6 +1341,18 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
         merged_i, mask_i, per_ids_i = retool_build_batch(
             prompt_i, segs_i, plen_i, tokenizer.pad_token_id)
         clen_i = [len(t) for t in per_ids_i]
+        # 【2026-10-02 B 桶长度画像·为什么必须落盘】native_p4_trunc 的核心悬案：
+        # `B_cut_mid_prose`（预算耗尽、在散文里被切）到底该抬 `answer_reserve`，
+        # 还是该治"写散文不收尾"？判别读数是**每段 assistant 的长度**，而 record
+        # 此前只有整条 clen，段长在落盘时被丢掉 → 只能靠猜。逐样本对齐落盘：
+        #   segl[i]  = 第 i 条样本的 assistant 段 token 数（按时间序，末位=末段）
+        #   tsegl[i] = 该样本的工具回包段 token 数
+        # 工具段长是"回包到底吃掉多少预算"的唯一实测标尺——`tool_result_max_chars`
+        # 是**字符**口径的估算（`//2+16`），只有它能给出真实 token 占用。
+        _segl = [[len(sg["ids"]) for sg in si if sg.get("kind") == "assistant"]
+                 for si in segs_i]
+        _tsegl = [[len(sg["ids"]) for sg in si if sg.get("kind") == "tool"]
+                  for si in segs_i]
         # 逐样本全长预算检查（按题：单题超长不再连坐其他题，2026-09-10）。
         # plen_i 为真实 prompt 长——旧版用批内最长（含 pad）会把 pad 宽度算进
         # 每个样本的 token 预算，单题超长判定偏严。
@@ -1369,6 +1383,10 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             results.append({"status": "uniform", "acc": acc_i, "fmt": fmt_i,
                             "clen": clen_i, "cu": cu_i, "ck": ck_i,
                             "trunc": _trunc_i,
+                            # 【2026-10-02】丢弃组同样带段长画像：B 桶在丢弃族也高发
+                            # （硬题两头顶死），缺它会让"段长画像"只在 ok 族可见
+                            # ——与 2026-09-21 clen/trunc 上送是同一类选择偏差修复。
+                            "segl": _segl, "tsegl": _tsegl,
                             "inv": [int(s.get("invalid_final", 0))
                                     for s in code_stats[i * n:(i + 1) * n]],
                             # 【2026-09-25】uniform 组的末轮废码也如实上送：旧版这里
@@ -1394,6 +1412,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         "fmt": fmt_i, "cu": cu_i, "ck": ck_i, "phase": phase,
                         "qk": _qks[i], "Q": inputs[i]["Q"],
                         "clen": clen_i,
+                        # 【2026-10-02】段长画像（见上方 _segl 注释）：
+                        # segl = assistant 段长表，tsegl = 工具段长表
+                        "segl": _segl, "tsegl": _tsegl,
                         "trunc": [int(s["trunc_final"])
                                   for s in code_stats[i * n:(i + 1) * n]],
                         # 末轮写了代码却不会被执行的次数（该轨迹结构性无 boxed，
@@ -2142,6 +2163,9 @@ def gen_worker(Q, cfg: dict):
                                 "trunc_final": res["trunc"],
                                 "code_wasted": res.get("cw", [0] * len(res["cu"])),
                                 "invalid_final": res.get("inv", [0] * len(res["cu"])),
+                                # 【2026-10-02】段长画像（旧键缺失由 analysis 补 None）
+                                "segl": res.get("segl", []),
+                                "tsegl": res.get("tsegl", []),
                                 "qk": res.get("qk"), "q_status": "uniform",
                                 "gen_version": policy_version[0],
                                 "phase": "dropped"}, ensure_ascii=False) + "\n")
@@ -2204,6 +2228,9 @@ def gen_worker(Q, cfg: dict):
                     "code_wasted": r["cw"],
                     # 【2026-09-25 原生协议诊断】围栏档恒 0（键仍在，同表可逐列读）
                     "invalid_final": r["inv"], "ctx_full": r["ctxf"],
+                    # 【2026-10-02】段长画像：segl=assistant 段长表 / tsegl=工具段长表
+                    # （per-sample，与 clen/trunc 同下标；B 桶长度画像的输入）
+                    "segl": r["segl"], "tsegl": r["tsegl"],
                     # 【2026-09-23 在线通过率监控】题目指纹 + 状态（uniform 组也落盘，
                     # 否则 p≈0 题在 record 里不可见，band 漂移观测有偏）
                     "qk": r.get("qk"), "q_status": "ok",
