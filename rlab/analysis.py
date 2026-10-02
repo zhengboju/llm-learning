@@ -636,6 +636,11 @@ def read_record(path: str) -> dict:
       segls/tsegls: list[list[int]|None] —— 该样本的 assistant / 工具段 token 数
                                            （按时间序；2026-10-02 前落盘 = None，
                                            与下标对齐，供 B 桶长度画像用）
+      trics: list[int]                  —— trunc_in_call（0/1）：预算耗尽时是否卡在
+                                           **未闭合调用块**里（token 档下 A 桶恒 0，
+                                           这是 B 桶做"纯散文 / 调用被切"二分的唯一
+                                           凭据；旧 record 无该键 → 全 0）
+      has_tric: bool                    —— record 里是否有 trunc_in_call 键（缺 → 二分不可用）
       fams: list[str]                   —— "ok"/"dropped"（record_family_of）
       stales: list[int|None]            —— opt-step 陈旧度；丢弃族 = None 占位，
                                            无 gen_version 的文件 = 空表
@@ -659,6 +664,8 @@ def read_record(path: str) -> dict:
     cus = []             # 每样本 code_used（原始计数；2026-09-29 供无 boxed 分解用）
     segls = []           # 每样本 assistant 段长表（None = 该行无该字段，旧 record）
     tsegls = []          # 每样本工具段长表（同上；2026-10-02）
+    trics = []           # 每样本 trunc_in_call（预算耗尽时卡在未闭合调用块里）
+    has_tric = False     # record 是否带该键（旧 record → B 桶二分降级）
     fams = []            # 每样本所属族（ok/dropped，见 record_family_of；2026-09-28）
     stales = []          # 每样本 staleness（opt-step 口径，见下；无 gen_version 时为空）
     _ok_seen = 0         # 已上传（ok 族）样本累计——staleness 的 micro-step 基准
@@ -760,13 +767,22 @@ def read_record(path: str) -> dict:
                              for x in _sv])
                 if len(_sv) < n:
                     _dst.extend([None] * (n - len(_sv)))
+            # 【2026-10-02 trunc_in_call】缺失补 0（旧 record 行为不变），但**单独记
+            # 一个 has_tric**：全 0 与"没有该字段"在表上必须可分——否则旧 record 会
+            # 被读成"没有一条卡在调用里"（那是编出来的结论，不是读数）。
+            if "trunc_in_call" in rec:
+                has_tric = True
+            _tc = rec.get("trunc_in_call") or []
+            trics.extend(int(x) for x in _tc)
+            if len(_tc) < n:
+                trics.extend([0] * (n - len(_tc)))
             ph = rec.get("phase")
             if ph:
                 phases.extend([ph] * n)
             sess_ids.extend([sess] * n)
     return {"accs": accs, "fmts": fmts, "codes": codes, "oks": oks, "trs": trs,
             "clens": clens, "cws": cws, "invs": invs, "ctxfs": ctxfs, "cus": cus,
-            "segls": segls, "tsegls": tsegls,
+            "segls": segls, "tsegls": tsegls, "trics": trics, "has_tric": has_tric,
             "fams": fams, "stales": stales, "sess_ids": sess_ids, "phases": phases,
             "sess_span": sess_span, "sess_gv": sess_gv, "n_sess": sess + 1}
 
@@ -986,13 +1002,15 @@ def no_boxed_breakdown(path: str) -> dict:
     fams = R["fams"]
     res = {"n_samples": n_tot, "n_nobox": 0, "n_nobox_total": 0,
            "zero_grad_total": 0, "waste_credit": waste_credit,
-           "trunc_credit": trunc_credit, "families": {}}
+           "trunc_credit": trunc_credit, "has_tric": R.get("has_tric", False),
+           "families": {}}
     for fam in ("ok", "dropped"):
         idx = [i for i, v in enumerate(fams) if v == fam]
         if not idx:
             continue
         buckets = collections.Counter()
         b2 = 0
+        b_call = 0      # B 桶里"预算耗尽时卡在未闭合调用块"的那部分（见 trics）
         nobox = 0
         zg = 0
         for i in idx:
@@ -1007,9 +1025,12 @@ def no_boxed_breakdown(path: str) -> dict:
             buckets[bk] += 1
             if bk == "B_cut_mid_prose" and R["cus"][i] == 0:
                 b2 += 1
+            if bk == "B_cut_mid_prose" and R["trics"][i]:
+                b_call += 1
         res["families"][fam] = {"n": len(idx), "nobox": nobox,
                                 "buckets": dict(buckets),
-                                "B2_pure_prose": b2, "zero_grad": zg}
+                                "B2_pure_prose": b2, "B_call_trunc": b_call,
+                                "zero_grad": zg}
         res["n_nobox_total"] += nobox
         res["zero_grad_total"] += zg
     res["n_nobox"] = res["n_nobox_total"]
@@ -1058,14 +1079,25 @@ def summarize_no_boxed(path: str) -> str:
     else:
         _zg_rule = "trunc ∪ 末轮废码 → sw=0"
     out.append(f"| 族 | 零梯度占比（{_zg_rule}） | 其中 B2 纯散文"
-               "（被切断且全程没调用过工具） |")
-    out.append("|---|---|---|")
+               "（被切断且全程没调用过工具） | 其中 B_call 调用未闭合被切 |")
+    out.append("|---|---|---|---|")
     for fam, label in (("ok", "ok（已上传）"), ("dropped", "dropped（丢弃）")):
         f = B["families"].get(fam)
         if not f:
             continue
+        _bc = (str(f["B_call_trunc"]) if B.get("has_tric")
+               else "—（无 trunc_in_call）")
         out.append(f"| {label} | {f['zero_grad']}/{f['n']} "
-                   f"（{f['zero_grad'] / f['n'] * 100:.0f}%） | {f['B2_pure_prose']} |")
+                   f"（{f['zero_grad'] / f['n'] * 100:.0f}%） | {f['B2_pure_prose']} "
+                   f"| {_bc} |")
+    out.append("")
+    out.append("> `B2` 与 `B_call` 是**两个轴、可以同时为真**：B2 = 全程零工具调用"
+               "（行为轴），B_call = 预算耗尽时卡在未闭合的调用块里（切点轴）。")
+    if not B.get("has_tric"):
+        out.append("> `B_call` 列不可用：本 record 无 `trunc_in_call` 字段（2026-10-02 "
+                   "前落盘）。该字段专治 token 预算档的结构性缺口——**A 桶（trunc ∩ "
+                   "invalid）恒 0**，于是「调用写到一半被墙切断」全被 B 桶吞掉，而 B 的"
+                   "定义是「没写出任何调用」（真机实测：无 boxed 里约 27% 属于前者）。")
     out.append("")
     # 【2026-10-02】B 桶末段长度画像：把"抬 answer_reserve"与"治啰嗦"分开的唯一
     # 读数（只有整条 clen 时，两者在数据里同形）。
@@ -1109,6 +1141,9 @@ def summarize_no_boxed(path: str) -> str:
         out.append(f"  · `{k}` — {desc}")
     out.append("  · `B2` — B 的子集：全程 `code_used==0`，即从没调用过工具"
                "（纯散文一路写到底被截，与工具协议无关）。")
+    out.append("  · `B_call` — B 的子集：预算耗尽时**卡在未闭合的调用块**里"
+               "（`trunc_in_call`）——要与 B2 交叉读：两者可同时为真，处置也不同"
+               "（B_call 该治「别把调用拖到最后一刻」）。")
     return "\n".join(out)
 
 

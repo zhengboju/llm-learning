@@ -798,8 +798,18 @@ def test_eval_stats_and_signature():
             _rows = _out
             while len(_rows) < _sp["n"]:                 # 其余样本有 boxed
                 _rows.append((True, 0, 0, 0, 0, 1))
+            _bc_left = 3 if _fam == "ok" else 0   # 【2026-10-02】B_call 真子集配额
             for _i in range(0, len(_rows), 8):
                 _ch = _rows[_i:_i + 8]
+                # B_call = B 桶 ∩ "预算耗尽时卡在未闭合调用块"（截断点轴）。必须是
+                # **真子集**：全标就 B_call≡B，断言恒真测不出东西（同 B2 的坑）。
+                _tric = []
+                for _c in _ch:
+                    if (not _c[0] and _c[1] and not _c[2] and not _c[3] and not _c[4]
+                            and _bc_left > 0):
+                        _tric.append(1); _bc_left -= 1
+                    else:
+                        _tric.append(0)
                 f.write(_json.dumps({
                     "t": 1000.0 + _i,
                     "acc": [1.0 if c[0] else 0.0 for c in _ch],
@@ -809,6 +819,7 @@ def test_eval_stats_and_signature():
                     "invalid_final": [c[3] for c in _ch],
                     "ctx_full": [c[4] for c in _ch],
                     "code_wasted": [c[2] for c in _ch],
+                    "trunc_in_call": _tric,
                     "q_status": "ok" if _fam == "ok" else "uniform",
                     "gen_version": 0, "phase": "cold",
                 }, ensure_ascii=False) + "\n")
@@ -832,6 +843,13 @@ def test_eval_stats_and_signature():
     check("分解：B2 独立于 B（4 / 17，不是 B 的全量 9 / 35）",
           _okb["B2_pure_prose"] == 4 and _drb["B2_pure_prose"] == 17
           and _okb["B2_pure_prose"] < _okb["buckets"]["B_cut_mid_prose"])
+    # 【2026-10-02 trunc_in_call】B 桶的第二个子集：切点落在未闭合调用块里。
+    # token 档下 A 桶（trunc∩invalid）恒 0，"调用被墙切"与"纯散文被墙切"（处置相反）
+    # 在数据里同形——真机轨迹实测前者占无 boxed 的 27%（219/822）。
+    check("分解：B_call 是真子集且与 B2 可交叉（ok 3/9，两个轴各自独立）",
+          _B["has_tric"] is True and _okb["B_call_trunc"] == 3
+          and _okb["B_call_trunc"] < _okb["buckets"]["B_cut_mid_prose"]
+          and _drb["B_call_trunc"] == 0)
     # ③ 零梯度口径 = trunc ∪ 末轮废码（**不看有没有 boxed**，与 sw 构造同人群）
     check("分解：零梯度占比按 trunc ∪ code_wasted 计（ok 92/336、dropped 227/240）",
           _okb["zero_grad"] == 92 and _drb["zero_grad"] == 227
@@ -847,6 +865,17 @@ def test_eval_stats_and_signature():
     check("分解表：零梯度行 + 六桶图例齐备",
           "零梯度占比" in _nb_tbl and "B2 纯散文" in _nb_tbl
           and all(f"`{k}`" in _nb_tbl for k, _ in NO_BOXED_BUCKETS))
+    check("分解表：B_call 列有值且写清与 B2 的双轴关系（可同时为真）",
+          "其中 B_call 调用未闭合被切" in _nb_tbl
+          and "| ok（已上传） | 92/336 （27%） | 4 | 3 |" in _nb_tbl
+          and "两个轴、可以同时为真" in _nb_tbl)
+    # 旧 record（无 trunc_in_call）必须降级：不许把"没有该字段"读成"没有一条卡在调用里"
+    _B_old = no_boxed_breakdown(_rec_fam)
+    _old_tbl = summarize_no_boxed(_rec_fam)
+    check("分解表：旧 record 无 trunc_in_call → has_tric=False 且列显式不可用",
+          _B_old["has_tric"] is False and _B_old["families"]["ok"]["B_call_trunc"] == 0
+          and "—（无 trunc_in_call）" in _old_tbl
+          and "无 `trunc_in_call` 字段" in _old_tbl)
     # 空文件 / 只有 ok 族：不得崩，且不输出不存在的族
     _rec_empty = os.path.join(_dir, "record_nobox_empty.jsonl")
     with open(_rec_empty, "w", encoding="utf-8") as f:

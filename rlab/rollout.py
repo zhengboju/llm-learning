@@ -53,7 +53,11 @@ from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            extract_python_blocks, initial_messages, make_call_id,
                            make_bytes_list, parse_assistant, render_chat_ids,
                            sanitize_tool_text, segment_mask_from_spans,
-                           tensor_to_bytes, tool_message)
+                           tensor_to_bytes, tool_message,
+                           # 【2026-10-02 trunc_in_call】调用块的开/闭标记**从协议
+                           # 正则派生**（`_RE_TOOL_CALL_ANY.pattern.split(".*?")`），
+                           # 绝不手写标签字面量——本项目三次被会话管道改写字节。
+                           _TOOL_OPEN as _CALL_OPEN, _TOOL_CLOSE as _CALL_CLOSE)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          group_eff_bonus,
                          total_reward_math, total_reward_retool,
@@ -559,7 +563,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     ctx_ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
     segs = [[] for _ in range(n)]
     code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0,
-                   "invalid_final": 0, "ctx_full": 0, "trunc_final": 0, "err_types": []}
+                   "invalid_final": 0, "ctx_full": 0, "trunc_final": 0,
+                   # 【2026-10-02】"预算耗尽时正处在未写完的调用块里"（见
+                   # trunc_in_call_flag）：A 桶（trunc∩invalid）在 token 档恒 0，
+                   # 没有这个字段就无法把"调用写到一半被墙切"从 B 桶里分出来。
+                   "trunc_in_call": 0, "err_types": []}
                   for _ in range(n)]
     # 【2026-09-29 token 预算档·续写缓冲】"一次生成"与"一个 assistant 轮"在这一档
     # 下解耦：被单轮上限切断（finish_reason=length）时该轮**没有结束**，累积进
@@ -610,6 +618,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     if collect_logps:
                         _s["logps"] = list(open_lps[i])
                     segs[i].append(_s)
+                    # 【2026-10-02】切点是不是落在**未闭合的调用块**里——必须在这里
+                    # 判：本分支只置 trunc_final，A 桶（trunc∩invalid）在 token 档
+                    # 恒 0，不单独记就永久分不出"调用被墙切"与"纯散文被墙切"。
+                    code_stats[i]["trunc_in_call"] = trunc_in_call_flag(
+                        open_raw[i], style)
                     open_ids[i], open_raw[i], open_lps[i] = [], "", []
             active = _still
             if not active:
@@ -810,13 +823,17 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
         # （理由同循环内的 flush：不落段 = 凭证丢失 = 打分与生成序列不符）。
         for i in range(n):
             if open_ids[i]:
-                _s = {"kind": "assistant", "text": open_raw[i],
+                _txt = open_raw[i]
+                _s = {"kind": "assistant", "text": _txt,
                       "ids": list(open_ids[i]), "finish_reason": "length"}
                 if collect_logps:
                     _s["logps"] = list(open_lps[i])
                 segs[i].append(_s)
                 open_ids[i], open_raw[i], open_lps[i] = [], "", []
                 code_stats[i]["trunc_final"] = 1
+                # 与循环内"预算耗尽"分支同口径：安全阀耗尽也是"没写完就停"，
+                # 切点落在未闭合调用块里同样要单列（否则又混进 B 桶）。
+                code_stats[i]["trunc_in_call"] = trunc_in_call_flag(_txt, style)
         full_text = ["".join(s["text"] for s in segs_i) for segs_i in segs]
     else:
         # 旧口径：末段被单轮上限切断即 trunc_final。token 预算档下该口径由循环内的
@@ -1279,6 +1296,30 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 
+def trunc_in_call_flag(text: str, style: str = "auto") -> int:
+    """预算/轮长用尽时，模型是否正处在**未写完的调用块**里（0/1）。纯函数，CPU 可测。
+
+    【为什么必须有这个字段（2026-10-02）】token 预算档下"预算耗尽"只置
+    `trunc_final`，**不置** `invalid_final`（invalid 只在轮结束分支判）→ 而 A 桶的
+    判据正是 `trunc ∩ invalid` ⇒ **A 恒 0**，于是所有"调用写到一半被墙切断"的样本
+    都被 B 桶吞掉，而 B 的定义是"没写出任何调用"——两类处置相反（要治"别把调用
+    拖到最后" vs 治"啰嗦"）却在数据里同形。真机 `eval_vllm_s200.traj.jsonl` 实测：
+    无 boxed 822 条里 **27%（219 条）**是这种（开标记多于闭标记）。
+
+    判据 = **开标记多于闭标记**（调用确实没闭合）**且** `parse_assistant` 判 invalid。
+    只写了"调用 + 尾巴"（闭标记齐）**不**置位——那种更接近末轮废码，混进"纯散文"
+    会污染读数，真机里只占 22/227。
+
+    调用标记从 `protocol` 正则派生导入（AGENTS.md 标签字节铁律：绝不手写标签字面量）。
+    旧 record 无该键 → analysis 按"不可用"降级，历史桶口径逐位不变。"""
+    if not text or not text.strip():
+        return 0
+    t = text.strip()
+    if t.count(_CALL_OPEN) <= t.count(_CALL_CLOSE):
+        return 0
+    return int(parse_assistant(t, style=style).kind == "invalid")
+
+
 def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
                   clen=None, gen_version=None, t=None):
     """把一条轨迹打成可落盘的一行（纯函数，CPU 可测；2026-10-02）。
@@ -1472,6 +1513,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                             # 才想起来调用），恒 0 会让该列在丢弃组上系统性偏低。
                             "cw": [int(s.get("code_wasted", 0))
                                    for s in code_stats[i * n:(i + 1) * n]],
+                            # 【2026-10-02】"调用写到一半被预算切"也如实上送
+                            "tric": [int(s.get("trunc_in_call", 0))
+                                     for s in code_stats[i * n:(i + 1) * n]],
                             "qk": _qks[i], "Q": inputs[i]["Q"]})
             continue
         if use_vllm_logps:
@@ -1498,6 +1542,11 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         # 且 retool_stop 下 trunc_final 记不到它）
                         "cw": [int(s.get("code_wasted", 0))
                                for s in code_stats[i * n:(i + 1) * n]],
+                        # 【2026-10-02 trunc_in_call】"预算耗尽时正卡在未闭合调用块里"：
+                        # token 档下 A 桶（trunc∩invalid）恒 0，这一个字段是 B 桶做
+                        # "纯散文 / 调用被切"二分的唯一凭据。围栏档恒 0（键仍在）。
+                        "tric": [int(s.get("trunc_in_call", 0))
+                                 for s in code_stats[i * n:(i + 1) * n]],
                         # 【2026-09-25 原生协议诊断列】两列在围栏档恒为 0（键仍在
                         # record 里，方便同一张表逐列读两档）：
                         #   inv = 有 <tool_call> 但形态不认识 / 调用后还跟内容
@@ -2281,6 +2330,8 @@ def gen_worker(Q, cfg: dict):
                                 # 【2026-10-02】段长画像（旧键缺失由 analysis 补 None）
                                 "segl": res.get("segl", []),
                                 "tsegl": res.get("tsegl", []),
+                                # 【2026-10-02】trunc_in_call（B 桶二分凭据）
+                                "trunc_in_call": res.get("tric", []),
                                 "qk": res.get("qk"), "q_status": "uniform",
                                 "gen_version": policy_version[0],
                                 "phase": "dropped"}, ensure_ascii=False) + "\n")
@@ -2343,6 +2394,8 @@ def gen_worker(Q, cfg: dict):
                     "code_wasted": r["cw"],
                     # 【2026-09-25 原生协议诊断】围栏档恒 0（键仍在，同表可逐列读）
                     "invalid_final": r["inv"], "ctx_full": r["ctxf"],
+                    # 【2026-10-02】B 桶二分凭据：预算耗尽时是否卡在未闭合调用块
+                    "trunc_in_call": r["tric"],
                     # 【2026-10-02】段长画像：segl=assistant 段长表 / tsegl=工具段长表
                     # （per-sample，与 clen/trunc 同下标；B 桶长度画像的输入）
                     "segl": r["segl"], "tsegl": r["tsegl"],

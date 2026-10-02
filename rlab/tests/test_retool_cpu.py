@@ -5043,6 +5043,34 @@ def test_token_budget_mode():
     check("预算耗尽 → 每轮 max_tokens 被夹到剩余预算（不越界）",
           len(_segs5[0][0]["ids"]) <= 8)
 
+    # (f2) 【2026-10-02 trunc_in_call】同样是"预算耗尽"，但**切点不同必须可分**：
+    # token 档下预算耗尽分支不置 invalid_final → A 桶（trunc∩invalid）恒 0 →
+    # "调用写到一半被墙切"会被 B 桶（定义=没写出任何调用）整额吞掉。真机轨迹实测
+    # 这类占无 boxed 的 27%（219/822），处置与"纯散文被切"相反。
+    from rlab.protocol import _TOOL_CLOSE as _TCLOSE
+    from rlab.rollout import trunc_in_call_flag as _tif
+    _full_call = _json_form("print(6*7)")
+    _unclosed = _full_call.split(_TCLOSE)[0]        # 去掉闭标记 = 未闭合调用
+    check("trunc_in_call_flag：未闭合调用 → 1；形态完整（带尾巴）→ 0；纯散文 → 0",
+          _tif(_unclosed) == 1 and _tif(_full_call) == 0
+          and _tif(_full_call + " 于是答案是 42。") == 0 and _tif("我们推一推：") == 0
+          and _tif("") == 0)
+    _cfg_uc = mk_cfg(max_traj_tokens=8, answer_reserve=1, budget_hint=False)
+    fg_uc = FakeGen([[_T(_unclosed, "length")] * 2])
+    _sg_uc, _f_uc, _cs_uc = multi_turn_rollout_group(
+        fg_uc, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _cfg_uc,
+        code_runner=fake_run, prompts_messages=prompt_messages_for(
+            [{"Q": "Q1"}], _cfg_uc) * 2)
+    check("trunc_in_call：墙切断时卡在未闭合调用块里 → trunc_final=1 且置 1",
+          all(c["trunc_final"] == 1 and c["trunc_in_call"] == 1 for c in _cs_uc))
+    fg_pr = FakeGen([[_T("aaaa bbbb", "length")] * 2])
+    _sg_pr, _f_pr, _cs_pr = multi_turn_rollout_group(
+        fg_pr, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _cfg_uc,
+        code_runner=fake_run, prompts_messages=prompt_messages_for(
+            [{"Q": "Q1"}], _cfg_uc) * 2)
+    check("trunc_in_call：同样被墙切断但只是散文 → 0（不许把纯散文混进 B_call）",
+          all(c["trunc_final"] == 1 and c["trunc_in_call"] == 0 for c in _cs_pr))
+
     # (g) 循环内每轮夹 max_tokens（用桩记录被改写的值）
     _sp_stub = _SPStub(list(NATIVE_BAD_WORDS))
     _sp_stub.max_tokens = 64

@@ -751,6 +751,69 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 
 ---
 
+## 4.12 评测轨迹归因（`eval_v_s200.traj.jsonl`，`val_n=8` 档）：失败是"写不完"，不是"不会做"（2026-10-02）
+
+数据源：`s200` 评测的轨迹 dump，**2384 条 = 298 题 × 8**（`val_n=8` 采样档；与 §4.11 的贪心档**不可比**，见 §4.11 结论 6）。这是第一次拿文本而不是统计判读失败机理。
+
+### 先记两条 dump 自身的缺陷（已修 `90f0bca`，读旧文件时必须知道）
+
+1. **eval 侧漏传 `code_stats`** → 该文件里 `code_used/code_ok/trunc_final/code_wasted/invalid_final/ctx_full` **全是 0**，桶判定会把 100% 的无 boxed 读成 `E_clean_no_box`（假象）。因此下文结论**全部只用** `segs` 结构 / 长度 / 文本 / per-trajectory `acc/fmt`。
+2. **工具段只有 `text`**，而它是**模板渲染**（4898 条全部以同一个 `im_end/im_start/tool_response` 包装开头，含 special token 与回答骨架）——真观察（`[exception] …`、`[budget] …`）在里面。已补 `body` 字段存纯回包。
+
+### 失败机理三分（无 boxed 822 条 = 34.5%；用 `parse_assistant` 判末段形态 + 开/闭调用标记计数）
+
+| 机理 | n | 占全体 | 占无 boxed | clen p50 | 末段 p50 | 贴预算墙(≥8000) |
+|---|---:|---:|---:|---:|---:|---:|
+| **散文写到墙**（末段 answer 形态、全程无调用） | 354 | 14.9% | 43% | 8192 | 4264 | **99%** |
+| **完整调用被预算判据拒**（末段是完整 call） | 241 | 10.1% | 29% | 7405 | 1838 | 11%（**100% 落在 [6902,8192)**） |
+| **调用未闭合写到墙**（开标记 > 闭标记） | 219 | 9.2% | 27% | 8192 | 8192 | **100%**（其中 119 条零调用） |
+| 其他 invalid（调用后还有内容） | 22 | 0.9% | 3% | — | 756 | — |
+
+三条硬证据：
+
+1. **失败发生在"写"上，不在"会不会"上**：`n_segs=1`（一整段写满 8192、一次工具都没调）**173 条，acc 恒 0.000**；样例开头 `We need to find the largest integer m ≤ 2016 …`、结尾以调用块收束 —— **推理全写在散文里，工具调用排在最后一刻**。
+2. **"散文写到墙"那批是在反复自证**：样例末段（4264 token）是拿到 `Code output -1427.5` 之后继续用 LaTeX 反复验算（`… Correct. So 2018 × 0.707 ≈ 1427 …`）直到撞墙。**不是不会，是不肯收尾。**
+3. **预算判据签名精确复现**：末段是完整调用的 246 条里 **100% 落在 `[8192−1290, 8192)`**（1290 = 回包估计 266 + `answer_reserve` 1024），与代码 `_can = (budget − used − obs) >= reserve` 逐字吻合。另有 9 条撞 `_iter_cap=20` 轮上限。
+
+### 对「`answer_reserve` 不够」的定量否证
+
+成功收尾的 1562 条，末段（= 实际作答）长度 **p50=266、p75=667、p90=1712；<512 占 68%，超过 1024 的只有 15.2%**。
+
+> **1024 的预留对 85% 的成功作答都够**，而失败样本的末段中位数是 **4264~8192** 的散文。抬 reserve 到 2048 只多覆盖约 7% 的作答形态，代价是把更多调用判废（C↑）→ **抬 reserve 不是对症的杠杆**。
+
+### 题级结构与 `budget_hint`
+
+- 297 个唯一题面：**全对 75（25.2%）/ 全错 47（15.8%）/ 混合 175（58.9%）**；全错题的 376 条里 **203 条（54%）末段是调用形态**（invalid/tool 结尾）→ **一半以上的"全错题"是没交卷，不是不会做**。提升空间主要在"把同题里失败的那几条救回来"。
+- **`budget_hint` 已经开着**（4898 条回包都带 `[budget] N tokens left …`），但仍有 **19.3%** 的轨迹死在调用上（10.1% 被拒 + 9.2% 未闭合）→ **"模型看得见额度"是必要不充分的**；先前"开 budget_hint 是最便宜单变量"的建议在本 run 已消费掉，需要的是"拿到工具结果后必须收尾"的硬信号。
+- 口径澄清：`code_ok_rate 83.5%` = "轨迹里**至少成功执行过一次**"，不是单次调用成功率；回包很小（含包装 p50 62 token，`tool` 段仅占 completion **4.8%**）→ "工具调用吃掉预算"彻底出局。
+
+### 数据缺陷：held-out 里同一题面 → 两个答案键
+
+`qk=9ffd553d2a25`（"A bug starts at a vertex of an equilateral triangle…"）出现 **16 条 = 两道题**：
+
+| 答案键 | 条数 | acc | 对 |
+|---|---:|---:|---:|
+| `-1` | 8 | **0.000** | 0 |
+| `683` | 8 | 0.875 | 7 |
+
+- 后果①：8 条结构性不可能得分的轨迹**进分母**（全库 `A=-1` 共 32 条 / 4 题）。
+- 后果②：配对键 `qk = sha1(Q)` **碰撞** → 配对检验按 qk 建 dict 只留最后一条，298 题被静默并成 **297**。**查 dev 切分是否按 (Q,A) 去重——按 (Q,A) 去重会原样保留"同题多答案"**。eval 侧已加重复 qk 告警。
+
+### 工具语义缺口与修复：`trunc_in_call`
+
+**缺口**：token 预算档下"预算耗尽"只置 `trunc_final`、**不置** `invalid_final`（invalid 只在轮结束分支判）→ 而 A 桶判据是 `trunc ∩ invalid` ⇒ **`A_cut_mid_call` 恒 0**，于是"调用写到一半被墙切"全被 B 桶吞掉，而 B 的定义是"没写出任何调用"——两类**处置相反**的样本在数据里同形（本节的 27%/219 条就是被吞掉的那部分）。
+
+**修复**（`trunc_in_call`，2026-10-02）：预算墙退出与安全阀兜底两个分支用 `trunc_in_call_flag()` 置位——判据 = **开标记多于闭标记 且 `parse_assistant` 判 invalid**（标记从 `protocol` 正则派生，不手写标签字面量）；record 新键 `trunc_in_call`；analysis 的 `--no-boxed-breakdown` 新增一列 **`B_call`（调用未闭合被切）**，与 `B2` **是两个轴、可同时为真**（B2 = 全程零调用，行为轴；B_call = 切点轴）。两个 flag 都做了**旧 record 降级**：缺键 → 列显 "—（无 trunc_in_call）"，历史桶口径逐位不变（测试锁死）。
+
+### 下一步（按序）
+
+1. **别抬 `answer_reserve`**（上面的定量否证）；目标应是"拿到工具结果后收尾"与"别把调用拖到最后"。
+2. 下一轮单变量首选 **`len_eff_w`**（更短的正确答案拿正分，已实现）或对"结果之后的散文"给局部负优势。
+3. **清数据**：dev 里的同题多答案（`-1` 哨兵键）清掉后重跑评测（影响 32 条分母 + 1 个碰撞配对）。
+4. 训练/评测都开 `--traj_dump` / `--dump_traj`：新行带真计数 + `body` + `trunc_in_call`，机理判定不必再靠 parse 反推。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
 - **`--native_stop_at_call` 的历史定位**：native_p3 在轮数档、1024/round、无 stop 下 invalid ~60%，说明它对旧档是关键协议部件；token-budget 档使用 `P=M=8192` 时不存在人工续写边界，但是否启用 stop 仍必须以 live `run_info.json` 为准，不能从文档猜测。
@@ -769,6 +832,10 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
   · **全量文本落盘**：训练加 `--traj_dump` → `<out_dir>/traj.jsonl`；评测加 `--dump_traj`（`eval_vllm_one.py` / `eval_vllm.py` / `rlab.eval` 三条入口都认）→ `<out>.traj.jsonl`。每行**一条轨迹**，**段级** `segs:[{kind,len,text}]` + `status(ok/uniform/overlong/eval)` + `gen_version` + 与 record 同源的计数与 ±1 分数；**含被丢弃的 uniform/overlong attempt**（它们整组不进 record，是记录口径幸存者偏差的主体）。纯观测面，**不进 `run_signature`**（打开它不会让旧 out_dir 变外来签名），可与任何单变量实验同开。体积：训练全量约 40~80MB/run；评测 `val_n=8`、500 题约 56MB/ckpt。
   · **两个阅读陷阱**：①`traj.jsonl` 是**追加写**，同 `out_dir` 多次 run 会混在一起（按 `gen_version` 回退切会话，或换 out_dir）；②文件里含 `<tool_call>` 一类标签，用 read/控制台看会被渲染成无括号普通词——判字节真伪要逐字符 `ord` 直出，且 **dump 是诊断产物，不要喂回模型**。
 - **评测档位（`--val_n`）必须与结论绑定（2026-10-02 险情）**：`--val_n` 默认 **1（贪心）**；`--val_n>1` 是 Average@N 采样档（temp 1.0/top_p 0.7），**同一 checkpoint 的 acc / `both` / 平均token / 工具轮数在两道之间整体位移**（实测 s200 两档 acc 差 10pp 量级）。踩点在于：历史上所有表都忘了记这一列，于是"同名的 step200" 会被当成同一个数比较。配套两条：①**一次评测内档位必须统一**（别一套表里混贪心与采样），四个臂一起评；②`McNemar b/c` 只属于贪心档——采样档由 `analysis.paired_test_auto` 自动改走配对均值 z 检验，若汇总表仍印 b/c，就是档位没被识别（查 per-item 的 `val_n` 字段）。
-- **当前下一动作（2026-10-02）**：`native_p4_trunc` held-out 出炉，**本 campaign 内只有 step400 显著**（+8.4pp，p=0.002，唯一过 Bonferroni），主模型取 step400。三件事按序做：①核两次 eval 的 `eval_protocol`（`gpu_mem` 优先，实测可差 7pp）；②把 `native_p4_credit` 的 step200/step300 与本次 step400 放进**同一次评测**——这是回答"ttp0.1 有没有用"的唯一方式（跨 campaign 不可比：BASE 61.4 vs 60.1）；③用 `--dump_traj` 抽 step200 vs step400 验"少调用多散文"假说。细节与全部读数见 §4.11。
+- **轨迹 dump 的读法与两个坑（2026-10-02 实测）**：①工具段有两个文本字段——`text` 是**模板渲染**（含 `im_end/im_start/tool_response` 等 special token 与回答骨架，4898 条全部以同一个包装开头），**读观察必须用 `body`**（消毒后的纯回包，含 `[etype]` 前缀与 `[budget]` 行）；长度字段 `len` 是 `text` 的 token 数，别当回包大小。②`traj.jsonl` 是**追加写**，同 out_dir 多次 run 会混（按 `gen_version` 回退切会话，或换 out_dir）。③dump 里含调用标记，用 read/控制台看会被渲染成无括号普通词——判字节真伪逐字符 `ord` 直出，且 **dump 是诊断产物，不要喂回模型**。④**落盘行的计数字段必须来自 `code_stats`**：eval 侧首版漏传 → 整份 dump 的 `code_used/trunc_final/code_wasted/invalid_final/code_ok/ctx_full` 全是 0，桶判定 100% 变假 `E`；现已加"含工具段却 `code_used=0`"自检告警，同类接线缺口当场可见。
+- **`trunc_in_call`（2026-10-02 新增分析字段·token 档专用）**：token 预算档下"预算耗尽"不置 `invalid_final` → **A 桶恒 0**，"调用写到一半被墙切"被 B 桶吞掉（真机轨迹实测占无 boxed 的 27%）。新键 `trunc_in_call` 标记切点是否落在未闭合调用块里，`--no-boxed-breakdown` 多一列 `B_call`（与 `B2` 是两个轴、可同时为真）；旧 record 缺键 → 列显 "—"、历史口径不变。判据 = 开标记多于闭标记 且 parse 判 invalid（标记从 `rlab.protocol` 正则派生）。
+- **held-out 数据缺陷：同题面 → 多答案键（2026-10-02 实测）**：`dev` 里同一道题出现两次，答案键分别是 `-1` 与 `683`（前者 8 条 acc=0，后者 7/8）。后果：①不可能得分的样本进分母；②配对键 `qk=sha1(Q)` 碰撞 → 配对按 qk 建 dict 只留一条，**298 题静默并成 297**。**按 (Q,A) 去重会原样保留"同题多答案"**；eval 侧已加重复 qk 告警，数据侧待清理。
+- **轨迹归因的第一结论（§4.12）**：失败是"写不完"不是"不会做"——无 boxed 822 条里 43% 是散文写到墙、27% 是调用未闭合被墙切；成功作答的末段 p75 只有 667 token ⇒ **`answer_reserve=1024` 对 85% 的成功轨迹都够，抬 reserve 不是对症杠杆**；而 `budget_hint` 早已开着，仍有 19.3% 死在调用上 ⇒ 提示必要不充分。
+- **当前下一动作（2026-10-02）**：`native_p4_trunc` held-out 出炉，**本 campaign 内只有 step400 显著**（+8.4pp，p=0.002，唯一过 Bonferroni），主模型取 step400。四件事按序做：①核两次 eval 的 `eval_protocol`（`gpu_mem` 优先，实测可差 7pp）；②把 `native_p4_credit` 的 step200/step300 与本次 step400 放进**同一次评测**——这是回答"ttp0.1 有没有用"的唯一方式（跨 campaign 不可比：BASE 61.4 vs 60.1）；③用 `--dump_traj` 抽 step200 vs step400 验"少调用多散文"假说；④按 §4.12 的轨迹归因选下一轮单变量（首选 `len_eff_w`，**不要抬 `answer_reserve`**）并清掉 dev 的同题多答案。细节与全部读数见 §4.11 / §4.12。
 - **本地工作区状态**：截断末段信用代码已提交推送；本轮改动涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。
 - **本地工作区状态（2026-10-02 追加）**：两轮诊断能力已提交推送（`f65c62c` B 桶末段长度画像、`62886f6` 轨迹全量落盘），涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[eval.py](rlab/eval.py)、[eval_vllm.py](eval_vllm.py)、[eval_vllm_one.py](eval_vllm_one.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。**新字段/新档位对旧 record 与旧 eval json 一律向后兼容**（缺键按"无该字段"降级，不造假值）。
