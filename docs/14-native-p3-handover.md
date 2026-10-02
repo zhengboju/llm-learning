@@ -641,6 +641,8 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 
 同时必须补生成端 `[rollout] 采样统计`：overlong 整组不落 record，上表不能证明真实丢弃率。
 
+> **执行结果见 §4.11**（2026-10-02）：record 侧验收（trunc/<8% B 桶）**未达标**，held-out 侧本 campaign 内**只有 step400 显著**。
+
 ---
 
 ## 4.10 第一轮信用实验 held-out 评测：收益确认（2026-10-01）
@@ -701,6 +703,49 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 
 ---
 
+## 4.11 native_p4_trunc（`trunc_tail_penalty=0.1`）held-out 评测：只有 step400 显著（2026-10-02）
+
+### 判定口径
+
+- `N=298`（配对 `n=297`）；单臂 95%CI 最坏 `≈±5.7pp`，两臂差 `≈±8.0pp`；判定 = CI 不跨 0，有 per-item 时改用 McNemar `p<0.05`；4 个 checkpoint 同时检验 → Bonferroni `0.0125`。
+- 数据源：`eval_vllm_one.py`（`--algo retool_math`，per-item 默认落盘）。
+- **欠账补齐**：§4.10「未验证项：效率目标只完成了一半」要求的**平均输出 token / 平均工具轮数**，本轮起进评测表（`avg_ans_tokens` / `avg_clen` / `avg_rounds`）。
+
+### 结果
+
+| 模型 | acc%(±95%CI) | fmt% | code% | 平均token | 工具轮数 | Δacc vs BASE | McNemar b/c | p | 判定 |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---|
+| BASE | 61.4±5.5 | 70.5 | 92.3 | 3254 | 3.22 | — | — | — | — |
+| step100 | 66.4±5.4 | 78.9 | 94.3 | 3046 | 2.39 | +5.0pp | 46/31 | 0.110 | 噪声内 |
+| step200 | 63.1±5.5 | 70.5 | 89.6 | 3934 | 1.40 | +1.7pp | 38/33 | 0.635 | 噪声内 |
+| step300 | 65.4±5.4 | 73.8 | 90.6 | 3538 | 1.89 | +4.0pp | 43/31 | 0.201 | 噪声内 |
+| **step400** | **69.8±5.2** | **79.5** | **94.3** | **2970** | 2.44 | **+8.4pp** | 44/19 | **0.002** | **显著（唯一过 Bonferroni）** |
+
+### 结论
+
+1. **本 campaign 内唯一硬结论 = step400：+8.4pp（McNemar p=0.002，净翻转 +25/297）**，也是 4 个检验里唯一通过 Bonferroni(0.0125) 的；BH 校正同样在它之后停止（次小 p=0.110 > 0.05×2/4=0.025）。step100(+5.0pp)/step300(+4.0pp)/step200(+1.7pp) **全在噪声内**。
+2. **不能宣称 ttp0.1 优于 credit 版，也不能宣称它让训练变差**：本次 BASE 读数 **61.4%**，credit campaign 为 **60.1%**（§4.10）——同一个 BASE 两次差 1.3pp ⇒ 档位已变，绝对值不可跨 campaign 比较。形态差异（credit 4/4 全显著、最佳在 step200/300；本 run 1/4 显著、收益出现在 step400）目前只是**待解释的观察**，不是结论。
+3. **checkpoint 之间 1~4pp 的排序一律作废**：四个两两差都落在 ±8.0pp 带内，且单 run 单 seed、checkpoint 间高度相关。"step100 优于 step200/300"不能当结论。
+4. **效率侧首次有读数，且三个读数完全同向**（本轮比 acc 更有信息量的部分）：
+
+| 读法 | 证据 |
+|---|---|
+| 4 个 checkpoint 上 `acc↑ / 平均token↓ / 工具轮数↑` **排序完全同向** | step200 < step300 < step100 < step400（acc 升序）恰好是 token 降序、轮数升序 |
+| **step200 = "少调用 + 长散文"形态** | 轮数最少(1.40) 却 token 最多(+21%)、code 率最低(89.6)、fmt 与 BASE 相同(70.5) —— 与训练 record 的 `B_cut_mid_prose`（散文写满预算）同源；它的"省轮数"**不是**效率改善 |
+| **轮数本身不是目标** | BASE 轮数最多(3.22) 却最差 —— 那些是**无效轮**（晚调用/废调用，`C_wasted`）；目标是"有效调用 + 及时收尾" |
+| 唯一"更准且更省" | **step400**：acc +8.4pp（显著）、token −284(−9%)、code 率并列最高(94.3)、fmt 最高(79.5) |
+
+5. **口径待确认**：「平均token」是 `avg_ans_tokens`（模型自产）还是 `avg_clen`（含工具回包）？eval json 两个都落，**"最少输出 token"的目标口径是前者**，不能混读。
+
+### 对下一步的影响
+
+1. **主模型取 step400**（本轮唯一显著、且唯一把平均 token 压到 BASE 以下的 checkpoint）；不要按 checkpoint 间 1~4pp 的排序选点。
+2. **先核两次 eval 的 `eval_protocol` 四件套**（`gpu_mem` 优先：实测 0.20 vs 0.78 可产生 **7pp** 差异），再决定"能否与 credit 的 69.8% 比较"。
+3. **回答"ttp0.1 有没有用"必须做同 campaign 对照**：把 `native_p4_credit` 的 step200/step300 与本次 step400 放进**同一次评测**（同 BASE / seed / `gpu_mem` / 协议 / `val_n`）。这是 §4.9 验收表里"追加一条 held-out 硬门槛"的执行方式。
+4. **验证结论 4 的假说**（step200 = 少调用多散文）：用新增的 `--dump_traj` 抽 step200 与 step400 各 ~50 条，比**末段 assistant 长度分布**与工具段占 `clen` 的比例。命令与阅读陷阱见 §5「轨迹全量落盘」条。
+
+---
+
 ## 5. 交接备注（避免重复踩坑）
 
 - **`--native_stop_at_call` 的历史定位**：native_p3 在轮数档、1024/round、无 stop 下 invalid ~60%，说明它对旧档是关键协议部件；token-budget 档使用 `P=M=8192` 时不存在人工续写边界，但是否启用 stop 仍必须以 live `run_info.json` 为准，不能从文档猜测。
@@ -713,5 +758,11 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
   已补**三项**诊断能力（`train.py`）：① `_ensure_gen_alive` 报 `exitcode` **并分档**——`-9` 单独一档说明"内核直接终止，任何 handler 都拦不住，没有 traceback 是必然"，给出三条定位命令；其他负信号（`-11/-6/-7/-8/-4`）指向 ② 的栈；`>0` 说明异常退出、traceback 在上方；③ ② 是 `_spawn_gen` 里的 **`faulthandler.enable()`**——**SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL 这类"没有 Python traceback"的死亡其实可以打出 Python 栈 + C 栈**（vLLM 的 CUDA/C++ 层崩溃正属此类），前提是崩溃前已装好 handler；③ `_spawn_gen` 把子进程 stdout/stderr 改**行缓冲**，避免被信号杀死时缓冲区里最后几行（做到哪一题/哪一轮/采样统计）随进程蒸发。
   **重跑必须先 `git pull`**（否则拿不到 exitcode/faulthandler），并用 `bash run.sh 2>&1 | tee /tmp/run.log` 保证栈落盘。
   **关于归因**：`trunc_tail_penalty` 是该 run 相对 credit run 的**唯一配置差异**，但静态审查找不到机制——它只改 advantage/sample_weight 的**值**（经 `requests.post` 上传的数据），不参与生成端任何显存/内存分配；`group_ok` 变宽只会**少重采**、方向与崩溃相反。因此需用 `--trunc_tail_penalty 0` 做**单变量判定实验**：仍崩 → 排除本项；跑过 step 3 → 确认相关、再深挖 `sw`/`group_ok` 链。
-- **当前下一动作**：第一轮信用实验（`native_p4_credit`，~436组）held-out 已确认有效（step200/300 并列 69.8%，Δ+9.7pp，p=0.001/0.002）；主模型取 step200 或 step300。下一步两件事：①补评测端**平均输出 token / 工具轮数**——效率目标尚未证明；②用 `rlab_new/native_p4_trunc` 单变量验证 `trunc_tail_penalty`（§4.9 验收 + acc 不低于 step200/300 的 held-out 硬门槛），不要在同批同时改 overlong。若要对比新旧机制，先把旧 `native_p4/step_400` 放进同一评测 campaign。**②的首跑在 step 1 后遇到生成端静默死亡（见上一条），先按 exitcode/dmesg 定位死因再重跑。**
+- **当前下一动作（2026-10-01 当时；已被 §4.11 取代，保留作历史）**：第一轮信用实验（`native_p4_credit`，~436组）held-out 已确认有效（step200/300 并列 69.8%，Δ+9.7pp，p=0.001/0.002）；主模型取 step200 或 step300。下一步两件事：①补评测端**平均输出 token / 工具轮数**——效率目标尚未证明；②用 `rlab_new/native_p4_trunc` 单变量验证 `trunc_tail_penalty`（§4.9 验收 + acc 不低于 step200/300 的 held-out 硬门槛），不要在同批同时改 overlong。若要对比新旧机制，先把旧 `native_p4/step_400` 放进同一评测 campaign。**②的首跑在 step 1 后遇到生成端静默死亡（见上一条），先按 exitcode/dmesg 定位死因再重跑。**
+- **轨迹与段长落盘（2026-10-02 新增诊断能力，回答"模型到底写了什么"）**：此前 record.jsonl 与 eval per-item **都只有统计**，于是"末段是答题被掐"与"写散文跑飞"在数据里同形（处置相反：前者抬 `answer_reserve`，后者抬 reserve 只会把 B 换成 C）。
+  · **段长进 record**：`rollout` 落 per-sample `segl`（assistant 段长表）/`tsegl`（工具段长表），ok 与 uniform 两个落盘点都带；`python -m rlab.analysis --no-boxed-breakdown <record>` 多出「B 桶末段长度画像」表——按桶给末段 p25/p50/p75 与分箱（`<512/512~1024/1024~2048/≥2048`），并以「有 boxed 成功收尾」的末段长度作**可比标尺**；同表还给出回包实测 token 与 `clen≥0.9cap` 自证列。**读法**：B 行落在 `≥2048`（或 B2 零调用占多数）→ 治啰嗦；B 行集中在 reserve 附近且与「有boxed」p50 同量级 → 才该抬 `answer_reserve`。旧 record 无 `segl` → 表上明说"无法画像"，不造假表（需要重新 rollout）。
+  · **全量文本落盘**：训练加 `--traj_dump` → `<out_dir>/traj.jsonl`；评测加 `--dump_traj`（`eval_vllm_one.py` / `eval_vllm.py` / `rlab.eval` 三条入口都认）→ `<out>.traj.jsonl`。每行**一条轨迹**，**段级** `segs:[{kind,len,text}]` + `status(ok/uniform/overlong/eval)` + `gen_version` + 与 record 同源的计数与 ±1 分数；**含被丢弃的 uniform/overlong attempt**（它们整组不进 record，是记录口径幸存者偏差的主体）。纯观测面，**不进 `run_signature`**（打开它不会让旧 out_dir 变外来签名），可与任何单变量实验同开。体积：训练全量约 40~80MB/run；评测 `val_n=8`、500 题约 56MB/ckpt。
+  · **两个阅读陷阱**：①`traj.jsonl` 是**追加写**，同 `out_dir` 多次 run 会混在一起（按 `gen_version` 回退切会话，或换 out_dir）；②文件里含 `<tool_call>` 一类标签，用 read/控制台看会被渲染成无括号普通词——判字节真伪要逐字符 `ord` 直出，且 **dump 是诊断产物，不要喂回模型**。
+- **当前下一动作（2026-10-02）**：`native_p4_trunc` held-out 出炉，**本 campaign 内只有 step400 显著**（+8.4pp，p=0.002，唯一过 Bonferroni），主模型取 step400。三件事按序做：①核两次 eval 的 `eval_protocol`（`gpu_mem` 优先，实测可差 7pp）；②把 `native_p4_credit` 的 step200/step300 与本次 step400 放进**同一次评测**——这是回答"ttp0.1 有没有用"的唯一方式（跨 campaign 不可比：BASE 61.4 vs 60.1）；③用 `--dump_traj` 抽 step200 vs step400 验"少调用多散文"假说。细节与全部读数见 §4.11。
 - **本地工作区状态**：截断末段信用代码已提交推送；本轮改动涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。
+- **本地工作区状态（2026-10-02 追加）**：两轮诊断能力已提交推送（`f65c62c` B 桶末段长度画像、`62886f6` 轨迹全量落盘），涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[eval.py](rlab/eval.py)、[eval_vllm.py](eval_vllm.py)、[eval_vllm_one.py](eval_vllm_one.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。**新字段/新档位对旧 record 与旧 eval json 一律向后兼容**（缺键按"无该字段"降级，不造假值）。
