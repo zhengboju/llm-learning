@@ -652,6 +652,7 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 - `N=298`（配对 `n=297`）；单臂 95%CI 最坏 `≈±5.7pp`，两臂差 `≈±8.0pp`；
 - 判定规则：CI 不跨 0；有 per-item 时改用 McNemar `p<0.05`；
 - 对 4 个 checkpoint 同时检验 → Bonferroni 阈值 `0.05/4=0.0125`。
+- **档位 = `--val_n 1`（贪心，默认）**：下表出现 `McNemar b/c` 即为此档的签名。采样档（`--val_n 8`）与它**不是同一个测量**，不可并列比较（详见 §4.11 结论 6）。
 
 ### 结果
 
@@ -708,6 +709,7 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 ### 判定口径
 
 - `N=298`（配对 `n=297`）；单臂 95%CI 最坏 `≈±5.7pp`，两臂差 `≈±8.0pp`；判定 = CI 不跨 0，有 per-item 时改用 McNemar `p<0.05`；4 个 checkpoint 同时检验 → Bonferroni `0.0125`。
+- **档位 = `--val_n 1`（贪心，默认）**。表里出现 `McNemar b/c` 本身就是贪心档的签名：`paired_counts` 按 `acc == 1.0` 二值化，只对 val_n=1 有效（[analysis.py](../rlab/analysis.py) 的 `items_are_binary` / `paired_test_auto`）。**采样档（`--val_n 8`：Average@8、temp 1.0/top_p 0.7）与贪心档不是同一个测量**——acc / `both` / 平均token / 工具轮数**全部不可跨档比较**，跨档只能各档内部自成一套表。
 - 数据源：`eval_vllm_one.py`（`--algo retool_math`，per-item 默认落盘）。
 - **欠账补齐**：§4.10「未验证项：效率目标只完成了一半」要求的**平均输出 token / 平均工具轮数**，本轮起进评测表（`avg_ans_tokens` / `avg_clen` / `avg_rounds`）。
 
@@ -735,7 +737,10 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
 | **轮数本身不是目标** | BASE 轮数最多(3.22) 却最差 —— 那些是**无效轮**（晚调用/废调用，`C_wasted`）；目标是"有效调用 + 及时收尾" |
 | 唯一"更准且更省" | **step400**：acc +8.4pp（显著）、token −284(−9%)、code 率并列最高(94.3)、fmt 最高(79.5) |
 
-5. **口径待确认**：「平均token」是 `avg_ans_tokens`（模型自产）还是 `avg_clen`（含工具回包）？eval json 两个都落，**"最少输出 token"的目标口径是前者**，不能混读。
+5. **口径待确认**：「平均token」是 `avg_ans_tokens`（模型自产）还是 `avg_clen`（含工具回包）？eval json 两个都落，**"最少输出 token"的目标口径是前者**，不能混读。（`eval_vllm_one.py` 会把两者分别打印为「平均输出token」与「平均完成长度(含工具回包)」，两者之差 = 回包实测 token：实测 2.05 轮只占 completion 的 **4.8%**（217/4521），再次否掉"工具调用吃掉预算"。）
+6. **档位纪律（2026-10-02 补，来自一次真实的误判险情）**：本节全部读数都是 **贪心（`val_n=1`）**档。后续若用采样档（`val_n=8`）通评，**同一 checkpoint 的读数会整体位移**（实测 s200：贪心/采样两档 acc 相差 10pp 量级、token 也不同），届时应：
+   - 四个臂（BASE + credit200/300 + trunc400）**在同一次、同 `val_n`** 调用里评完，禁止与本节数字并列；
+   - 判定改用**配对均值 z 检验**（`analysis.paired_test_auto` 按 `items_are_binary` 自动分派；`val_n>1` 直接判连续档），**不要再用 McNemar**——按 `acc==1.0` 二值化检验的是"N 条全对率"，p8 事故实测过它会把 −1.5pp 的真实差报成 −4.6pp/p=0.003 的假显著。
 
 ### 对下一步的影响
 
@@ -763,6 +768,7 @@ bash rlab/run_gsm8k.sh retool_math /root/Qwen3.5-4B \
   · **段长进 record**：`rollout` 落 per-sample `segl`（assistant 段长表）/`tsegl`（工具段长表），ok 与 uniform 两个落盘点都带；`python -m rlab.analysis --no-boxed-breakdown <record>` 多出「B 桶末段长度画像」表——按桶给末段 p25/p50/p75 与分箱（`<512/512~1024/1024~2048/≥2048`），并以「有 boxed 成功收尾」的末段长度作**可比标尺**；同表还给出回包实测 token 与 `clen≥0.9cap` 自证列。**读法**：B 行落在 `≥2048`（或 B2 零调用占多数）→ 治啰嗦；B 行集中在 reserve 附近且与「有boxed」p50 同量级 → 才该抬 `answer_reserve`。旧 record 无 `segl` → 表上明说"无法画像"，不造假表（需要重新 rollout）。
   · **全量文本落盘**：训练加 `--traj_dump` → `<out_dir>/traj.jsonl`；评测加 `--dump_traj`（`eval_vllm_one.py` / `eval_vllm.py` / `rlab.eval` 三条入口都认）→ `<out>.traj.jsonl`。每行**一条轨迹**，**段级** `segs:[{kind,len,text}]` + `status(ok/uniform/overlong/eval)` + `gen_version` + 与 record 同源的计数与 ±1 分数；**含被丢弃的 uniform/overlong attempt**（它们整组不进 record，是记录口径幸存者偏差的主体）。纯观测面，**不进 `run_signature`**（打开它不会让旧 out_dir 变外来签名），可与任何单变量实验同开。体积：训练全量约 40~80MB/run；评测 `val_n=8`、500 题约 56MB/ckpt。
   · **两个阅读陷阱**：①`traj.jsonl` 是**追加写**，同 `out_dir` 多次 run 会混在一起（按 `gen_version` 回退切会话，或换 out_dir）；②文件里含 `<tool_call>` 一类标签，用 read/控制台看会被渲染成无括号普通词——判字节真伪要逐字符 `ord` 直出，且 **dump 是诊断产物，不要喂回模型**。
+- **评测档位（`--val_n`）必须与结论绑定（2026-10-02 险情）**：`--val_n` 默认 **1（贪心）**；`--val_n>1` 是 Average@N 采样档（temp 1.0/top_p 0.7），**同一 checkpoint 的 acc / `both` / 平均token / 工具轮数在两道之间整体位移**（实测 s200 两档 acc 差 10pp 量级）。踩点在于：历史上所有表都忘了记这一列，于是"同名的 step200" 会被当成同一个数比较。配套两条：①**一次评测内档位必须统一**（别一套表里混贪心与采样），四个臂一起评；②`McNemar b/c` 只属于贪心档——采样档由 `analysis.paired_test_auto` 自动改走配对均值 z 检验，若汇总表仍印 b/c，就是档位没被识别（查 per-item 的 `val_n` 字段）。
 - **当前下一动作（2026-10-02）**：`native_p4_trunc` held-out 出炉，**本 campaign 内只有 step400 显著**（+8.4pp，p=0.002，唯一过 Bonferroni），主模型取 step400。三件事按序做：①核两次 eval 的 `eval_protocol`（`gpu_mem` 优先，实测可差 7pp）；②把 `native_p4_credit` 的 step200/step300 与本次 step400 放进**同一次评测**——这是回答"ttp0.1 有没有用"的唯一方式（跨 campaign 不可比：BASE 61.4 vs 60.1）；③用 `--dump_traj` 抽 step200 vs step400 验"少调用多散文"假说。细节与全部读数见 §4.11。
 - **本地工作区状态**：截断末段信用代码已提交推送；本轮改动涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。
 - **本地工作区状态（2026-10-02 追加）**：两轮诊断能力已提交推送（`f65c62c` B 桶末段长度画像、`62886f6` 轨迹全量落盘），涉及 [config.py](rlab/config.py)、[rollout.py](rlab/rollout.py)、[train.py](rlab/train.py)、[analysis.py](rlab/analysis.py)、[eval.py](rlab/eval.py)、[eval_vllm.py](eval_vllm.py)、[eval_vllm_one.py](eval_vllm_one.py)、[test_retool_cpu.py](rlab/tests/test_retool_cpu.py)、[test_smoke_cpu.py](rlab/tests/test_smoke_cpu.py) 与本文档。**新字段/新档位对旧 record 与旧 eval json 一律向后兼容**（缺键按"无该字段"降级，不造假值）。
