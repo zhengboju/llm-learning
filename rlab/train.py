@@ -1197,6 +1197,16 @@ def main():
     # 放大更新预算不需要改 config 源码——preset 默认值仍是 3B 时代标定。
     ap.add_argument("--lr", type=float, default=None,
                     help="覆盖学习率（preset 默认 1e-6；4B 加杠杆建议 5e-6）")
+    # 【2026-10-03 补 CLI 入口】GAS 此前只能改 config 源码，而它是 dose 三件套之一：
+    # 有效 batch = micro_batch(=num_pre_Q) × GAS 条/更新，参考实现为 8 题×8 条=64，
+    # 本项目 preset 停在 4（=32 条/更新，见 config.BASE 注释与 docs/08 §5.2）。
+    # ⚠ all_steps 计的是 micro-step：抬 GAS 会按比例压低更新次数（600/4=150 →
+    # 600/8=75）。要维持更新预算必须同比放大 --steps（docs/08 §5.2「只抬 GAS 不放大
+    # all_steps 是反向操作」）。不改微批契约（仍 num_pre_Q 行）、不改显存。
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=None,
+                    help="梯度累积步数（preset/BASE 默认 4）：每次 optimizer 更新前攒 "
+                         "几个上传批。有效 batch = num_pre_Q × 该值 条/更新。"
+                         "抬它需同比放大 --steps，否则只是减少更新次数")
     ap.add_argument("--beta", type=float, default=None,
                     help="覆盖 KL 锚系数（preset 默认 0.04；放松建议 0.01）")
     ap.add_argument("--overlong_shaping", action="store_true",
@@ -1362,6 +1372,8 @@ def main():
     if args.optim_8bit: overrides["optim_8bit"] = True
     if args.attn_implementation: overrides["attn_implementation"] = args.attn_implementation
     if args.lr is not None: overrides["lr"] = args.lr
+    if args.gradient_accumulation_steps is not None:
+        overrides["gradient_accumulation_steps"] = args.gradient_accumulation_steps
     if args.beta is not None: overrides["beta"] = args.beta
     if args.overlong_shaping: overrides["overlong_shaping"] = True
     if args.trunc_shaping is not None: overrides["trunc_shaping"] = args.trunc_shaping
