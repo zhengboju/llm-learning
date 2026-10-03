@@ -498,6 +498,20 @@ def _char_aligned_span(tokenizer, ids_a, ids_b, width: int = 60):
 _RENDER_TOLERANCE_WARNED = False
 
 
+class PromptMismatchError(ValueError):
+    """校验①（模板重渲染 vs 拼接流文本不同源）专用异常——ValueError 子类。
+
+    【为什么单列一个类型】校验① 的触发分两类，处置不同：
+      · **采样随机事件**（事故 C/D：模型偶发吐出协议外字节）——稀有、单点，
+        值得"丢本题重采"而不是中断整场训练（rollout 里按类型分流）；
+      · **系统性档位事故**（tools/ctkw 不一致、模板改写历史）——每组必现，
+        即使被跳过档接住，也会把窗口丢弃率冲顶 → discard_abort / 零产出熔断
+        （config 默认 0.90 / 6 轮）照样终止训练，与 fail-fast 等价但留下完整计数。
+    校验②③④（占位边界不可定位 / observation 污染历史 / 回包被吞）是**确定性**
+    的模板行为事故——与采样内容无关、每组必现——保持裸 ValueError，rollout
+    依旧包成 RuntimeError 上抛，不进跳过档。"""
+
+
 def build_next_prompt(tokenizer, messages_before_assistant: list,
                       previous_prompt_tokens: list, completion_tokens: list,
                       next_tool_message: dict,
@@ -607,7 +621,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
                         "拒跑）。\n")
             except Exception:
                 pass
-            raise ValueError(
+            raise PromptMismatchError(
                 "[protocol] 模板渲染的 prompt 与生成端实际喂给 vLLM 的 token 不一致"
                 f"（长度 {len(canonical_prompt)} vs {len(prev)}，首个分歧位 {_i}）；"
                 f"且**解码文本也不同**（不只是分词/空白差异）→ 真的不同源。\n"

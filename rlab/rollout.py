@@ -47,6 +47,7 @@ from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.model_loading import load_causal_lm, resolve_load_config
 from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON,
+                           PromptMismatchError,
                            RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
                            TOOL_END, TOOL_START, assert_native_sampling_ban,
                            build_next_prompt, encode_batch,
@@ -569,7 +570,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                    # 【2026-10-02】"预算耗尽时正处在未写完的调用块里"（见
                    # trunc_in_call_flag）：A 桶（trunc∩invalid）在 token 档恒 0，
                    # 没有这个字段就无法把"调用写到一半被墙切"从 B 桶里分出来。
-                   "trunc_in_call": 0, "err_types": []}
+                   "trunc_in_call": 0, "err_types": [],
+                   # 【2026-10-03 校验① 跳过档】本条轨迹是否因 PromptMismatchError
+                   # 被终止（事故 C/D 类采样随机事件）；collect_retool_group 见到
+                   # 非零即整题丢弃（status="proto_mismatch"），不进训练。
+                   "proto_mismatch": 0}
                   for _ in range(n)]
     # 【2026-09-29 token 预算档·续写缓冲】"一次生成"与"一个 assistant 轮"在这一档
     # 下解耦：被单轮上限切断（finish_reason=length）时该轮**没有结束**，累积进
@@ -766,9 +771,24 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                 try:
                     nxt = build_next_prompt(tokenizer, msgs_before, turn_ctx[i],
                                             comp_ids, obs_msg, ctkw)
+                except PromptMismatchError as e:
+                    # 【2026-10-03 校验① 跳过档】文本不同源若是**采样随机事件**
+                    # （事故 C/D 类：模型偶发吐出协议外字节），中断整场训练太贵
+                    # （真机：step 130/5.3h 处 abort）。改为：本条轨迹立即终止
+                    # （不进下一轮、不进训练），本题整组由 collect_retool_group
+                    # 丢弃重采。事件全文打印留证（稀有，负担得起）。
+                    # 若是**系统性**事故（tools/ctkw 档不一致），每组都会走到这里
+                    # → 窗口丢弃率冲顶 → discard_abort/零产出熔断（config 默认
+                    # 0.90/6 轮）照样终止训练——随机事件被跳过、系统性事故仍死。
+                    code_stats[i]["proto_mismatch"] += 1
+                    print(f"[rollout] 校验① 不同源（样本 {i}，第 {len(segs[i])} 段）"
+                          f"→ 本条轨迹终止、本题整组丢弃重采（proto_mismatch "
+                          f"累计 {sum(c.get('proto_mismatch', 0) for c in code_stats)} "
+                          f"次）。事件全文：\n{e}", flush=True)
+                    continue
                 except ValueError as e:
-                    # 【不静默降级】模板行为异常是协议级问题，继续跑会产出成批错位
-                    # 序列并把整轮实验作废——当场抛，留下可排查的错（docs/09 §3）。
+                    # 【不静默降级】校验②③④（占位边界/历史改写/回包被吞）是确定性
+                    # 模板事故——当场抛，留下可排查的错（docs/09 §3）。
                     raise RuntimeError(
                         f"[rollout] 原生协议 token 增量拼接失败（样本 {i}，第 "
                         f"{len(segs[i])} 段）：{e}") from e
@@ -1335,10 +1355,12 @@ def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
     ——消毒后的纯回包（含 `[etype]` 错误前缀与 `[budget]` 额度行，若开了 hint）。
     两者都由 `len` 给出 token 数（`text` 的长度含包装，别拿它当回包大小）。
 
-    `status` 三态：ok（已上传）/ uniform（零方差丢弃）/ overlong（轨迹超长丢弃）。
-    后两类整组不进 record.jsonl——dump 含它们才治得了记录口径的幸存者偏差
+    `status` 四态：ok（已上传）/ uniform（零方差丢弃）/ overlong（轨迹超长丢弃）
+    / proto_mismatch（校验① 采样随机事件终止轨迹，整组丢弃，2026-10-03）。
+    后三类整组不进 record.jsonl——dump 含它们才治得了记录口径的幸存者偏差
     （record 只看得见"活下来的组"）。计数类与 record 同源（同一个 code_stats），
-    acc/fmt 是 ±1 奖励原值；overlong 分支没打分 → None（不写 0 冒充"全错"）。
+    acc/fmt 是 ±1 奖励原值；overlong/proto_mismatch 分支没打分 → None（不写 0
+    冒充"全错"）。
 
     ⚠ 阅读路径：dump 里含调用标记，用 read/控制台看会被渲染成无括号普通词——
     判字节真伪要逐字符 ord 直出（AGENTS.md 标签铁律）。"""
@@ -1371,7 +1393,8 @@ def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
 def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                          inputs, prompts_text, prompt_ids, plen,
                          sampling_params, steps_elapsed=0, verify_logps=None,
-                         prompts_messages=None, traj_sink=None):
+                         prompts_messages=None, traj_sink=None,
+                         code_runner=None):
     """多轮 rollout → 打分 → 按题拆分的上传就绪结果（模块级，FakeGen CPU 可测）。
 
     【2026-09-10 结构修改·采样并发与按题拆分】一次调用处理 len(inputs) 道题
@@ -1385,7 +1408,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     sampling_params: 与 Q*num_pre_Q 条轨迹等长的列表（gen_worker 构造，每条
       独立 seed；拆出来是为了让本函数不依赖 vllm import，FakeGen 可直接测）。
 
-    返回 per-question list，每项 {"status": "ok"|"uniform"|"overlong"}；
+    返回 per-question list，每项 {"status": "ok"|"uniform"|"overlong"|
+    "proto_mismatch"}——proto_mismatch = 校验① 采样随机事件（事故 C/D 类）
+    终止了本题至少一条轨迹，整组丢弃重采（不教调度器拉黑，与题目难度无关）；
     ok 项另含 merged/mask/gen_logps/adv/acc/fmt/cu/ck/phase/clen/trunc/plen
     与段长画像 segl（assistant 段长表）/tsegl（工具段长表）——两者 per-sample、
     与 acc/fmt 同下标对齐（2026-10-02）。
@@ -1427,7 +1452,8 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     use_vllm_logps = bool(cfg.get("vllm_gen_logps"))
     segs, _full_texts, code_stats = multi_turn_rollout_group(
         vllm_gen, sampling_params, tokenizer, group_prompts, cfg,
-        collect_logps=use_vllm_logps, prompts_messages=prompts_messages)
+        collect_logps=use_vllm_logps, prompts_messages=prompts_messages,
+        code_runner=code_runner or run_code)
     asst_texts = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                   for segs_i in segs]
     results = []
@@ -1469,6 +1495,14 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                     acc=None if acc_list is None else float(acc_list[j]),
                     fmt=None if fmt_list is None else float(fmt_list[j])))
 
+        # 【2026-10-03 校验① 跳过档】任一轨迹被 PromptMismatchError 终止 →
+        # 本题**整组**丢弃（num_pre_Q 契约不允许训练缺条的组）。这是采样随机
+        # 事件的处置位（事故 C/D 类）；系统性事故的出口在窗口丢弃率熔断
+        # （gen_worker 的 discard_abort），不在这里。
+        if any(cs.get("proto_mismatch") for cs in code_stats[i * n:(i + 1) * n]):
+            _sink("proto_mismatch")
+            results.append({"status": "proto_mismatch"})
+            continue
         # 逐样本全长预算检查（按题：单题超长不再连坐其他题，2026-09-10）。
         # plen_i 为真实 prompt 长——旧版用批内最长（含 pad）会把 pad 宽度算进
         # 每个样本的 token 预算，单题超长判定偏严。
@@ -2197,7 +2231,7 @@ def gen_worker(Q, cfg: dict):
     uploaded_total = 0
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
     samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0,
-                  "prompt_overlong": 0}
+                  "prompt_overlong": 0, "proto_mismatch": 0}
     _pad_logged = [False]   # 剥左 pad 的可见性只打一次（见 retool 分支）
     # 题目级调度两条路径（2026-09-10 重构）：
     # - 队列路径（gen_questions_per_attempt>1，当前仅 retool_math）：QuestionScheduler
@@ -2348,6 +2382,12 @@ def gen_worker(Q, cfg: dict):
                         # → 模型整体变长时采样主循环无限空转。见 QuestionScheduler.report。
                         if sched is not None:
                             sched.report(q, "overlong", count_overlong=_count_ov)
+                    elif res["status"] == "proto_mismatch":
+                        # 【2026-10-03 校验① 跳过档】采样随机事件（事故 C/D 类），
+                        # 与题目难度无关——**不回填调度器**（不累计 streak、不拉黑，
+                        # 题随下次 refill 自然回池）。计数单列：它若开始增长就是
+                        # 新的协议类 bug 在敲门，应当场可见而不是混进"其他"。
+                        samp_stats["proto_mismatch"] += 1
                     else:
                         if sched is not None:
                             sched.report(q, "ok")
@@ -2443,7 +2483,8 @@ def gen_worker(Q, cfg: dict):
                   f"：attempts={attempts} 全部被丢弃"
                   f"（uniform={samp_stats['uniform']} "
                   f"trajectory_overlong={samp_stats['overlong']} "
-                  f"prompt_overlong={samp_stats['prompt_overlong']}）",
+                  f"prompt_overlong={samp_stats['prompt_overlong']} "
+                  f"proto_mismatch={samp_stats['proto_mismatch']}）",
                   flush=True)
             if _zy_limit and zero_yield >= _zy_limit:
                 raise RuntimeError(
@@ -2451,7 +2492,8 @@ def gen_worker(Q, cfg: dict):
                     f"  累计 attempts={samp_stats['attempts']} "
                     f"uniform={samp_stats['uniform']} "
                     f"trajectory_overlong={samp_stats['overlong']} "
-                    f"prompt_overlong={samp_stats['prompt_overlong']}"
+                    f"prompt_overlong={samp_stats['prompt_overlong']} "
+                    f"proto_mismatch={samp_stats['proto_mismatch']}"
                     f" uploaded={uploaded_total}\n"
                     f"  最常见根因：预算不自洽/模型长度膨胀 → overlong 全丢"
                     f"（查 config.validate_retool_budget、record 的 clen/trunc_final 分布）；"
@@ -2464,6 +2506,7 @@ def gen_worker(Q, cfg: dict):
             _a = samp_stats["attempts"]
             _u, _o = samp_stats["uniform"], samp_stats["overlong"]
             _po = samp_stats["prompt_overlong"]
+            _pm = samp_stats["proto_mismatch"]
             # 总丢弃以 attempts-uploaded 为唯一真值；原因项只负责归因。旧版用
             # uniform+overlong 当总数，native_p4 因 prompt 超限 20 次把 20.7% 低报成
             # 16.4%。other 始终打印，未来增加新丢弃分支时不会再静默少算。
@@ -2475,7 +2518,8 @@ def gen_worker(Q, cfg: dict):
                         else sum(1 for v in q_stat.values() if v > 0))
             print(f"[rollout] 采样统计: 累计尝试 {_a} 次 / 有效上传 {uploaded_total} 组"
                   f"（真实丢弃率 {_discarded / max(1, _a) * 100:.0f}% = "
-                  f"零方差 {_u} + 轨迹超长 {_o} + prompt超限 {_po} + 其他 {_other}；"
+                  f"零方差 {_u} + 轨迹超长 {_o} + prompt超限 {_po} + "
+                  f"协议校验 {_pm} + 其他 {_other - _pm}；"
                   f"题目过滤中 {_skipped}/{len(QAs)} 题被跳过）"
                   # 【2026-10-02】轨迹落盘量只在本档开启时附加（关闭时该行逐字不变，
                   # 既有日志断言不受影响）；跳过行数非 0 = 落盘有损，必须可见。

@@ -26,6 +26,7 @@ from rlab.config import (BASE, NATIVE_PROTOCOL_DEFAULTS, TOOL_PROTOCOLS,
 from rlab.losses import compute_loss
 from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_STYLE_FUNCTION,
                            NATIVE_STYLE_JSON, NATIVE_STYLES,
+                           PromptMismatchError,
                            TOOL_NAME, _RE_TOOL_CALL_ANY, _TOOL_CLOSE, _TOOL_OPEN,
                            assert_native_sampling_ban, build_next_prompt,
                            derive_tool_style,
@@ -852,14 +853,19 @@ def test_p2d_special_token_leak_guard():
     字节被 **.text 丢弃**。non-special added token（tool_response 等）两侧文本
     一致，被文本判据天然容忍，无需禁言。
 
-    本组锁死六件事：
-      ① 事故复现：prev 含 special id、消息文本缺它 → 校验① 必 raise；
+    本组锁死八件事：
+      ① 事故复现：prev 含 special id、消息文本缺它 → 校验① 必 raise
+         （且异常类型 = PromptMismatchError，rollout 跳过档的分流凭据）；
       ② 报错带事故 D 分流提示（且事故 C 提示**不**误报——窗口里没有 </think>）；
       ③ 对照：消息文本**保住**了 special 文本（literal 路径）→ 文本一致、放行；
       ④ 禁言派生本体：special=True 且非 eos 才进清单；无 added_tokens_decoder
          的老桩 → 空清单（向后兼容）；
       ⑤ 入口断言扩展：传 tokenizer 时缺 special 禁言 → raise；
-      ⑥ 三处接线源码锁（bad_words 必须带 native_special_ban_words 派生）。
+      ⑥ 三处接线源码锁（bad_words 必须带 native_special_ban_words 派生）；
+      ⑦ 跳过档（multi_turn 级）：校验① 随机事件 → 本条轨迹终止、其余照常、
+         不中断（事故 C/D 的训练期处置）；
+      ⑧ 跳过档（collect 级）：proto 题整组 proto_mismatch 丢弃、ok 题不受影响、
+         轨迹 dump 覆盖 proto 组、gen_worker 计数接线。
     """
     print("[P2d] special token 禁言：事故 D 复现 + 派生/断言扩展 + 三处接线")
     from types import SimpleNamespace as _NS
@@ -893,6 +899,10 @@ def test_p2d_special_token_leak_guard():
     except ValueError as e:
         check("事故 D 复现：采样混入 special token 被 .text 丢弃 → round-2 校验① 必 raise",
               "不同源" in str(e))
+        # 异常类型锁：rollout 的跳过档按 PromptMismatchError 分流——类型退化回
+        # 裸 ValueError 会让跳过档失效（退回 RuntimeError 中断训练）。
+        check("校验① 抛 PromptMismatchError 子类（rollout 跳过档的分流凭据）",
+              isinstance(e, PromptMismatchError))
         # ② 分流提示：命中事故 D 且**不**误报事故 C（窗口里没有 </think>——
         # 窗口级判据锁死的就是这个：旧的全序列检查在 et=False 档恒真误报）
         check("报错带事故 D 分流提示（指向 special 禁言派生）",
@@ -941,6 +951,105 @@ def test_p2d_special_token_leak_guard():
           "native_special_ban_words(tokenizer)" in ev)
     check("probe_difficulty 接线：bad_words 带 special 禁言派生（探针与训练同档）",
           "native_special_ban_words(tokenizer)" in pd_)
+
+    # ---- ⑦ 校验① 跳过档（multi_turn 级）：采样随机事件 → 本条终止、不中断 ----
+    # 模拟事故 D 的 text/ids 不对称：token_ids 里多一个 special id（MockTok.decode
+    # 渲染为 "\x00{id}"），text 里没有（= vLLM skip_special_tokens 的效果）。
+    cfg7 = {"max_rounds": 3, "max_context_tokens": 8192,
+            "round_gen_tokens": 64, "sandbox_timeout": 1.0, "sandbox_mem_mb": 64,
+            "tool_result_max_chars": 200, "tool_protocol": "native",
+            "native_tool_style": "auto", "sandbox_workers": 1,
+            "system_prompt": "SYS"}
+
+    def _fake_run7(code, timeout=None, mem_mb=None, max_chars=None):
+        return {"ok": True, "display": "42", "error_type": None}
+
+    class _PC:
+        """text/ids 不对称的 completion 桩（事故 C/D 的采样侧形态）。"""
+        def __init__(self, text, poison=False):
+            self.text = text
+            self.token_ids = t.encode(text) + ([MockTok.IM_START] if poison else [])
+            self.finish_reason = "stop"
+
+    class _PO:
+        def __init__(self, text, poison=False):
+            self.outputs = [_PC(text, poison)]
+
+    class _PFakeGen:
+        def __init__(self, rounds):
+            self.rounds, self.r, self.seen = rounds, 0, []
+
+        def generate(self, prompts, sps, use_tqdm=False):
+            self.seen.append([list(p["prompt_token_ids"]) for p in prompts])
+            texts = self.rounds[self.r]
+            self.r += 1
+            assert len(texts) == len(prompts), \
+                f"第{self.r}轮：回放 {len(texts)} 条但收到 {len(prompts)} 个 prompt"
+            return [_PO(*x) if isinstance(x, tuple) else _PO(x) for x in texts]
+
+    _call7 = "think\n" + _json_form("print(6*7)")
+    _ans7 = "the answer is \\boxed{42}"
+    # 4 条：s0 两轮都调用（第 2 轮回填时校验① 必触发）；s1/s3 直接答；s2 调用后答。
+    fg7 = _PFakeGen([
+        [("p0 " + _call7, True), _ans7, _call7, _ans7],   # round 1：4 条
+        [_call7, _ans7],                                  # round 2：active={s0,s2}
+    ])
+    segs7, _f7, cs7 = multi_turn_rollout_group(
+        fg7, [_SPStub(list(NATIVE_BAD_WORDS) + native_special_ban_words(t))
+              for _ in range(4)], t, ["P"] * 4, cfg7,
+        code_runner=_fake_run7,
+        prompts_messages=prompt_messages_for([{"Q": "Q1"}], cfg7) * 4)
+    check("跳过档：校验① 随机事件不再中断 rollout（不 raise）", True)
+    check("跳过档：触发样本 proto_mismatch=1，其余为 0",
+          [c["proto_mismatch"] for c in cs7] == [1, 0, 0, 0])
+    check("跳过档：触发样本立即终止（第 3 轮不再生成）", len(fg7.seen) == 2)
+    check("跳过档：其余样本轨迹结构不受影响",
+          [s["kind"] for s in segs7[1]] == ["assistant"]
+          and [s["kind"] for s in segs7[2]] == ["assistant", "tool", "assistant"]
+          and [s["kind"] for s in segs7[3]] == ["assistant"])
+    check("跳过档：触发样本保留部分段（a,tool,a——诊断落盘用）",
+          [s["kind"] for s in segs7[0]] == ["assistant", "tool", "assistant"])
+
+    # ---- ⑧ 校验① 跳过档（collect 级）：proto 题整组丢弃、ok 题不受影响 ----
+    from rlab.rollout import collect_retool_group
+    cfg8 = get_config("retool", use_wandb=False)
+    cfg8["tool_protocol"] = "native"
+    cfg8["max_traj_tokens"] = 0          # 轮次档（非 token 预算档），行为确定
+    cfg8["sandbox_workers"] = 1
+    qs8 = [{"Q": "q0", "A": "72"}, {"Q": "q1", "A": "72"}]
+    _pm8 = prompt_messages_for(qs8, cfg8)
+    ptext8, pids8, plen8 = build_prompt_batch(qs8, cfg8, t, prompts_messages=_pm8)
+    _a_ok8, _a_bad8 = "the answer is \\boxed{72}", "the answer is \\boxed{1}"
+    fg8 = _PFakeGen([
+        [("p0 " + _call7, True), _a_ok8, _call7, _a_bad8,   # q0 ×4（s0 会触发）
+         _a_ok8, _a_bad8, _a_ok8, _a_bad8],                 # q1 ×4（对错混合 → 有梯度）
+        [_call7, _a_ok8],                        # round 2：active={q0s0, q0s2}
+    ])
+    gl8 = []
+
+    def _gl8(merged, plen_):
+        gl8.append(merged.shape[0])
+        return torch.zeros(merged.shape[0], merged.shape[1] - plen_)
+
+    sink8 = []
+    res8 = collect_retool_group(
+        fg8, t, cfg8, _gl8, qs8, ptext8, pids8, plen8,
+        [_SPStub(list(NATIVE_BAD_WORDS) + native_special_ban_words(t))
+         for _ in range(8)],
+        steps_elapsed=0, prompts_messages=_pm8, traj_sink=sink8,
+        code_runner=_fake_run7)
+    check("collect 级：proto 题整组 proto_mismatch（不含上传字段）",
+          res8[0]["status"] == "proto_mismatch" and "merged" not in res8[0])
+    check("collect 级：同批 ok 题不受影响（gen_logps 只为 ok 题算一次）",
+          res8[1]["status"] == "ok" and gl8 == [4])
+    check("collect 级：轨迹 dump 覆盖被丢弃的 proto 组（4 proto + 4 ok）",
+          len(sink8) == 8
+          and sum(1 for r in sink8 if r["status"] == "proto_mismatch") == 4
+          and sum(1 for r in sink8 if r["status"] == "ok") == 4)
+    # gen_worker 接线（源码锁）：状态分支 + 计数初始化 + 采样统计可见
+    check("gen_worker 接线：proto_mismatch 计数分支 + samp_stats 初始化",
+          '"proto_mismatch": 0' in ro and 'res["status"] == "proto_mismatch"' in ro
+          and "协议校验" in ro)
 
 
 # =====================================================================
