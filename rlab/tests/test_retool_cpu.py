@@ -5612,6 +5612,14 @@ def test_gen_death_diagnostics():
           _sp.index("HUP={") < _sp.index("_signal.SIG_IGN"))
     check("HUP 定档在 register 之前（register 捕到的 previous 必须是 IGN）",
           _sp.index("_signal.SIG_IGN") < _sp.index("faulthandler.register"))
+    check("train 侧 spawn 前也定档 HUP=SIG_IGN（不依赖 launcher，防第三方库顶掉 IGN）",
+          "_hup_disp" in src and "signal.signal(signal.SIGHUP, signal.SIG_IGN)" in src)
+    check("train 侧取证打印在定档之前（打印的是继承到的值，不是自己刚设的）",
+          src.index('_hup_disp("spawn 生成端之前")')
+          < src.index("signal.signal(signal.SIGHUP, signal.SIG_IGN)"))
+    check("生成端 spawn 在 train 侧定档之后（exec 保留的才是 IGN）",
+          src.index("signal.signal(signal.SIGHUP, signal.SIG_IGN)")
+          < src.index("gen_proc.start()"))
     print()
 
 

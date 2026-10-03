@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import time
 
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -515,11 +516,33 @@ _SIG_NAMES = {1: "SIGHUP", 2: "SIGINT", 4: "SIGILL", 6: "SIGABRT", 7: "SIGBUS",
 _FAULT_SIGNALS = frozenset({4, 6, 7, 8, 11, 31})   # faulthandler.enable() 覆盖集(Linux)
 
 
+def _hup_disp(tag):
+    """【2026-10-03 取证】打印当前进程 SIGHUP 的处置。
+
+    以 /proc/self/status 的 SigCgt/SigIgn 为准：`signal.getsignal()` 读不到
+    C 级库用 sigaction() 装的 handler（会给出过时的快照值），2026-10-03 的排查
+    就因此一度走偏。ignored=1 ⇔ nohup/显式 IGN 生效；caught=1 ⇔ 有库装了 handler
+    ——而 spawn = fork+exec **只保留 IGN**（handler 会被复位成 SIG_DFL），
+    所以这两行直接决定生成端出生时是"免疫"还是"DFL"。
+    """
+    try:
+        st = {ln.split(":", 1)[0]: ln.split(":", 1)[1].strip()
+              for ln in open("/proc/self/status")
+              if ln.startswith(("SigCgt", "SigIgn"))}
+        c, i = int(st["SigCgt"], 16) & 1, int(st["SigIgn"], 16) & 1
+    except (OSError, KeyError, ValueError):
+        print(f"[sig] {tag}: HUP 处置不可读（非 Linux？）", flush=True)
+        return None
+    print(f"[sig] {tag}: HUP caught={c} ignored={i}", flush=True)
+    return c, i
+
+
 def run_training(cfg, args):
     import deepspeed
     from transformers import AutoTokenizer   # 模型加载收口到 rlab.model_loading
 
     deepspeed.init_distributed()
+    _hup_disp("run_training 入口（imports + init_distributed 之后）")
 
     # rank0 在 spawn 出 gen worker 之后再加载训练模型，避免 fork 时的 CUDA 上下文污染
     gen_proc = None
@@ -531,6 +554,12 @@ def run_training(cfg, args):
         print("\n[train] START vLLM generation worker...\n")
         mp.set_start_method("spawn", force=True)
         Q = mp.Queue()
+        # 【2026-10-03 定档】spawn=fork+exec 只保留 IGN，所以生成端出生时的 HUP
+        # 处置跟着这里走：显式定成 IGN 就不再依赖 launcher（nohup/setsid），也不怕
+        # 第三方库在 spawn 之前把继承来的 IGN 顶掉——2026-10-02/03 两次"只有生成端
+        # 被 HUP 打死"的事故即此。取证打印放在改动之前（继承到的值才是证据）。
+        _hup_disp("spawn 生成端之前")
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         gen_proc = mp.Process(target=_spawn_gen, args=(Q, cfg), daemon=True)
         gen_proc.start()
 
