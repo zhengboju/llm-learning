@@ -51,7 +51,8 @@ from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            TOOL_END, TOOL_START, assert_native_sampling_ban,
                            build_next_prompt, encode_batch,
                            extract_python_blocks, initial_messages, make_call_id,
-                           make_bytes_list, parse_assistant, render_chat_ids,
+                           make_bytes_list, native_special_ban_words,
+                           parse_assistant, render_chat_ids,
                            sanitize_tool_text, segment_mask_from_spans,
                            tensor_to_bytes, tool_message,
                            # 【2026-10-02 trunc_in_call】调用块的开/闭标记**从协议
@@ -545,10 +546,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     if style not in ("auto", NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON):
         raise ValueError(f"[rollout] 未知 native_tool_style={style!r}（可选 auto/"
                          f"{NATIVE_STYLE_FUNCTION}/{NATIVE_STYLE_JSON}）")
-    # 假 </think> 禁言 fail-fast（事故 C，docs/09 §10.6.3）：缺禁言时"会不会炸
-    # 校验①"是随机事件（哪一条采样在第几步吐出 </think>），真机形态是运行几十
-    # 步后 abort——入口断言把失败提前到第 1 组之前。
-    assert_native_sampling_ban(sampling_params)
+    # 假 </think> + special token 禁言 fail-fast（事故 C/D，docs/09 §10.6.3/§10.6.4）：
+    # 缺禁言时"会不会炸校验①"是随机事件（哪一条采样在第几步吐出 </think> 或
+    # special token），真机形态是运行几十/上百步后 abort——入口断言把失败提前到
+    # 第 1 组之前。传 tokenizer = 连 special 禁言一起查（事故 D）。
+    assert_native_sampling_ban(sampling_params, tokenizer)
     budget = int(cfg.get("max_context_tokens", 8192))
     max_rounds = int(cfg.get("max_rounds", 5))
     max_code_calls = max(0, max_rounds - 1)      # 末轮不许执行代码（发现3）
@@ -2142,7 +2144,11 @@ def gen_worker(Q, cfg: dict):
                     "[rollout] 原生协议需要 SamplingParams.bad_words（禁言假 "
                     f"{NATIVE_BAD_WORDS[0]}，docs/09 §10.6.3），当前 vLLM 版本的 "
                     "SamplingParams 没有该字段——升级 vLLM 或回退 fence 档。")
-            kw["bad_words"] = list(NATIVE_BAD_WORDS)
+            # 【事故 D（docs/09 §10.6.4）】special=True 的 added token（im_start/
+            # endoftext/vision 系，除 eos）同样必须禁言：模型偶发在内容里采样出
+            # 它们，vLLM .text 会静默丢弃（token_ids 保留）→ 下一轮校验① 必炸。
+            kw["bad_words"] = (list(NATIVE_BAD_WORDS)
+                               + native_special_ban_words(tokenizer))
         elif cfg.get("retool_stop"):
             kw.update(_RETOOL_STOP_KWARGS)
         if _use_vllm_logps:

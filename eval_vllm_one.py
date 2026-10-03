@@ -382,7 +382,8 @@ prompts = [_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw, tools=_tool
            for item in sample]
 # 原生档的多轮 messages（与 prompt 渲染同源；协议分支要它，围栏档不需要）
 from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
-                           initial_messages as _initial_messages)
+                           initial_messages as _initial_messages,
+                           native_special_ban_words)
 _prompt_msgs = ([_initial_messages(system_prompt, it["Q"]) for it in sample]
                 if _native else None)
 # fail-fast：请求关思考但模板没响应（如 transformers 版本行为变化），立刻告警
@@ -623,10 +624,12 @@ if is_retool_family:
     if _native:
         _stop = ({"stop": [NATIVE_CALL_STOP], "include_stop_str_in_output": True}
                  if _rcfg.get("native_stop_at_call") else {})
-        # 假 </think> 禁言（事故 C，docs/09 §10.6.3）：与训练同口径——采样内容
-        # 混入 </think> 会让续写的校验① 必炸；eval 的多轮走同一 build_next_prompt。
+        # 假 </think> + special token 禁言（事故 C/D，docs/09 §10.6.3/§10.6.4）：
+        # 与训练同口径——采样内容混入 </think> 或 special token 会让续写的校验①
+        # 必炸；eval 的多轮走同一 build_next_prompt。
         # 只限原生档：围栏档的格式契约要求模型自己写 </think>，绝不能禁。
-        _bad = {"bad_words": list(NATIVE_BAD_WORDS)}
+        _bad = {"bad_words": list(NATIVE_BAD_WORDS)
+                + native_special_ban_words(tokenizer)}
     else:
         _stop = dict(_STOP_KW) if _rcfg.get("retool_stop") else {}
         _bad = {}

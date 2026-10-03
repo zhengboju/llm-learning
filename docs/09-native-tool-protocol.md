@@ -1034,6 +1034,56 @@ round-2 校验① 必 raise 且带分流提示）；对照（不含 `</think>` �
 > stop 串同一哲学：**在采样端把协议外的字节禁掉**，比在比对端"认识"它们便宜得多、
 > 也安全得多。
 
+### 10.6.4 事故 D（2026-10-03）：采样内容混入 special token → 被 vLLM `.text` 丢弃 → 校验① 上百步后 abort
+
+**真机报错形态**（retool_math，step 130，样本 12 第 3 段，`build_next_prompt` 校验①）：
+
+```
+长度 2659 vs 2660；且解码文本也不同 → 真的不同源
+字符域首个分歧位 5310
+模板侧文本 …'vals\n\n</tool_response>\n\nassistant\n<think>\nLet me run a cleaner, …'
+拼接侧文本 …'vals\n\n</tool_response>\n\n<|im_start|>assistant\n<think>\nLet me run a cleaner, …'
+```
+
+**判读要点（本次排查实锤的两条）**：
+
+1. **token 窗口是噪声，字符窗口才是真相**。报错里的 `模板侧 [1463:1471] = [9, 36479, …]`
+   vs `拼接侧 [37797, 445, …]` 看着吓人，但拿 Qwen3.5 vocab 反查 = `*+cop` vs `*c+op`
+   ——模型采样了非规范 BPE 分段的 `*cop`，**解码文本完全相同**。真正的差异在字符域：
+   拼接侧多出 `<|im_start|>` 这 12 个字符（恰好 1 个 token，与 2660 vs 2659 吻合）。
+2. **`</think>` 分流提示误报了一次**：旧判据查**全序列**，而 et=False 档每轮历史都带
+   预填空 think 段 → 恒真 → 把事故 D 误导向事故 C。已改为只查**分歧窗口**（事故 C
+   的窗口内必含 `</think>`，灵敏度不降）。
+
+**根因链（与事故 C 同族互补，四环）**：
+
+1. retool_math 档 top_k=-1 **全词表**采样，special token（Qwen3.5 词表 248044–248076 共
+   25 个 special=True added token）是普通可采样 id，模型偶发在**内容中间**吐一个
+   （本例：伪造了 `</tool_response>` + 新轮边界 `<|im_start|>assistant\n<think>`）；
+2. vLLM `.text` 默认 `skip_special_tokens=True`——token_ids 保留该 id（拼接侧在），
+   文本却**静默丢弃**它（入 history 的消息内容没有）；
+3. 下一轮 canonical 重渲染自然少这一段 → 文本层面结构性不同 → 校验① 正确地 raise；
+4. 随机事件 → 运行 130 步（5+ 小时）后才炸，与事故 C 的"几十步后 abort"同形态。
+
+对照安全类（实测推演）：non-special added token（`<tool_response>`/`<tool_call>` 等，
+special=False）即使被采样，`.text` 不丢、模板重编码回同一 added id，**两侧文本一致**，
+被校验① 的文本判据天然容忍——不需要禁。`<|im_end|>`（eos）是合法轮终止符，**不能禁**。
+
+**修复 = 采样端禁言扩展**（与事故 C 同一哲学：在采样端把协议外字节禁掉，比在比对端
+"认识"它们便宜且安全）：
+
+| 位置 | 改动 |
+|---|---|
+| `protocol.native_special_ban_words(tokenizer)` | 新函数：special=True 且非 eos 的 added token **运行时派生**禁言清单（换模型换代际自动跟随，不维护静态打地鼠清单） |
+| `make_retool_sps` / `eval_vllm_one` / `probe_difficulty` | 原生档 `bad_words = list(NATIVE_BAD_WORDS) + native_special_ban_words(tokenizer)` |
+| `assert_native_sampling_ban` | 新增可选 `tokenizer` 参数：给了就把 special 禁言纳入必查项（rollout 入口已传），不给保持旧行为（CPU 测试桩无 `added_tokens_decoder`，零影响） |
+| `build_next_prompt` 报错 | `</think>` 分流提示改为**窗口级**（修误报）；新增事故 D 分流提示：special token 仅在分歧窗口**一侧**出现时触发（对称出现=真实轮边界，不报） |
+
+**测试（P2d 组，10 项）**：事故复现（prev 含 special id + 消息文本缺它 → 校验① 必 raise
+且带事故 D 提示、**不**误报事故 C）；对照（消息文本保住 special 文本 → 文本判据容忍放行，
+锁死 literal 路径不误伤）；派生本体（special∧非 eos 才进清单、老桩空清单）；断言扩展；
+三处接线源码锁。
+
 ### 10.7 尚未验证的部分（如实声明，2026-09-25 更新；2026-09-28 补事故 C 行）
 
 | 项 | 状态 | 怎么验 |

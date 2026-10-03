@@ -156,7 +156,37 @@ NATIVE_CALL_STOP = _TOOL_CLOSE
 NATIVE_BAD_WORDS = ["</think>"]
 
 
-def assert_native_sampling_ban(sampling_params) -> None:
+def native_special_ban_words(tokenizer) -> list:
+    """special=True 的 added tokens（除 eos）全部进采样禁言（事故 D 护栏）。
+
+    【事故 D（2026-10-03 真机，docs/09 §10.6.4）】形态：step 130 校验① raise，
+    字符域分歧 = 拼接侧比模板侧多出一段 `<|im_start|>`（12 字符、1 个 token），
+    其余逐字相同。根因链：
+      1. retool_math 档 top_k=-1 全词表采样，special token（Qwen3.5 的
+         `<|im_start|>`=248045 等 25 个）是普通可采样 id，模型偶发在**内容中间**
+         吐一个（伪造成交 tool_response/新轮边界）；
+      2. vLLM `.text` 默认 skip_special_tokens=True——token_ids 保留该 id
+         （拼接侧在），文本却丢掉它（入 history 的消息内容没有）；
+      3. 下一轮 canonical 重渲染自然少这一段 → 文本层面不同 → 校验① 正确地
+         raise。与事故 C 同族（采样空间 ⊃ 模板表达空间）但机制互补：C 是
+         special=False 的 `</think>` 被模板**重构**，D 是 special=True 的被
+         **`.text` 静默丢弃**（non-special added token 如 `<tool_response>` 则
+         两侧文本一致、被文本判据天然容忍，无需禁）。
+    为什么 eos（`<|im_end|>`）除外：它是**合法的轮终止符**，禁掉生成永不停。
+    其余 special token 出现在 assistant 内容里永远是协议垃圾（轮结构由 harness
+    驱动），禁言对采样分布的扭曲与禁 `</think>` 同类且更小；gen_logps 取
+    raw_logprobs（禁言前的真实策略 logp），训练 ratio 不失真。
+    从 tokenizer **运行时派生**而不是静态清单：换模型换代际时特殊 token 布局
+    自动跟随（docs/03 换代际铁律），不为每个模型维护一份打地鼠清单。
+    """
+    eos = getattr(tokenizer, "eos_token", None)
+    dec = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    return [str(t.content) for t in dec.values()
+            if getattr(t, "special", False)
+            and getattr(t, "content", None) not in (None, eos)]
+
+
+def assert_native_sampling_ban(sampling_params, tokenizer=None) -> None:
     """原生协议的 SamplingParams 必须带 NATIVE_BAD_WORDS 禁言（事故 C 护栏）。
 
     【为什么 fail-fast 放在 rollout 入口】缺禁言时"会不会炸校验①"是随机事件
@@ -164,22 +194,33 @@ def assert_native_sampling_ban(sampling_params) -> None:
     ——比启动期拒跑贵得多。入口检查把失败提前到第 1 组之前，且报错直接指向
     缺失的接线（而不是让操作者从校验① 的 token 分歧窗口反推）。
 
+    传入 tokenizer 时把事故 D 的 special 禁言（native_special_ban_words）一并
+    纳入必查项——否则"只接了 </think> 没接 special"的新入口会退回运行中期
+    abort 的老路。tokenizer=None 保持旧行为（只查静态清单）。
+
     sampling_params 与 multi_turn_rollout_group_native 同构：单个 SP（eval 贪心
     共用）或逐请求 SP 列表。SP 是 vLLM 对象（测试里是带 bad_words 属性的桩），
     只读 getattr，不构造。"""
     sps = (list(sampling_params)
            if isinstance(sampling_params, (list, tuple)) else [sampling_params])
+    required = list(NATIVE_BAD_WORDS)
+    if tokenizer is not None:
+        required += [w for w in native_special_ban_words(tokenizer)
+                     if w not in required]
     for sp in sps:
         bw = set(getattr(sp, "bad_words", None) or [])
-        missing = [w for w in NATIVE_BAD_WORDS if w not in bw]
+        missing = [w for w in required if w not in bw]
         if missing:
             raise ValueError(
                 "[protocol] 原生协议的 SamplingParams 缺禁言 bad_words="
-                f"{missing}（protocol.NATIVE_BAD_WORDS）——采样内容一旦混入假 "
+                f"{missing}（protocol.NATIVE_BAD_WORDS + "
+                "native_special_ban_words(tokenizer)）——采样内容一旦混入假 "
                 f"{NATIVE_BAD_WORDS[0]}，Qwen3.5 模板会把它重构成 reasoning/content "
-                "两段，build_next_prompt 校验① 必然在运行中期 abort"
-                "（事故 C，docs/09 §10.6.3）。处置：构造 SamplingParams 时带 "
-                "bad_words=list(NATIVE_BAD_WORDS)（训练 make_retool_sps / "
+                "两段；混入 special token 则会被 vLLM .text（skip_special_tokens）"
+                "从文本丢弃而 token_ids 保留——两者都使 build_next_prompt 校验① 在"
+                "运行中期 abort（事故 C/D，docs/09 §10.6.3/§10.6.4）。处置：构造 "
+                "SamplingParams 时带 bad_words=list(NATIVE_BAD_WORDS) + "
+                "native_special_ban_words(tokenizer)（训练 make_retool_sps / "
                 "eval_vllm_one / probe_difficulty 三处已接线，自定义入口照抄）。")
 
 
@@ -517,26 +558,53 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
                          f"  模板侧文本 …{_ta!r}\n"
                          f"  拼接侧文本 …{_tb!r}\n")
             else:
-                _diff = (f"  模板侧文本 …{_decode_span(tokenizer, canonical_prompt, _i, 60)!r}\n"
-                         f"  拼接侧文本 …{_decode_span(tokenizer, prev, _i, 60)!r}\n")
-            # 【事故 C 签名识别】若分歧两侧任一含 </think>，最可能是"采样内容混入
-            # 假 </think> 被模板重构成 reasoning/content 两段"（docs/09 §10.6.3），
-            # 而不是 tools/ctkw 档不一致——处置完全不同，必须在报错里分流，
-            # 否则操作者会去查一场不存在的档位事故（真机已误导一次）。
+                _ta = _decode_span(tokenizer, canonical_prompt, _i, 60)
+                _tb = _decode_span(tokenizer, prev, _i, 60)
+                _diff = f"  模板侧文本 …{_ta!r}\n  拼接侧文本 …{_tb!r}\n"
+            # 【事故 C 签名识别】若分歧**窗口**内任一含 </think>，最可能是"采样内容
+            # 混入假 </think> 被模板重构成 reasoning/content 两段"（docs/09
+            # §10.6.3），而不是 tools/ctkw 档不一致——处置完全不同，必须在报错里
+            # 分流，否则操作者会去查一场不存在的档位事故（真机已误导一次）。
+            # 【只看窗口不看全序列】et=False 档每一轮历史都带预填空 think 段，
+            # 全序列查 </think> 恒真 → 纯噪声（事故 D 的真机报警就被它误导向了
+            # 事故 C）。窗口（分歧位 ±24/+60 字符）内出现才是真签名。
             _think_hint = ""
             try:
                 _bw = NATIVE_BAD_WORDS[0]
-                if any(_bw in tokenizer.decode([int(t) for t in ids],
-                                               skip_special_tokens=False)
-                       for ids in (canonical_prompt, prev)):
+                if _bw in _ta or _bw in _tb:
                     _think_hint = (
-                        f"  另查：分歧两侧文本含 {_bw}——若是“采样内容混入假 "
+                        f"  另查：分歧窗口文本含 {_bw}——若是“采样内容混入假 "
                         f"{_bw} 被模板重构成 reasoning/content 两段”（事故 C 签名："
                         "拼接侧是空 think 段+全文、模板侧把前文搬进了 think 段），"
                         "则与 tools/ctkw 档无关；\n"
                         "    处置：确认采样端 bad_words=protocol.NATIVE_BAD_WORDS "
                         "已接线（multi_turn_rollout_group_native 入口有断言），"
                         "且 enable_thinking=False 真正生效。\n")
+            except Exception:
+                pass
+            # 【事故 D 签名识别】special token（im_start/endoftext/vision 系，
+            # eos 除外）只出现在分歧窗口的**一侧**（拼接侧有、模板侧无）= 模型在
+            # 内容里采样出 special token，vLLM .text 的 skip_special_tokens=True
+            # 把它从文本丢掉（token_ids 保留）→ 消息历史重渲染天然缺失
+            # （docs/09 §10.6.4）。对称出现（真实轮边界两侧都有）不报。
+            _sp_hint = ""
+            try:
+                _dec = getattr(tokenizer, "added_tokens_decoder", None) or {}
+                _eos = getattr(tokenizer, "eos_token", None)
+                _hit = [str(_t.content) for _t in _dec.values()
+                        if getattr(_t, "special", False)
+                        and getattr(_t, "content", None) not in (None, _eos)
+                        and ((str(_t.content) in _ta) != (str(_t.content) in _tb))]
+                if _hit:
+                    _sp_hint = (
+                        f"  另查：分歧窗口仅一侧出现 special token {_hit}——事故 D "
+                        "签名（docs/09 §10.6.4）：采样内容混入 special token，被 "
+                        "vLLM .text（skip_special_tokens=True）从文本丢弃而 "
+                        "token_ids 保留，消息历史重渲染自然缺失 → 文本不同源；\n"
+                        "    处置：采样端 bad_words 须为 list(NATIVE_BAD_WORDS) + "
+                        "native_special_ban_words(tokenizer)（special=True 且非 "
+                        "eos 的全部禁言；rollout 入口断言已覆盖，缺了会在第 1 组"
+                        "拒跑）。\n")
             except Exception:
                 pass
             raise ValueError(
@@ -547,6 +615,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
                 f"  拼接侧 [{_i}:{_i + 8}] = {[int(t) for t in prev[_i:_i + 8]]}\n"
                 + _diff
                 + _think_hint
+                + _sp_hint
                 + "  后果：续写序列与采样序列不同源 → gen_logps 基线失真、训练/生成分布分叉。\n"
                 "  处置：检查 build_prompt 的 tools/chat_template_kwargs 是否与 "
                 "apply_chat_template 同参（tools 必须两边都传或都不传）。")

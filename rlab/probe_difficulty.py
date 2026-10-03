@@ -403,7 +403,7 @@ def main():
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
-    from rlab.protocol import NATIVE_BAD_WORDS
+    from rlab.protocol import NATIVE_BAD_WORDS, native_special_ban_words
     from rlab.rollout import (attention_backend_kwargs, batch_invariant_guard,
                               gdn_backend_missing)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_path"])
@@ -461,10 +461,12 @@ def main():
             p = build_prompt(x["Q"], cfg["system_prompt"], tokenizer,
                              cfg.get("chat_template_kwargs"), tools=_nat)
             group_prompts.extend([p] * k)   # 每题扩成 k 条独立轨迹（与训练扩样同构）
-        # 原生档必须带假 </think> 禁言（事故 C，docs/09 §10.6.3）——与训练
-        # make_retool_sps 同口径（探针与训练同档是铁律）；multi_turn_rollout_group
-        # 的原生分支入口有断言，缺了会在第 1 组就拒跑。
-        _bad = ({"bad_words": list(NATIVE_BAD_WORDS)} if _nat else {})
+        # 原生档必须带假 </think> + special token 禁言（事故 C/D，docs/09
+        # §10.6.3/§10.6.4）——与训练 make_retool_sps 同口径（探针与训练同档是
+        # 铁律）；multi_turn_rollout_group 的原生分支入口有断言，缺了会在第 1
+        # 组就拒跑。
+        _bad = ({"bad_words": list(NATIVE_BAD_WORDS)
+                 + native_special_ban_words(tokenizer)} if _nat else {})
         sps = [SamplingParams(n=1, temperature=cfg["temperature"],
                               max_tokens=cfg["round_gen_tokens"], top_p=cfg["top_p"],
                               top_k=cfg["top_k"], seed=args.seed * 1000003 + n_traj + j,

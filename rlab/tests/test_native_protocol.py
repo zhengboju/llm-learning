@@ -30,7 +30,9 @@ from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_STYLE_FUNCTION,
                            assert_native_sampling_ban, build_next_prompt,
                            derive_tool_style,
                            encoded_text_tokens, initial_messages, make_call_id,
-                           parse_assistant, render_chat_ids, segment_mask_from_spans,
+                           native_special_ban_words,
+                           parse_assistant, render_chat_ids,
+                           segment_mask_from_spans,
                            stop_sequences, suffix_prefix_overlap, tool_message)
 from rlab.rollout import (TOOL_PROTOCOL_FENCE, TOOL_PROTOCOL_NATIVE, build_prompt,
                           build_prompt_batch, build_prompt_ids, is_native_protocol,
@@ -824,14 +826,121 @@ def test_p2c_think_leak_guard():
     _nat_slice = ro[ro.index("def multi_turn_rollout_group_native("):
                     ro.index("def multi_turn_rollout_group(")]
     check("rollout 入口断言在原生函数体内（不是只在 SP 构造侧）",
-          "assert_native_sampling_ban(sampling_params)" in _nat_slice)
+          "assert_native_sampling_ban(sampling_params, tokenizer)" in _nat_slice)
     check("训练 SP 接线：make_retool_sps 原生档带 bad_words 禁言 + 字段探测 fail-fast",
-          'kw["bad_words"] = list(NATIVE_BAD_WORDS)' in ro
+          'kw["bad_words"] = (list(NATIVE_BAD_WORDS)' in ro
           and '"bad_words" not in _sp_fields' in ro)
     check("eval 接线：原生档 SP 带 bad_words（围栏档不带——围栏格式契约需要 think 标签）",
           '"bad_words": list(NATIVE_BAD_WORDS)' in ev and "NATIVE_BAD_WORDS" in ev)
     check("probe_difficulty 接线（探针与训练同档铁律）",
           '"bad_words": list(NATIVE_BAD_WORDS)' in pd_ and "NATIVE_BAD_WORDS" in pd_)
+
+
+# =====================================================================
+# P2d 事故 D（2026-10-03）：采样内容混入 special token → 被 vLLM .text 丢弃 → 校验① 上百步后 abort
+# =====================================================================
+def test_p2d_special_token_leak_guard():
+    """事故 D 复现与修复锁（docs/09 §10.6.4）。
+
+    真机形态（step 130 校验① raise）：字符域分歧 = 拼接侧比模板侧多出一段
+    special token 文本（Qwen3.5 的 im_start，special=True），其余逐字相同。
+    根因链：模型在内容里采样出 special token → token_ids 保留（拼接侧在）但
+    vLLM .text（skip_special_tokens=True 默认）把它从文本丢掉 → 入 history 的
+    消息内容缺失 → 下一轮 canonical 重渲染自然少一段 → 文本不同源 → raise。
+
+    与事故 C 同族互补：C 是 special=False 字节被模板**重构**；D 是 special=True
+    字节被 **.text 丢弃**。non-special added token（tool_response 等）两侧文本
+    一致，被文本判据天然容忍，无需禁言。
+
+    本组锁死六件事：
+      ① 事故复现：prev 含 special id、消息文本缺它 → 校验① 必 raise；
+      ② 报错带事故 D 分流提示（且事故 C 提示**不**误报——窗口里没有 </think>）；
+      ③ 对照：消息文本**保住**了 special 文本（literal 路径）→ 文本一致、放行；
+      ④ 禁言派生本体：special=True 且非 eos 才进清单；无 added_tokens_decoder
+         的老桩 → 空清单（向后兼容）；
+      ⑤ 入口断言扩展：传 tokenizer 时缺 special 禁言 → raise；
+      ⑥ 三处接线源码锁（bad_words 必须带 native_special_ban_words 派生）。
+    """
+    print("[P2d] special token 禁言：事故 D 复现 + 派生/断言扩展 + 三处接线")
+    from types import SimpleNamespace as _NS
+
+    t = MockTok()
+    # MockTok.decode 把 >=0x10000 的 id 渲染为 "\x00{id}"——给 IM_START/IM_END
+    # 注册同形 content 的 special added token，让事故 D 提示的窗口扫描能命中。
+    t.added_tokens_decoder = {
+        MockTok.IM_START: _NS(content="\x00100000", special=True),
+        MockTok.IM_END: _NS(content="\x00100001", special=True),
+    }
+    base = initial_messages("SYS", "Q1")
+    obs = tool_message(make_call_id(0, 0, 1), "42")
+    obs2 = tool_message(make_call_id(0, 0, 2), "43")
+
+    # ---- ① 事故复现：round-1 采样在内容中间吐出 special token（IM_START）----
+    prev1 = render_chat_ids(t, base, True, {})
+    _tail = "then call the tool " + "x" * 60   # 拉长尾巴：把下游结构 token 推出分歧窗口
+    comp1 = (encoded_text_tokens(t, "let me compute ") + [MockTok.IM_START]
+             + encoded_text_tokens(t, _tail))
+    nxt1 = build_next_prompt(t, base, prev1, comp1, obs)
+    check("前提：round-1 续写本身不炸（history 里还没有 assistant 段）",
+          nxt1[:len(prev1)] == prev1)
+    # vLLM .text 丢弃 special → 入 history 的文本没有它
+    msgs2 = [*base, {"role": "assistant",
+                     "content": ("let me compute " + _tail).strip()}, obs]
+    try:
+        build_next_prompt(t, msgs2, nxt1, encoded_text_tokens(t, "second"), obs2)
+        check("事故 D 复现：采样混入 special token 被 .text 丢弃 → round-2 校验① 必 raise",
+              False)
+    except ValueError as e:
+        check("事故 D 复现：采样混入 special token 被 .text 丢弃 → round-2 校验① 必 raise",
+              "不同源" in str(e))
+        # ② 分流提示：命中事故 D 且**不**误报事故 C（窗口里没有 </think>——
+        # 窗口级判据锁死的就是这个：旧的全序列检查在 et=False 档恒真误报）
+        check("报错带事故 D 分流提示（指向 special 禁言派生）",
+              "事故 D" in str(e) and "native_special_ban_words" in str(e))
+        check("报错不误报事故 C（窗口无 </think> 时分流提示不炸）",
+              "事故 C" not in str(e))
+
+    # ---- ③ 对照：文本保住了 special（literal 路径）→ 文本一致、校验① 放行 ----
+    msgs2b = [*base, {"role": "assistant",
+                      "content": ("let me compute \x00100000" + _tail).strip()}, obs]
+    got2b = build_next_prompt(t, msgs2b, nxt1, encoded_text_tokens(t, "second"), obs2)
+    check("对照：消息文本保住 special 文本 → 文本判据容忍（不误伤 literal 路径）",
+          got2b[:len(nxt1)] == nxt1)
+
+    # ---- ④ 禁言派生本体 ----
+    _tk = _NS(eos_token="[EOS_X]",
+              added_tokens_decoder={
+                  1: _NS(content="[S1]", special=True),
+                  2: _NS(content="[EOS_X]", special=True),   # eos 必须豁免
+                  3: _NS(content="[PLAIN]", special=False),  # non-special 不进清单
+              })
+    check("special 禁言派生：special=True 且非 eos 才进清单",
+          native_special_ban_words(_tk) == ["[S1]"])
+    check("无 added_tokens_decoder 的老桩 → 空清单（向后兼容，不加要求）",
+          native_special_ban_words(MockTok()) == [])
+
+    # ---- ⑤ 入口断言扩展：传 tokenizer 就连 special 禁言一起查 ----
+    try:
+        assert_native_sampling_ban(_SPStub(list(NATIVE_BAD_WORDS)), _tk)
+        ok = False
+    except ValueError as e:
+        ok = "bad_words" in str(e)
+    check("断言扩展：传 tokenizer 时缺 special 禁言 → raise", ok)
+    assert_native_sampling_ban(_SPStub(list(NATIVE_BAD_WORDS) + ["[S1]"]), _tk)
+    check("断言扩展：带齐静态清单 + special 禁言 → 放行", True)
+
+    # ---- ⑥ 三处接线（源码锁：训练/eval/探针）----
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ro = open(os.path.join(root, "rlab", "rollout.py"), encoding="utf-8").read()
+    ev = open(os.path.join(root, "eval_vllm_one.py"), encoding="utf-8").read()
+    pd_ = open(os.path.join(root, "rlab", "probe_difficulty.py"),
+               encoding="utf-8").read()
+    check("训练 SP 接线：bad_words 带 special 禁言派生（事故 D）",
+          "native_special_ban_words(tokenizer)" in ro)
+    check("eval 接线：bad_words 带 special 禁言派生（多轮走同一 build_next_prompt）",
+          "native_special_ban_words(tokenizer)" in ev)
+    check("probe_difficulty 接线：bad_words 带 special 禁言派生（探针与训练同档）",
+          "native_special_ban_words(tokenizer)" in pd_)
 
 
 # =====================================================================
@@ -1507,6 +1616,7 @@ if __name__ == "__main__":
     test_p2_sequence_contract()
     test_p2b_whitespace_tolerance()
     test_p2c_think_leak_guard()
+    test_p2d_special_token_leak_guard()
     test_p3_template_guard()
     test_p4_mask_and_grad()
     test_scoring_domain()
