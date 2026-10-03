@@ -5580,8 +5580,10 @@ def test_gen_death_diagnostics():
           "_SIG_NAMES" in src and '"SIGHUP"' in src and '"SIGTERM"' in src)
     check("只有 faulthandler 覆盖的崩溃信号（SEGV/ABRT/BUS/FPE/ILL/SYS）才说'应有栈'",
           "_FAULT_SIGNALS" in src)
-    check("非崩溃信号（HUP/TERM/INT）单独一档：明说 faulthandler 不会打栈",
-          "faulthandler 不会为它打栈" in src)
+    check("非崩溃信号（HUP/TERM/INT）单独一档：指出那段栈正是 register 打的",
+          "非崩溃信号" in src and "日志上方那段全线程栈就是它打的" in src)
+    check("该档写明 -1 的判据（IGN 则只留栈不死；真死 ⇒ 出生即 SIG_DFL）",
+          "raise 被丢弃" in src and "出生时是 SIG_DFL" in src)
     check("SIGKILL 档给出 dmesg/cgroup 诊断命令（可当场定位 OOM）",
           "killed process" in src and "memory.peak" in src)
     check("dmesg 用全量 grep（tail -40 会把本次记录挤出窗口）",
@@ -5601,6 +5603,15 @@ def test_gen_death_diagnostics():
           "faulthandler.register" in _sp and "chain=True" in _sp)
     check("register 同样在 gen_worker 之前（启动期被 HUP 也留痕）",
           _sp.index("faulthandler.register") < _sp.index("gen_worker(Q, cfg)"))
+    check("生成端显式把 HUP 定为 SIG_IGN（不再依赖 launcher 的 nohup 是否生效）",
+          "_signal.SIG_IGN" in _sp
+          and "signal(_signal.SIGHUP, _signal.SIG_IGN)" in _sp)
+    check("出生处置 + pid/pgid/sid 落日志（下次 -1 能直接判 IGN/DFL）",
+          "os.getsid(0)" in _sp and "HUP={" in _sp)
+    check("取证打印在改处置之前（否则打印的是自己刚设的 IGN，失去证据）",
+          _sp.index("HUP={") < _sp.index("_signal.SIG_IGN"))
+    check("HUP 定档在 register 之前（register 捕到的 previous 必须是 IGN）",
+          _sp.index("_signal.SIG_IGN") < _sp.index("faulthandler.register"))
     print()
 
 

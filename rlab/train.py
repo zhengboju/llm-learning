@@ -572,21 +572,27 @@ def run_training(cfg, args):
                         "（生成端启动极早期），或 stderr 未能落盘（用 `2>&1 | tee` 重跑）")
                 else:
                     _why = (
-                        f"被 {_sname}({_sig}) 杀死——**非崩溃信号，faulthandler 不会为它打栈**"
-                        "（它只登记 SEGV/ABRT/BUS/FPE/ILL/SYS）。HUP/TERM/INT 这类"
-                        "信号来自进程外部：终端/会话断开（ssh、kubectl exec -it、tmux 面板"
-                        "关闭）、显式 kill、或运行环境收拾带 TTY 的会话。训练端还活着而"
-                        "生成端单独收到 = 信号是冲生成端进程来的，不是程序内部崩溃。"
-                        "真凶通常在这**之前**的停滞处：被杀前生成端往往已卡死（本次事故"
-                        "即 version=72 推送后约 5 分钟零产出）。按序查："
-                        "①这次 run 是怎么起的（kubectl exec -it/ssh/tmux/nohup？当时会话"
-                        "是否有断开、是否有 watchdog 会 kill 生成端）；"
-                        "②生成端最后一行 [rollout] 日志停在哪个调用（权重同步 apply_model / "
-                        "vLLM generate / ref_server 上传——三者都无超时，卡住即无限等）；"
-                        "③`dmesg -T | grep -iE 'killed process|out of memory|segfault' "
-                        "| tail -20` 与 cgroup 峰值（排除被杀前就有内存压力的可能）；"
-                        "④ref_server 是否还活着、其日志尾部是否同样冻结"
-                        "（`curl -s localhost:<port>/health` 一验便知）")
+                        f"被 {_sname}({_sig}) 杀死——**非崩溃信号**（HUP/TERM/INT 来自"
+                        "进程外部：终端/会话断开、显式 kill、运行环境收拾带 TTY 的会话，"
+                        "不是程序内部崩溃）。enable() 不覆盖它们，但生成端已"
+                        "register(chain=True)：**日志上方那段全线程栈就是它打的**"
+                        "（没有才说明死在 register 安装之前）——先看栈落在哪个调用"
+                        "（apply_model 权重同步 / vLLM generate / ref_server 上传，三者都"
+                        "无超时、卡住即无限等），再判是否停滞。"
+                        "【2026-10-03 处置语义·别把 -1 当成'被卡死'的证据】chain=True 是"
+                        "restore previous 再 raise：previous 是 SIG_IGN（nohup/setsid 起的"
+                        "run 会继承；已实测 pod 上 torch/deepspeed 导入与 "
+                        "init_distributed 都不改它、spawn 子进程照常继承）时 raise 被丢弃、"
+                        "**进程继续活着，只有栈没有死亡**；真死出 -1 ⇒ 出生时是 SIG_DFL。"
+                        "又：train 与 ref_server 与生成端同进程组却都活着 ⇒ 信号是点名"
+                        "发给生成端的，不是组投递（终端断开是组投递，会三个一起死）。按序查："
+                        "①这次 run 是怎么起的（kubectl exec -it/ssh/tmux/nohup？是否有 "
+                        "watchdog 会 kill 生成端）；"
+                        "②`dmesg -T | grep -iE 'killed process|out of memory|segfault' "
+                        "| tail -20` 与 cgroup 峰值（排除被杀前就有内存压力）；"
+                        "③ref_server 是否还活着（`curl -s localhost:<port>/health`）。"
+                        "【2026-10-03 起生成端已显式定档 HUP=SIG_IGN+打印出生处置：本档"
+                        "只应出现在 register 安装之前被杀、或 TERM/INT/其他信号】")
             elif _rc:
                 _why = (f"异常退出（exitcode={_rc}）——其 traceback 应在本日志上方，"
                         "先往上翻")
@@ -890,9 +896,23 @@ def _spawn_gen(Q, cfg):
     # （HUP/TERM/INT）时默认行为直接终止、一个字节都不留，训练端只看到 exitcode=-1
     # 和一段"不知道卡在哪"的空白（本次事故=version=72 推送后卡约 5 分钟再被 HUP）。
     # register(chain=True) 补上：收到时先 dump **全线程 Python 栈**（当场可见卡在
-    # vLLM generate / apply_model / requests.post 的哪一行），再调用注册前的处置——
-    # 进程仍按原信号终止，父端 exitcode 语义不变（HUP 仍报 -1，已本地实测验证）。
+    # vLLM generate / apply_model / requests.post 的哪一行），再按注册前的处置终止。
+    # 【2026-10-03 定档】chain=True 是"restore previous 再 raise"：previous 为
+    # SIG_IGN 时 raise 被丢弃 → 进程**继续活着、只留栈**；为 SIG_DFL 时才死出 -1。
+    # 实测（pod 2026-10-03）：nohup 起的 run 里 import torch/deepspeed 与
+    # deepspeed.init_distributed() 都不改处置，spawn 子进程照常继承 SIG_IGN；
+    # 但 2026-10-02/03 两次事故的生成端都真死出 -1 ⇒ 那两次出生时不是 IGN
+    # （launcher 没给 IGN，或 IGN 在父进程里被谁换成了 handler → exec 复位成 DFL）。
+    # 所以不再依赖 launcher：显式定档 HUP=SIG_IGN（HUP 只留痕、不再杀生成端），
+    # TERM/INT 维持终止语义（要停 run 用 TERM/-9，别用 HUP）。同时打印出生时的
+    # 处置 + pid/pgid/sid：下次再出 -1，日志直接给出"继承到的到底是什么"。
     import signal as _signal
+    print(f"[gen] pid={os.getpid()} pgid={os.getpgid(0)} sid={os.getsid(0)} "
+          f"HUP={_signal.getsignal(_signal.SIGHUP)!r}", flush=True)
+    try:
+        _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+    except (ValueError, OSError, RuntimeError):
+        pass       # 非主线程/受限环境下设置失败也不影响生成端启动
     for _s in (_signal.SIGHUP, _signal.SIGTERM, _signal.SIGINT):
         try:
             faulthandler.register(_s, chain=True)
