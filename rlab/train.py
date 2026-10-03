@@ -952,6 +952,10 @@ def _spawn_gen(Q, cfg):
 
 
 def main():
+    # 【2026-10-03 取证】main 入口 = 模块级 import 之后、argparse/get_config 之前。
+    # 与 run_training 入口、spawn 前那两行组成三点定位：哪一段把继承来的
+    # HUP=IGN 弄丢了（真机上生成端出生即 DFL 的原因），日志一眼可判。
+    _hup_disp("main 入口（模块级 import 之后）")
     ap = argparse.ArgumentParser()
     ap.add_argument("--algo", required=True, choices=ALGOS)
     ap.add_argument("--model_path", default=None)

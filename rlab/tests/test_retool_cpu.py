@@ -5620,6 +5620,10 @@ def test_gen_death_diagnostics():
     check("生成端 spawn 在 train 侧定档之后（exec 保留的才是 IGN）",
           src.index("signal.signal(signal.SIGHUP, signal.SIG_IGN)")
           < src.index("gen_proc.start()"))
+    check("三点定位取证齐全（main 入口 / run_training 入口 / spawn 前）",
+          src.count("_hup_disp(") >= 4
+          and '_hup_disp("main 入口' in src
+          and 'run_training 入口' in src and 'spawn 生成端之前' in src)
     print()
 
 
