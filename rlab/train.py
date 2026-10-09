@@ -170,6 +170,10 @@ def run_signature(cfg: dict) -> str:
     mtj_tag = f"-mtj{_mtj}-ar{int(cfg.get('answer_reserve', 0) or 0)}" if _mtj > 0 else ""
     _lew = float(cfg.get("len_eff_w", 0.0) or 0.0)
     lew_tag = f"-lew{_lew:g}" if _lew > 0.0 else ""
+    # 正确且超组内 ref 的 capped 惩罚独立成档：不与 MiMo 失败样本惩罚共用键，
+    # 避免相同 -lp0.1 签名下 reward 曲面不同而混目录。
+    _lepw = float(cfg.get("len_eff_penalty_w", 0.0) or 0.0)
+    lep_tag = f"-lep{_lepw:g}" if _lepw > 0.0 else ""
     _olr = int(cfg.get("overlong_ref", 0) or 0)
     olr_tag = f"-olr{_olr}" if _olr > 0 else ""
     once_tag = "-cs1" if cfg.get("code_shaping_once") else ""
@@ -217,7 +221,7 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{olr_tag}"
+            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}"
             f"{once_tag}{hint_tag}{_opt_tag}")
 
 
@@ -264,6 +268,8 @@ def write_run_info(path: str, cfg: dict) -> None:
             "len_penalty_w": cfg.get("len_penalty_w"),
             "len_penalty_quantile": cfg.get("len_penalty_quantile"),
             "len_penalty_gate": cfg.get("len_penalty_gate"),
+            "len_eff_w": cfg.get("len_eff_w"),
+            "len_eff_penalty_w": cfg.get("len_eff_penalty_w"),
             "difficulty_path": cfg.get("difficulty_path"),
             "difficulty_band": cfg.get("difficulty_band"),
             "lr": cfg.get("lr"),
@@ -1053,6 +1059,10 @@ def main():
                          "len_penalty（只罚未通过）互补：本项让**更短地答对**拿正分，"
                          "直接对齐'最少 token 答最优'的目标。必须组内相对（绝对长度"
                          "惩罚是 run2 表面收尾事故的根源），且有 cap 防短答案套利")
+    ap.add_argument("--len_eff_penalty_w", type=float, default=None,
+                    help="通过轨迹内部的组相对超长惩罚权重（0=关闭，推荐0.10）。"
+                         "只罚答对且长于通过轨迹中位数者，ratio cap=1、reward保留正值；"
+                         "失败轨迹仍由 MiMo len_penalty 负责")
     ap.add_argument("--code_shaping_once", action=argparse.BooleanOptionalAction,
                     default=None,
                     help="把 code_attempt_w/code_w 从'每次调用累加'改成'一次性'："
@@ -1328,6 +1338,8 @@ def main():
     if args.budget_hint is not None: overrides["budget_hint"] = args.budget_hint
     if args.traj_dump is not None: overrides["traj_dump"] = args.traj_dump
     if args.len_eff_w is not None: overrides["len_eff_w"] = args.len_eff_w
+    if args.len_eff_penalty_w is not None:
+        overrides["len_eff_penalty_w"] = args.len_eff_penalty_w
     if args.code_shaping_once is not None:
         overrides["code_shaping_once"] = args.code_shaping_once
     if args.tool_call_cost is not None:

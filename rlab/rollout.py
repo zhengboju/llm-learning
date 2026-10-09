@@ -61,7 +61,7 @@ from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            # 绝不手写标签字面量——本项目三次被会话管道改写字节。
                            _TOOL_OPEN as _CALL_OPEN, _TOOL_CLOSE as _CALL_CLOSE)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
-                         group_eff_bonus,
+                         group_eff_bonus, group_eff_penalty,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math, group_length_penalty)
 from rlab.sandbox import run_code
@@ -1274,9 +1274,10 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # "组内都变短"不改变任何 advantage，无捷径可钻。weight=0 完全跳过（逐位同旧）。
     _lp_w = float(cfg.get("len_penalty_w", 0.0) or 0.0)
     _eff_w0 = float(cfg.get("len_eff_w", 0.0) or 0.0)
-    # 两项都吃 completion_lens：任一开启就取（否则效率项静默无效）
+    _eff_pen_w0 = float(cfg.get("len_eff_penalty_w", 0.0) or 0.0)
+    # 三项都吃 completion_lens：任一开启就取（否则效率项静默无效）
     _lp_clens = ([int(x) for x in (completion_lens if completion_lens is not None else [])]
-                 if (_lp_w > 0.0 or _eff_w0 > 0.0) else [])
+                 if (_lp_w > 0.0 or _eff_w0 > 0.0 or _eff_pen_w0 > 0.0) else [])
     if _lp_w > 0.0 and len(_lp_clens) == len(rewards):
         _pen = group_length_penalty(rewards.tolist(), _lp_clens,
                                     weight=_lp_w,
@@ -1289,15 +1290,24 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # 前置条件与 len_penalty 相同（要 completion_lens）；不满足则跳过并告警一次，
     # 因为"开了开关却没接线"正是本项目最贵的一类静默失败。
     _eff_w = _eff_w0
-    if _eff_w > 0.0:
-        if len(_lp_clens) == len(rewards):
-            rewards = torch.tensor(
-                group_eff_bonus(rewards.tolist(), _lp_clens, weight=_eff_w),
-                dtype=torch.float32)
-        elif not _EFF_WARNED[0]:
-            _EFF_WARNED[0] = True
-            print("[rollout][提示] len_eff_w>0 但本组没拿到 completion_lens → "
-                  "效率项静默无效（检查调用点是否传了 completion_lens）。", flush=True)
+    if _eff_w > 0.0 and len(_lp_clens) == len(rewards):
+        rewards = torch.tensor(
+            group_eff_bonus(rewards.tolist(), _lp_clens, weight=_eff_w),
+            dtype=torch.float32)
+    # 【2026-10-09 正确轨迹反向效率信用】短于 ref 的通过轨迹由 bonus 加分，
+    # 长于 ref 的通过轨迹由独立权重 capped 扣分；失败轨迹仍归 MiMo len_penalty。
+    # cap=1 且纯函数保留最小正值，结构性保证长度项不把正确结果翻成非正。
+    _eff_pen_w = _eff_pen_w0
+    if _eff_pen_w > 0.0 and len(_lp_clens) == len(rewards):
+        rewards = torch.tensor(
+            group_eff_penalty(rewards.tolist(), _lp_clens, weight=_eff_pen_w),
+            dtype=torch.float32)
+    if ((_eff_w > 0.0 or _eff_pen_w > 0.0)
+            and len(_lp_clens) != len(rewards) and not _EFF_WARNED[0]):
+        _EFF_WARNED[0] = True
+        print("[rollout][提示] len_eff_w/len_eff_penalty_w>0 但本组没拿到 "
+              "completion_lens → 效率项静默无效（检查调用点是否传了长度）。",
+              flush=True)
     # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage 和组统计中移除：
     # 组均值只算非截断 → 截断样本 adv=0 → 不贡献 pg_term。
     # 杀 NeMo-RL bug：全错组+混合截断不再因 trunc_shaping 产生假方差通过 group_ok。

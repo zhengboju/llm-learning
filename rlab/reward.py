@@ -398,6 +398,41 @@ def group_eff_bonus(group_rewards: list, group_lens: list,
     return out
 
 
+def group_eff_penalty(group_rewards: list, group_lens: list,
+                      weight: float = 0.0, quantile: int = 50,
+                      cap: float = 1.0, min_positive: float = 1e-6) -> list:
+    """通过轨迹内部的组相对超长惩罚（与 group_eff_bonus 互补）。
+
+    ref 与 bonus 同源：通过轨迹长度分位数（默认中位数）。只对 ``r>0`` 且
+    ``len>ref`` 的轨迹扣分，失败轨迹仍由 MiMo ``group_length_penalty`` 负责，
+    两者职责不重叠。惩罚比例 ``len/ref-1`` 由 ``cap`` 封顶，且 reward 保持
+    ``>= min_positive``，结构性保证正确结果不会被长度项翻成非正。
+
+    weight=0 时逐位退化；通过轨迹不足两条时相对参考无定义，逐位返回。
+    """
+    n = len(group_rewards)
+    if weight <= 0.0 or n == 0 or n != len(group_lens) or cap <= 0.0:
+        return list(group_rewards)
+    passed = [l for l, r in zip(group_lens, group_rewards) if r > 0.0]
+    if len(passed) < 2:
+        return list(group_rewards)
+    passed.sort()
+    B = min(max(int(quantile), 1), 100) / 100.0
+    k = int(math.ceil(B * (len(passed) - 1)))
+    ref = passed[k]
+    if ref <= 0:
+        return list(group_rewards)
+    out = []
+    for r, l in zip(group_rewards, group_lens):
+        if r > 0.0 and l > ref:
+            penalty = weight * min(l / ref - 1.0, float(cap))
+            applied = min(penalty, max(0.0, float(r) - float(min_positive)))
+            out.append(float(r) - applied)
+        else:
+            out.append(float(r))
+    return out
+
+
 def total_reward_math(ground_truth: str, answer: str, *,
                       completion_len: int = 0, max_gen_tokens: int = 8192,
                       overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:

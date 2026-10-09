@@ -367,6 +367,11 @@ BASE = dict(
     # **必须组内相对**：绝对长度惩罚是 run2"表面收尾"事故的根因
     # （模型学会草草收尾骗过惩罚），见 group_length_penalty 的 docstring。
     len_eff_w=0.0,
+    # 【2026-10-09 正确轨迹反向效率信用】只罚**通过且长于组内通过分位数**的轨迹。
+    # 与 len_eff_w 共用组内参考系：短于 ref 拿正分，长于 ref 最多扣本权重；失败
+    # 轨迹仍只由 MiMo len_penalty 管，职责不重叠。0=关闭，历史行为逐位不变；
+    # 推荐 0.10，reward.py 内 ratio cap=1 且保留最小正值，正确结果不翻成非正。
+    len_eff_penalty_w=0.0,
     # 【2026-09-29 反激励修正】code_attempt_w/code_w 由"每次调用累加"改"一次性"
     # （用过就给固定小分，不随调用次数增长）。保留对冲"代码压灭"的作用
     # （p6 实测 code% 50→3），去掉"多调用多拿分"的方向性错误。
@@ -818,7 +823,8 @@ def get_config(algo: str, **overrides) -> dict:
             f"[config] tool_protocol='native' 只对 retool 家族有效，当前 algo="
             f"{algo!r} 走单轮路径（从不读该键）→ 传了等于没传。\n"
             f"  要跑原生工具协议：--algo retool_math（或 retool）。")
-    for _key in ("tool_call_cost", "tool_waste_penalty", "trunc_tail_penalty"):
+    for _key in ("tool_call_cost", "tool_waste_penalty", "trunc_tail_penalty",
+                 "len_eff_penalty_w"):
         if float(cfg.get(_key, 0.0) or 0.0) < 0.0:
             raise ValueError(f"[config] {_key} 必须 >= 0，收到 {cfg.get(_key)!r}")
     # 原生协议预算档（docs/09 §5.1 档 A）。显式 override 优先（CLI 单变量微调位）。

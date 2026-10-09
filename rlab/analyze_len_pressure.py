@@ -5,9 +5,14 @@
 输入使用 record.jsonl：一行就是一个题组，组内 acc/clen/code_* 列严格对齐。
 脚本从同目录 run_info.json 读取真实训练配方，复算三种形态：
 
-  shipped : MiMo 原形态，只罚未通过且超 ref 的轨迹
-  all_raw : 当前本地改法，所有超 ref 轨迹都罚，不封顶
-  all_cap : 推荐反事实，所有超 ref 轨迹都罚，ratio cap=1
+  shipped : 真实 run 配方；若 run_info 启用 len_eff_penalty_w，会复算独立 lep
+  all_raw : 历史风险对照，直接改 MiMo 本体，所有超 ref 都罚且不封顶
+  all_cap : 历史对照，直接改 MiMo 本体并 cap；不是当前推荐实现
+
+正式推荐形态是独立 ``len_eff_penalty_w``：MiMo 失败分支保持不动，只对正确且
+超 ref 的轨迹 capped 扣分。可对旧 record 做反事实：
+
+  python -m rlab.analyze_len_pressure OUT --len-eff-penalty-w 0.1
 
 复算终点是 tool-credit 之前的 sequence-level group_mean advantage。工具调用成本、
 废调用信用和截断末段信用是后续 segment-level 局部覆盖，不在本次长度曲面比较内。
@@ -161,13 +166,30 @@ def apply_eff_bonus(rewards, lens, weight, quantile=50, cap=1.0):
     return out
 
 
+def apply_eff_penalty(rewards, lens, weight, quantile=50, cap=1.0,
+                      min_positive=1e-6):
+    rewards = [float(x) for x in rewards]
+    ref, n_pass = quantile_ref(lens, rewards, quantile)
+    if weight <= 0 or n_pass < 2 or ref is None or ref <= 0:
+        return rewards
+    out = []
+    for r, length in zip(rewards, lens):
+        if r > 0.0 and length > ref:
+            penalty = weight * min(length / ref - 1.0, float(cap))
+            applied = min(penalty, max(0.0, r - float(min_positive)))
+            out.append(r - applied)
+        else:
+            out.append(r)
+    return out
+
+
 def group_mean_adv(rewards, mask):
     valid = [r for r, m in zip(rewards, mask) if m]
     mean = statistics.fmean(valid) if valid else 0.0
     return [(r - mean) if m else 0.0 for r, m in zip(rewards, mask)]
 
 
-def replay(row, cfg, mode, cap, eff_weight=None):
+def replay(row, cfg, mode, cap, eff_weight=None, eff_pen_weight=None):
     lens = [int(x) for x in row["clen"]]
     r0 = base_rewards(row, cfg)
     r1, ref, n_pass, active = apply_len_penalty(
@@ -179,6 +201,12 @@ def replay(row, cfg, mode, cap, eff_weight=None):
     )
     ew = float(cfg.get("len_eff_w", 0.0) or 0.0) if eff_weight is None else eff_weight
     r2 = apply_eff_bonus(r1, lens, ew)
+    # 新版正式配方：run_info 中若显式启用 lep，shipped 复算必须带上；反事实
+    # all_raw/all_cap 仍表示旧分析里的“改 MiMo 本体”，避免两种机制混在同一列。
+    if mode == "shipped":
+        lep_w = (float(cfg.get("len_eff_penalty_w", 0.0) or 0.0)
+                 if eff_pen_weight is None else float(eff_pen_weight))
+        r2 = apply_eff_penalty(r2, lens, lep_w)
 
     n = len(r2)
     trunc = [int(x) for x in row.get("trunc_final", [0] * n)]
@@ -241,6 +269,8 @@ def main():
                     help="覆盖 run_info 的 len_penalty_w，仅用于反事实")
     ap.add_argument("--len-eff-w", type=float, default=None,
                     help="覆盖 run_info 的 len_eff_w")
+    ap.add_argument("--len-eff-penalty-w", type=float, default=None,
+                    help="覆盖 run_info 的 len_eff_penalty_w；可对旧 record 反事实模拟新配方")
     args = ap.parse_args()
 
     record_path, run_info_path = resolve_paths(args.target, args.run_info)
@@ -249,6 +279,8 @@ def main():
         cfg["len_penalty_w"] = args.len_penalty_w
     if args.len_eff_w is not None:
         cfg["len_eff_w"] = args.len_eff_w
+    if args.len_eff_penalty_w is not None:
+        cfg["len_eff_penalty_w"] = args.len_eff_penalty_w
     if cfg.get("adv_mode", "group_mean") != "group_mean":
         raise SystemExit(f"本脚本只支持 adv_mode=group_mean，收到 {cfg.get('adv_mode')!r}")
 
@@ -259,7 +291,8 @@ def main():
     print(f"run_info={run_info_path}")
     print(f"signature={info.get('signature')}")
     print(f"len_penalty_w={lpw} quantile={cfg.get('len_penalty_quantile')} "
-          f"gate={cfg.get('len_penalty_gate')} len_eff_w={lew}")
+          f"gate={cfg.get('len_penalty_gate')} len_eff_w={lew} "
+          f"len_eff_penalty_w={cfg.get('len_eff_penalty_w', 0.0)}")
     print(f"overlong={cfg.get('overlong_shaping')} ref={overlong_ref_tokens(cfg)} "
           f"buffer={cfg.get('overlong_buffer')} filter={cfg.get('overlong_filter')}")
     print(f"code_attempt_w={cfg.get('code_attempt_w')} code_w={cfg.get('code_w')} "
@@ -273,7 +306,7 @@ def main():
     trunc_failed = trunc_correct = 0
     ratio, adv_old, adv_raw, adv_cap = [], [], [], []
     rew_old, rew_raw, rew_cap = [], [], []
-    delta_eff, delta_raw, delta_cap = [], [], []
+    delta_eff, delta_lep, delta_raw, delta_cap = [], [], [], []
     raw_reward_flip = cap_reward_flip = raw_adv_flip = cap_adv_flip = 0
     would_ununiform_raw = would_ununiform_cap = uniform_groups = 0
 
@@ -300,6 +333,7 @@ def main():
 
             old = replay(row, cfg, "shipped", args.cap)
             old_no_eff = replay(row, cfg, "shipped", args.cap, eff_weight=0.0)
+            old_no_lep = replay(row, cfg, "shipped", args.cap, eff_pen_weight=0.0)
             raw = replay(row, cfg, "all_raw", args.cap)
             capped = replay(row, cfg, "all_cap", args.cap)
             groups += 1
@@ -336,6 +370,7 @@ def main():
                 rew_raw.append(raw["reward"][i])
                 rew_cap.append(capped["reward"][i])
                 delta_eff.append(old["adv"][i] - old_no_eff["adv"][i])
+                delta_lep.append(old["adv"][i] - old_no_lep["adv"][i])
                 delta_raw.append(raw["adv"][i] - old["adv"][i])
                 delta_cap.append(capped["adv"][i] - old["adv"][i])
                 raw_reward_flip += int(old["reward"][i] > 0 >= raw["reward"][i])
@@ -362,6 +397,7 @@ def main():
     print(f"adv<0: {neg}/{affected} ({fmt_pct(neg, affected)})")
     print(f"|adv|<0.02: {neutral}/{affected} ({fmt_pct(neutral, affected)})")
     print_dist("len_eff 对目标人群的 adv 增量（通常应<=0）", delta_eff)
+    print_dist("独立 lep 对目标人群的 adv 增量（启用后应<=0）", delta_lep)
     print("解释：目标样本不拿 eff bonus，但短正确样本会抬高组均值；若该增量接近 0，"
           "说明隐式压力确实太弱。\n")
 

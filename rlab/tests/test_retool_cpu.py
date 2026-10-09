@@ -4784,10 +4784,11 @@ def test_token_budget_mode():
     print("[AO] token 预算档：预算判据 / 续写 / 已完成调用不续写 / 预算提示")
     import torch as _t
     from rlab.config import get_config, validate_retool_budget
-    from rlab.reward import (group_eff_bonus, reward_code_attempt, reward_code,
+    from rlab.reward import (group_eff_bonus, group_eff_penalty,
+                             reward_code_attempt, reward_code,
                              overlong_ref_tokens)
     from rlab.train import run_signature
-    from rlab.rollout import multi_turn_rollout_group
+    from rlab.rollout import multi_turn_rollout_group, retool_score_flat
 
     # ---------- 1. group_eff_bonus（效率激励）纯函数 ----------
     # 通过轨迹 [1000, 2000, 3000]，另两条未通过
@@ -4816,6 +4817,49 @@ def test_token_budget_mode():
     check("效率项：全组等比变短 → 完全相同（相对化，无'集体缩短'捷径）",
           all(abs(x - y) < 1e-9 for x, y in zip(_a, _b)))
 
+    # ---------- 1b. group_eff_penalty（正确但超 ref 的 capped 反向信用） ----------
+    _pr = [1.0, 1.0, 1.0, -1.0]
+    _pl = [1000, 2000, 6000, 8000]  # 通过中位 ref=2000；第三条 ratio-1=2
+    check("效率长罚：w=0 逐位同旧", group_eff_penalty(_pr, _pl, weight=0.0) == _pr)
+    _pp = group_eff_penalty(_pr, _pl, weight=0.1, cap=1.0)
+    check("效率长罚：短/等 ref 的正确轨迹不动",
+          abs(_pp[0] - 1.0) < 1e-9 and abs(_pp[1] - 1.0) < 1e-9)
+    check("效率长罚：超 ref 正确轨迹 ratio 被 cap=1，最多扣 weight",
+          abs(_pp[2] - 0.9) < 1e-9)
+    check("效率长罚：失败轨迹仍归 MiMo len_penalty，本项分文不动",
+          abs(_pp[3] - (-1.0)) < 1e-9)
+    _floor = group_eff_penalty([0.05, 1.0, 1.0], [8000, 1000, 1100],
+                               weight=0.2, cap=1.0)
+    check("效率长罚：正确 reward 保留最小正值，不翻成非正",
+          0.0 < _floor[0] <= 1e-5)
+    _tiny = group_eff_penalty([5e-7, 1.0, 1.0], [8000, 1000, 1100],
+                              weight=0.2, cap=1.0)
+    check("效率长罚：低于 min_positive 的既有 reward 不被惩罚反向抬高",
+          abs(_tiny[0] - 5e-7) < 1e-12)
+    _adv_before = _t.tensor(_pr) - _t.tensor(_pr).mean()
+    _adv_after = _t.tensor(_pp) - _t.tensor(_pp).mean()
+    check("效率长罚梯度方向：超 ref 正确轨迹 advantage 降低、短正确相对提高",
+          _adv_after[2] < _adv_before[2] and _adv_after[0] > _adv_before[0])
+    check("效率长罚：组内不足两条通过 → 相对参考无定义，逐位同旧",
+          group_eff_penalty([1.0, -1.0], [8000, 1000], weight=0.1) == [1.0, -1.0])
+    _cfg_adv = get_config("retool_math", use_wandb=False, len_eff_w=0.0,
+                          len_eff_penalty_w=0.0, len_penalty_w=0.0,
+                          overlong_shaping=False)
+    _adv_stats = [{"code_used": 0, "code_ok": 0, "trunc_final": 0}
+                  for _ in range(8)]
+    _adv_off, *_ = retool_score_flat(
+        [{"Q": "q", "A": "42"}], ["\\boxed{42}"] * 8,
+        _adv_stats, _cfg_adv, steps_elapsed=0,
+        completion_lens=[1000] * 7 + [8000])
+    _cfg_adv["len_eff_penalty_w"] = 0.1
+    _adv_on, *_ = retool_score_flat(
+        [{"Q": "q", "A": "42"}], ["\\boxed{42}"] * 8,
+        _adv_stats, _cfg_adv, steps_elapsed=0,
+        completion_lens=[1000] * 7 + [8000])
+    check("效率长罚 rollout 探针：关闭时全对组零adv，开启后长正确负adv/短正确正adv",
+          bool((_adv_off.abs() < 1e-8).all())
+          and _adv_on[-1].item() < 0.0 and _adv_on[0].item() > 0.0)
+
     # ---------- 2. 反激励修正（once） ----------
     check("once=False 旧口径：线性累加（答对+4次=+0.4）",
           abs(reward_code_attempt(4, 0.1, max_rounds=8) - 0.4) < 1e-9)
@@ -4841,12 +4885,16 @@ def test_token_budget_mode():
               "token 预算不自洽" in str(e) and "9216" in str(e))
     _tc = get_config("retool_math", use_wandb=False, tool_protocol="native",
                      max_traj_tokens=8192, max_context_tokens=9216,
-                     max_prompt_length=1024, len_eff_w=0.1, answer_reserve=1024,
+                     max_prompt_length=1024, len_eff_w=0.1,
+                     len_eff_penalty_w=0.1, answer_reserve=1024,
                      budget_hint=True, code_shaping_once=True, overlong_ref=4096)
     _sig = run_signature(_tc)
-    check("签名带 token 档五件套（mtj/ar/lew/olr/cs/bh）",
-          "-mtj8192-ar1024" in _sig and "-lew0.1" in _sig and "-olr4096" in _sig
-          and "-cs1" in _sig and "-bh1" in _sig)
+    check("签名带 token 档六件套（mtj/ar/lew/lep/olr/cs/bh）",
+          "-mtj8192-ar1024" in _sig and "-lew0.1" in _sig and "-lep0.1" in _sig
+          and "-olr4096" in _sig and "-cs1" in _sig and "-bh1" in _sig)
+    from rlab.train import _OPT_TAG_PREFIXES as _lep_opt, _is_opt_suffix as _lep_suffix
+    check("lep 改 reward 语义，不得被旧签名前缀兼容放行",
+          "lep" not in _lep_opt and not _lep_suffix("-lep0.1"))
     check("token 档下 overlong_ref 显式覆盖生效（死开关修复）",
           overlong_ref_tokens(_tc) == 4096)
     _tc2 = dict(_tc); _tc2["overlong_ref"] = 0
@@ -4859,7 +4907,13 @@ def test_token_budget_mode():
                       len_penalty_w=0.1)
     check("关闭新档 → 签名里一个新标记都没有（历史签名逐字不变）",
           not any(x in run_signature(_old)
-                  for x in ("-mtj", "-lew", "-olr", "-cs1", "-bh1")))
+                  for x in ("-mtj", "-lew", "-lep", "-olr", "-cs1", "-bh1")))
+    try:
+        get_config("retool_math", use_wandb=False, len_eff_penalty_w=-0.1)
+        check("len_eff_penalty_w<0 必须 fail-fast", False)
+    except ValueError as _e:
+        check("len_eff_penalty_w<0 必须 fail-fast",
+              "len_eff_penalty_w" in str(_e) and ">= 0" in str(_e))
     # token 档只在原生协议下实现（fail-fast 而非静默降级）
     _fn = get_config("retool_math", use_wandb=False, max_traj_tokens=4096,
                      max_context_tokens=5120)
@@ -5198,16 +5252,23 @@ def test_token_budget_mode():
     check("retool_score_flat 在 advantage 之前应用效率项（相对项才进得去）",
           "_eff_w > 0.0" in ro and "group_eff_bonus" in ro
           and ro.index("group_eff_bonus") < ro.index("excl = [1 if (tf or wf)"))
-    check("completion_lens 的取用条件覆盖效率项（否则静默无效）",
-          "_lp_w > 0.0 or _eff_w0 > 0.0" in ro)
+    check("completion_lens 的取用条件覆盖正/反效率项（否则静默无效）",
+          "_lp_w > 0.0 or _eff_w0 > 0.0 or _eff_pen_w0 > 0.0" in ro)
+    check("正确长轨迹效率惩罚在 advantage 之前应用",
+          "group_eff_penalty" in ro
+          and ro.index("group_eff_penalty(rewards.tolist()")
+          < ro.index("excl = [1 if (tf or wf)"))
     check("code_shaping_once 贯通到 reward 调用",
           "code_shaping_once=cfg.get(\"code_shaping_once\"" in ro
           or "code_shaping_once=" in ro)
-    check("CLI 有五个新开关", all(x in tr for x in
+    check("CLI 有效率奖励/惩罚等新开关", all(x in tr for x in
           ('"--max_traj_tokens"', '"--answer_reserve"', '"--budget_hint"',
-           '"--len_eff_w"', '"--code_shaping_once"', '"--overlong_ref"')))
+           '"--len_eff_w"', '"--len_eff_penalty_w"',
+           '"--code_shaping_once"', '"--overlong_ref"')))
     check("run_info 落 max_traj_tokens（eval 端能回读同档）",
           '"max_traj_tokens": cfg.get("max_traj_tokens")' in tr)
+    check("run_info 落 len_eff_penalty_w（checkpoint 自证 reward 曲面）",
+          '"len_eff_penalty_w": cfg.get("len_eff_penalty_w")' in tr)
     # 【eval 端同档】终止结构是协议的一部分：不传这三键，eval 就会用"轮数档"的
     # 终止结构去评一个 token 档训出来的 ckpt（轨迹/终止点/截断率全不同）。
     _ev = open(os.path.join(root, "eval_vllm_one.py"), encoding="utf-8").read()
@@ -5284,7 +5345,8 @@ def test_max_prompt_length_cli():
                     "--max_traj_tokens", "8192", "--answer_reserve", "1024",
                     "--budget_hint", "--max_context_tokens", "9216",
                     "--max_prompt_length", "1024",
-                    "--len_eff_w", "0.1", "--code_shaping_once",
+                    "--len_eff_w", "0.1", "--len_eff_penalty_w", "0.1",
+                    "--code_shaping_once",
                     "--overlong_ref", "4096", "--no-log",
                     "--steps", "20", "--save_steps", "5",
                     "--out_dir", os.path.join(tempfile.gettempdir(), "_ap_probe")]
@@ -5302,6 +5364,9 @@ def test_max_prompt_length_cli():
           _parsed and "cfg" in _cap)
     check("命令里的 --max_prompt_length 1024 真落到 cfg（不是被忽略）",
           _cap.get("cfg", {}).get("max_prompt_length") == 1024)
+    check("命令里的 --len_eff_penalty_w 0.1 真落到 cfg 并进签名",
+          abs(float(_cap.get("cfg", {}).get("len_eff_penalty_w", 0.0)) - 0.1) < 1e-9
+          and "-lep0.1" in _cap.get("cfg", {}).get("run_signature", ""))
 
     # ---- 3. 进签名 + 迁移兼容（否则 CLI 改的 run 撞 out_dir）----
     from rlab.train import run_signature as _rs, _is_opt_suffix as _ios2
