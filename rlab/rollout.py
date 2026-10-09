@@ -522,6 +522,36 @@ def is_native_protocol(cfg: dict) -> bool:
     return tool_protocol_of(cfg) == TOOL_PROTOCOL_NATIVE
 
 
+def budget_hint_line(left: int, call_need: int) -> str:
+    """剩余额度提示行（纯函数，CPU 可测）——分档，给模型**可执行**的信息。
+
+    【2026-10-09 为什么改分档】p6/p7 真机归因：无 boxed 的 ~50% 是 C_wasted
+    （预算已不够「回包+作答」仍写完整调用，按预算判据不执行、轨迹无分而终）、
+    ~19% 是 B_call（把调用拖到预算耗尽前一刻）。旧提示只有一句「还剩 N token」，
+    模型不知道**执行阈值**——"还剩多少"是它本来就算不准的事（回包/作答各占多少
+    它看不见），信息量约等于零。分档把判据直接说出来：
+
+      · left < call_need  → 再写调用**必然**不执行（连零长度调用都装不下）：
+        明说"不要调用，立刻 boxed 收尾"；
+      · left < 2·call_need → 只够**一次短调用**（调用文本预算 = left−call_need）：
+        预警"尽快收尾"；
+      · 其余 → 维持旧文案（逐位不变）。
+
+    call_need = 回包估算（tool_result_max_chars//2+16）+ answer_reserve，与
+    执行判据 `_can` 同口径——提示说的是真话，这是它能被学进去的前提。"""
+    if left < call_need:
+        return (f"\n[budget] Only {left} tokens left — NOT enough for another "
+                f"tool call (a call needs about {call_need} tokens of free space "
+                f"after it; one now would NOT be executed). Do not call the tool "
+                f"— end now with your final \\boxed{{}} answer.")
+    if left < 2 * call_need:
+        return (f"\n[budget] {left} tokens left (low). At most one more short "
+                f"tool call fits. Wrap up and finish with your \\boxed{{}} "
+                f"answer soon.")
+    return (f"\n[budget] {left} tokens left in this trajectory. "
+            f"Finish with your final answer when you have enough.")
+
+
 def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                                     prompts_messages, cfg, code_runner=run_code,
                                     collect_logps: bool = False):
@@ -561,6 +591,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     traj_budget = int(cfg.get("max_traj_tokens", 0) or 0)
     tok_mode = traj_budget > 0
     _hint = bool(cfg.get("budget_hint", False)) and tok_mode
+    # 执行一次调用的预算开销估算：工具回包（obs）+ 之后作答的空间（reserve）。
+    # 执行判据（_can）与分档提示（budget_hint_line）共用同一口径——提示里说的
+    # 阈值必须就是真实阈值，否则模型学到的是错误判据。
+    _obs_est = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
+    _ans_res = max(1, int(cfg.get("answer_reserve", 0) or 0))
     # 每样本状态：messages（协议用）/ prompt_ids（生成端喂 vLLM 的真实序列）/ 调用数
     msgs = [list(m) for m in prompts_messages]
     ctx_ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
@@ -710,9 +745,7 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
             # 执行一次调用要花掉两笔：工具回包（obs）+ 之后作答的空间
             # （answer_reserve），两者都装得下才执行。
             if tok_mode:
-                _obs = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
-                _res = max(1, int(cfg.get("answer_reserve", 0) or 0))
-                _can = (traj_budget - _used_tokens(i) - _obs) >= _res
+                _can = (traj_budget - _used_tokens(i) - _obs_est) >= _ans_res
             else:
                 _can = (not is_final_round
                         and code_stats[i]["code_used"] < max_code_calls)
@@ -763,9 +796,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     # 回包是环境插入的、不进 loss、不参与打分（见 retool_score_flat），
                     # 加一行零成本；它把 C 从"不可学的悬崖"变成"可学的判断"。
                     # 剩余额度按**当前 ctx_ids** 算（本样本此刻的真实占用）。
+                    # 【2026-10-09】分档化（budget_hint_line）：p6/p7 上 C_wasted 仍占
+                    # 无 boxed ~50%——只报剩余额度不够，模型算不准执行阈值，必须把
+                    # "再调用会不会被执行"直接告诉它。
                     _left = max(0, traj_budget - (len(ctx_ids[i]) - p0[i]) - len(body) // 2)
-                    body += (f"\n[budget] {_left} tokens left in this trajectory. "
-                             f"Finish with your final answer when you have enough.")
+                    body += budget_hint_line(_left, _obs_est + _ans_res)
                 call_id = make_call_id(0, i, code_stats[i]["code_used"])
                 obs_msg = tool_message(call_id, body)
                 try:

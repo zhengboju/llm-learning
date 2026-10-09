@@ -5081,6 +5081,94 @@ def test_token_budget_mode():
     check("budget_hint=False：回包不含额度行（默认关，逐位同旧）",
           "[budget]" not in _tool_text(False))
 
+    # (e2) 【2026-10-09 分档提示】p6/p7 真机归因：C_wasted（预算不够回包+作答仍
+    #     写完整调用）占无 boxed ~50%、B_call（把调用拖到最后一刻）~19%——只报
+    #     剩余额度模型算不准执行阈值，必须把"再调用会不会被执行"直接说出来。
+    from rlab.rollout import budget_hint_line as _bhl
+    # 宽松档：旧文案逐位不变（老 run 的行为锚点）
+    check("分档提示：预算充足 → 旧文案逐位不变",
+          _bhl(9000, 600) == ("\n[budget] 9000 tokens left in this trajectory. "
+                              "Finish with your final answer when you have enough."))
+    # 边界：left < need → 强警告（再调用必然不执行）；need ≤ left < 2·need → 软预警
+    check("分档提示：left < need（连零长度调用都装不下）→ 明说不要调用",
+          "would NOT be executed" in _bhl(599, 600)
+          and "Do not call the tool" in _bhl(599, 600))
+    check("分档提示：left = need 已进软预警（边界归入'只够一次短调用'）",
+          "(low)" in _bhl(600, 600) and "would NOT be executed"
+          not in _bhl(600, 600))
+    check("分档提示：need ≤ left < 2·need → 软预警",
+          "(low)" in _bhl(1199, 600))
+    check("分档提示：left = 2·need 回到宽松档（边界归入充足）",
+          "in this trajectory" in _bhl(1200, 600))
+    # 集成：预算只够一次短调用时，回包里真的出现软预警而非宽松文案
+    # （mk_cfg 的 obs_est=200//2+16=116，ans_res=400 → need=516、2·need=1032；
+    #   首轮调用+回包后 left≈700−调用文本(≪100)−obs≈660 < 1032 → 软预警；
+    #   且 700−调用−116 ≥ 400 调用仍执行，余量双向都够宽，不吃 tokenizer 细节）
+    def _tool_text_cfg(**kw):
+        _c = mk_cfg(budget_hint=True, **kw)
+        _fg = FakeGen([[_call, _call], ["\\boxed{42}", "\\boxed{42}"]])
+        _sg, _ff, _cc = multi_turn_rollout_group(
+            _fg, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, _c,
+            code_runner=fake_run,
+            prompts_messages=prompt_messages_for([{"Q": "Q1"}], _c) * 2)
+        return "".join(s["text"] for s in _sg[0] if s["kind"] == "tool")
+
+    _tt_low = _tool_text_cfg(max_traj_tokens=700, answer_reserve=400)
+    check("分档提示集成：低预算回包带软预警（与执行判据同口径）",
+          "(low)" in _tt_low and "in this trajectory" not in _tt_low)
+    _tt_wide = _tool_text_cfg(max_traj_tokens=100000, answer_reserve=10)
+    check("分档提示集成：充足预算回包仍是宽松文案",
+          "in this trajectory" in _tt_wide and "(low)" not in _tt_wide)
+
+    # (e3) 【2026-10-09 预算段】B2 子桶（全程零调用、纯散文写到底）永远收不到
+    #     回包提示行——系统提示是到达它的唯一信道。get_config 在 native +
+    #     max_traj_tokens>0 + budget_hint 三条件齐备时把预算段追加进
+    #     system_prompt（preset 与自定义提示都吃），签名自动带 -sp<hash>。
+    from rlab.config import inject_budget_prompt as _ibp
+    from rlab.config import (system_prompt_retool_math as _sp_fen,
+                             system_prompt_retool_math_native as _sp_nat)
+    _c0 = get_config("retool_math", use_wandb=False, tool_protocol="native")
+    check("预算段：默认档（mtj=0）不注入，native preset 逐位不变",
+          _c0["system_prompt"] == _sp_nat)
+    _c0b = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                      max_traj_tokens=8192, answer_reserve=1024,
+                      max_context_tokens=9216)
+    check("预算段：budget_hint 关（缺省）→ 不注入",
+          _c0b["system_prompt"] == _sp_nat)
+    _c0c = get_config("retool_math", use_wandb=False,
+                      max_traj_tokens=8192, answer_reserve=1024,
+                      max_context_tokens=9216, budget_hint=True)
+    check("预算段：fence 协议不注入（提示行只在 native 实现，说了没有=幻觉指令）",
+          _c0c["system_prompt"] == _sp_fen)
+    _c1 = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                     max_traj_tokens=8192, answer_reserve=1024,
+                     max_context_tokens=9216, budget_hint=True)
+    check("预算段：native+bh+mtj → 注入且带真实预算数字",
+          _c1["system_prompt"].startswith(_sp_nat)
+          and "Token budget:" in _c1["system_prompt"]
+          and "8192 tokens" in _c1["system_prompt"]
+          and "1024 tokens" in _c1["system_prompt"]
+          and "[budget] N tokens left" in _c1["system_prompt"])
+    _c1b = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                      max_traj_tokens=8192, answer_reserve=1024,
+                      max_context_tokens=9216,
+                      budget_hint=True, system_prompt="MY CUSTOM PROMPT")
+    check("预算段：自定义提示（--system_prompt_file 场景）同样追加且不破原文",
+          _c1b["system_prompt"].startswith("MY CUSTOM PROMPT")
+          and "Token budget:" in _c1b["system_prompt"])
+    check("预算段：幂等（eval 回读 run_info 再走 get_config 不会叠第二遍）",
+          _ibp(_c1) is False and _c1["system_prompt"].count("Token budget:") == 1)
+    check("预算段：注入后 ≠ preset → 签名自动带 -sp<hash>（旧 run 不被静默复用）",
+          "-sp" in run_signature(_c1) and "-sp" not in run_signature(_c0))
+    # 探针侧必须同口径注入（--system_prompt_file 是 get_config 之后的整段替换）
+    import inspect as _insp
+    from rlab import probe_difficulty as _pb_mod
+    _pb_src = _insp.getsource(_pb_mod)
+    check("probe_difficulty：--system_prompt_file 之后补注入预算段（探针=训练提示）",
+          "inject_budget_prompt" in _pb_src
+          and _pb_src.index("inject_budget_prompt")
+          > _pb_src.index('cfg["system_prompt"] = f.read().strip()'))
+
     # (f) 预算耗尽：最后一次生成被切断 → 缓冲必须落段（否则 token 凭空丢失）
     #     回放一律 finish_reason="length"（持续续写直到 8 token 预算耗尽）
     _cfg_tight = mk_cfg(max_traj_tokens=8, answer_reserve=1, budget_hint=False)

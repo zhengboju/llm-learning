@@ -306,6 +306,11 @@ def main():
         # 打印指纹，便于与训练启动行的 `signature=...-sp<hash6>` 逐字对上。
         with open(args.system_prompt_file, encoding="utf-8") as f:
             cfg["system_prompt"] = f.read().strip()
+    # 【2026-10-09】预算段必须与训练同口径：get_config 已对 preset 注入过（幂等），
+    # 但 --system_prompt_file 是**之后**整段替换的，必须补注入，否则探针/训练的
+    # system_prompt 分叉（本函数正是 get_config 之后直接改 cfg 的形态）。
+    from rlab.config import inject_budget_prompt as _inject_bp
+    _inject_bp(cfg)
     # 提示指纹始终计算（probe_meta 要写入每行；不传 --system_prompt_file 时
     # 用 preset 默认提示的指纹）
     import hashlib

@@ -618,6 +618,47 @@ NATIVE_PROTOCOL_DEFAULTS = {
 }
 
 
+# 【2026-10-09 预算段】budget_hint + token 预算档下追加到系统提示末尾。
+# 动机（p6/p7 真机归因）：无 boxed 的 B2 子桶（全程零调用、纯散文写到底被切）
+# 从来收不到 [budget] 提示行——提示行只搭工具回包的便车，零调用 = 零提示，
+# 模型对总预算完全盲。系统提示是到达 B2 的**唯一**信道；同时它把 [budget] 行的
+# 语义与「调用执行判据」（回包 + 作答预留装得下才执行）预先声明，回包里的分档
+# 提示（rollout.budget_hint_line）才不需要自解释。
+# 门控条件与提示行的生效条件严格一致（native + max_traj_tokens>0 + budget_hint）：
+# 提示里承诺了 [budget] 行而实际不注入 = 幻觉指令，比不写更糟。
+_BUDGET_PROMPT_MARK = "Token budget:"
+_BUDGET_PROMPT_PARA = (
+    "\n\nToken budget: the whole trajectory (all your reasoning, tool calls, and "
+    "their results) shares a total budget of {mtj} tokens. After each tool result, "
+    "a line like \"[budget] N tokens left\" reports the remaining budget. A tool "
+    "call is executed only if its result plus about {res} tokens reserved for your "
+    "final answer still fits the budget; otherwise the call is discarded and the "
+    "trajectory ends unscored. Plan ahead: keep each step short, and when the "
+    "budget runs low, stop calling the tool and end immediately with your final "
+    "\\boxed{{}} answer."
+)
+
+
+def inject_budget_prompt(cfg: dict) -> bool:
+    """budget 档开启时把预算段追加进 cfg["system_prompt"]（幂等，返回是否追加）。
+
+    在 get_config 装配末尾与 probe_difficulty 的 --system_prompt_file 之后各调
+    一次：两侧最终 prompt 必须逐字节相同（探针出的难度表只对同提示的训练有效）。
+    追加后 system_prompt ≠ default_system_prompt → 签名自动带 -sp<hash>，
+    旧 run 不会被静默复用。marker 判重：eval 回读 run_info（已含预算段）再走
+    get_config 时不会叠加第二遍。"""
+    if not (cfg.get("budget_hint")
+            and int(cfg.get("max_traj_tokens", 0) or 0) > 0
+            and cfg.get("tool_protocol") == "native"):
+        return False
+    sp = cfg.get("system_prompt") or ""
+    if _BUDGET_PROMPT_MARK in sp:
+        return False
+    cfg["system_prompt"] = sp + _BUDGET_PROMPT_PARA.format(
+        mtj=int(cfg["max_traj_tokens"]), res=int(cfg.get("answer_reserve", 0) or 0))
+    return True
+
+
 def default_system_prompt(algo: str, tool_protocol: str = "fence") -> str:
     """该算法 preset 的**默认**系统提示（供 run_signature 判定"提示被改过"）。
 
@@ -837,6 +878,9 @@ def get_config(algo: str, **overrides) -> dict:
         cfg["system_prompt"] = system_prompt_retool
     if algo == "retool_math" and "system_prompt" not in overrides:
         cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
+    # 预算档系统提示段（preset 与 --system_prompt_file 自定义提示都吃）：必须发生在
+    # override 合并之后，且幂等（marker 判重），详见 inject_budget_prompt docstring。
+    inject_budget_prompt(cfg)
     if cfg["wandb_name"] is None:
         cfg["wandb_name"] = f"{algo}"
     # 输出目录按算法隔离（防 grpo/dapo 的 step_N checkpoint 与 record 互相覆盖）
