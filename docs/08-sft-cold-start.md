@@ -643,6 +643,9 @@ need    = 4×6144 + 1024 + 798 = 26398  ≤ 26400 ✅ 余量仅 +2
 
 ## 7. 实施顺序（按信息量/成本排序）
 
+> **【2026-10-09 更新】下表是 few-shot 合成（`synth_tir`）路线，已废弃。**
+> 现行路线（dump 开采 + 预算感知收尾）的运行手册见 §7.5。
+
 | 步骤 | 工作量 | 产出 | 判据 |
 |---|---|---|---|
 | **① 小样本合成探针** | 半天 | 200 题 × k=8 | 四连过滤后**每题覆盖率**；"用码且对"联合率 |
@@ -656,6 +659,72 @@ need    = 4×6144 + 1024 + 798 = 26398  ≤ 26400 ✅ 余量仅 +2
 到底有没有戏"这个已消耗 11 版的问题。
 
 ---
+
+## 7.5 运行手册（2026-10-09 落地版，dump 开采路线，以此为准）
+
+目标：**教预算感知收尾**（治 p6/p7 无 boxed 三桶 C_wasted/B_call/B2），
+不是"教写代码"。前置：pod 上 `git pull` 到 ≥ `75868df`，且训练 run 已开
+`traj_dump`（p6/p7 均已开）。
+
+### ① 数据生成（分钟级，纯 CPU）
+
+```bash
+python -m rlab.sft_data \
+    --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
+    --out rlab_out/sft_budget_v1.jsonl \
+    --system_prompt_file <与 RL 训练同一份提示文件> \
+    --max_traj_tokens 8192 --answer_reserve 1024
+```
+
+产出三类样本：`real_tool`（用码答对未截断）/ `zero_call`（零调用答对）/
+`low_budget`（合成：最后工具回包处截断 + 强警档预算行 + 简短 boxed 收尾，
+答案取自轨迹自身）。每题限额 `--max_per_q 2` 且偏好更短轨迹；low_budget
+每题至多 `--synth_per_q 1` 条。
+
+**读打印**：`分类: {...}` 里 low_budget 为 0 = dump 没淘到货（检查行里
+segs 是否带 body）；末尾的 `sp<sha6>` 是数据所用系统提示的指纹，后续 RL
+签名必须出现同一个 `-sp<sha6>`。
+
+### ② SFT 训练（4B，H20 单卡，千条级数据约半小时内）
+
+```bash
+python -m rlab.sft --data rlab_out/sft_budget_v1.jsonl \
+    --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v1 \
+    --lr 1e-5 --epochs 2 --optim_8bit
+```
+
+- lr 默认 1e-5（**不照抄论文 1e-6**——那句是 RL 段超参，§3.2 归属辨析）；
+- 超长样本（>9216 token）丢弃并计数，不截断（截断轨迹恰是要治的负示范）；
+- 产出 `final/`（vLLM 可直读）+ `sft_info.json`（数据/超参/丢弃统计自证）。
+
+### ③ 验收门（不过门不准进 RL）
+
+```bash
+python eval_vllm_one.py --model rlab_out/sft_budget_v1/final \
+    --algo retool_math --split test --n 300 --seed 42 \
+    --gpu_mem 0.78 --out rlab_out/eval_sft_v1.json --name sft_v1
+python -m rlab.sft_gate --eval rlab_out/eval_sft_v1.json \
+    --base_eval <BASE 同档评测.json>     # exit 0 才可进 RL
+```
+
+| 指标 | 门槛 | 本次的靶心 |
+|---|---|---|
+| fmt（有 boxed） | > 90% | ★ 主靶：对应无 boxed 率 <10%（p6/p7 是 ~25%） |
+| code_rate | > 60% | SFT 不应把工具行为学丢 |
+| code_ok/code_used | > 70% | 代码质量 |
+| acc | ≥ BASE | 冷启动不许伤基础能力 |
+
+**门不过的处置**：fmt 过门但 acc 跌破 BASE → lr 降 5e-6 重训；
+low_budget 样本过少（<总量 10%）→ 先回 ① 检查 dump 源。
+
+### ④ 进 RL
+
+`--model_path` 换成 `rlab_out/sft_budget_v1/final`，`--system_prompt_file`
+不变，其余沿用 p6 配方（含 `--len_eff_penalty_w 0.1`）。签名里应出现与
+数据一致的 `-sp<sha6>`；新 out_dir。
+
+**预期观察**（`--no-boxed-breakdown`）：C_wasted 与 B_call 占比应明显回落；
+B2 是最硬的一桶，若仍高位再考虑机制性强制收尾。
 
 ## 8. 元教训
 
