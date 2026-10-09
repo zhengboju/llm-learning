@@ -692,12 +692,20 @@ CLI 覆盖 preset 是本项目的常态（`--trunc_shaping`、`--round_gen_token
 
 ## 附：待建文件清单
 
+> **【2026-10-09 落地更新】** SFT 已按**新目标**实现：不是初版设想的
+> "教模型写代码"（原生协议下代码行为本就在分布里），而是**教预算感知收尾**
+> ——治 p6/p7 无 boxed 三桶（C_wasted/B_call/B2，见 record 的无 boxed 归因
+> 分解）。数据源从"few-shot 合成"改为**直接开采 traj.jsonl dump**（真实轨迹，
+> 含被丢弃 attempt），初版的 `synth_tir.py` 路线废弃。
+
 | 文件 | 状态 | 说明 |
 |---|---|---|
-| `rlab/synth_tir.py` | 待写 | 阶段①；**落盘层需重写**（现有 `--dump_samples` 不存 `ids` 且有配额，见 §2.2），其余复用 `probe_difficulty.py` |
-| `rlab/sft.py` | 待写 | 阶段②，唯一真正的新代码 |
-| `rlab/tests/test_sft_cpu.py` | 待写 | 工具位梯度=0 探针 + segs↔ids 序列契约 |
-| `config.py` 的 `sft` preset | 待加 | lr 1e-5（起调）/ epoch 2 / max_seq 8192 / zero_stage 2 |
+| `rlab/sft_data.py` | ✅ 已建 | 阶段①；从 traj.jsonl 选 real_tool/zero_call 正确轨迹 + 合成 low_budget 收尾样本（cut=last 信息完备口径）；预算行经 `rollout.budget_hint_line` 改写成当前分档形态；系统提示经 `get_config`+`inject_budget_prompt` 装配并落 sp_sha |
+| `rlab/sft.py` | ✅ 已建 | 阶段②；`encode_example` 经 `render_chat_ids` 增量渲染（与 rollout 同源），labels 仅 assistant（含收尾 im_end）；`chunked_sft_loss` 分块算 logits 不物化 T×V；plain torch + bf16 + AdamW（8bit 可选），默认 lr 1e-5 / epoch 2 |
+| `rlab/sft_gate.py` | ✅ 已建 | 阶段②验收门：code_rate>0.6 / fmt>0.9 / code_ok÷used>0.7 / acc≥BASE，exit code 可 `&&` 链进 RL |
+| `rlab/tests/test_sft_cpu.py` | ✅ 已建 | 数据过滤/改写/合成 + encode mask 契约（MockTok）+ **梯度探针**（masked 位梯度严格 0）+ gate 判定 |
+| ~~`rlab/synth_tir.py`~~ | 废弃 | 被 dump 开采路线取代（见上方更新说明） |
+| `config.py` 的 `sft` preset | 不加 | SFT 是独立入口（`python -m rlab.sft` 自带 CLI 默认值），不进 RL 的 config 体系 |
 
 ## 附：外部参考
 
