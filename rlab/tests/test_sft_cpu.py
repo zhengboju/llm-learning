@@ -146,9 +146,42 @@ def test_sft_data():
 
     # compose_system_prompt：预算段自动注入（与 RL 同入口）
     from rlab.sft_data import compose_system_prompt
-    sp, sha = compose_system_prompt(max_traj_tokens=8192, answer_reserve=1024)
+    sp, sha, need0, src0 = compose_system_prompt(max_traj_tokens=8192,
+                                                 answer_reserve=1024)
     check("compose_system_prompt：含预算段且带真实数字、返回 sha6",
           "Token budget:" in sp and "8192 tokens" in sp and len(sha) == 6)
+    check("compose_system_prompt：preset 路径 call_need = 500//2+16+1024",
+          need0 == 1290 and src0 == "preset")
+
+    # --from_run_info：提示与预算三件套从 run_info 取；历史提示不含预算段，
+    # 经幂等注入后与"同内容文件路径"逐字节一致（同一函数，不是两处各写）
+    with tempfile.TemporaryDirectory() as td:
+        ri_p = os.path.join(td, "run_info.json")
+        with open(ri_p, "w", encoding="utf-8") as f:
+            json.dump({"config": {"system_prompt": "MY PROMPT",
+                                  "max_traj_tokens": 8192, "answer_reserve": 1024,
+                                  "tool_result_max_chars": 500}}, f)
+        sp_ri, sha_ri, need_ri, src_ri = compose_system_prompt(
+            run_info_path=ri_p)
+        _, sha_f, need_f, _ = compose_system_prompt(
+            system_prompt_file=None, max_traj_tokens=8192, answer_reserve=1024)
+        with open(os.path.join(td, "sp.txt"), "w", encoding="utf-8") as f:
+            f.write("MY PROMPT\n")
+        sp_file, sha_file, need_file, _ = compose_system_prompt(
+            system_prompt_file=os.path.join(td, "sp.txt"),
+            max_traj_tokens=8192, answer_reserve=1024)
+        # 显式文件优先于 run_info：内容不同的文件应赢
+        with open(os.path.join(td, "sp2.txt"), "w", encoding="utf-8") as f:
+            f.write("OTHER PROMPT")
+        sp_pri, _, _, _ = compose_system_prompt(
+            system_prompt_file=os.path.join(td, "sp2.txt"), run_info_path=ri_p)
+        check("from_run_info：预算段补注入 + 三件套取自 run_info",
+              sp_ri.startswith("MY PROMPT") and "Token budget:" in sp_ri
+              and need_ri == 1290 and "run_info" in src_ri)
+        check("from_run_info ≡ 同内容文件路径（sha 逐字一致，RL 侧才可对拍）",
+              sha_ri == sha_file and need_ri == need_file)
+        check("from_run_info：显式 --system_prompt_file 优先于 run_info",
+              sp_pri.startswith("OTHER PROMPT"))
 
     # main 端到端：临时 dump → jsonl，行内含系统提示与 turns
     with tempfile.TemporaryDirectory() as td:

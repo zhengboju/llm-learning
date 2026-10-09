@@ -672,9 +672,16 @@ need    = 4×6144 + 1024 + 798 = 26398  ≤ 26400 ✅ 余量仅 +2
 python -m rlab.sft_data \
     --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
     --out rlab_out/sft_budget_v1.jsonl \
-    --system_prompt_file <与 RL 训练同一份提示文件> \
-    --max_traj_tokens 8192 --answer_reserve 1024
+    --from_run_info rlab_new/native_p6_best/run_info.json
 ```
+
+`--from_run_info`（推荐）：系统提示与预算三件套（`max_traj_tokens`/
+`answer_reserve`/`tool_result_max_chars`）直接从 run_info 取。历史 run_info
+写在预算段功能之前、提示里不含预算段——本命令经 `inject_budget_prompt`
+幂等补注入，结果与后续 RL run 用同一提示文件时逐字节一致（测试锁定：
+`from_run_info ≡ 同内容 --system_prompt_file`）。仍可用
+`--system_prompt_file <文件> --max_traj_tokens 8192 --answer_reserve 1024`
+显式指定（优先级更高）。
 
 产出三类样本：`real_tool`（用码答对未截断）/ `zero_call`（零调用答对）/
 `low_budget`（合成：最后工具回包处截断 + 强警档预算行 + 简短 boxed 收尾，

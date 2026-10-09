@@ -174,19 +174,54 @@ def synthesize_low_budget(turns, call_need: int, rng: random.Random):
 
 
 def compose_system_prompt(system_prompt_file=None, max_traj_tokens=8192,
-                          answer_reserve=1024):
-    """与训练/probe 同一入口装配系统提示（含预算段自动注入），返回 (sp, sha6)。"""
-    from rlab.config import get_config
-    ov = dict(use_wandb=False, tool_protocol="native",
-              max_traj_tokens=int(max_traj_tokens),
-              answer_reserve=int(answer_reserve),
-              max_context_tokens=int(max_traj_tokens) + 1024,
-              budget_hint=True)
+                          answer_reserve=1024, tool_result_max_chars=500,
+                          run_info_path=None):
+    """与训练/probe 同一入口装配系统提示（含预算段自动注入）。
+
+    返回 (sp, sha6, call_need, src)。优先级：--system_prompt_file >
+    --from_run_info > native preset。
+
+    【run_info 路径的注意点】历史 run_info 写在预算段功能之前，其
+    config.system_prompt **不含**预算段；这里经 inject_budget_prompt（幂等）
+    补注入——结果与未来 RL run 用同一提示文件 + 同预算参数时逐字节一致
+    （同一入口、同一函数，不是两处各写一遍）。call_need 也从 run_info 的
+    tool_result_max_chars/answer_reserve 推导，少传三个易错参数。"""
+    from rlab.config import get_config, inject_budget_prompt
+    src = "preset"
     if system_prompt_file:
         with open(system_prompt_file, encoding="utf-8") as f:
-            ov["system_prompt"] = f.read().strip()
-    sp = get_config("retool_math", **ov)["system_prompt"]
-    return sp, hashlib.sha1(sp.encode("utf-8")).hexdigest()[:6]
+            base_sp = f.read().strip()
+        src = f"file:{system_prompt_file}"
+    elif run_info_path:
+        with open(run_info_path, encoding="utf-8") as f:
+            ri = json.load(f)
+        rc = ri.get("config") or {}
+        if not rc.get("system_prompt"):
+            raise ValueError(f"[sft_data] {run_info_path} 里没有 config.system_prompt")
+        base_sp = rc["system_prompt"]
+        max_traj_tokens = int(rc.get("max_traj_tokens") or max_traj_tokens)
+        answer_reserve = int(rc.get("answer_reserve") or answer_reserve)
+        tool_result_max_chars = int(rc.get("tool_result_max_chars")
+                                    or tool_result_max_chars)
+        src = f"run_info:{run_info_path}"
+    else:
+        base_sp = None
+    call_need = tool_result_max_chars // 2 + 16 + answer_reserve
+    if base_sp is None:
+        ov = dict(use_wandb=False, tool_protocol="native",
+                  max_traj_tokens=int(max_traj_tokens),
+                  answer_reserve=int(answer_reserve),
+                  max_context_tokens=int(max_traj_tokens) + 1024,
+                  budget_hint=True)
+        sp = get_config("retool_math", **ov)["system_prompt"]
+    else:
+        c = {"system_prompt": base_sp, "budget_hint": True,
+             "max_traj_tokens": int(max_traj_tokens),
+             "answer_reserve": int(answer_reserve),
+             "tool_protocol": "native"}
+        inject_budget_prompt(c)
+        sp = c["system_prompt"]
+    return sp, hashlib.sha1(sp.encode("utf-8")).hexdigest()[:6], call_need, src
 
 
 def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
@@ -250,6 +285,11 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--system_prompt_file", default=None,
                     help="必须与后续 RL 训练同一份（缺省 = native preset）")
+    ap.add_argument("--from_run_info", default=None,
+                    help="从 run_info.json 取系统提示与预算三件套（推荐：p6/p7 的"
+                         " run_info；其提示不含预算段，经 inject_budget_prompt"
+                         " 幂等补注入后与后续 RL 同配方逐字节一致）。"
+                         "优先级低于 --system_prompt_file")
     ap.add_argument("--max_traj_tokens", type=int, default=8192)
     ap.add_argument("--answer_reserve", type=int, default=1024)
     ap.add_argument("--tool_result_max_chars", type=int, default=500,
@@ -260,10 +300,9 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args(argv)
 
-    call_need = args.tool_result_max_chars // 2 + 16 + args.answer_reserve
-    sp, sp_sha = compose_system_prompt(args.system_prompt_file,
-                                       args.max_traj_tokens,
-                                       args.answer_reserve)
+    sp, sp_sha, call_need, sp_src = compose_system_prompt(
+        args.system_prompt_file, args.max_traj_tokens, args.answer_reserve,
+        args.tool_result_max_chars, args.from_run_info)
     samples, stats = build_dataset(load_dump_rows(args.dump),
                                    call_need=call_need,
                                    max_per_q=args.max_per_q,
@@ -285,7 +324,7 @@ def main(argv=None):
     print(f"[sft_data] 分类: {stats['per_source']}；结构非法跳过 "
           f"{stats['bad_struct']}，无 boxed 跳过 {stats['no_boxed']}，"
           f"预算行改写 {stats['rewritten_budget_lines']} 行", flush=True)
-    print(f"[sft_data] 系统提示 sp{sp_sha}（含预算段）已写入每行；"
+    print(f"[sft_data] 系统提示 sp{sp_sha}（来源 {sp_src}，含预算段）已写入每行；"
           f"后续 RL 的签名必须出现同一 -sp{sp_sha}", flush=True)
     if stats["per_source"]["low_budget"] == 0:
         print("[sft_data][警告] low_budget 合成 0 条——治 C_wasted/B_call 的"
