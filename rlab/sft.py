@@ -271,6 +271,9 @@ def main(argv=None):
         pad_id = tokenizer.eos_token_id
     step = update = 0
     t1 = time.time()
+    tok_seen = 0          # 累计已过 forward 的真实 token（吞吐用，与 epoch 无关）
+    win_loss_sum = 0.0    # 当前 update 窗口的 token 加权 loss 和
+    win_tok = 0
     for ep in range(args.epochs):
         order = list(range(len(encoded)))
         random.shuffle(order)
@@ -280,6 +283,12 @@ def main(argv=None):
             loss, nb = chunked_sft_loss(model, ids.cuda(), attn.cuda(),
                                         labels.cuda(), chunk=args.loss_chunk)
             (loss / args.grad_accum).backward()
+            # loss 是**单 micro-batch** 的 token 均值：micro_bs=1 时即逐样本，
+            # 样本间方差 ≈±0.13，逐条打出来是噪声不是趋势。按 token 加权累计到
+            # 一个 update 窗口（口径同全局 token-mean）再打。
+            win_loss_sum += loss.item() * nb
+            win_tok += nb
+            tok_seen += sum(e["n_tokens"] for e in batch)
             step += 1
             if step % args.grad_accum == 0:
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(),
@@ -290,12 +299,12 @@ def main(argv=None):
                 optimizer.zero_grad(set_to_none=True)
                 update += 1
                 if update % args.log_every == 0:
-                    el = time.time() - t1
+                    el = max(1e-9, time.time() - t1)
                     print(f"[sft] ep{ep} update {update}/{n_update} "
-                          f"loss {loss.item():.4f} lr {lr_at(update):.2e} "
-                          f"gnorm {gn:.2f} tok/s "
-                          f"{sum(e['n_tokens'] for e in encoded) * (ep + step * args.micro_bs / len(encoded)) / max(1., el):.0f}",
-                          flush=True)
+                          f"loss {win_loss_sum / max(1, win_tok):.4f} "
+                          f"lr {lr_at(update):.2e} gnorm {gn:.2f} "
+                          f"tok/s {tok_seen / el:.0f}", flush=True)
+                win_loss_sum, win_tok = 0.0, 0
         print(f"[sft] epoch {ep} 完成（update {update}/{n_update}）", flush=True)
 
     # ---- 存盘（vLLM 可直读的 HF 目录）+ 自证信息 ----
