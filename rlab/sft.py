@@ -187,6 +187,9 @@ def main(argv=None):
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
     ap.add_argument("--loss_chunk", type=int, default=1024)
+    ap.add_argument("--no_grad_ckpt", action="store_true",
+                    help="关闭梯度检查点（默认开：T=9216 全层激活约 78GB，"
+                         "H20-96G 必 OOM；开后激活降到约 3GB，时长 +30%）")
     ap.add_argument("--optim_8bit", action="store_true",
                     help="bitsandbytes AdamW8bit（与 RL 同一显存策略）")
     ap.add_argument("--seed", type=int, default=42)
@@ -239,6 +242,11 @@ def main(argv=None):
     model = load_causal_lm(args.model_path, dtype=torch.bfloat16,
                            attn_implementation="flash_attention_2")
     model.cuda().train()
+    if not args.no_grad_ckpt:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
     if args.optim_8bit:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr,
