@@ -19,6 +19,7 @@ RL 教学项目（GRPO/DAPO/CISPO/GSPO/RF++ 六算法 + ReTool 代码交织 + re
 - held-out 契约必须落盘复读断言（verify_train_pool_clean——「已剔除 dev」是声明不是证据）；prepare 切分按题面不按行；n>池子要告警+落盘实际 N；空答案计 0 分入分母
 - eval 与 rlab 的 reward 是两套实现（0/1 vs ±1 口径），改打分逻辑两边都查
 - 聚合指标改口径（greedy→Average@N）时清点所有按题号索引/取平均/二值判定的消费点；「>100% 的率」是除数错的免费签名；「显著」先问检验的是哪个量
+- 报「vs 基础模型显著」前先拆归属：链路上任何中间产物（如 SFT）都会偷走末端环节的功劳（p9：p<0.001 实为 SFT +6.5pp / RL +3.8pp 不显著）；边际指标涨不代表能力涨，每轮必报**条件指标** `acc/fmt`（p9：三段 +10.3pp 全来自交卷率，条件精度平坦 84.9~86.2%）
 
 ## 训练/实验纪律
 - 单变量实验纪律；性能优化先画数据流实际发生次数（随机池上「重复出现才触发」的逻辑先算重现概率）；「过滤器存在且测试全绿」≠真实数据流生效
@@ -40,4 +41,4 @@ RL 教学项目（GRPO/DAPO/CISPO/GSPO/RF++ 六算法 + ReTool 代码交织 + re
 ## 文档地图（结论级内容查这里，别重复排查）
 - docs/01-loss-variants.md：阶段1 六算法总表与大结论（变体趋同、GRPO 并列最佳、运行方差 ±4pp）；docs/02-retool.md：ReTool 代码交织
 - docs/03-qwen35-4b-retool-math-checklist.md：4B 迁移清单；docs/04-qwen35-4b-gpu-memory-oom.md：显存炸点时序+公式表；docs/07-vllm-logprobs-non-determinism-4b.md：可复现档
-- docs/08-sft-cold-start.md（§7.5 运行手册 / §7.6 锚机制）、09-native-tool-protocol.md、14-native-p3-handover.md、p8-diagnosis.md、p9-diagnosis.md（SFT→RL 全链路定版 + 桶归因 + 门限校准）、p10-diagnosis.md
+- docs/08-sft-cold-start.md（§7.5 运行手册含归属拆分 / §7.6 锚机制）、09-native-tool-protocol.md、14-native-p3-handover.md、p8-diagnosis.md、p9-diagnosis.md（SFT→RL 全链路定版；★条件精度全程平坦=瓶颈在此）、p10-diagnosis.md
