@@ -1,0 +1,250 @@
+# retool_math p9 全链路诊断：SFT 冷启动 → RL 定版（2026-10-11）
+
+**链路**：`base → traj dump(p6/p7) → SFT 数据 v1 → sft_v1 → eval 臂矩阵 → RL p9 → step400`
+**本次结论**：链路走通，**acc +10.2pp（70.6→80.9，McNemar p<0.001）、fmt 81.9→94.9、输出 token −30%、工具轮次砍半（3.78→1.91）**——首次出现"更准且更省"。
+**签名**：`retool_math-ts0-ol1-r5x2048-s400x100-lr1e-06-nodiff-vk...-tpnative-nsc1-sp632ef7-of1-caw0.05-cw0.05-tcc0.02-twp0.2-ttp0.2-lp0.1-lq50-lg0.25-mtj12288-ar1024-lew0.15-lep0.1-olr8192-cs1-bh1-g8-u8-c13312-sd42-ob2048`
+
+---
+
+## 1. 结论先行
+
+1. **p9 是首条"更准且更省"的配方**：acc/token/轮次四条曲线同向（acc 有一处在噪声内回落，token 与轮次严格单调）。模型不是靠"多想"换分。
+2. **★ 锚机制（本次最重要的机制发现）**：**系统提示里的预算数字是"规划锚"，`max_traj_tokens` 是"溢出余量"**——两者错开（承诺紧、余量松）反而最优。干净单变量对照（A vs self，只差提示里一个数字）：**+5.2pp acc / +4.1pp fmt，且少花 343 token**。
+3. **格式已饱和，瓶颈转向条件精度**：step400 的 `acc 80.9 / fmt 94.9` → 有 boxed 者仅 **85.2%** 正确。损失里"写了 boxed 但答错"（~41 题）是"没写 boxed"（~15 题）的 **2.8 倍**；而条件精度从 p6 起几乎不动（87.5→88.0→88.9）——**此前所有工作修的是"有没有交卷"，不是"答得对不对"**。
+4. **无 boxed 率 22%→9.1%（−59%）**，四个桶全部腰斩以上，`零梯度 0/3200` 说明惩罚不是死开关。
+5. **本次最大的方法论事故不是配置错，是我把 eval 当成了探索场**（10 个臂、同一批 293 题、没动过权重），且手改派生配置状态导致一个臂根本不存在（§4.4）。
+
+---
+
+## 2. 阶段①：SFT 数据（`rlab/sft_data.py`）
+
+```bash
+python -m rlab.sft_data \
+    --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
+    --out rlab_out/sft_budget_v1.jsonl \
+    --from_run_info rlab_new/native_p6_best/run_info.json
+```
+
+**本机落地补两条**（跑手册原版没有）：
+
+- **`--dump` 可以再加 p8**：dump 行**不自带系统提示**，`compose_system_prompt` 合成一份 sp 统一重编码所有行、每行落同一 `sp_sha`，所以混源不会引入第二份提示。p8 的行是"见过预算提示"的策略产出的，离 RL 起点更近。
+- **`--from_run_info` 指谁 = 下个 RL 用哪份提示**：p6 是自定义精简文件（sp5361b5），p8 是 native preset + 预算段（sp632ef7），两者基提示不同。**本次用 p8**。
+
+**产出**：2140 条 / 5.36M token / assistant 占 58.2% / `sp632ef7`。
+
+---
+
+## 3. 阶段②：SFT 训练（`rlab/sft.py`）
+
+```bash
+python -m rlab.sft --data rlab_out/sft_budget_v1.jsonl \
+    --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v1 \
+    --lr 1e-5 --epochs 2 --optim_8bit
+```
+
+**实测**：268 次 optimizer update（2140×2/16）、约 1 小时、3050 tok/s。loss window 均值 ep0 0.291 → ep1 0.239（−18%），ep1 尾段连续落在 0.10~0.15 全程最低段。
+
+### 3.1 两个已修的坑（都在本阶段暴露）
+
+| 坑 | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| **OOM（首 batch 即炸）** | `torch.OutOfMemoryError`，H20-96G 进程已占 94GB | **没开梯度检查点**：T=9216 全层激活约 78GB。`loss_chunk` 只压了 logits 峰值，主干激活才是大头 | `sft.py` 默认 `gradient_checkpointing_enable(use_reentrant=False)` + `enable_input_require_grads()` + `use_cache=False`；留 `--no_grad_ckpt` 逃生门（激活 78GB→~3GB，时长 +30%） |
+| **loss 看起来没降** | 日志逐条乱跳 0.009~0.51 | 打的是**单 micro-batch（micro_bs=1）逐样本** loss，样本间方差 ±0.13；`tok/s` 公式里 `ep` 与跨 epoch 的 `step` **重复计数**，epoch 边界翻倍跳变（6057→3000） | loss 改**窗口 token 加权均值**（口径同全局 token-mean），`tok/s` 改**累计 token/累计耗时** |
+
+**读法纪律**：SFT 目标是自己生成的同分布轨迹，per-token CE ≈0.25（困惑度 ≈1.3）**贴着熵底**是正常的，不是训练无效。**该看的不是 loss 曲线，而是 eval 的 fmt 与 `--no-boxed-breakdown` 的桶分布**。
+
+### 3.2 验收门：FAIL 了，而这次 FAIL 是**门限设错**而非配方坏
+
+`rlab/sft_gate`：code_rate 94.9% PASS / **fmt 84.3% FAIL（门限 0.9）** / code_ok 97.1% PASS / acc 72.4% PASS。
+
+**复盘**：门限 0.9 是**当时设的目标值，不是实测基线**（同档 BASE 才 77.5%）。SFT 段实测上限 84.3~86.7%，剩下的缺口最终由 **RL 段补齐到 94.9%**。⇒ 门限应按实测校准为**两段式**：SFT 段 `fmt ≥ 0.85`、`0.9` 作为 RL 段目标（§7 行动清单 B2）。
+
+---
+
+## 4. ★ 锚机制：eval 臂矩阵
+
+### 4.1 矩阵（全部 N=293 / seed42 / temp1.0；"锚"= 系统提示里写的数字，"上限"= `max_traj_tokens`）
+
+| 臂 | 锚 | 上限 | 轮上限 | acc% | fmt% | 输出token | 轮次 |
+|---|---|---|---|---|---|---|---|
+| BASE | 8192 | 8192 | 8192 | 66.9 | 77.5 | 3075 | 3.40 |
+| sft_v1 | 8192 | 8192 | 8192 | 72.4 | 84.3 | 2652 | 2.04 |
+| **A** | **8192** | **12288** | 8192 | **78.2** | **90.8** | 3190 | 2.40 |
+| A2 ≡ A3（重复臂） | 12288 | 8192 | 8192 | 70.6 / 71.0 | 86.0 / 85.7 | 2652 | 2.25 |
+| **self** | 12288 | 12288 | 8192 | 73.0 | 86.7 | 3533 | 2.61 |
+| sft_rt2048 ≡ 12288_2048（重复臂） | 8192 | 8192 | **2048** | 74.7 | 86.7 / 89.1 | 2525 | 2.08 |
+| BASE_mtj12288 | 8192 | 12288 | 8192 | 70.0 | 79.9 | 3878 | 3.67 |
+
+**2×2（锚 × 上限，轮上限固定 8192）——本次唯一干净的机制对照**：
+
+| 锚↓ \ 上限→ | 8192 | 12288 |
+|---|---|---|
+| **8192** | 72.4 / 84.3 / 2652 | **78.2 / 90.8 / 3190** |
+| **12288** | 70.6 / 86.0 / 2652 | 73.0 / 86.7 / 3533 |
+
+### 4.2 机制
+
+**上限决定"会不会被切断"，提示数字决定"它打算写多少"。最优是让两者错开——承诺紧、余量松。**
+
+- **锚低 + 余量大 = 最优（A）**：模型按 8192 规划（写 3190），12288 兜住溢出 → 46 条原本撞 8192 被切断的断头路活下来。
+- **锚高**：模型把计划撑到它以为的额度（3533），**照样撞 12288**，白花 33% token（self）。上限从 8192 抬到 12288 在锚 12288 时只值 +2.4pp（噪声内）。
+- **纵向弹性**：输出长度对**提示数字**的弹性（2652→3533，+33%）**大于**对真实上限的弹性。这就是"锚"的直接证据。
+- 方向自证：BASE 同协议抬上限 66.9→70.0（+3.1pp）但 token +26%（3075→3878）——**给 base 更多就一定花掉**；SFT 模型则按锚规划，余量只当安全垫。
+
+### 4.3 护栏（p9 全部按此执行，且训练中未被教坏）
+
+1. **必须传 `--system_prompt_file`**：`inject_budget_prompt` 见到 "Token budget:" 标记即跳过注入，提示里的数字才会**停在 8192**，而 `--max_traj_tokens` 独立抬到 12288。若走默认注入，提示会被自动改写成 12288 → **锚消失，退化成 self 那一格**。
+2. **`--overlong_ref 8192` 必须显式给**：它默认取 `max_traj_tokens`（`reward.py:174`）——不给则长度惩罚软悬崖跟着抬到 12288，"省 token"这一半**静默失效**。
+3. **盯 `record` 的 `avg_clen` 是否爬向 12288**：那是"模型学会把余量花光、锚失效"的签名。**p9 实测全程稳定在 2400~4600**（末尾反而降到 2602）→ 锚稳定，路径可用。
+4. 显存 +44%（T 9216→13312）**未 OOM**，但这是本次才验证的；换更大 mtj 仍需先探。
+
+### 4.4 本次的方法论事故（自查，必读）
+
+**A3 臂根本不存在，我却解释过它。**
+
+- 三次造 proto 时，`proto_12288_12288` 与 `proto_mtj12288_ok` **逐字节相同**（都只改了提示文本，没改 `round_gen_tokens`，也没改 `mtj`）；`proto_12288_2048` 与 `proto_rt2048` 同理。我拿两个"同一配置"的读数当作两个不同臂，产出了一段"A3 否掉 12288"的无效推理。
+- **根因三层**：① 同一事实有 **4 份物理拷贝**（`max_traj_tokens`、`max_context_tokens`、`max_rounds×round_gen_tokens`、**以及 system_prompt 文本里嵌的自然语言数字**），我每次只改想到的那一份；② **没写断言**（`assert str(cfg["max_traj_tokens"]) in sp` 一行就能拦住全部三次）；③ **读了自己的输出却没交叉验证**——两个声称测不同变量的臂读数几乎相同，本身就是"它们是同一个东西"的强信号，该去 diff 而不是去解释。
+- **正解**：改 `mtj` 应让 `inject_budget_prompt` 重新生成提示（单一来源），而不是 `str.replace` 成品文本。为了"不想让 sha 变"而绕过单一来源机制，是错误的取舍。
+
+**副产物（有用的）**：重复臂给出了**同配置重跑噪声**——`acc ≤0.4pp`（70.6/71.0）、`fmt 可达 2.4pp`（86.7/89.1）。⇒ A vs A2 的 7.6pp、A vs self 的 5.2pp **远超噪声**；但 **1.8~2.4pp 的差异一律不可当结论**（含 A2 vs sft_v1）。
+
+---
+
+## 5. 阶段③：RL 配置与结果
+
+```bash
+python -m rlab.train --algo retool_math \
+    --model_path rlab_out/sft_budget_v1/final_mm \
+    --system_prompt_file <锚提示：SFT 数据首行的 system_prompt，锚 8192> \
+    --round_gen_tokens 2048 --max_rounds 5 \
+    --max_traj_tokens 12288 --max_context_tokens 13312 --overlong_ref 8192 \
+    --budget_hint --len_eff_w 0.15 --len_eff_penalty_w 0.1 --len_penalty_w 0.1 \
+    --len_penalty_quantile 50 --len_penalty_gate 0.25 \
+    --tool_waste_penalty 0.2 --trunc_tail_penalty 0.2 \
+    --num_pre_Q 8 --gradient_accumulation_steps 8 --micro_rows 1 --optim_8bit \
+    --gen_gpu_mem 0.30 --steps 400 --save_steps 100 --out_dir rlab_new/native_p9_best
+```
+
+**与 p8 的差异（可迁移的三项）**：`round_gen_tokens 8192→2048`、`max_traj_tokens 8192→12288`（锚保持 8192）、`len_eff_penalty_w 0→0.1`。
+
+**注**：`--max_rounds 5` 已足够（实测平均轮次 ≤2.9）；`--vllm_model_path` 未用，因为起点已是复合目录 `final_mm`（**统一目录**写法，`sync.py` 支持）。
+
+### 5.1 评测曲线（N=293）
+
+| ckpt | acc% | fmt% | 输出token | 轮次 | McNemar |
+|---|---|---|---|---|---|
+| BASE | 70.6 | 81.9 | 3700 | 3.78 | — |
+| step100 | 76.5 | 88.4 | 3480 | 2.83 | p=0.027 显著 |
+| step200 | 74.7 | 87.7 | 3345 | 2.48 | p=0.092 噪声内 |
+| step300 | 78.8 | 90.8 | 3092 | 2.29 | p=0.003 显著 |
+| **step400** | **80.9** | **94.9** | **2602** | **1.91** | **p<0.001 显著** |
+
+- 三条曲线同向单调（acc 一处噪声内回落），**不是挑最大值**：四个 ckpt 单调上升。
+- **fmt 94.9% 越过 0.9**；门限四项（code>0.6 / fmt>0.9 / code_ok>0.7 / acc≥BASE）全过。
+- **训练 acc率 80.8% ≈ 评测 80.9%**：无过拟合信号。
+- `eval_during_training=false`，故 step 边界窗口在 record 表里显示"盲"，属预期。
+
+### 5.2 归属未关（唯一未关的方法论缺口）
+
+上表的 BASE 是**按 p9 档重评**的（3700 tok / 3.78 轮，与 p8 表的 3075/3.40 不同档）——所以 `66.9→70.6` 里含**协议红利**（与 BASE_mtj12288 的 70.0 一致，佐证）。
+
+**仍缺**：sft_v1 在同一档下的读数。现有 SFT 臂 A=78.2 是 `rt8192/gpu_mem0.78`，与本表不同档。若同档下 SFT ≈78，则 **RL 只贡献 +2.7pp，SFT 贡献 +7.6pp**——决定下一轮投数据还是投训练。**这是下一件事。**
+
+---
+
+## 6. 无 boxed 归因对比（p8 → p9，同为 3200 样本）
+
+| 桶 | p8 | p9 | 变化 |
+|---|---|---|---|
+| **无 boxed 总数** | 705（22%） | **292（9%）** | **−59%** |
+| C_wasted（末轮废码） | 371 | 124 | −67% |
+| B_cut_mid_prose（散文被切） | 266 | 135 | −49% |
+| B2（零调用纯散文） | 42 | 19 | −55% |
+| B_call（调用未闭合被切） | 92 | 49 | −47% |
+| D+E | 68 | 33 | −51% |
+| trunc 率 | 9.1% | **5.0%** | −45% |
+| 末轮废码率 | ~11% | **~4%** | −64% |
+| 零梯度占比 | 0% | 0% | 惩罚非死开关 |
+
+**训练曲线**：acc率 78.8→90.0 波动上行，会话均值 80.8%；条件精度 88.9%。
+
+### 6.1 残余 292 条的结构与处方
+
+| 子类 | 条数 | 画像 | 处方 |
+|---|---|---|---|
+| C_wasted | 124（42%） | 最后一刻才写调用；115/124 `clen≥0.9cap` | 已被 SFT 合成压掉 67% 后平台化；再压需 SFT v2（`--synth_per_q 2`） |
+| B 带工具 | 116（46%） | 末段 p25/p50/p75 = **3434/5456/8362**，104/116 ≥2048 | **见下** |
+| B2 零调用 | 19（0.6%） | 末段恒 12288（吃满） | 全程一次 `[budget]` 都没见过 → 纯静态提示；**不值得为 0.6% 改协议** |
+| D+E | 33（11%） | 干净收尾没给 boxed | 提示层微调 |
+
+**B 那 116 条已吃满长度惩罚**（`olr=8192` 的软悬崖在 8192 饱和，它们的 clen 在 11059+）⇒ **加大惩罚无效**（p7 已证幅度饱和）。真正的缺口是**末段的预算可见性**：`[budget]` 行只在工具回包处出现，软档阈值 `left < 2×need ≈ 2580` —— 这类样本最后一次回包时可能还有 ~6000 额度，**一行警告都没有**，然后一口气写 5456 token 撞墙。**同一个 POMDP，位置从"轮间"挪到了"末段内"。**
+
+⇒ 唯一对症的小改是**放宽软档带宽**（约 3 行 + 测试，可 A/B），**不是**动惩罚幅度。
+
+---
+
+## 7. 行动清单
+
+### A. 立即可做（按 ROI）
+
+1. **续训**（最高 ROI）：step300→400 还有 +2.1pp，**无平台迹象**。从 step400 再跑 400 步。
+2. **补同档 SFT 复评**（30 分钟，关掉 §5.2 的归属缺口）：
+   ```bash
+   python eval_vllm_one.py --model rlab_out/sft_budget_v1/final \
+       --proto_from rlab_new/native_p9_best --mm_base /root/Qwen3.5-4B \
+       --algo retool_math --split test --n 300 --seed 42 \
+       --gpu_mem <与 p9 表同档> --out rlab_out/eval_sft_p9proto.json --name sft_p9proto
+   ```
+   注意 `sft_budget_v1/final` 是**纯文本** ckpt（`sft.py` 直存，无 `save_mm_checkpoint`），vLLM 起不来会报 A2 TypeError ⇒ 必须给 `--proto_from`（顺带解决协议档）**与** `--mm_base`。
+3. **归因分解**：`python -m rlab.analysis --record rlab_new/native_p9_best/record.jsonl --no-boxed-breakdown rlab_new/native_p9_best/record.jsonl`（本次已跑，见 §6）。
+
+### B. 需要写代码的
+
+1. **`budget_target` 与 `max_traj_tokens` 拆成两个键**（约 40 行 + 测试）：现在"锚 ≠ 上限"只能靠"传 `--system_prompt_file` 让注入跳过"这种旁路实现，不可复现、不可自证。拆开后锚是**一等配置**、进签名。
+2. **门限两段式校准**（§3.2）：SFT 段 `fmt ≥ 0.85`；`0.9` 归 RL 段目标。
+3. **放宽软档带宽**（§6.1，3 行）：`left < 4096` 即报 low 档，治 B 桶末段无警告。
+4. **`proto_from` 生成工具**（防 §4.4 复发）：改 `mtj`/`rt` 时**自动重注入提示 + 断言一致 + 打印全部相关键 + 与父配置 diff**。手工改配置这条路直接封死。
+
+**不做**：为 B2 的 0.6% 改协议；加大惩罚幅度（已证饱和）。
+
+---
+
+## 8. 元教训
+
+1. **派生状态不许手工改**：同一事实有 4 份物理拷贝时，任何手工改动都要配"一致性断言 + diff 自证"，否则会造出**不存在的臂**并解释它（§4.4）。
+2. **"两个臂读数几乎相同"先怀疑它们是同一个东西**，去 diff，不要急着解释。
+3. **eval 是用来验证假设的，不是用来发现假设的**：本次在同一批 293 题上跑了 10 个臂、没动过权重——"发现了就想要更多"会让一个只该读数的位置变成调参场，出错是概率问题。**正确顺序：先读代码把机制读清，再设计最小的判别实验。**（`rollout.py:708-718` 的续写语义是在用户追问"vllm 用 base 会不会不一致"之后才去读的，顺序反了。）
+4. **门限是目标不是基线**：设门时必须同时记录"同档实测基线"，否则会把"配方合格但没到理想值"误判成"配方失败"（§3.2 的 fmt 0.9 vs 实测 84.3~86.7）。
+5. **重复臂的收益**：为省一条命令而用同一配置跑两次，是**免费的噪声标尺**（acc ≤0.4pp / fmt ≤2.4pp）——低于它的差异不该进任何结论。
+6. **长 prompt 的 OOM 先算激活**：`loss_chunk` 只压 logits（T×V），主干激活（全层、无检查点）才是 T 的量级来源；T 抬 44% 前必须重算或先跑小步探针。
+
+---
+
+## 附录：p9 run_info 关键参数
+
+```json
+{
+  "model_path": "rlab_out/sft_budget_v1/final_mm",
+  "algo": "retool_math", "all_steps": 400, "save_steps": 100, "seed": 42,
+  "round_gen_tokens": 2048, "max_rounds": 5,
+  "max_traj_tokens": 12288, "max_context_tokens": 13312,
+  "answer_reserve": 1024, "budget_hint": true, "tool_protocol": "native",
+  "tool_result_max_chars": 500, "sandbox_workers": 8,
+  "overlong_shaping": true, "overlong_buffer": 2048, "overlong_ref": 8192,
+  "len_eff_w": 0.15, "len_eff_penalty_w": 0.1, "len_penalty_w": 0.1,
+  "len_penalty_quantile": 50, "len_penalty_gate": 0.25,
+  "tool_waste_penalty": 0.2, "trunc_tail_penalty": 0.2, "trunc_shaping": 0.0,
+  "num_pre_Q": 8, "gradient_accumulation_steps": 8, "micro_rows": 1,
+  "lr": 1e-06, "optim_8bit": true, "temperature": 1.0,
+  "beta": 0.04, "clip_low": 0.2, "clip_high": 0.28, "adv_mode": "group_mean",
+  "gen_update_steps": 8, "gen_gpu_mem": 0.7, "vllm_gen_kwargs": {"gdn_prefill_backend": "triton"}
+}
+```
+
+**系统提示（锚）**：`sp632ef7` = native preset + 预算段，段内文字写 **8192**（而 `max_traj_tokens=12288`，见 §4.3 护栏 1）。
+
+---
+
+**报告完成时间**：2026-10-11
+**上游**：p8-diagnosis.md（无 boxed 三桶的发现）、08-sft-cold-start.md §7.5（SFT 落地路线）
+**待补**：§5.2 的 SFT 同档复评（决定下一轮投数据还是投训练）

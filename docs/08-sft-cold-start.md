@@ -671,9 +671,19 @@ need    = 4×6144 + 1024 + 798 = 26398  ≤ 26400 ✅ 余量仅 +2
 ```bash
 python -m rlab.sft_data \
     --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
+    --dump rlab_new/native_p8_best/traj.jsonl \
     --out rlab_out/sft_budget_v1.jsonl \
-    --from_run_info rlab_new/native_p6_best/run_info.json
+    --from_run_info rlab_new/native_p8_best/run_info.json
 ```
+
+**【2026-10-11 落地实测·两条修正】**
+
+- **`--dump` 可以任意混源**：dump 行**不自带系统提示**，`compose_system_prompt`
+  合成一份 sp 统一重编码所有行、每行落同一 `sp_sha` —— 混源不会引入第二份提示。
+  p8 的行是"见过预算提示"的策略产出的，离 RL 起点更近，建议加上。
+- **`--from_run_info` 指谁 = 下个 RL 用哪份提示**：p6 是自定义精简文件
+  （sp5361b5），p8 是 native preset + 预算段（sp632ef7），两者基提示不同。
+  实测采用 **p8**：2140 条 / 5.36M token / assistant 占 58.2% / `sp632ef7`。
 
 `--from_run_info`（推荐）：系统提示与预算三件套（`max_traj_tokens`/
 `answer_reserve`/`tool_result_max_chars`）直接从 run_info 取。历史 run_info
@@ -704,34 +714,132 @@ python -m rlab.sft --data rlab_out/sft_budget_v1.jsonl \
 - 超长样本（>9216 token）丢弃并计数，不截断（截断轨迹恰是要治的负示范）；
 - 产出 `final/`（vLLM 可直读）+ `sft_info.json`（数据/超参/丢弃统计自证）。
 
+**【2026-10-11 落地实测·两个坑已修】**
+
+- **梯度检查点默认开**（`134286c`）：不开发首位 batch 即 OOM——T=9216 全层激活约
+  78GB，`--loss_chunk` 只压 logits 峰值（T×V），**主干激活才是大头**。开后
+  78GB→~3GB，代价时长 +30%。留 `--no_grad_ckpt` 逃生门。
+- **日志口径**（`7454b9d`）：loss 是**窗口 token 加权均值**（逐样本方差 ±0.13，
+  逐条打出来是噪声）；`tok/s` 是**累计 token/累计耗时**（旧公式 `ep` 与跨 epoch 的
+  `step` 重复计数，epoch 边界翻倍跳变）。
+- **实测**：268 次 update / 约 1 小时 / 3050 tok/s；loss window 均值
+  ep0 0.291→ep1 0.239（−18%）。**per-token CE ≈0.25 是数据性质**（目标是模型自产的
+  同分布轨迹，贴着熵底），**该看的不是 loss 曲线，而是 ③ 的 fmt 与桶分布**。
+
 ### ③ 验收门（不过门不准进 RL）
 
 ```bash
 python eval_vllm_one.py --model rlab_out/sft_budget_v1/final \
+    --proto_from rlab_new/native_p8_best --mm_base /root/Qwen3.5-4B \
     --algo retool_math --split test --n 300 --seed 42 \
     --gpu_mem 0.78 --out rlab_out/eval_sft_v1.json --name sft_v1
 python -m rlab.sft_gate --eval rlab_out/eval_sft_v1.json \
     --base_eval <BASE 同档评测.json>     # exit 0 才可进 RL
 ```
 
+**【2026-10-11 实测·`final/` 是纯文本 ckpt，两个参数必须给】**
+
+`sft.py` 直存 `save_pretrained`，**没有** `train.py` 的 `save_mm_checkpoint` 逻辑
+→ 产物是纯文本（`Qwen3_5TextConfig`），vLLM 直接加载会 TypeError（A2）。
+- `--proto_from rlab_new/native_p8_best`：一份参数同时解决**协议档**（sp/预算三件套
+  回读到训练同一套）与 **mm 骨架**（`_find_mm_base` 的候选含 proto 配置的
+  `model_path`）。**不给就等于用 preset 默认协议评一个别的协议训出来的模型，Δacc 无意义。**
+- `--mm_base /root/Qwen3.5-4B`：显式骨架（双保险，`_find_mm_base` 内部是
+  `try/except continue` 静默跳过）。
+- 更省事的替代：先 `python -m rlab.materialize_mm_ckpt --text_ckpt .../final
+  --mm_base /root/Qwen3.5-4B --out .../final_mm`，之后 eval/RL 都不再需要 `--mm_base`。
+
 | 指标 | 门槛 | 本次的靶心 |
 |---|---|---|
-| fmt（有 boxed） | > 90% | ★ 主靶：对应无 boxed 率 <10%（p6/p7 是 ~25%） |
+| fmt（有 boxed） | **SFT 段 ≥85%** / RL 段目标 >90% | ★ 主靶：对应无 boxed 率 <10%（p6/p7 是 ~25%） |
 | code_rate | > 60% | SFT 不应把工具行为学丢 |
 | code_ok/code_used | > 70% | 代码质量 |
 | acc | ≥ BASE | 冷启动不许伤基础能力 |
 
+**⚠ 门限校准记录（2026-10-11）**：初版 `fmt>0.9` 是**目标值而非实测基线**
+（同档 BASE 只有 77.5%）。实测 sft_v1 = 84.3%、臂矩阵上限 86.7% → **判 FAIL，
+但这是门限设错，不是配方坏**：缺口最终由 RL 段补齐到 **94.9%**。⇒ 改成两段式：
+SFT 段 `≥0.85` 放行、`>0.9` 作为 RL 段目标。**校准必须在跑 ④ 之前完成，不能边跑边放宽。**
+
 **门不过的处置**：fmt 过门但 acc 跌破 BASE → lr 降 5e-6 重训；
-low_budget 样本过少（<总量 10%）→ 先回 ① 检查 dump 源。
+low_budget 样本过少（<总量 10%）→ 先回 ① 检查 dump 源；
+若 fmt 卡在 85% 以下且缺口集中在"撞预算被切"（看 `--no-boxed-breakdown` 的
+`clen>=0.9cap`），**优先抬 ④ 的 `max_traj_tokens`（配锚机制，§7.6），不要重训**。
 
-### ④ 进 RL
+### ④ 进 RL（2026-10-11 实测定版，p9 已验证）
 
-`--model_path` 换成 `rlab_out/sft_budget_v1/final`，`--system_prompt_file`
-不变，其余沿用 p6 配方（含 `--len_eff_penalty_w 0.1`）。签名里应出现与
-数据一致的 `-sp<sha6>`；新 out_dir。
+`--model_path` 换成 SFT 产物，`--system_prompt_file` 传**锚提示**，其余按下方定版：
 
-**预期观察**（`--no-boxed-breakdown`）：C_wasted 与 B_call 占比应明显回落；
-B2 是最硬的一桶，若仍高位再考虑机制性强制收尾。
+```bash
+# 锚提示 = SFT 数据首行的 system_prompt（内含预算段，文字写 8192）
+python - <<'PY'
+import json
+r = json.loads(open('rlab_out/sft_budget_v1.jsonl', encoding='utf-8').readline())
+assert 'Token budget:' in r['system_prompt']
+open('rlab_out/sp_anchor.txt','w',encoding='utf-8').write(r['system_prompt'])
+print('锚提示已写出，sp_sha =', r['sp_sha'])
+PY
+
+python -m rlab.train --algo retool_math \
+    --model_path rlab_out/sft_budget_v1/final_mm \
+    --system_prompt_file rlab_out/sp_anchor.txt \
+    --round_gen_tokens 2048 --max_rounds 5 \
+    --max_traj_tokens 12288 --max_context_tokens 13312 --overlong_ref 8192 \
+    --budget_hint --len_eff_w 0.15 --len_eff_penalty_w 0.1 --len_penalty_w 0.1 \
+    --len_penalty_quantile 50 --len_penalty_gate 0.25 \
+    --tool_waste_penalty 0.2 --trunc_tail_penalty 0.2 \
+    --num_pre_Q 8 --gradient_accumulation_steps 8 --micro_rows 1 --optim_8bit \
+    --gen_gpu_mem 0.30 --steps 400 --save_steps 100 --out_dir rlab_new/native_p9_best
+```
+
+**与 p8 的三处可迁移差异**：`round_gen_tokens 8192→2048`（回到 4B 定版量级）、
+`max_traj_tokens 8192→12288`（**锚保持 8192**，见 §7.6）、`len_eff_penalty_w 0→0.1`。
+
+**实测结果**（N=293，同档 BASE 70.6%）：
+
+| ckpt | acc% | fmt% | 输出token | 轮次 | McNemar |
+|---|---|---|---|---|---|
+| step100 | 76.5 | 88.4 | 3480 | 2.83 | p=0.027 |
+| step300 | 78.8 | 90.8 | 3092 | 2.29 | p=0.003 |
+| **step400** | **80.9** | **94.9** | **2602** | **1.91** | **p<0.001** |
+
+**acc +10.2pp / fmt +13.0pp / 输出 token −30% / 轮次砍半**——首次"更准且更省"，
+且训练 acc率 80.8% ≈ 评测 80.9%（无过拟合）。**step300→400 仍在涨（+2.1pp），无平台。**
+
+**预期观察**（`--no-boxed-breakdown`）：实测无 boxed 22%→**9.1%**，C_wasted −67%、
+B_cut_mid_prose −49%、B2 −55%、B_call −47%，`零梯度 0/3200`。残余结构里
+**C_wasted 124（42%）** 已被 SFT 合成压到平台，**B 116（46%）** 是下一处靶
+（末段 p50=5456，且长度惩罚已吃满 ⇒ **加大惩罚无效，要治的是末段预算可见性**）。
+
+### 7.6 ★ 锚机制：提示里的数字 ≠ 上限（2026-10-11 发现，p9 采用）
+
+**系统提示里写的预算数字是"规划锚"，`max_traj_tokens` 是"溢出余量"——两者错开
+（承诺紧、余量松）反而最优。**
+
+干净单变量对照（只差提示里一个数字，硬上限/上下文/hint 口径全同）：
+
+| 锚 ↓ \ 上限 → | 8192 | 12288 |
+|---|---|---|
+| **8192** | 72.4 / 84.3 / 2652 | **78.2 / 90.8 / 3190** |
+| **12288** | 70.6 / 86.0 / 2652 | 73.0 / 86.7 / 3533 |
+
+（格内 = acc% / fmt% / 输出token）⇒ **锚 8192 + 上限 12288：+5.2pp acc、+4.1pp fmt，且少花 343 token。**
+
+**弹性证据**：输出长度对**提示数字**的弹性（2652→3533，+33%）大于对真实上限的弹性。
+**上限决定"会不会被切断"，锚决定"它打算写多少"。**
+
+**三条护栏（缺一即失效）**：
+
+1. **必须传 `--system_prompt_file`**：`inject_budget_prompt` 见到 "Token budget:"
+   标记即跳过注入，提示里的数字才停在 8192。**走默认注入会被自动改写成 12288
+   → 锚消失，退化成表中右下格（73.0/86.7/3533）。**
+2. **`--overlong_ref 8192` 必须显式给**：它默认取 `max_traj_tokens`
+   （`reward.py:174`）——不给则长度惩罚软悬崖跟着抬到 12288，"省 token"**静默失效**。
+3. **盯 `record` 的 `avg_clen` 是否爬向 12288**：那是"模型学会把余量花光、锚失效"
+   的签名。**p9 实测全程稳定 2400~4600**（末尾降到 2602）→ 锚稳定。
+
+**已知欠债**：现在"锚 ≠ 上限"靠"传提示文件让注入跳过"这种**旁路**实现，不可自证。
+正解是把 `budget_target` 与 `max_traj_tokens` 拆成两个键（见 p9-diagnosis.md §7-B1）。
 
 ## 8. 元教训
 

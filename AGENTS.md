@@ -40,4 +40,4 @@ RL 教学项目（GRPO/DAPO/CISPO/GSPO/RF++ 六算法 + ReTool 代码交织 + re
 ## 文档地图（结论级内容查这里，别重复排查）
 - docs/01-loss-variants.md：阶段1 六算法总表与大结论（变体趋同、GRPO 并列最佳、运行方差 ±4pp）；docs/02-retool.md：ReTool 代码交织
 - docs/03-qwen35-4b-retool-math-checklist.md：4B 迁移清单；docs/04-qwen35-4b-gpu-memory-oom.md：显存炸点时序+公式表；docs/07-vllm-logprobs-non-determinism-4b.md：可复现档
-- docs/08-sft-cold-start.md、09-native-tool-protocol.md、14-native-p3-handover.md、p8-diagnosis.md、p10-diagnosis.md
+- docs/08-sft-cold-start.md（§7.5 运行手册 / §7.6 锚机制）、09-native-tool-protocol.md、14-native-p3-handover.md、p8-diagnosis.md、p9-diagnosis.md（SFT→RL 全链路定版 + 桶归因 + 门限校准）、p10-diagnosis.md
