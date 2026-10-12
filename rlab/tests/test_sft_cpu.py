@@ -489,8 +489,15 @@ def test_wiring():
                '"--grad_accum"')))
     check("sft：loss 走 chunked_sft_loss（不整物化 T×V logits）",
           "chunked_sft_loss(model" in src_t)
-    check("sft：存盘 save_pretrained（vLLM 可直读）+ sft_info.json",
-          "save_pretrained" in src_t and "sft_info.json" in src_t)
+    check("sft：复合模型 checkpoint 直接保存成 vLLM 可读多模态壳",
+          "resolve_load_config" in src_t
+          and "write_mm_checkpoint" in src_t
+          and '"checkpoint_format"' in src_t
+          and "state_dict = {k: v.detach().cpu()" in src_t)
+    check("sft：非复合模型保留 save_pretrained 文本格式回退",
+          "model.save_pretrained(save_dir)" in src_t
+          and "tokenizer.save_pretrained(save_dir)" in src_t
+          and "sft_info.json" in src_t)
     check("sft：逐 epoch 存档（判'多训是赚是亏'的唯一入口）",
           "save_every_epoch" in src_t and "epoch{ep + 1}" in src_t
           and "epoch_ckpts" in src_t)

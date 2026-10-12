@@ -811,7 +811,9 @@ python -m rlab.sft --data rlab_out/sft_budget_v2.jsonl \
 
 - lr 默认 1e-5（**不照抄论文 1e-6**——那句是 RL 段超参，§3.2 归属辨析）；
 - 超长样本（>9216 token）丢弃并计数，不截断（截断轨迹恰是要治的负示范）；
-- 产出 `final/` + **`epoch1/`、`epoch2/`** + `sft_info.json`（数据/超参/丢弃统计自证）。
+- 产出 `final/` + **`epoch1/`、`epoch2/`** + `sft_info.json`（数据/超参/丢弃统计自证）；
+- Qwen3.5 复合模型的三个 checkpoint **直接保存为多模态壳**（与 RL 共用
+  `write_mm_checkpoint`），vLLM 可直读，不再需要另做 `final_mm/`。
 
 **【为什么必须存逐 epoch（`4a6aa1e`，默认开，成本 ~40s/份）】**
 
@@ -840,25 +842,25 @@ python -m rlab.sft --data rlab_out/sft_budget_v2.jsonl \
 ### ③ 验收门（不过门不准进 RL）
 
 ```bash
-python eval_vllm_one.py --model rlab_out/sft_budget_v1/final \
-    --proto_from rlab_new/native_p8_best --mm_base /root/Qwen3.5-4B \
+# epoch1 / epoch2 / final 必须同一批配置分别评测；以下以 epoch1 为例
+python eval_vllm_one.py --model rlab_out/sft_budget_v2/epoch1 \
+    --proto_from rlab_new/native_p9_best \
     --algo retool_math --split test --n 300 --seed 42 \
-    --gpu_mem 0.78 --out rlab_out/eval_sft_v1.json --name sft_v1
-python -m rlab.sft_gate --eval rlab_out/eval_sft_v1.json \
+    --gpu_mem 0.78 --out rlab_out/eval_sft_v2_epoch1.json --name sft_v2_epoch1
+python -m rlab.sft_gate --eval rlab_out/eval_sft_v2_epoch1.json \
     --base_eval <BASE 同档评测.json>     # exit 0 才可进 RL
 ```
 
-**【2026-10-11 实测·`final/` 是纯文本 ckpt，两个参数必须给】**
+**【checkpoint 格式】**
 
-`sft.py` 直存 `save_pretrained`，**没有** `train.py` 的 `save_mm_checkpoint` 逻辑
-→ 产物是纯文本（`Qwen3_5TextConfig`），vLLM 直接加载会 TypeError（A2）。
-- `--proto_from rlab_new/native_p8_best`：一份参数同时解决**协议档**（sp/预算三件套
-  回读到训练同一套）与 **mm 骨架**（`_find_mm_base` 的候选含 proto 配置的
-  `model_path`）。**不给就等于用 preset 默认协议评一个别的协议训出来的模型，Δacc 无意义。**
-- `--mm_base /root/Qwen3.5-4B`：显式骨架（双保险，`_find_mm_base` 内部是
-  `try/except continue` 静默跳过）。
-- 更省事的替代：先 `python -m rlab.materialize_mm_ckpt --text_ckpt .../final
-  --mm_base /root/Qwen3.5-4B --out .../final_mm`，之后 eval/RL 都不再需要 `--mm_base`。
+当前 `sft.py` 与 RL 保存口径一致：若 `--model_path` 是 Qwen3.5 复合目录，
+`epochN/` 和 `final/` 都直接写成多模态壳，评测可直接 `--model .../epochN`，
+不需要 `--mm_base` 或 `materialize_mm_ckpt`。
+
+旧版 `sft_budget_v1/*` 是纯文本 checkpoint（`Qwen3_5TextConfig`），评测旧产物时仍需：
+- `--proto_from rlab_new/native_p8_best`：回读同一协议档；
+- `--mm_base /root/Qwen3.5-4B`：提供多模态骨架；
+或先用 `python -m rlab.materialize_mm_ckpt` 生成 `*_mm`。
 
 | 指标 | 门槛 | 本次的靶心 |
 |---|---|---|

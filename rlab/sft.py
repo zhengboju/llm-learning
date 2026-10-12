@@ -17,9 +17,12 @@
 AdamW（可选 8bit）+ grad accum 足够；少一层抽象少一类"配置标称≠进程实测"。
 
 用法（pod）：
-  python -m rlab.sft --data rlab_out/sft_budget_v1.jsonl \
-      --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v1 \
+  python -m rlab.sft --data rlab_out/sft_budget_v2.jsonl \
+      --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v2 \
       --lr 1e-5 --epochs 2 --optim_8bit
+
+Qwen3.5 复合模型的 epochN/ 与 final/ 直接保存成多模态壳 checkpoint，
+与 RL 的 save_checkpoint 同一条 write_mm_checkpoint 路径，vLLM 可直接读取。
 """
 import argparse
 import json
@@ -216,9 +219,10 @@ def main(argv=None):
           "（与后续 RL 的 -sp 签名必须逐字一致）", flush=True)
 
     from transformers import AutoTokenizer
-    from rlab.model_loading import load_causal_lm
+    from rlab.model_loading import load_causal_lm, resolve_load_config
     tokenizer = AutoTokenizer.from_pretrained(args.model_path,
                                               trust_remote_code=True)
+    _, model_is_composite = resolve_load_config(args.model_path)
     ctkw = {"enable_thinking": False}
     t0 = time.time()
     encoded, dropped = [], {"overlong": 0, "encode_err": 0}
@@ -263,6 +267,34 @@ def main(argv=None):
     n_update = math.ceil(
         len(encoded) * args.epochs / (args.micro_bs * args.grad_accum))
     warmup = max(1, int(n_update * args.warmup_ratio))
+
+    # 与 RL save_checkpoint 同一保存口径：torch 训练实例是纯文本类，但输入目录
+    # 若为 Qwen3.5 复合模型，落盘时把语言权重写回多模态骨架。骨架只在首次保存
+    # 流式读取一次并缓存；epochN/final 都可被 vLLM 直接读取。
+    mm_skeleton = None
+
+    def save_sft_checkpoint(save_dir):
+        nonlocal mm_skeleton
+        if model_is_composite:
+            from rlab.materialize_mm_ckpt import (load_mm_skeleton,
+                                                  write_mm_checkpoint)
+            if mm_skeleton is None:
+                print(f"[sft] 读多模态骨架（流式，只留非语言键）: "
+                      f"{args.model_path}", flush=True)
+                mm_skeleton = load_mm_skeleton(args.model_path)
+            state_dict = {k: v.detach().cpu()
+                          for k, v in model.state_dict().items()}
+            try:
+                stats = write_mm_checkpoint(
+                    state_dict, args.model_path, save_dir,
+                    skeleton=mm_skeleton, dtype=torch.bfloat16)
+            finally:
+                del state_dict
+            return (f"多模态壳：替换 {stats['text_substituted']} 语言键 / "
+                    f"保留 {stats['base_kept']} 非语言键")
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        return "文本格式（非复合模型）"
 
     def lr_at(update):
         if update < warmup:
@@ -317,27 +349,25 @@ def main(argv=None):
             # 放在 epoch 末而不是按 update 计，是为了让存档点直接对应"训了几个
             # epoch"这个待定超参；final/ 仍是最后一份，语义不变。
             _ep_dir = os.path.join(args.out_dir, f"epoch{ep + 1}")
-            os.makedirs(_ep_dir, exist_ok=True)
-            model.save_pretrained(_ep_dir)
-            tokenizer.save_pretrained(_ep_dir)
-            print(f"[sft] 存档 → {_ep_dir}（update {update}）", flush=True)
+            _fmt = save_sft_checkpoint(_ep_dir)
+            print(f"[sft] 存档 → {_ep_dir}（update {update}；{_fmt}）", flush=True)
 
-    # ---- 存盘（vLLM 可直读的 HF 目录）+ 自证信息 ----
+    # ---- 存盘（复合模型直接产多模态壳，vLLM 可直读）+ 自证信息 ----
     out = os.path.join(args.out_dir, "final")
-    model.save_pretrained(out)
-    tokenizer.save_pretrained(out)
+    _final_fmt = save_sft_checkpoint(out)
     info = {"data": os.path.abspath(args.data), "model_path": args.model_path,
             "sp_sha": sp_sha, "n_examples": len(encoded), "dropped": dropped,
             "n_tokens": n_tok, "n_assistant_tokens": n_atok,
             "args": vars(args), "updates": update,
+            "checkpoint_format": ("multimodal" if model_is_composite else "text"),
             "epoch_ckpts": ([f"epoch{e + 1}" for e in range(args.epochs)]
                             if args.save_every_epoch else []),
             "wall_s": round(time.time() - t1, 1)}
     with open(os.path.join(args.out_dir, "sft_info.json"), "w",
               encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
-    print(f"[sft] 完成 → {out}（update {update}，{time.time() - t1:.0f}s）",
-          flush=True)
+    print(f"[sft] 完成 → {out}（update {update}，{time.time() - t1:.0f}s；"
+          f"{_final_fmt}）", flush=True)
     return 0
 
 
