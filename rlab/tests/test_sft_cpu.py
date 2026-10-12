@@ -215,6 +215,33 @@ def test_sft_data():
     check("build_dataset：min_att 过滤样本不足的题（q1 attempts=4 < 5）",
           _st_ma["pass_hist"] == {})
 
+    # 【口径事故防护 ③】通过率未知的题（参考 run 里没采到）在近界筛选时
+    # **默认保留**——筛选的目的是剔除"有证据表明已掌握"的题，而"未知"≠"已掌握"。
+    # 实机形态：741 题里 341 题（46%）不在 p9 的 400 题内，静默丢掉是最糟默认。
+    _mix = [dict(r, _src=0) for r in rows]            # run0 有 q1/q2/q3
+    _mix += [dict(r, _src=1, qk=r["qk"] + "X")        # run1 有别的题（q1X..q3X）
+             for r in rows]
+    _s_ku, _st_ku = build_dataset(_mix, call_need=need, max_per_q=2,
+                                  synth_per_q=0, seed=42, ref_src=0,
+                                  min_att=1, max_rate=0.875)
+    check("build_dataset：近界筛选默认保留'通过率未知'的题（不静默丢）",
+          _st_ku["band_skipped_unknown"] == 0
+          and any(s["qk"].endswith("X") for s in _s_ku))
+    _s_du, _st_du = build_dataset(_mix, call_need=need, max_per_q=2,
+                                  synth_per_q=0, seed=42, ref_src=0,
+                                  min_att=1, max_rate=0.875, keep_unknown=False)
+    check("build_dataset：--drop_unknown 严格模式丢掉未知题并计数",
+          _st_du["band_skipped_unknown"] > 0
+          and not any(s["qk"].endswith("X") for s in _s_du))
+    check("build_dataset：n_unknown_q 按最终入样集统计（严格模式自然为 0）",
+          _st_ku["n_unknown_q"] > 0 and _st_du["n_unknown_q"] == 0)
+    # 覆盖率信息在**不开筛选**时也应可用（多 run 合并的默认路径）
+    _st_nf = build_dataset(_mix, call_need=need, max_per_q=2, synth_per_q=0,
+                           seed=42, ref_src=0, min_att=1)[1]
+    check("build_dataset：不开近界筛选时也报未知题数（覆盖率可见）",
+          _st_nf["n_unknown_q"] > 0
+          and _st_nf["band_skipped_unknown"] == 0)
+
     # prefer_short=False：不再按 clen 升序取前 k，改为 seeded 随机抽（可复现）
     def _pick(seed_v):
         _s, _ = build_dataset(rows, call_need=need, max_per_q=1, synth_per_q=0,
@@ -451,8 +478,8 @@ def test_wiring():
                '"--synth_per_q"')))
     check("sft_data CLI：近界选样(比例口径) + 参考 run + 长度偏好 + 直方图",
           all(x in src_d for x in ('"--min_rate"', '"--max_rate"', '"--ref_src"',
-                                   '"--min_att"', '"--no_prefer_short"',
-                                   "pass_hist"))
+                                   '"--min_att"', '"--drop_unknown"',
+                                   '"--no_prefer_short"', "pass_hist"))
           and "近界" in src_d and "tag=True" in src_d)
     check("sft_data：预算行只从 budget_hint_line 派生（与线上同一函数）",
           "from rlab.rollout import budget_hint_line" in src_d)

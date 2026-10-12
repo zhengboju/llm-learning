@@ -245,7 +245,8 @@ def compose_system_prompt(system_prompt_file=None, max_traj_tokens=8192,
 
 def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
                   max_examples=0, seed=42, min_rate=0.0, max_rate=1.0,
-                  prefer_short=True, ref_src=None, min_att=4):
+                  prefer_short=True, ref_src=None, min_att=4,
+                  keep_unknown=True):
     """dump 行 → SFT 样本（纯函数，CPU 可测）。返回 (samples, stats)。
 
     【2026-10-11 选样口径改版】服务"交卷率已接近饱和、该碰解题力"：
@@ -267,6 +268,11 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
         混合池上统计（那会得到"已掌握 0%、近界 92%" 这种全假读数，实机踩过）。
       · `min_att`：参考 run 内 attempts < min_att 的题不进直方图/不参与筛选
         （样本不足时通过率不可信）。
+      · `keep_unknown`（近界筛选时才有意义）：参考 run 里**没采到**的题
+        （通过率未知）**默认保留**——筛选目的是剔除"有证据表明已掌握"的题，
+        而"未知" ≠ "已掌握"，静默丢掉它们是最糟的默认。实机形态：741 题里
+        341 题（46%）不在 p9 的 400 题内。置 False = 严格模式（只留参考 run 里
+        有实测通过率的题），会被 stats["band_skipped_unknown"] 单独计数。
       · `stats["pass_hist"]`：按**换算到 num_pre_Q 刻度**的通过率分档
         （`round(rate × num_pre_Q)`，key 0..num_pre_Q）。这样不同 attempts 的题
         可比，也和 RL record 里"8 条里对几条"的直觉一致。
@@ -326,15 +332,33 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
         stats["pass_hist"][_b] = stats["pass_hist"].get(_b, 0) + 1
     stats["pass_hist_scale"] = _scale_q
     stats["pass_hist_num_pre_Q"] = _scale
-    _band_q = 0
+    _band_q = _unknown_dropped = 0
     if min_rate > 0.0 or max_rate < 1.0:
-        _keep = {q for q, a in _ra.items()
-                 if a >= int(min_att)
-                 and rate[q] >= float(min_rate) - 1e-9
-                 and rate[q] <= float(max_rate) + 1e-9}
-        _band_q = len([q for q in by_q if q not in _keep])
+        _keep = set()
+        for _q in by_q:
+            _a = _ra.get(_q, 0)
+            if _a < int(min_att):
+                # 【通过率未知的题】参考 run 里没采到（或样本不足）。
+                # 缺省**保留**：筛选的目的是剔除"有证据表明已掌握"的题，而"未知"
+                # ≠ "已掌握"。静默丢掉它们是最糟的默认（实机：741 题里 341 题
+                # 不在参考 run 内，占 46%）。`--drop_unknown` 可改为严格模式。
+                if keep_unknown:
+                    _keep.add(_q)
+                else:
+                    _unknown_dropped += 1
+                continue
+            _r = rate[_q]
+            if _r >= float(min_rate) - 1e-9 and _r <= float(max_rate) + 1e-9:
+                _keep.add(_q)
+        _band_q = len([q for q in by_q if q not in _keep]) - _unknown_dropped
         by_q = {q: v for q, v in by_q.items() if q in _keep}
     stats["band_skipped_questions"] = _band_q
+    stats["band_skipped_unknown"] = _unknown_dropped
+    # 入样且通过率未知的题数（诚实记账：这部分未经过近界验证）。
+    # **无条件按最终 by_q 统计**——严格模式下自然为 0，默认模式下自然计数，
+    # 且两种模式下覆盖率打印用的是同一个量。
+    stats["n_unknown_q"] = sum(1 for _q in by_q
+                               if _ra.get(_q, 0) < int(min_att))
     samples = []
     for qk, cands in by_q.items():
         if prefer_short:
@@ -399,6 +423,11 @@ def main(argv=None):
     ap.add_argument("--min_att", type=int, default=4,
                     help="参考 run 内该题 attempts 下限（低于此不进直方图/不参与"
                          "近界筛选：样本不足时通过率不可信）")
+    ap.add_argument("--drop_unknown", action="store_true",
+                    help="近界筛选时丢掉'参考 run 里没采到'的题（通过率未知）。"
+                         "**默认不丢**——筛选是剔除有证据表明已掌握的题，而'未知'"
+                         "≠'已掌握'；静默丢掉是最糟的默认（实机：741 题里 341 题"
+                         "不在参考 run 内，占 46%%）")
     ap.add_argument("--no_prefer_short", action="store_true",
                     help="关闭'偏好短轨迹'。长度已压住（SFT −17%%/RL −21%%），"
                          "该偏好现在只会优先剔除长轨迹=难题的正确解，纯伤害解题力")
@@ -419,7 +448,8 @@ def main(argv=None):
                                    max_rate=args.max_rate,
                                    prefer_short=not args.no_prefer_short,
                                    ref_src=args.ref_src,
-                                   min_att=args.min_att)
+                                   min_att=args.min_att,
+                                   keep_unknown=not args.drop_unknown)
     with open(args.out, "w", encoding="utf-8") as f:
         for s in samples:
             f.write(json.dumps(
@@ -435,6 +465,16 @@ def main(argv=None):
     print(f"[sft_data] 分类: {stats['per_source']}；结构非法跳过 "
           f"{stats['bad_struct']}，无 boxed 跳过 {stats['no_boxed']}，"
           f"预算行改写 {stats['rewritten_budget_lines']} 行", flush=True)
+    # 【覆盖率】直方图只覆盖参考 run 内实测的题；入样题里不在其中的部分通过率
+    # **未知**。多 run 合并时该差额可到一半（实机：741 入样 vs 参考 run 内 400
+    # 题 ⇒ 46% 未知），必须显式报出——否则会被误当成"全部题都按通过率筛过了"。
+    _unk = stats.get("n_unknown_q", 0)
+    _nq = stats.get("n_questions", 0)
+    if _unk and _nq:
+        print(f"[sft_data] ⚠ 入样 {_nq} 题中有 {_unk} 题"
+              f"（{_unk / max(1, _nq) * 100:.0f}%）通过率**未知**（不在参考 run "
+              f"内）→ 未经过近界验证；只留有实测通过率的题请加 --drop_unknown",
+              flush=True)
     # 【pass-rate 直方图】决定"要不要开近界选样（--max_rate）"的唯一判据。
     # 两条口径纪律（都是 2026-10-11 实机踩出来的）：
     #   ① **限定参考 run**：混合多 run 后同一题被反复采样，合并统计全假；
@@ -470,9 +510,14 @@ def main(argv=None):
         else:
             print(f"[sft_data]   ⇒ 近界题充足（{_band} 题），可试 "
                   f"`--max_rate 0.875`（=7/8，只留不是每次都对的题）", flush=True)
-    if stats.get("band_skipped_questions"):
-        print(f"[sft_data] 近界筛选丢掉 {stats['band_skipped_questions']} 题"
-              f"（min_rate={args.min_rate}, max_rate={args.max_rate}）", flush=True)
+    if stats.get("band_skipped_questions") or stats.get("band_skipped_unknown"):
+        print(f"[sft_data] 近界筛选（min_rate={args.min_rate}, "
+              f"max_rate={args.max_rate}）：按通过率剔除 "
+              f"{stats.get('band_skipped_questions', 0)} 题，丢掉'通过率未知'"
+              f"（参考 run 未采到）{stats.get('band_skipped_unknown', 0)} 题"
+              f"（--drop_unknown 才丢）", flush=True)
+    # 【通过率覆盖率】诚实记账：多少题是**真的**按通过率筛过的
+    # （打印在 build_dataset 的直方图段已做过一次，这里不重复）
     print(f"[sft_data] 系统提示 sp{sp_sha}（来源 {sp_src}，含预算段）已写入每行；"
           f"后续 RL 的签名必须出现同一 -sp{sp_sha}", flush=True)
     if stats["per_source"]["low_budget"] == 0:
