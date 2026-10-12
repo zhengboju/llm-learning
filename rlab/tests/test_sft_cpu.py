@@ -144,6 +144,47 @@ def test_sft_data():
     check("build_dataset：low_budget 派生自最短 real_tool 且收尾 boxed 在",
           _lb["qk"] == "q1" and "\\boxed{42}" in _lb["turns"][-1]["text"])
 
+    # 【2026-10-11 选样改版】pass_hist / 近界筛选 / 长度偏好开关
+    # rows 里：q1 有 4 条 attempt（3 条 acc>0 + 1 条答错）→ ok=3；q2 → ok=1；
+    # q3（trunc）虽不入样本，但仍是一道**落盘题**，ok=1 → 直方图必须含它。
+    check("build_dataset：pass_hist 覆盖全部落盘题（含截断题与已掌握端）",
+          stats["pass_hist"] == {3: 1, 1: 2}
+          and stats["pass_hist_num_pre_Q"] == 4)
+    _s_all, _st_all = build_dataset(rows, call_need=need, max_per_q=2,
+                                    synth_per_q=0, seed=42)
+    check("build_dataset：max_ok=0 默认不筛题（题数不变）",
+          _st_all["n_questions"] == 2
+          and _st_all["band_skipped_questions"] == 0)
+    # q1 是"已掌握"（ok=3）→ max_ok=1 应剔除它，只留 ok≤1 的题
+    _s_b, _st_b = build_dataset(rows, call_need=need, max_per_q=2,
+                                synth_per_q=0, seed=42, max_ok=1)
+    check("build_dataset：max_ok=1 剔除已掌握的题（近界选样生效）",
+          _st_b["n_questions"] == 1 and _st_b["band_skipped_questions"] == 1
+          and all(s["qk"] != "q1" for s in _s_b))
+    # q1 ok=3、q2 ok=1 → min_ok=2 只留 q1
+    _s_c, _st_c = build_dataset(rows, call_need=need, max_per_q=2,
+                                synth_per_q=0, seed=42, min_ok=2)
+    check("build_dataset：min_ok=2 只留 ≥2 条正确的题 + 计数落 stats",
+          _st_c["n_questions"] == 1 and _st_c["band_skipped_questions"] == 1
+          and all(s["qk"] == "q1" for s in _s_c))
+    # prefer_short=False：不再按 clen 升序取前 k，改为 seeded 随机抽（可复现）
+    def _pick(seed_v):
+        _s, _ = build_dataset(rows, call_need=need, max_per_q=1, synth_per_q=0,
+                              seed=seed_v, prefer_short=False)
+        return sorted((x["qk"], x["clen"]) for x in _s)
+
+    check("build_dataset：prefer_short=False 同 seed 可复现（rng 受 seed 控制）",
+          _pick(7) == _pick(7))
+    _short = build_dataset(rows, call_need=need, max_per_q=1, synth_per_q=0,
+                           seed=7)[0]
+    check("build_dataset：prefer_short=True 仍取最短（默认行为不回归）",
+          [s["clen"] for s in _short if s["qk"] == "q1"] == [100])
+    # 关键语义差异：随机路径**不保证**取到最短。q1 有 3 条候选（100/200/300），
+    # 扫多个 seed 取并集——若并集只含 {100}，说明"随机"退化成"偏好短"。
+    _union = {c for sd in range(20) for q, c in _pick(sd) if q == "q1"}
+    check("build_dataset：随机路径不保证取最短（并集含 >1 种长度）",
+          len(_union) > 1 and 100 in _union)
+
     # compose_system_prompt：预算段自动注入（与 RL 同入口）
     from rlab.sft_data import compose_system_prompt
     sp, sha, need0, src0 = compose_system_prompt(max_traj_tokens=8192,
@@ -360,6 +401,10 @@ def test_wiring():
               ('"--dump"', '"--out"', '"--system_prompt_file"',
                '"--max_traj_tokens"', '"--answer_reserve"', '"--max_per_q"',
                '"--synth_per_q"')))
+    check("sft_data CLI：近界选样 + 长度偏好开关 + pass-rate 直方图",
+          all(x in src_d for x in ('"--min_ok"', '"--max_ok"',
+                                   '"--no_prefer_short"', "pass_hist"))
+          and "近界" in src_d)
     check("sft_data：预算行只从 budget_hint_line 派生（与线上同一函数）",
           "from rlab.rollout import budget_hint_line" in src_d)
     check("sft CLI：lr/epochs/8bit/max_seq_len/grad_accum",
@@ -370,6 +415,9 @@ def test_wiring():
           "chunked_sft_loss(model" in src_t)
     check("sft：存盘 save_pretrained（vLLM 可直读）+ sft_info.json",
           "save_pretrained" in src_t and "sft_info.json" in src_t)
+    check("sft：逐 epoch 存档（判'多训是赚是亏'的唯一入口）",
+          "save_every_epoch" in src_t and "epoch{ep + 1}" in src_t
+          and "epoch_ckpts" in src_t)
     check("sft_gate：读数经 analysis.read_eval_result（嵌套壳事故的教训）",
           "from rlab.analysis import read_eval_result" in src_g)
     check("sft_gate：exit code 接 PASS/FAIL（可 && 链进 RL）",

@@ -194,6 +194,12 @@ def main(argv=None):
                     help="bitsandbytes AdamW8bit（与 RL 同一显存策略）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_every", type=int, default=5)
+    ap.add_argument("--save_every_epoch", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="每个 epoch 末存一份 epochN/（默认开）。【为什么必须】"
+                         "只存 final 就无法回答'多训是赚还是亏'：判据是"
+                         "fmt 涨但 acc/fmt（条件精度）掉 = '格式换推理'，该停在"
+                         "最优点。成本约 40s/份，换一个直接决定 lr/epochs 的读数")
     args = ap.parse_args(argv)
 
     random.seed(args.seed)
@@ -306,6 +312,15 @@ def main(argv=None):
                           f"tok/s {tok_seen / el:.0f}", flush=True)
                 win_loss_sum, win_tok = 0.0, 0
         print(f"[sft] epoch {ep} 完成（update {update}/{n_update}）", flush=True)
+        if args.save_every_epoch:
+            # 逐 epoch 存档：下游评测靠它回答"多训是赚还是亏"（判据见 --help）。
+            # 放在 epoch 末而不是按 update 计，是为了让存档点直接对应"训了几个
+            # epoch"这个待定超参；final/ 仍是最后一份，语义不变。
+            _ep_dir = os.path.join(args.out_dir, f"epoch{ep + 1}")
+            os.makedirs(_ep_dir, exist_ok=True)
+            model.save_pretrained(_ep_dir)
+            tokenizer.save_pretrained(_ep_dir)
+            print(f"[sft] 存档 → {_ep_dir}（update {update}）", flush=True)
 
     # ---- 存盘（vLLM 可直读的 HF 目录）+ 自证信息 ----
     out = os.path.join(args.out_dir, "final")
@@ -315,6 +330,8 @@ def main(argv=None):
             "sp_sha": sp_sha, "n_examples": len(encoded), "dropped": dropped,
             "n_tokens": n_tok, "n_assistant_tokens": n_atok,
             "args": vars(args), "updates": update,
+            "epoch_ckpts": ([f"epoch{e + 1}" for e in range(args.epochs)]
+                            if args.save_every_epoch else []),
             "wall_s": round(time.time() - t1, 1)}
     with open(os.path.join(args.out_dir, "sft_info.json"), "w",
               encoding="utf-8") as f:

@@ -25,10 +25,17 @@ sft.py 的 encode_example 里经 render_chat_ids 增量渲染完成——序列�
 
 用法：
   python -m rlab.sft_data \
-      --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
-      --out rlab_out/sft_budget_v1.jsonl \
-      --system_prompt_file rlab/prompts/retool_math_concise.txt \
-      --max_traj_tokens 8192 --answer_reserve 1024
+      --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p8_best/traj.jsonl \
+      --out rlab_out/sft_budget_v2.jsonl \
+      --from_run_info rlab_new/native_p9_best/run_info.json
+
+选样（2026-10-11 新增，服务"交卷率已近饱和、该碰解题力"）：
+  · `--max_ok N`（N < num_pre_Q）开启**近界选样**：只保留该题答对条数 ≤N 的题，
+    排除已掌握的题（信号饱和）。这是 rejection sampling / STaR，唯一能真实抬高
+    `P(correct)` 的选样口径。先用 pass-rate 直方图（下面那行打印）判断值不值得开。
+  · `--no_prefer_short`：关闭"偏好短轨迹"。该偏好在长度已压住后只会优先剔除
+    长轨迹（=难题的正确解），纯伤害解题力。
+  · `--max_per_q 4 --synth_per_q 2`：放宽每题信号量。
 """
 import argparse
 import hashlib
@@ -225,18 +232,38 @@ def compose_system_prompt(system_prompt_file=None, max_traj_tokens=8192,
 
 
 def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
-                  max_examples=0, seed=42):
+                  max_examples=0, seed=42, min_ok=1, max_ok=0,
+                  prefer_short=True):
     """dump 行 → SFT 样本（纯函数，CPU 可测）。返回 (samples, stats)。
 
-    每题（qk）限额且**偏好更短**的轨迹——简洁正是要教的行为，长轨迹留给
-    RL 自己探索。low_budget 每题至多 synth_per_q 条，从入选的 real_tool
-    轨迹派生。"""
+    【2026-10-11 选样口径改版】三处新参数，服务"交卷率已接近饱和、该碰解题力"：
+
+      · `min_ok`/`max_ok`：按**该题答对的轨迹条数**（pass rate 的绝对值，不是
+        比例）筛题。`max_ok=0` 表示不限上限。默认 `min_ok=1, max_ok=0` 与旧行为
+        等价（能进 samples 的题必然已有 ≥1 条正确轨迹）。
+        **设 `max_ok=N<num_pre_Q` = rejection sampling（STaR 机制）**：只保留
+        "模型不是每次都做对"的近界题，排除已掌握（ok=num_pre_Q，信号饱和）与
+        零正确（无正例可用）两端。这是唯一能真实抬高 `P(correct)` 的选样方式。
+      · `prefer_short`：旧行为是每题**按 clen 升序取前 max_per_q 条**——长度早已
+        压住（SFT −17%、RL −21%），该偏好现在只会**优先剔除长轨迹（=难题的正确
+        解）**，纯伤害解题力。置 False 改为在候选里**均匀随机抽**（seeded）。
+      · `stats["pass_hist"]`：每题答对条数的直方图（key=ok 数，value=题数）。
+        它是"该不该开近界选样"的判据：若 `ok=num_pre_Q` 占绝大多数 ⇒ 池子已
+        饱和、近界题太少，先别指望 ② 路线的收益。
+    """
     rng = random.Random(seed)
     by_q = {}
+    # 每题两条计数：全部落盘 attempt 数、其中答对条数（pass rate 的分子/分母）。
+    n_att, n_ok_q = {}, {}
     stats = {"rows": 0, "ok": 0, "bad_struct": 0, "no_boxed": 0,
              "rewritten_budget_lines": 0}
     for row in rows:
         stats["rows"] += 1
+        _qk0 = row.get("qk") or hashlib.sha1(
+            str(row.get("Q", "")).encode("utf-8")).hexdigest()[:12]
+        n_att[_qk0] = n_att.get(_qk0, 0) + 1
+        if (row.get("acc") or 0) > 0:
+            n_ok_q[_qk0] = n_ok_q.get(_qk0, 0) + 1
         if not row_ok(row):
             continue
         stats["ok"] += 1
@@ -248,17 +275,36 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
             stats["no_boxed"] += 1
             continue
         stats["rewritten_budget_lines"] += rewrite_budget_lines(turns, call_need)
-        qk = row.get("qk") or hashlib.sha1(
-            str(row.get("Q", "")).encode("utf-8")).hexdigest()[:12]
+        qk = _qk0
         clen = int(row.get("clen") or 0)
         source = "real_tool" if int(row.get("code_used") or 0) > 0 else "zero_call"
         by_q.setdefault(qk, []).append(
             {"qk": qk, "Q": row.get("Q"), "A": row.get("A"),
              "source": source, "clen": clen, "turns": turns})
+    # ---- 近界筛选（按该题答对条数）----
+    # 直方图覆盖**所有落盘题目**（含 ok=0——它们不在 n_ok_q 里，漏了就看不到
+    # "整组全错"这一端，而那正是 pass rate 分布的另一半）。
+    stats["pass_hist"] = {}
+    for _qk0 in n_att:
+        _n = n_ok_q.get(_qk0, 0)
+        stats["pass_hist"][_n] = stats["pass_hist"].get(_n, 0) + 1
+    stats["pass_hist_num_pre_Q"] = max(n_att.values()) if n_att else 0
+    _band_q = 0
+    if min_ok > 1 or max_ok > 0:
+        _keep = {q for q, n in n_ok_q.items()
+                 if n >= int(min_ok) and (int(max_ok) <= 0 or n <= int(max_ok))}
+        _band_q = len(by_q) - len([q for q in by_q if q in _keep])
+        by_q = {q: v for q, v in by_q.items() if q in _keep}
+    stats["band_skipped_questions"] = _band_q
     samples = []
     for qk, cands in by_q.items():
-        cands.sort(key=lambda c: c["clen"])
-        kept = cands[:max(1, int(max_per_q))]
+        if prefer_short:
+            cands.sort(key=lambda c: c["clen"])
+            kept = cands[:max(1, int(max_per_q))]
+        else:
+            # 均匀随机抽（不按长度偏好）：长轨迹 = 难题的正确解，不该被系统性剔除
+            k = min(len(cands), max(1, int(max_per_q)))
+            kept = rng.sample(cands, k)
         samples.extend(kept)
         n_synth = 0
         for c in kept:
@@ -296,6 +342,15 @@ def main(argv=None):
                     help="与线上同值：推导 call_need = chars//2+16+answer_reserve")
     ap.add_argument("--max_per_q", type=int, default=2)
     ap.add_argument("--synth_per_q", type=int, default=1)
+    ap.add_argument("--min_ok", type=int, default=1,
+                    help="按该题答对条数筛题的下限（1=不限，能进样本的题必然≥1）")
+    ap.add_argument("--max_ok", type=int, default=0,
+                    help="按该题答对条数筛题的上限（0=不限）。设 <num_pre_Q 即"
+                         "开启近界选样（rejection sampling / STaR）：排除已掌握的"
+                         "题（信号饱和），只留'不是每次都对'的题")
+    ap.add_argument("--no_prefer_short", action="store_true",
+                    help="关闭'偏好短轨迹'。长度已压住（SFT −17%%/RL −21%%），"
+                         "该偏好现在只会优先剔除长轨迹=难题的正确解，纯伤害解题力")
     ap.add_argument("--max_examples", type=int, default=0, help="0=不限")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args(argv)
@@ -308,7 +363,10 @@ def main(argv=None):
                                    max_per_q=args.max_per_q,
                                    synth_per_q=args.synth_per_q,
                                    max_examples=args.max_examples,
-                                   seed=args.seed)
+                                   seed=args.seed,
+                                   min_ok=args.min_ok,
+                                   max_ok=args.max_ok,
+                                   prefer_short=not args.no_prefer_short)
     with open(args.out, "w", encoding="utf-8") as f:
         for s in samples:
             f.write(json.dumps(
@@ -324,6 +382,32 @@ def main(argv=None):
     print(f"[sft_data] 分类: {stats['per_source']}；结构非法跳过 "
           f"{stats['bad_struct']}，无 boxed 跳过 {stats['no_boxed']}，"
           f"预算行改写 {stats['rewritten_budget_lines']} 行", flush=True)
+    # 【pass-rate 直方图】决定"要不要开近界选样（--max_ok）"的唯一判据：
+    # 若 ok=num_pre_Q 的题占绝大多数 ⇒ 池子已饱和、近界题太少，② 路线收益有限。
+    _ph = stats.get("pass_hist") or {}
+    if _ph:
+        _np = stats.get("pass_hist_num_pre_Q") or max(_ph)
+        _tot = sum(_ph.values())
+        _sat = _ph.get(_np, 0)
+        _zero = _ph.get(0, 0)
+        _band = sum(v for k, v in _ph.items() if 1 <= k < _np)
+        print(f"[sft_data] pass-rate 直方图（每题答对条数 / 该题数，共 {_tot} 题；"
+              f"每题 attempts≈{_np}）:", flush=True)
+        print("           " + "  ".join(
+            f"{k}→{_ph[k]}" for k in sorted(_ph)), flush=True)
+        print(f"[sft_data]   已掌握(ok={_np}) {_sat}/{_tot} = "
+              f"{_sat / max(1, _tot) * 100:.1f}% ｜ 全错(ok=0) {_zero} ｜ "
+              f"**近界(1≤ok<{_np}) {_band}** "
+              f"= {_band / max(1, _tot) * 100:.1f}%", flush=True)
+        if _band < 0.2 * _tot:
+            print("[sft_data]   ⇒ 近界题 <20%：`--max_ok` 近界选样收益有限"
+                  "（池子已饱和），优先走交卷率路线", flush=True)
+        else:
+            print(f"[sft_data]   ⇒ 近界题充足，可试 `--max_ok {_np - 1}`"
+                  "（rejection sampling，只保留不是每次都对的题）", flush=True)
+    if stats.get("band_skipped_questions"):
+        print(f"[sft_data] 近界筛选丢掉 {stats['band_skipped_questions']} 题"
+              f"（min_ok={args.min_ok}, max_ok={args.max_ok}）", flush=True)
     print(f"[sft_data] 系统提示 sp{sp_sha}（来源 {sp_src}，含预算段）已写入每行；"
           f"后续 RL 的签名必须出现同一 -sp{sp_sha}", flush=True)
     if stats["per_source"]["low_budget"] == 0:
