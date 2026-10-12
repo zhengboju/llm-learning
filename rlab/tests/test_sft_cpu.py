@@ -144,29 +144,77 @@ def test_sft_data():
     check("build_dataset：low_budget 派生自最短 real_tool 且收尾 boxed 在",
           _lb["qk"] == "q1" and "\\boxed{42}" in _lb["turns"][-1]["text"])
 
-    # 【2026-10-11 选样改版】pass_hist / 近界筛选 / 长度偏好开关
-    # rows 里：q1 有 4 条 attempt（3 条 acc>0 + 1 条答错）→ ok=3；q2 → ok=1；
-    # q3（trunc）虽不入样本，但仍是一道**落盘题**，ok=1 → 直方图必须含它。
-    check("build_dataset：pass_hist 覆盖全部落盘题（含截断题与已掌握端）",
-          stats["pass_hist"] == {3: 1, 1: 2}
-          and stats["pass_hist_num_pre_Q"] == 4)
+    # 【2026-10-11 选样改版】pass-rate 口径 / 近界筛选 / 长度偏好开关
+    # 参考 run 口径：rows 全无 _src → 全归 run 0。q1 attempts=4（3 对 + 1 错，
+    # 通过率 75%）、q2 attempts=1（对，100%）、q3 attempts=1（截断题，通过率
+    # 100%；不入样本但仍是**落盘题**，通过率分布必须含它）。
+    # 测试里显式 min_att=1 把小样本题纳入（min_att 本身单独测）。
+    # 直方图按**比例换算到 8 刻度**：q1→6（0.75×8）、q2/q3→8。
     _s_all, _st_all = build_dataset(rows, call_need=need, max_per_q=2,
-                                    synth_per_q=0, seed=42)
-    check("build_dataset：max_ok=0 默认不筛题（题数不变）",
+                                    synth_per_q=0, seed=42, min_att=1)
+    check("build_dataset：pass_hist 按参考 run 内通过率（换算 8 刻度）统计",
+          _st_all["pass_hist"] == {6: 1, 8: 2} and _st_all["ref_src"] == 0
+          and _st_all["pass_hist_scale"] == 8)
+    check("build_dataset：max_rate=1.0 默认不筛题（题数不变）",
           _st_all["n_questions"] == 2
           and _st_all["band_skipped_questions"] == 0)
-    # q1 是"已掌握"（ok=3）→ max_ok=1 应剔除它，只留 ok≤1 的题
+    # q1 通过率 75% < 100% → max_rate=0.875 保留它；q2 通过率 100% → 剔除
     _s_b, _st_b = build_dataset(rows, call_need=need, max_per_q=2,
-                                synth_per_q=0, seed=42, max_ok=1)
-    check("build_dataset：max_ok=1 剔除已掌握的题（近界选样生效）",
+                                synth_per_q=0, seed=42, max_rate=0.875,
+                                min_att=1)
+    check("build_dataset：max_rate 剔除全对题、保留近界题",
           _st_b["n_questions"] == 1 and _st_b["band_skipped_questions"] == 1
-          and all(s["qk"] != "q1" for s in _s_b))
-    # q1 ok=3、q2 ok=1 → min_ok=2 只留 q1
+          and all(s["qk"] == "q1" for s in _s_b))
     _s_c, _st_c = build_dataset(rows, call_need=need, max_per_q=2,
-                                synth_per_q=0, seed=42, min_ok=2)
-    check("build_dataset：min_ok=2 只留 ≥2 条正确的题 + 计数落 stats",
+                                synth_per_q=0, seed=42, min_rate=0.8,
+                                min_att=1)
+    # 候选题只有 q1(75%)、q2(100%)（q3 是截断题，不进 by_q）→ 只留 q2
+    check("build_dataset：min_rate=0.8 只留通过率 ≥80% 的题 + 计数落 stats",
           _st_c["n_questions"] == 1 and _st_c["band_skipped_questions"] == 1
-          and all(s["qk"] == "q1" for s in _s_c))
+          and all(s["qk"] == "q2" for s in _s_c))
+    # 【口径事故防护 ①】多 run 合并：同一 qk 在两个 run 各出现一遍——不限定
+    # 参考 run 就会把 attempts 累加，得到"永不掌握"的假读数（实机踩过）。
+    _multi = []
+    for r in rows:
+        _multi.append({**r, "_src": 0})
+        _multi.append({**r, "_src": 1})
+    _, _st_auto = build_dataset(_multi, call_need=need, max_per_q=2,
+                                synth_per_q=0, seed=42, min_att=1)
+    check("build_dataset：多 run 时参考 run 内 attempts 不被累加（q1 仍是 4）",
+          _st_auto["ref_src"] in (0, 1)
+          and _st_auto["pass_hist_num_pre_Q"] == 4)
+    # 【口径事故防护 ②】绝对条数不可比（本 bug 的实机形态）：同样的 ok=3，
+    # attempts=4（75%，近界）与 attempts=40（7.5%，也该算近界）在比例口径下
+    # 都保留；而"绝对条数阈值"会把前者误判为已掌握。这里构造横跨两个量级的
+    # 题，断言比例口径下二者都被正确分档。
+    _wide = []
+    for _n_att, _n_ok in ((4, 3), (40, 30), (40, 40)):
+        for k in range(_n_att):
+            _wide.append({
+                "Q": f"W{_n_att}_{_n_ok}", "A": "1", "qk": f"W{_n_att}_{_n_ok}",
+                "status": "ok", "acc": 1 if k < _n_ok else -1,
+                "trunc_final": 0, "code_used": 1, "clen": 100, "_src": 0,
+                "segs": [
+                    {"kind": "assistant", "len": 3, "text": "a"},
+                    {"kind": "tool", "len": 3, "body": "42\n[budget] 7000 tokens left in this trajectory. Finish with your final answer."},
+                    {"kind": "assistant", "len": 3, "text": "b\n\\boxed{1}"}]})
+    _, _st_w = build_dataset(_wide, call_need=need, max_per_q=2, synth_per_q=0,
+                             seed=42, min_att=1)
+    # (4,3)→0.75→6；(40,30)→0.75→6；(40,40)→1.0→8
+    check("build_dataset：绝对条数不可比（同 75% 在两个量级上分档一致）",
+          _st_w["pass_hist"] == {6: 2, 8: 1})
+    _s_w, _st_w2 = build_dataset(_wide, call_need=need, max_per_q=2,
+                                 synth_per_q=0, seed=42, max_rate=0.875,
+                                 min_att=1)
+    check("build_dataset：比例口径下近界筛正确（只剔全对那题）",
+          _st_w2["n_questions"] == 2 and _st_w2["band_skipped_questions"] == 1
+          and all(s["qk"] != "W40_40" for s in _s_w))
+    # min_att：参考 run 内 attempts 不足的题不进直方图（也不参与近界筛选）
+    _st_ma = build_dataset(rows, call_need=need, max_per_q=2, synth_per_q=0,
+                           seed=42, min_att=5)[1]
+    check("build_dataset：min_att 过滤样本不足的题（q1 attempts=4 < 5）",
+          _st_ma["pass_hist"] == {})
+
     # prefer_short=False：不再按 clen 升序取前 k，改为 seeded 随机抽（可复现）
     def _pick(seed_v):
         _s, _ = build_dataset(rows, call_need=need, max_per_q=1, synth_per_q=0,
@@ -401,10 +449,11 @@ def test_wiring():
               ('"--dump"', '"--out"', '"--system_prompt_file"',
                '"--max_traj_tokens"', '"--answer_reserve"', '"--max_per_q"',
                '"--synth_per_q"')))
-    check("sft_data CLI：近界选样 + 长度偏好开关 + pass-rate 直方图",
-          all(x in src_d for x in ('"--min_ok"', '"--max_ok"',
-                                   '"--no_prefer_short"', "pass_hist"))
-          and "近界" in src_d)
+    check("sft_data CLI：近界选样(比例口径) + 参考 run + 长度偏好 + 直方图",
+          all(x in src_d for x in ('"--min_rate"', '"--max_rate"', '"--ref_src"',
+                                   '"--min_att"', '"--no_prefer_short"',
+                                   "pass_hist"))
+          and "近界" in src_d and "tag=True" in src_d)
     check("sft_data：预算行只从 budget_hint_line 派生（与线上同一函数）",
           "from rlab.rollout import budget_hint_line" in src_d)
     check("sft CLI：lr/epochs/8bit/max_seq_len/grad_accum",
