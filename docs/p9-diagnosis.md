@@ -239,17 +239,17 @@ python -m rlab.train --algo retool_math \
 
 ### A. 立即可做（按 ROI）
 
-1. **★ SFT v2（当前最高 ROI，1.5h）**：SFT 是全程最大功臣（+6.5pp），且**它做的事
-   单一明确——抬高交卷率**，所以还剩下的同性质 headroom 应当继续用 SFT 拿
-   （RL 要 11h，SFT 1.5h）。三步已在 `08-sft-cold-start.md §7.5` 落地为可直接跑的命令：
-   - **① 数据 v2**：dump 加 p9（fmt/条件精度双优的策略）+ `--max_per_q 4
-     --synth_per_q 2 --no_prefer_short`，`--from_run_info` 仍取 **p9**（保锚
-     `sp632ef7`，零对齐成本）；**看 pass-rate 直方图**决定是否追加
-     `--max_rate 0.875 --ref_src 3`。
-   - **② 训练**：`--save_every_epoch`（默认开）产出 `epoch1/epoch2/final`。
-   - **③ 评测**：三个 ckpt 同批同 `gpu_mem` 评；**主判据是条件精度 `acc/fmt`
-     不许掉 >1.5pp**（掉 = "格式换推理"，该停），fmt 目标 ≥98%。
-   - 预期：fmt 90.8→**95~98**、acc **+4~6pp**（> RL 的 +3.8pp），条件精度不变。
+1. **★ SFT v3（当前最高 ROI）**：v2 从 16,096 条 RL rollout 最终只得到 532 题，
+   暴露出“RL 组内多采样几何 ≠ SFT 广题面几何”。最终方案改为：
+   - 从干净、去重且严格剔除 dev 的训练池随机取 **4000 个不同题面**，先每题1次；
+   - 只有首采失败题才追加2次，仍失败逐次补到最多4次；正确性经现有数学 reward 验证，
+     若两次仍全败再逐次补到最多4次；发现成功后停止后续轮；由 `rlab.sft_collect` 输出标准 traj dump；
+   - 每题最多留1条正确真实轨迹，约一半轨迹派生 low-budget 收尾锚（最终约1/3）；
+   - 双卡必须先全部 `--phase first`，合并状态后再 `--phase retry`，保证全局覆盖优先；
+   - adaptive attempts 有选择偏差，**禁止**用该 dump 的 attempts 做 `--max_rate`；
+   - 训练仍产出 `epoch1/epoch2/final`，同批评测并以 held-out `acc/fmt` 为主判据。
+   完整命令见 `08-sft-cold-start.md §7.5 ①B`。v2 的2983条仍是有效的预算收尾专项集，
+   但不再作为“最终最优全集”。
 2. **攻条件精度**（唯一未开发的维度，也是最大的一块）：交了卷但答错 ~40 题，
    是没交卷 ~18 题的 2.3 倍，而**条件精度从基础模型到 RL 一步没涨（86.2→84.9→86.2）**。
    根因：RL 的 group-mean 优势里，"答错"与"没交卷"的 reward 同为 −1，**对错题无区分力**；
@@ -317,5 +317,5 @@ python -m rlab.train --algo retool_math \
 
 **报告完成时间**：2026-10-11（含 §5.2 归属补测更新）
 **上游**：p8-diagnosis.md（无 boxed 三桶的发现）、08-sft-cold-start.md §7.5（SFT 落地路线）
-**下一步**：SFT v2（最高 ROI，1.5h）＞ 攻条件精度（难度课程/近界选样）＞ 续训 ＞ 同批重跑定 RL 结论
+**下一步**：SFT v3 广覆盖采集（4000题，失败题自适应重试）＞ SFT训练与分层验收 ＞ 续训 ＞ 同批重跑定 RL 结论
 **开放项**：§1.1 两臂是否同批（fmt 94.9 vs 93.9）；RL +3.8pp 的显著性需 N≈900 或 2~3 seed

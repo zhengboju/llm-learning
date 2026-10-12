@@ -140,6 +140,12 @@ def test_sft_data():
     check("build_dataset：三类齐（real_tool×2 + zero_call×1 + low_budget×1）",
           stats["per_source"] == {"real_tool": 2, "zero_call": 1,
                                   "low_budget": 1})
+    _no_synth, _st_no_synth = build_dataset(
+        rows, call_need=need, max_per_q=2, synth_per_q=1,
+        synth_prob=0.0, seed=42)
+    check("build_dataset：synth_prob=0 可关闭 low_budget 锚样本",
+          _st_no_synth["per_source"]["low_budget"] == 0
+          and all(s["source"] != "low_budget" for s in _no_synth))
     _lb = next(s for s in samples if s["source"] == "low_budget")
     check("build_dataset：low_budget 派生自最短 real_tool 且收尾 boxed 在",
           _lb["qk"] == "q1" and "\\boxed{42}" in _lb["turns"][-1]["text"])
@@ -319,6 +325,114 @@ def test_sft_data():
                   for g in got for t in g["turns"] if t["kind"] == "tool"))
 
 
+
+
+def test_sft_collect():
+    print("[A2] sft_collect：覆盖优先 / 自适应重试 / 恢复 / 污染防线")
+    from rlab.sft_collect import (build_first_plan, build_retry_plan,
+                                  clean_training_pool, collect_seed,
+                                  load_collect_state, qa_key)
+    order = [{"Q": "q1", "A": "1"}, {"Q": "q2", "A": "2"},
+             {"Q": "q3", "A": "3"}]
+    check("collector：空状态首采覆盖所有题且每题恰好1次",
+          build_first_plan(order, {}) == [(x, 1) for x in order])
+    k1, k2, k3 = [qa_key(x["Q"], x["A"]) for x in order]
+    state = {
+        k1: {"seen": True, "attempts": 1, "success": True, "terminal": False},
+        k2: {"seen": True, "attempts": 1, "success": False, "terminal": False},
+        k3: {"seen": True, "attempts": 4, "success": False, "terminal": False},
+    }
+    rp = build_retry_plan(order, state, retry_min=2, retry_max=4)
+    check("collector：首采成功不重试；失败先补2次；已重试3次者只补1次",
+          rp == [(order[1], 2), (order[2], 1)])
+    state[k2]["attempts"] = 3
+    state[k2]["success"] = True
+    state[k3]["attempts"] = 5
+    check("collector：成功即停、总重试达到上限即停",
+          build_retry_plan(order, state, 2, 4) == [])
+    seeds = {collect_seed(42, k1, i, shard_index=s) for s in range(2)
+             for i in range(5)}
+    check("collector：题×attempt×shard seed 唯一", len(seeds) == 10)
+
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "traj.jsonl")
+        rows = [
+            {"Q": "q1", "A": "1", "qa_key": k1, "status": "ok",
+             "acc": 1, "fmt": 1, "trunc_final": 0, "attempt_idx": 0,
+             "collect_uid": "u1", "collect_phase": "first",
+             "sp_sha": "abc123", "plan_sha": "plan111"},
+            # 同一 uid 重复合并不能让 attempts 虚增
+            {"Q": "q1", "A": "1", "qa_key": k1, "status": "ok",
+             "acc": 1, "fmt": 1, "trunc_final": 0, "attempt_idx": 0,
+             "collect_uid": "u1", "collect_phase": "first",
+             "sp_sha": "abc123", "plan_sha": "plan111"},
+            {"Q": "q2", "A": "2", "qa_key": k2, "status": "ok",
+             "acc": -1, "fmt": 1, "trunc_final": 0, "attempt_idx": 2,
+             "collect_uid": "u2", "collect_phase": "retry",
+             "sp_sha": "abc123", "plan_sha": "plan111"},
+        ]
+        with open(p, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        st = load_collect_state([p], expected_sp_sha="abc123")
+        check("collector：dump恢复 success 与最大 attempt_idx，不被重复行污染",
+              st[k1]["success"] and st[k1]["attempts"] == 1
+              and not st[k2]["success"] and st[k2]["attempts"] == 3)
+        try:
+            load_collect_state([p], expected_sp_sha="ffffff")
+            mismatch = False
+        except RuntimeError:
+            mismatch = True
+        check("collector：恢复时 sp_sha 错档 fail-fast", mismatch)
+        try:
+            load_collect_state([p], expected_plan_sha="plan222")
+            plan_mismatch = False
+        except RuntimeError:
+            plan_mismatch = True
+        check("collector：恢复时seed/题池/分片计划错档 fail-fast", plan_mismatch)
+
+    try:
+        clean_training_pool(order, [{"Q": "q2", "A": "x"}])
+        leaked = False
+    except RuntimeError:
+        leaked = True
+    check("collector：train∩dev 非空直接拒绝", leaked)
+    clean, cs = clean_training_pool(
+        order + [{"Q": "q3", "A": "另一个答案"}], [])
+    check("collector：同题多答案整题跳过，防 qk 合并冲突监督",
+          len(clean) == 2 and cs["n_conflict_q"] == 1
+          and all(x["Q"] != "q3" for x in clean))
+
+    # collector dump 的 sp_sha 与 compose 后提示不同，sft_data 必须拒绝。
+    from rlab.sft_data import build_dataset
+    bad = _mk_row()
+    bad["sp_sha"] = "aaaaaa"
+    try:
+        build_dataset([bad], call_need=1290, expected_sp_sha="bbbbbb")
+        mismatch = False
+    except ValueError:
+        mismatch = True
+    check("sft_data：collector 提示与训练提示错档 fail-fast", mismatch)
+    adaptive = _mk_row()
+    adaptive["collect_phase"] = "first"
+    adaptive["sp_sha"] = "bbbbbb"
+    try:
+        build_dataset([adaptive], call_need=1290, max_rate=0.875,
+                      min_att=1)
+        adaptive_rate = False
+    except ValueError:
+        adaptive_rate = True
+    check("sft_data：自适应collector dump禁止 --max_rate（attempts有选择偏差）",
+          adaptive_rate)
+    adaptive.pop("sp_sha", None)
+    try:
+        build_dataset([adaptive], call_need=1290)
+        missing_sp = False
+    except ValueError:
+        missing_sp = True
+    check("sft_data：collector行缺sp_sha也fail-fast", missing_sp)
+
+
 # ---------------------------------------------------------------- B. encode ----
 def test_encode():
     print("[B] encode_example（MockTok）：mask 契约与前缀校验")
@@ -467,7 +581,8 @@ def test_gate():
 def test_wiring():
     print("[F] CLI/源码接线")
     import inspect
-    from rlab import sft, sft_data, sft_gate
+    from rlab import sft, sft_collect, sft_data, sft_gate
+    src_c = inspect.getsource(sft_collect)
     src_d = inspect.getsource(sft_data)
     src_t = inspect.getsource(sft)
     src_g = inspect.getsource(sft_gate)
@@ -475,7 +590,7 @@ def test_wiring():
           all(x in src_d for x in
               ('"--dump"', '"--out"', '"--system_prompt_file"',
                '"--max_traj_tokens"', '"--answer_reserve"', '"--max_per_q"',
-               '"--synth_per_q"')))
+               '"--synth_per_q"', '"--synth_prob"')))
     check("sft_data CLI：近界选样(比例口径) + 参考 run + 长度偏好 + 直方图",
           all(x in src_d for x in ('"--min_rate"', '"--max_rate"', '"--ref_src"',
                                    '"--min_att"', '"--drop_unknown"',
@@ -483,6 +598,12 @@ def test_wiring():
           and "近界" in src_d and "tag=True" in src_d)
     check("sft_data：预算行只从 budget_hint_line 派生（与线上同一函数）",
           "from rlab.rollout import budget_hint_line" in src_d)
+    check("sft_collect：广覆盖/重试两阶段 + 分片合并状态 + 指纹接线",
+          all(x in src_c for x in ('"--phase"', '"--state"', '"--retry_min"',
+                                   '"--retry_max"', '"--shard_index"',
+                                   '"--shard_count"', "expected_sp_sha"))
+          and "多分片禁止 --phase all" in src_c
+          and "retry 状态缺" in src_c)
     check("sft CLI：lr/epochs/8bit/max_seq_len/grad_accum",
           all(x in src_t for x in
               ('"--lr"', '"--epochs"', '"--optim_8bit"', '"--max_seq_len"',
@@ -509,6 +630,7 @@ def test_wiring():
 
 def main():
     test_sft_data()
+    test_sft_collect()
     test_encode()
     test_loss()
     test_chunked_loss()

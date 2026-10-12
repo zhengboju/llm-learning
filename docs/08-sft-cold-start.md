@@ -801,6 +801,100 @@ SFT v1 的 +6.5pp **全部来自提高交卷率**，条件精度（`acc/fmt`）�
 segs 是否带 body）；末尾的 `sp<sha6>` 是数据所用系统提示的指纹，后续 RL
 签名必须出现同一个 `-sp<sha6>`。
 
+### ①B ★ v3 最优数据：广覆盖优先 + 失败题追加探索（2026-10-12）
+
+v2 的 16,096 条 RL rollout 实际只覆盖 741 题；这是 RL 的组内采样几何，不是 SFT
+的最优几何。v3 改为：**先从去重训练池随机取 4000 个不同题面、每题只采1次；首采
+失败题**同批追加2次**；若这两次仍全败，才逐次补到最多4次，任一次成功后不再开
+下一轮。** 正确性仍由
+`total_reward_retool_math` 验证，错误轨迹只用于调度，不进 SFT。
+
+数据防线：dev 缺失直接终止；训练加载器先剔除并告警任何 dev 重叠，collector 再断言
+最终训练池与 dev 零交集；同题多答案整题跳过（防现有 `qk`
+按题面合并冲突监督）；每条轨迹落 `qa_key/attempt_idx/collect_phase/sp_sha`；断点续跑
+从 dump 恢复。collector 使用自适应 attempts，因此**禁止拿它做 `--max_rate` 通过率
+筛选**——首轮成功题1次、失败题3~5次，尝试数由结果决定。
+
+#### 双卡阶段一：全局首采（两条命令可并行）
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m rlab.sft_collect \
+  --model_path rlab_new/native_p9_best/step_400 \
+  --proto_from rlab_new/native_p9_best \
+  --out rlab_out/sft_wide_v3.first.0.jsonl \
+  --phase first --max_questions 4000 --questions_per_wave 32 \
+  --shard_index 0 --shard_count 2 --seed 42 --gpu_mem 0.78 &
+
+CUDA_VISIBLE_DEVICES=1 python -m rlab.sft_collect \
+  --model_path rlab_new/native_p9_best/step_400 \
+  --proto_from rlab_new/native_p9_best \
+  --out rlab_out/sft_wide_v3.first.1.jsonl \
+  --phase first --max_questions 4000 --questions_per_wave 32 \
+  --shard_index 1 --shard_count 2 --seed 42 --gpu_mem 0.78 &
+wait
+cat rlab_out/sft_wide_v3.first.0.jsonl \
+    rlab_out/sft_wide_v3.first.1.jsonl \
+  > rlab_out/sft_wide_v3.first.jsonl
+```
+
+#### 双卡阶段二：只重试首采失败题（仍可并行）
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m rlab.sft_collect \
+  --model_path rlab_new/native_p9_best/step_400 \
+  --proto_from rlab_new/native_p9_best \
+  --state rlab_out/sft_wide_v3.first.jsonl \
+  --out rlab_out/sft_wide_v3.retry.0.jsonl \
+  --phase retry --retry_min 2 --retry_max 4 \
+  --max_questions 4000 --questions_per_wave 32 \
+  --shard_index 0 --shard_count 2 --seed 42 --gpu_mem 0.78 &
+
+CUDA_VISIBLE_DEVICES=1 python -m rlab.sft_collect \
+  --model_path rlab_new/native_p9_best/step_400 \
+  --proto_from rlab_new/native_p9_best \
+  --state rlab_out/sft_wide_v3.first.jsonl \
+  --out rlab_out/sft_wide_v3.retry.1.jsonl \
+  --phase retry --retry_min 2 --retry_max 4 \
+  --max_questions 4000 --questions_per_wave 32 \
+  --shard_index 1 --shard_count 2 --seed 42 --gpu_mem 0.78 &
+wait
+cat rlab_out/sft_wide_v3.first.jsonl \
+    rlab_out/sft_wide_v3.retry.0.jsonl \
+    rlab_out/sft_wide_v3.retry.1.jsonl \
+  > rlab_out/sft_wide_v3.traj.jsonl
+```
+
+不能让每个 shard 自己 `--phase all`：快卡会在慢卡尚未完成题面覆盖时开始重试，破坏
+“全局覆盖优先”。代码已直接禁止多分片 `all`；retry 也会复读合并状态，若4000题尚
+未全部首采则拒绝启动。
+
+#### 生成最终 SFT v3 JSONL
+
+```bash
+python -m rlab.sft_data \
+  --dump rlab_out/sft_wide_v3.traj.jsonl \
+  --out rlab_out/sft_budget_v3.jsonl \
+  --from_run_info rlab_new/native_p9_best/run_info.json \
+  --max_per_q 1 --synth_per_q 1 --synth_prob 0.5 --no_prefer_short
+```
+
+这里**不加 `--max_rate`**；每题最多留一条真实正确轨迹，最大化题面有效覆盖。
+`--synth_prob 0.5` 让约一半可合成轨迹附带 low-budget 收尾锚，最终占比约1/3，避免
+v2 那种窄题面重复，也不让格式样本淹没解题样本。打印中的
+`采集来源 {'first':…, 'retry':…}` 分别代表广覆盖正确轨迹与“首采失败后才找到”的
+纠错轨迹；后者应非0。最终训练改用：
+
+```bash
+python -m rlab.sft --data rlab_out/sft_budget_v3.jsonl \
+  --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v3 \
+  --lr 1e-5 --epochs 2 --optim_8bit
+```
+
+验收仍评 `epoch1/epoch2/final`，主判据是 held-out `acc/fmt`；另把 collector 见过题
+与完全未见题分开报告，防“广覆盖”退化成训练题记忆。**边界**：v3 是当前无外部
+teacher 条件下的最优自举；追加4次仍无正确轨迹的稳定错题不会进入 SFT。要继续突破
+这部分，必须换更强 teacher，或先用 RL 探索产生非零概率正确轨迹，再回灌下一轮 SFT。
+
 ### ② SFT 训练（4B，H20 单卡，千条级数据约半小时内）
 
 ```bash
@@ -1015,6 +1109,7 @@ CLI 覆盖 preset 是本项目的常态（`--trunc_shaping`、`--round_gen_token
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
+| `rlab/sft_collect.py` | ✅ 已建 | SFT v3 广覆盖采集：全池首采1次，失败题追加2~4次；严格 held-out/多答案冲突防线；双卡 first→合并→retry；输出标准 traj dump + meta 审计 |
 | `rlab/sft_data.py` | ✅ 已建 | 阶段①；从 traj.jsonl 选 real_tool/zero_call 正确轨迹 + 合成 low_budget 收尾样本（cut=last 信息完备口径）；预算行经 `rollout.budget_hint_line` 改写成当前分档形态；系统提示经 `get_config`+`inject_budget_prompt` 装配并落 sp_sha |
 | `rlab/sft.py` | ✅ 已建 | 阶段②；`encode_example` 经 `render_chat_ids` 增量渲染（与 rollout 同源），labels 仅 assistant（含收尾 im_end）；`chunked_sft_loss` 分块算 logits 不物化 T×V；plain torch + bf16 + AdamW（8bit 可选），默认 lr 1e-5 / epoch 2 |
 | `rlab/sft_gate.py` | ✅ 已建 | 阶段②验收门：code_rate>0.6 / fmt>0.9 / code_ok÷used>0.7 / acc≥BASE，exit code 可 `&&` 链进 RL |

@@ -30,9 +30,10 @@ sft.py 的 encode_example 里经 render_chat_ids 增量渲染完成——序列�
       --from_run_info rlab_new/native_p9_best/run_info.json
 
 选样（2026-10-11 新增，服务"交卷率已近饱和、该碰解题力"）：
-  · `--max_rate 0.875`（<1）开启**近界选样**：只保留通关率 <1 的题，排除已掌握
-    的题（信号饱和）。rejection sampling / STaR，唯一能真实抬高 `P(correct)`
-    的选样口径。先用 pass-rate 直方图（下面那行打印）判断值不值得开。
+  · 固定 k 的旧 RL dump 可用 `--max_rate 0.875` 做近界选样；
+  · `sft_collect` 的广覆盖 dump 是自适应采样（成功题1次、失败题多次），尝试数由
+    结果决定，禁止据此估通过率/使用 `--max_rate`；它靠广题面 + 失败题追加探索
+    提供纠错轨迹。
     **口径必须用比例**：合并 dump 后每题 attempts 8~40 不等，绝对条数不可比
     （`ok=10` 在 40 次里是 25%，在 8 次里是全对）。
   · `--ref_src N`：pass-rate 的参考 run（多 run 合并时**必须限定**，否则同一题
@@ -246,7 +247,7 @@ def compose_system_prompt(system_prompt_file=None, max_traj_tokens=8192,
 def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
                   max_examples=0, seed=42, min_rate=0.0, max_rate=1.0,
                   prefer_short=True, ref_src=None, min_att=4,
-                  keep_unknown=True):
+                  keep_unknown=True, expected_sp_sha=None, synth_prob=1.0):
     """dump 行 → SFT 样本（纯函数，CPU 可测）。返回 (samples, stats)。
 
     【2026-10-11 选样口径改版】服务"交卷率已接近饱和、该碰解题力"：
@@ -278,14 +279,27 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
         可比，也和 RL record 里"8 条里对几条"的直觉一致。
     """
     rng = random.Random(seed)
+    if not 0.0 <= float(synth_prob) <= 1.0:
+        raise ValueError(f"synth_prob 必须在 [0,1]，收到 {synth_prob}")
     by_q = {}
     # 每题**分 run** 计数：n_att[src][qk]、n_ok[src][qk]。混合池上算通过率是
     # 错的（不同 run 是不同策略，且同一题被重复采了 N 遍）。
     n_att, n_ok_q = {}, {}
     stats = {"rows": 0, "ok": 0, "bad_struct": 0, "no_boxed": 0,
-             "rewritten_budget_lines": 0}
+             "rewritten_budget_lines": 0, "adaptive_collect": False}
     for row in rows:
         stats["rows"] += 1
+        if row.get("collect_phase") in ("first", "retry"):
+            stats["adaptive_collect"] = True
+        _row_sp = row.get("sp_sha")
+        if row.get("collect_phase") in ("first", "retry") and not _row_sp:
+            raise ValueError(
+                f"[sft_data] collector dump 第 {stats['rows']} 行缺 sp_sha；"
+                "无法证明生成提示与SFT编码提示一致，拒绝混入")
+        if expected_sp_sha and _row_sp and _row_sp != expected_sp_sha:
+            raise ValueError(
+                f"[sft_data] dump 第 {stats['rows']} 行按 sp{_row_sp} 生成，"
+                f"本次 SFT 将按 sp{expected_sp_sha} 编码；提示错档，拒绝混入")
         _qk0 = row.get("qk") or hashlib.sha1(
             str(row.get("Q", "")).encode("utf-8")).hexdigest()[:12]
         _src = row.get("_src", 0)
@@ -310,8 +324,14 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
         source = "real_tool" if int(row.get("code_used") or 0) > 0 else "zero_call"
         by_q.setdefault(qk, []).append(
             {"qk": qk, "Q": row.get("Q"), "A": row.get("A"),
-             "source": source, "clen": clen, "turns": turns})
+             "source": source, "clen": clen, "turns": turns,
+             "collect_phase": row.get("collect_phase")})
     # ---- 参考 run 选择 + 通过率（比例口径）----
+    if stats["adaptive_collect"] and (min_rate > 0.0 or max_rate < 1.0):
+        raise ValueError(
+            "[sft_data] collector dump 是自适应采样：首轮成功题1次、失败题3~5次，"
+            "attempts 由结果决定，不能据此做 --min_rate/--max_rate 近界筛选；"
+            "请移除 rate 过滤，近界率只用独立 fixed-k run/probe")
     stats["src_counts"] = {k: sum(v.values()) for k, v in n_att.items()}
     if ref_src is None and n_att:
         ref_src = max(stats["src_counts"], key=lambda k: stats["src_counts"][k])
@@ -371,7 +391,9 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
         samples.extend(kept)
         n_synth = 0
         for c in kept:
-            if c["source"] != "real_tool" or n_synth >= synth_per_q:
+            if (c["source"] != "real_tool" or n_synth >= synth_per_q
+                    or (float(synth_prob) < 1.0
+                        and rng.random() >= float(synth_prob))):
                 continue
             sv = synthesize_low_budget(c["turns"], call_need, rng)
             if sv is not None:
@@ -384,6 +406,10 @@ def build_dataset(rows, *, call_need, max_per_q=2, synth_per_q=1,
     stats["n_samples"] = len(samples)
     stats["per_source"] = {s: sum(1 for x in samples if x["source"] == s)
                            for s in _SOURCES}
+    stats["per_collect_phase"] = {
+        p: sum(1 for x in samples
+               if x.get("collect_phase") == p and x["source"] != "low_budget")
+        for p in ("first", "retry")}
     return samples, stats
 
 
@@ -407,6 +433,9 @@ def main(argv=None):
                     help="与线上同值：推导 call_need = chars//2+16+answer_reserve")
     ap.add_argument("--max_per_q", type=int, default=2)
     ap.add_argument("--synth_per_q", type=int, default=1)
+    ap.add_argument("--synth_prob", type=float, default=1.0,
+                    help="每个可合成候选生成 low_budget 样本的概率；默认1保持旧行为。"
+                         "广覆盖集建议0.5，使 low_budget 约占最终样本1/3")
     ap.add_argument("--min_rate", type=float, default=0.0,
                     help="按参考 run 内该题**通过率**筛题的下限（0=不限）")
     ap.add_argument("--max_rate", type=float, default=1.0,
@@ -449,11 +478,14 @@ def main(argv=None):
                                    prefer_short=not args.no_prefer_short,
                                    ref_src=args.ref_src,
                                    min_att=args.min_att,
-                                   keep_unknown=not args.drop_unknown)
+                                   keep_unknown=not args.drop_unknown,
+                                   expected_sp_sha=sp_sha,
+                                   synth_prob=args.synth_prob)
     with open(args.out, "w", encoding="utf-8") as f:
         for s in samples:
             f.write(json.dumps(
                 {"qk": s["qk"], "Q": s["Q"], "A": s["A"], "source": s["source"],
+                 "collect_phase": s.get("collect_phase"),
                  "system_prompt": sp, "sp_sha": sp_sha,
                  "turns": [{"kind": t["kind"],
                             **({"text": t["text"]} if t["kind"] == "assistant"
@@ -462,7 +494,8 @@ def main(argv=None):
                 ensure_ascii=False) + "\n")
     print(f"[sft_data] 读 {stats['rows']} 行 dump → ok {stats['ok']} → "
           f"{stats['n_samples']} 条样本 / {stats['n_questions']} 题", flush=True)
-    print(f"[sft_data] 分类: {stats['per_source']}；结构非法跳过 "
+    print(f"[sft_data] 分类: {stats['per_source']}；采集来源(不含合成): "
+          f"{stats.get('per_collect_phase')}；结构非法跳过 "
           f"{stats['bad_struct']}，无 boxed 跳过 {stats['no_boxed']}，"
           f"预算行改写 {stats['rewritten_budget_lines']} 行", flush=True)
     # 【覆盖率】直方图只覆盖参考 run 内实测的题；入样题里不在其中的部分通过率
@@ -470,7 +503,7 @@ def main(argv=None):
     # 题 ⇒ 46% 未知），必须显式报出——否则会被误当成"全部题都按通过率筛过了"。
     _unk = stats.get("n_unknown_q", 0)
     _nq = stats.get("n_questions", 0)
-    if _unk and _nq:
+    if _unk and _nq and not stats.get("adaptive_collect"):
         print(f"[sft_data] ⚠ 入样 {_nq} 题中有 {_unk} 题"
               f"（{_unk / max(1, _nq) * 100:.0f}%）通过率**未知**（不在参考 run "
               f"内）→ 未经过近界验证；只留有实测通过率的题请加 --drop_unknown",
@@ -482,6 +515,11 @@ def main(argv=None):
     #      是 25%（近界、该留）、在 8 次里是全对（该剔）——绝对阈值跨题不可比。
     # 直方图即按比例换算到 num_pre_Q=8 刻度，与本项目"8 条里对几条"的直觉一致。
     _ph = stats.get("pass_hist") or {}
+    if stats.get("adaptive_collect"):
+        print("[sft_data] 自适应 collector dump：首轮成功题1次、失败题3~5次，"
+              "attempts 由结果决定；本表不把直方图解释为通过率，也禁止 --max_rate。",
+              flush=True)
+        _ph = {}
     if _ph:
         _sc = stats.get("pass_hist_scale") or 8
         _tot = sum(_ph.values())
