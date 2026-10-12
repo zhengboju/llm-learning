@@ -244,7 +244,8 @@ python -m rlab.train --algo retool_math \
    （RL 要 11h，SFT 1.5h）。三步已在 `08-sft-cold-start.md §7.5` 落地为可直接跑的命令：
    - **① 数据 v2**：dump 加 p9（fmt/条件精度双优的策略）+ `--max_per_q 4
      --synth_per_q 2 --no_prefer_short`，`--from_run_info` 仍取 **p9**（保锚
-     `sp632ef7`，零对齐成本）；**看 pass-rate 直方图**决定是否追加 `--max_ok 7`。
+     `sp632ef7`，零对齐成本）；**看 pass-rate 直方图**决定是否追加
+     `--max_rate 0.875 --ref_src 3`。
    - **② 训练**：`--save_every_epoch`（默认开）产出 `epoch1/epoch2/final`。
    - **③ 评测**：三个 ckpt 同批同 `gpu_mem` 评；**主判据是条件精度 `acc/fmt`
      不许掉 >1.5pp**（掉 = "格式换推理"，该停），fmt 目标 ≥98%。

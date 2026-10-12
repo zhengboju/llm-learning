@@ -694,21 +694,27 @@ v1 的 dump 是 fmt 78~90 的策略；**p9 是 RL 抛光后的策略（fmt 93.9�
 与 p9（及后续 RL）逐字节相同，**无需重新对齐 sha**。
 
 ```bash
-# v2：dump 混 p6+p7+p8+p9；放宽每题信号量；pass-rate 直方图决定要不要开 --max_ok
+# v2：dump 混 p6+p7+p8+p9；放宽每题信号量；pass-rate 直方图决定要不要开 --max_rate
 python -m rlab.sft_data \
     --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
     --dump rlab_new/native_p8_best/traj.jsonl --dump rlab_new/native_p9_best/traj.jsonl \
     --out rlab_out/sft_budget_v2.jsonl \
     --from_run_info rlab_new/native_p9_best/run_info.json \
     --max_per_q 4 --synth_per_q 2 --no_prefer_short
-# 若直方图显示"近界题充足"（>20%），追加 --max_ok 7 开近界选样（rejection sampling）
+# 直方图若显示"近界题充足"（>20%），追加一行开近界选样：
+#   --max_rate 0.875        # =7/8：只留"不是每次都做对"的题
+#   --ref_src 3             # 显式指定参考 run（--dump 顺序：p6=0, p7=1, p8=2, p9=3）
 ```
+
+**⚠ 必须显式给 `--ref_src`**：四个 run 合并后同一题被反复采样，缺省只会取
+"行数最多的 run"——那通常**不是**你想参照的那个（你想要的是**最接近下个 RL
+起点的策略**，即 p9=3）。顺序由 `--dump` 给出顺序决定。
 
 **两条方案**（先跑①，②的开关由①的直方图决定，改一个参数即可，不用重跑）：
 
 | | ① 交卷率路线 | ② A+B 一起 |
 |---|---|---|
-| 数据 | 上表命令 + `--no_prefer_short` | 再 `--max_ok 7` |
+| 数据 | 上表命令 + `--no_prefer_short` | 再 `--max_rate 0.875 --ref_src 3` |
 | 预期 | fmt 90.8→**95~98**，acc **+4~6pp**，条件精度不变 | fmt 同①，**条件精度 +1~3pp（不确定）** |
 | 风险 | 低，可解释 | 中：近界题太少或解太单一 → 退化成记忆 |
 
@@ -737,22 +743,34 @@ SFT v1 的 +6.5pp **全部来自提高交卷率**，条件精度（`acc/fmt`）�
 
 | 参数 | 作用 | 为什么 |
 |---|---|---|
-| `--max_ok N`（N < num_pre_Q） | **近界选样**：只留"该题答对条数 ≤N"的题 | rejection sampling / STaR。排除已掌握题（信号饱和），是唯一能真实抬高 `P(correct)` 的选样口径 |
+| `--max_rate R`（R<1） | **近界选样**：只留参考 run 内通过率 ≤R 的题 | rejection sampling / STaR。排除已掌握题（信号饱和），是唯一能真实抬高 `P(correct)` 的选样口径 |
+| `--ref_src N` | pass-rate 的**参考 run**（`--dump` 顺序，0 起） | 多 run 合并后同一题被反复采样；**不限定就统计全假**（见下方事故） |
 | `--no_prefer_short` | 关闭"偏好最短轨迹" | 长度已压住（SFT −17%/RL −21%），该偏好现在**只优先剔除长轨迹 = 难题的正确解**，纯伤害解题力（实测：默认封顶 clen 800，关闭后达 1100） |
 | `--max_per_q 4 --synth_per_q 2` | 放宽每题信号量 | 原 `2/1` 限制了每题贡献 |
 
-**新增打印（决定"要不要开 `--max_ok`"的唯一判据）**：
+**★ 口径两铁律（`5ac5021`，实机踩出来的两个假读数）**
+
+合并 4 个 run 的 dump 后，首版实现打出了 **`attempts≈40` / `已掌握 0%` / `近界 92.3%`**
+——**三条全是错的**，因为它同时违反了下面两条：
+
+1. **必须限定参考 run**：同一 `qk` 被每个 run 的每个 step 各采一遍，`attempts≈40`
+   而非 `num_pre_Q=8`。缺省自动取行数最多的 run **并打印报出用的是谁**。
+2. **必须用比例，不能用绝对条数**：每题 attempts 是 **8~40 不等**。`ok=10` 在
+   attempts=40 里是 25%（近界，该留）、在 attempts=8 里是全对（该剔）
+   ——**绝对条数阈值跨题不可比**。故直方图按 `round(rate × 8)` 换算到 8 刻度，
+   与本项目"8 条里对几条"的直觉一致。
+
+**新增打印（决定"要不要开 `--max_rate`"的唯一判据）**：
 
 ```
-[sft_data] pass-rate 直方图（每题答对条数 / 该题数，共 12 题；每题 attempts≈8）:
-           0→3  2→3  4→3  8→3
-[sft_data]   已掌握(ok=8) 3/12 = 25.0% ｜ 全错(ok=0) 3 ｜ **近界(1≤ok<8) 6** = 50.0%
-[sft_data]   ⇒ 近界题充足，可试 `--max_ok 7`（rejection sampling，...）
+[sft_data] pass-rate 直方图（参考 run #3 内，按通过率换算到 8 刻度；共 741 题，...）:
+           0/8→57  1/8→29  2/8→21  ...  8/8→118
+[sft_data]   近全错档(0，通过率<6.2%) 57/741 ｜ 已掌握档(8，通过率≥93.8%) 118/741
+             ｜ **近界(中间档) 566** = 76.4%
+[sft_data]   各 run 行数（参考 run 取行数最多者，可用 --ref_src 显式指定）: {...}
 ```
 
-直方图**覆盖全部落盘题目（含 ok=0 与截断题）**——它们不在被选中的样本里，
-但正是 pass rate 分布的两端。**近界题 <20% ⇒ 池子已饱和，`--max_ok` 收益有限，
-优先走交卷率路线**（打印会直接给这句判据）。
+档位是**四舍五入制**：档 8 含 97.5% 这类"近全对"，不是严格全对。
 
 **读打印**：`分类: {...}` 里 low_budget 为 0 = dump 没淘到货（检查行里
 segs 是否带 body）；末尾的 `sp<sha6>` 是数据所用系统提示的指纹，后续 RL
