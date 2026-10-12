@@ -683,7 +683,39 @@ python -m rlab.sft_data \
   p8 的行是"见过预算提示"的策略产出的，离 RL 起点更近，建议加上。
 - **`--from_run_info` 指谁 = 下个 RL 用哪份提示**：p6 是自定义精简文件
   （sp5361b5），p8 是 native preset + 预算段（sp632ef7），两者基提示不同。
-  实测采用 **p8**：2140 条 / 5.36M token / assistant 占 58.2% / `sp632ef7`。
+  实测 v1 采用 **p8**：2140 条 / 5.36M token / assistant 占 58.2% / `sp632ef7`。
+
+**【★ v2 推荐：dump 换/加 p9，仍取 p9 的 run_info（保锚，零对齐成本）】**
+
+v1 的 dump 是 fmt 78~90 的策略；**p9 是 RL 抛光后的策略（fmt 93.9、条件精度 86.2，
+两项都更好）**，SFT 是"装行为"，数据越接近目标策略越好。关键：p9 的
+`config.system_prompt` 里写的是 **8192（锚文本）**，`inject_budget_prompt`
+因 marker 存在会跳过注入 ⇒ **取 p9 的 run_info 得到仍为 `sp632ef7`**，
+与 p9（及后续 RL）逐字节相同，**无需重新对齐 sha**。
+
+```bash
+# v2：dump 混 p6+p7+p8+p9；放宽每题信号量；pass-rate 直方图决定要不要开 --max_ok
+python -m rlab.sft_data \
+    --dump rlab_new/native_p6_best/traj.jsonl --dump rlab_new/native_p7_best/traj.jsonl \
+    --dump rlab_new/native_p8_best/traj.jsonl --dump rlab_new/native_p9_best/traj.jsonl \
+    --out rlab_out/sft_budget_v2.jsonl \
+    --from_run_info rlab_new/native_p9_best/run_info.json \
+    --max_per_q 4 --synth_per_q 2 --no_prefer_short
+# 若直方图显示"近界题充足"（>20%），追加 --max_ok 7 开近界选样（rejection sampling）
+```
+
+**两条方案**（先跑①，②的开关由①的直方图决定，改一个参数即可，不用重跑）：
+
+| | ① 交卷率路线 | ② A+B 一起 |
+|---|---|---|
+| 数据 | 上表命令 + `--no_prefer_short` | 再 `--max_ok 7` |
+| 预期 | fmt 90.8→**95~98**，acc **+4~6pp**，条件精度不变 | fmt 同①，**条件精度 +1~3pp（不确定）** |
+| 风险 | 低，可解释 | 中：近界题太少或解太单一 → 退化成记忆 |
+
+**⚠ 重跑时看 `丢 {'overlong': N}`**：p9 的 `avg_clen` 3200 而上限 12288，而
+`sft.py --max_seq_len` 是 9216；`--no_prefer_short` 让长轨迹权重上升后，该计数
+可能不再是 0。**若 >0 需同步抬 `--max_seq_len`**（显存代价：T 抬 44%，参照
+§② 梯度检查点那条的教训）。
 
 `--from_run_info`（推荐）：系统提示与预算三件套（`max_traj_tokens`/
 `answer_reserve`/`tool_result_max_chars`）直接从 run_info 取。历史 run_info
@@ -695,8 +727,32 @@ python -m rlab.sft_data \
 
 产出三类样本：`real_tool`（用码答对未截断）/ `zero_call`（零调用答对）/
 `low_budget`（合成：最后工具回包处截断 + 强警档预算行 + 简短 boxed 收尾，
-答案取自轨迹自身）。每题限额 `--max_per_q 2` 且偏好更短轨迹；low_budget
-每题至多 `--synth_per_q 1` 条。
+答案取自轨迹自身）。
+
+**【2026-10-11 选样改版（`4a6aa1e`）：从"教交卷"转向"碰解题力"】**
+
+SFT v1 的 +6.5pp **全部来自提高交卷率**，条件精度（`acc/fmt`）没动
+（86.2→84.9，噪声内）。交卷率已 90.8、余量有限；**错题（~40 题）是漏交卷
+（~18 题）的 2.3 倍且从未被优化过**。三个新开关服务这条路：
+
+| 参数 | 作用 | 为什么 |
+|---|---|---|
+| `--max_ok N`（N < num_pre_Q） | **近界选样**：只留"该题答对条数 ≤N"的题 | rejection sampling / STaR。排除已掌握题（信号饱和），是唯一能真实抬高 `P(correct)` 的选样口径 |
+| `--no_prefer_short` | 关闭"偏好最短轨迹" | 长度已压住（SFT −17%/RL −21%），该偏好现在**只优先剔除长轨迹 = 难题的正确解**，纯伤害解题力（实测：默认封顶 clen 800，关闭后达 1100） |
+| `--max_per_q 4 --synth_per_q 2` | 放宽每题信号量 | 原 `2/1` 限制了每题贡献 |
+
+**新增打印（决定"要不要开 `--max_ok`"的唯一判据）**：
+
+```
+[sft_data] pass-rate 直方图（每题答对条数 / 该题数，共 12 题；每题 attempts≈8）:
+           0→3  2→3  4→3  8→3
+[sft_data]   已掌握(ok=8) 3/12 = 25.0% ｜ 全错(ok=0) 3 ｜ **近界(1≤ok<8) 6** = 50.0%
+[sft_data]   ⇒ 近界题充足，可试 `--max_ok 7`（rejection sampling，...）
+```
+
+直方图**覆盖全部落盘题目（含 ok=0 与截断题）**——它们不在被选中的样本里，
+但正是 pass rate 分布的两端。**近界题 <20% ⇒ 池子已饱和，`--max_ok` 收益有限，
+优先走交卷率路线**（打印会直接给这句判据）。
 
 **读打印**：`分类: {...}` 里 low_budget 为 0 = dump 没淘到货（检查行里
 segs 是否带 body）；末尾的 `sp<sha6>` 是数据所用系统提示的指纹，后续 RL
@@ -705,14 +761,26 @@ segs 是否带 body）；末尾的 `sp<sha6>` 是数据所用系统提示的指�
 ### ② SFT 训练（4B，H20 单卡，千条级数据约半小时内）
 
 ```bash
-python -m rlab.sft --data rlab_out/sft_budget_v1.jsonl \
-    --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v1 \
+python -m rlab.sft --data rlab_out/sft_budget_v2.jsonl \
+    --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v2 \
     --lr 1e-5 --epochs 2 --optim_8bit
 ```
 
 - lr 默认 1e-5（**不照抄论文 1e-6**——那句是 RL 段超参，§3.2 归属辨析）；
 - 超长样本（>9216 token）丢弃并计数，不截断（截断轨迹恰是要治的负示范）；
-- 产出 `final/`（vLLM 可直读）+ `sft_info.json`（数据/超参/丢弃统计自证）。
+- 产出 `final/` + **`epoch1/`、`epoch2/`** + `sft_info.json`（数据/超参/丢弃统计自证）。
+
+**【为什么必须存逐 epoch（`4a6aa1e`，默认开，成本 ~40s/份）】**
+
+只存 `final` **无法回答"多训是赚还是亏"**，而这是 lr/epochs 该往哪走的唯一依据：
+
+| 观测量（epoch1 → epoch2） | 判定 | 处置 |
+|---|---|---|
+| fmt↑ 且**条件精度不掉** | 干净收益 | 可加 epoch / 加数据 |
+| fmt↑ 但**条件精度 ↓ >1.5pp** | **"格式换推理"** | 停在最优点，lr 降到 5e-6 |
+
+⇒ 评测时**三个 ckpt 都评**（`final` / `epoch1` / `epoch2`），**条件精度 `acc/fmt`
+是主判据，acc 只作观测**（N=293 下 <4pp 不判）。
 
 **【2026-10-11 落地实测·两个坑已修】**
 

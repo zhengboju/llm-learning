@@ -239,16 +239,28 @@ python -m rlab.train --algo retool_math \
 
 ### A. 立即可做（按 ROI）
 
-1. **攻条件精度（现在这是唯一未开发的杠杆，也是最大的一块）**：交了卷但答错 ~40 题，
+1. **★ SFT v2（当前最高 ROI，1.5h）**：SFT 是全程最大功臣（+6.5pp），且**它做的事
+   单一明确——抬高交卷率**，所以还剩下的同性质 headroom 应当继续用 SFT 拿
+   （RL 要 11h，SFT 1.5h）。三步已在 `08-sft-cold-start.md §7.5` 落地为可直接跑的命令：
+   - **① 数据 v2**：dump 加 p9（fmt/条件精度双优的策略）+ `--max_per_q 4
+     --synth_per_q 2 --no_prefer_short`，`--from_run_info` 仍取 **p9**（保锚
+     `sp632ef7`，零对齐成本）；**看 pass-rate 直方图**决定是否追加 `--max_ok 7`。
+   - **② 训练**：`--save_every_epoch`（默认开）产出 `epoch1/epoch2/final`。
+   - **③ 评测**：三个 ckpt 同批同 `gpu_mem` 评；**主判据是条件精度 `acc/fmt`
+     不许掉 >1.5pp**（掉 = "格式换推理"，该停），fmt 目标 ≥98%。
+   - 预期：fmt 90.8→**95~98**、acc **+4~6pp**（> RL 的 +3.8pp），条件精度不变。
+2. **攻条件精度**（唯一未开发的维度，也是最大的一块）：交了卷但答错 ~40 题，
    是没交卷 ~18 题的 2.3 倍，而**条件精度从基础模型到 RL 一步没涨（86.2→84.9→86.2）**。
    根因：RL 的 group-mean 优势里，"答错"与"没交卷"的 reward 同为 −1，**对错题无区分力**；
    fmt 已 93.9% 近顶，优势函数剩下的方差几乎全在"交不交卷"上。
-   ⇒ 要用**难度课程**（`--difficulty_path`，p9 是 `null`）或按难度分层采样，把错题显出来。
-2. **续训**（零代码）：训练曲线 step300→400 仍 +2.1pp、**无平台**；
-   若 RL 真有 +3.8pp 量级，延长后应跨过显著线。从 step400 接跑 400 步。
-3. **同批重跑两臂以定 RL 结论**（§1.1/§5.2 的口子）：step400 vs SFT 必须**同 `gpu_mem`、
-   同批**，标签用 `sft_p9proto`（不要写成 `BASE`）。要硬结论还需 **N≈900 或 2~3 seed 合并**。
-4. **归因分解**：`python -m rlab.analysis --record rlab_new/native_p9_best/record.jsonl --no-boxed-breakdown rlab_new/native_p9_best/record.jsonl`（本次已跑，见 §6）。
+   ⇒ 用**难度课程**（`--difficulty_path`，p9 是 `null`）或按难度分层采样把错题显出来。
+   SFT 侧的着力点是**近界选样**（`--max_ok`，见 A1 ①）——那是唯一能真实抬高
+   `P(correct)` 的数据口径。
+3. **续训**（零代码）：训练曲线 step300→400 仍 +2.1pp、**无平台**；
+   若 RL 真有 +3.8pp 量级，延长后应跨过显著线。
+4. **同批重跑两臂以定 RL 结论**（§1.1/§5.2 的口子）：必须**同 `gpu_mem`、同批**，
+   标签用 `sft_p9proto`（不要写成 `BASE`）。要硬结论还需 **N≈900 或 2~3 seed 合并**。
+5. **归因分解**：`python -m rlab.analysis --record rlab_new/native_p9_best/record.jsonl --no-boxed-breakdown rlab_new/native_p9_best/record.jsonl`（本次已跑，见 §6）。
 
 ### B. 需要写代码的
 
@@ -304,5 +316,5 @@ python -m rlab.train --algo retool_math \
 
 **报告完成时间**：2026-10-11（含 §5.2 归属补测更新）
 **上游**：p8-diagnosis.md（无 boxed 三桶的发现）、08-sft-cold-start.md §7.5（SFT 落地路线）
-**下一步**：攻条件精度（最大未开发杠杆）＞ 续训 ＞ 同批重跑定 RL 结论
+**下一步**：SFT v2（最高 ROI，1.5h）＞ 攻条件精度（难度课程/近界选样）＞ 续训 ＞ 同批重跑定 RL 结论
 **开放项**：§1.1 两臂是否同批（fmt 94.9 vs 93.9）；RL +3.8pp 的显著性需 N≈900 或 2~3 seed
