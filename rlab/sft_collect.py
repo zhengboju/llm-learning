@@ -21,10 +21,21 @@ def collect_seed(base_seed, qakey, attempt_idx, shard_index=0):
     return int(hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8], 16) & 0x7FFFFFFF
 
 
+def plan_fingerprint(seed, max_questions, shard_count, pool_hash, dev_hash):
+    fields = {"seed": int(seed), "max_questions": int(max_questions),
+              "shard_count": int(shard_count), "pool_hash": pool_hash,
+              "dev_hash": dev_hash}
+    sha = hashlib.sha1(json.dumps(
+        fields, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return sha, fields
+
+
 def load_collect_state(paths, expected_sp_sha=None, expected_model=None,
-                       expected_protocol_sha=None, expected_plan_sha=None):
+                       expected_protocol_sha=None, expected_plan_sha=None,
+                       allowed_plan_shas=()):
     """从一个或多个 collector dump 恢复进度；重复合并的行不会重复计数。"""
     state, seen = {}, set()
+    allowed_plan_shas = set(allowed_plan_shas)
     for path in paths:
         if not path or not os.path.exists(path):
             continue
@@ -62,8 +73,9 @@ def load_collect_state(paths, expected_sp_sha=None, expected_model=None,
                     raise RuntimeError(
                         f"[sft_collect] 状态文件 {path} 混入协议 "
                         f"{row['protocol_sha']}，当前是 {expected_protocol_sha}")
-                if expected_plan_sha and row.get("plan_sha") \
-                        and row["plan_sha"] != expected_plan_sha:
+                if (expected_plan_sha and row.get("plan_sha")
+                        and row["plan_sha"] != expected_plan_sha
+                        and row["plan_sha"] not in allowed_plan_shas):
                     raise RuntimeError(
                         f"[sft_collect] 状态文件 {path} 混入采集计划 "
                         f"{row['plan_sha']}，当前是 {expected_plan_sha}")
@@ -90,6 +102,48 @@ def load_collect_state(paths, expected_sp_sha=None, expected_model=None,
                         and not int(row.get("trunc_final") or 0)):
                     s["success"] = True
     return state
+
+
+def validate_reshard_state(paths, full_order, *, base_seed, old_shard_count,
+                           old_plan_sha, current_plan_sha):
+    """证明旧状态确实来自同题池/seed，只是 shard_count 不同。"""
+    if old_shard_count < 1:
+        raise ValueError("old_shard_count 必须 >=1")
+    old_shard = {qa_key(x["Q"], x["A"]): i % old_shard_count
+                 for i, x in enumerate(full_order)}
+    checked = 0
+    for path in paths:
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                plan = row.get("plan_sha")
+                if plan == current_plan_sha:
+                    continue
+                if plan != old_plan_sha:
+                    raise RuntimeError(
+                        f"[sft_collect] 重分片状态 {path} 含未知 plan={plan}；"
+                        f"只允许旧 {old_plan_sha} 或当前 {current_plan_sha}")
+                key = row.get("qa_key") or qa_key(row.get("Q", ""), row.get("A", ""))
+                if key not in old_shard:
+                    raise RuntimeError(
+                        f"[sft_collect] 重分片状态 {path} 含当前题池之外的题 {key[:12]}")
+                idx = row.get("attempt_idx")
+                if isinstance(idx, int) and idx >= 0:
+                    got = row.get("collect_seed")
+                    want = collect_seed(base_seed, key, idx, old_shard[key])
+                    if got != want:
+                        raise RuntimeError(
+                            f"[sft_collect] 重分片状态 {path} 的题 {key[:12]} attempt={idx} "
+                            f"seed={got}，按旧 {old_shard_count} 分片应为 {want}")
+                checked += 1
+    if not checked:
+        raise RuntimeError("[sft_collect] --reshard_from 没找到可验证的旧计划轨迹")
+    return checked
 
 
 def build_first_plan(order, state):
@@ -198,7 +252,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="标准 traj.jsonl，支持断点续跑")
     ap.add_argument("--phase", choices=("first", "retry", "all"), default="all")
     ap.add_argument("--state", action="append", default=[],
-                    help="retry 时的完整首采 dump；分片先 cat 后传，可多次")
+                    help="恢复状态文件，可多次；首采重分片或retry时传完整已有dump")
     ap.add_argument("--max_questions", type=int, default=4000)
     ap.add_argument("--retry_min", type=int, default=2)
     ap.add_argument("--retry_max", type=int, default=4)
@@ -207,6 +261,9 @@ def main(argv=None):
     ap.add_argument("--gpu_mem", type=float, default=0.78)
     ap.add_argument("--shard_index", type=int, default=0)
     ap.add_argument("--shard_count", type=int, default=1)
+    ap.add_argument("--reshard_from", type=int, default=None, metavar="OLD_COUNT",
+                    help="显式把同seed/题池/协议的旧 OLD_COUNT 分片状态迁移到当前"
+                         " --shard_count；会复算旧plan与每条collect_seed，任一不符即拒绝")
     args = ap.parse_args(argv)
 
     if args.phase == "all" and args.shard_count != 1:
@@ -248,19 +305,33 @@ def main(argv=None):
     dev_hash = hashlib.sha1("\n".join(sorted(
         hashlib.sha1(str(x["Q"]).encode("utf-8")).hexdigest()
         for x in dev)).encode("utf-8")).hexdigest()[:12]
-    plan_fields = {"seed": int(args.seed), "max_questions": int(args.max_questions),
-                   "shard_count": int(args.shard_count), "pool_hash": pool_hash,
-                   "dev_hash": dev_hash}
-    plan_sha = hashlib.sha1(json.dumps(
-        plan_fields, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    plan_sha, plan_fields = plan_fingerprint(
+        args.seed, args.max_questions, args.shard_count, pool_hash, dev_hash)
+    old_plan_sha = None
+    if args.reshard_from is not None:
+        if not args.state:
+            raise SystemExit("[sft_collect] --reshard_from 必须配合 --state 传旧状态文件")
+        if args.reshard_from == args.shard_count:
+            raise SystemExit("[sft_collect] --reshard_from 必须与当前 --shard_count 不同")
+        old_plan_sha, _ = plan_fingerprint(
+            args.seed, args.max_questions, args.reshard_from, pool_hash, dev_hash)
 
     state_paths = list(args.state)
     if os.path.exists(args.out):
         state_paths.append(args.out)
+    if old_plan_sha:
+        n_checked = validate_reshard_state(
+            state_paths, full_order, base_seed=args.seed,
+            old_shard_count=args.reshard_from, old_plan_sha=old_plan_sha,
+            current_plan_sha=plan_sha)
+        print(f"[sft_collect] 重分片验证通过：旧 {args.reshard_from} 卡 plan="
+              f"{old_plan_sha} → 当前 {args.shard_count} 卡 plan={plan_sha}，"
+              f"核对 {n_checked} 行", flush=True)
     state = load_collect_state(state_paths, expected_sp_sha=sp_sha,
                                expected_model=args.model_path,
                                expected_protocol_sha=protocol_sha,
-                               expected_plan_sha=plan_sha)
+                               expected_plan_sha=plan_sha,
+                               allowed_plan_shas=([old_plan_sha] if old_plan_sha else ()))
     if args.phase == "retry":
         missing = [x for x in full_order
                    if not state.get(qa_key(x["Q"], x["A"]), {}).get("seen")]
@@ -407,7 +478,8 @@ def main(argv=None):
     final_state = load_collect_state(
         list(args.state) + [args.out], expected_sp_sha=sp_sha,
         expected_model=args.model_path, expected_protocol_sha=protocol_sha,
-        expected_plan_sha=plan_sha)
+        expected_plan_sha=plan_sha,
+        allowed_plan_shas=([old_plan_sha] if old_plan_sha else ()))
     covered = sum(bool(final_state.get(qa_key(x["Q"], x["A"]), {}).get("seen"))
                   for x in order)
     success = sum(bool(final_state.get(qa_key(x["Q"], x["A"]), {}).get("success"))

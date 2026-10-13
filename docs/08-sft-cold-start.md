@@ -837,6 +837,40 @@ cat rlab_out/sft_wide_v3.first.0.jsonl \
   > rlab_out/sft_wide_v3.first.jsonl
 ```
 
+#### 单卡首采中断后改双卡续跑
+
+旧文件没有 `.meta.json` 代表进程未正常结束，但逐行flush的轨迹仍有效。若旧命令是
+`seed=42 / max_questions=4000 / shard_count=1`，可显式迁移到2卡；collector会复算旧
+`plan_sha`、逐题归属和每条 `collect_seed`，任一不符就终止：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m rlab.sft_collect \
+  --model_path rlab_new/native_p9_best/step_400 \
+  --proto_from rlab_new/native_p9_best \
+  --state rlab_out/sft_wide_v3.jsonl \
+  --out rlab_out/sft_wide_v3.first.resume.0.jsonl \
+  --phase first --reshard_from 1 \
+  --max_questions 4000 --questions_per_wave 32 \
+  --shard_index 0 --shard_count 2 --seed 42 --gpu_mem 0.78 &
+
+CUDA_VISIBLE_DEVICES=1 python -m rlab.sft_collect \
+  --model_path rlab_new/native_p9_best/step_400 \
+  --proto_from rlab_new/native_p9_best \
+  --state rlab_out/sft_wide_v3.jsonl \
+  --out rlab_out/sft_wide_v3.first.resume.1.jsonl \
+  --phase first --reshard_from 1 \
+  --max_questions 4000 --questions_per_wave 32 \
+  --shard_index 1 --shard_count 2 --seed 42 --gpu_mem 0.78 &
+wait
+cat rlab_out/sft_wide_v3.jsonl \
+    rlab_out/sft_wide_v3.first.resume.0.jsonl \
+    rlab_out/sft_wide_v3.first.resume.1.jsonl \
+  > rlab_out/sft_wide_v3.first.jsonl
+```
+
+两卡都读取旧文件但写**不同的新文件**；不要让两个进程同时追加旧文件。之后retry阶段
+也要带 `--reshard_from 1`，因为合并状态里仍保留旧640行的单卡plan指纹。
+
 #### 双卡阶段二：只重试首采失败题（仍可并行）
 
 ```bash

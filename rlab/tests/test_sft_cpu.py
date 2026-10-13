@@ -331,7 +331,8 @@ def test_sft_collect():
     print("[A2] sft_collect：覆盖优先 / 自适应重试 / 恢复 / 污染防线")
     from rlab.sft_collect import (build_first_plan, build_retry_plan,
                                   clean_training_pool, collect_seed,
-                                  load_collect_state, qa_key)
+                                  load_collect_state, plan_fingerprint, qa_key,
+                                  validate_reshard_state)
     order = [{"Q": "q1", "A": "1"}, {"Q": "q2", "A": "2"},
              {"Q": "q3", "A": "3"}]
     check("collector：空状态首采覆盖所有题且每题恰好1次",
@@ -390,6 +391,36 @@ def test_sft_collect():
         except RuntimeError:
             plan_mismatch = True
         check("collector：恢复时seed/题池/分片计划错档 fail-fast", plan_mismatch)
+
+        old_plan, _ = plan_fingerprint(42, 3, 1, "poolx", "devx")
+        new_plan, _ = plan_fingerprint(42, 3, 2, "poolx", "devx")
+        rp = os.path.join(td, "reshard.jsonl")
+        rr = {"Q": "q2", "A": "2", "qa_key": k2, "status": "ok",
+              "acc": -1, "fmt": 1, "trunc_final": 0, "attempt_idx": 0,
+              "collect_phase": "first", "collect_uid": "r1",
+              "collect_seed": collect_seed(42, k2, 0, 0),
+              "sp_sha": "abc123", "plan_sha": old_plan}
+        with open(rp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rr) + "\n")
+        ncheck = validate_reshard_state(
+            [rp], order, base_seed=42, old_shard_count=1,
+            old_plan_sha=old_plan, current_plan_sha=new_plan)
+        rs = load_collect_state([rp], expected_sp_sha="abc123",
+                                expected_plan_sha=new_plan,
+                                allowed_plan_shas=[old_plan])
+        check("collector：1卡旧状态经plan+题池+seed验证后可迁移到2卡",
+              ncheck == 1 and rs[k2]["seen"])
+        rr["collect_seed"] += 1
+        with open(rp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rr) + "\n")
+        try:
+            validate_reshard_state(
+                [rp], order, base_seed=42, old_shard_count=1,
+                old_plan_sha=old_plan, current_plan_sha=new_plan)
+            bad_seed = False
+        except RuntimeError:
+            bad_seed = True
+        check("collector：重分片旧seed复算不符即拒绝", bad_seed)
 
     try:
         clean_training_pool(order, [{"Q": "q2", "A": "x"}])
