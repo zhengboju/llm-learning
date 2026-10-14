@@ -16,6 +16,32 @@ ALGO=${1:?用法: run_gsm8k.sh <algo> [model_path] [train.py 参数...]}
 MODEL=${2:-/root/Qwen2.5-3B}
 shift; shift || true
 
+# 【预检·位置参数合约】2026-10-12 事故：把 train.py 的 flag 当位置参数传
+#   (`bash rlab/run_gsm8k.sh --algo retool_math --model_path X …`) ⇒
+#   ALGO="--algo"、MODEL="retool_math"，ref_server 去 HF 找 repo `retool_math`
+#   撞 429（重试 213s）→ 120s /health 超时 → 报"ref_server 没起来"，真因被藏两层。
+#   合约是位置参数，这里当场拦，不留 120s 的假诊断。
+case "$ALGO" in
+  -*) echo "[run] 致命错误: 第 1 个参数必须是算法名（grpo/dapo/cispo/gspo/rfpp/retool/retool_math），"
+      echo "[run]   收到 '$ALGO' —— 看起来把 train.py 的 flag 传成位置参数了。"
+      echo "[run]   用法: bash $0 <algo> [model_path] [train.py 参数...]"
+      echo "[run]   例:   bash $0 retool_math rlab_out/sft_budget_v3/epoch1 --max_traj_tokens 12288 …"
+      exit 1 ;;
+esac
+case "$MODEL" in
+  -*) echo "[run] 致命错误: 第 2 个参数应是 model_path（位置参数），收到 flag '$MODEL'。"
+      echo "[run]   → bash $0 $ALGO <model_path> $MODEL …（脚本会自动把 --model_path 注入 train.py）"
+      exit 1 ;;
+esac
+if [ ! -d "$MODEL" ]; then
+  case "$MODEL" in
+    */*) echo "[run] 注意: model_path '$MODEL' 不是本地目录 → 按 HF repo id 处理（pod 上 HF 不通会卡在重试）" ;;
+    *)   echo "[run] 致命错误: model_path '$MODEL' 既不是本地目录、也不像 HF repo id（没有 '/'）。"
+         echo "[run]   本地路径请写全（如 rlab_out/sft_budget_v3/epoch1 或 /root/Qwen3.5-4B）。"
+         exit 1 ;;
+  esac
+fi
+
 REF_GPU=${REF_GPU:-0}
 TRAIN_GPU=${TRAIN_GPU:-1}
 
