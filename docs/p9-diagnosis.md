@@ -317,5 +317,12 @@ python -m rlab.train --algo retool_math \
 
 **报告完成时间**：2026-10-11（含 §5.2 归属补测更新）
 **上游**：p8-diagnosis.md（无 boxed 三桶的发现）、08-sft-cold-start.md §7.5（SFT 落地路线）
-**下一步**：SFT v3 广覆盖采集（4000题，失败题自适应重试）＞ SFT训练与分层验收 ＞ 续训 ＞ 同批重跑定 RL 结论
+**下一步（2026-10-12 更新）**：SFT v3 广覆盖（4000 题，失败题自适应重试）已完成采集/训练/验收，
+读数与判据见 [08-sft-cold-start.md](08-sft-cold-start.md) §7.5「SFT v3 首轮落地实测」：
+
+1. v3 与 v2 在 acc 上**配对打平**（vs v2 final `p=0.341`），fmt **89.1→92.2**，
+   题面覆盖 **741→3563 题**；**epoch2 零收益**（final 与 epoch1 的 acc/fmt 逐位相同）⇒ `--epochs 1` 够。
+2. ⇒ **RL 起点定 `rlab_out/sft_budget_v3/epoch1`**（多模态壳，无需 `final_mm`），其余照 §4.3 定版。
+3. 待读两件事：**RL 段条件精度是否仍平坦**（本报告最大的 open item）、
+   **覆盖是否兑现**（RL 池 4000 题里 3563 已被 v3 覆盖，p9 那轮只覆盖 741 题中的 532 题）。
 **开放项**：§1.1 两臂是否同批（fmt 94.9 vs 93.9）；RL +3.8pp 的显著性需 N≈900 或 2~3 seed

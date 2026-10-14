@@ -919,15 +919,57 @@ v2 那种窄题面重复，也不让格式样本淹没解题样本。打印中�
 纠错轨迹；后者应非0。最终训练改用：
 
 ```bash
+# 【2026-10-12 实测】epoch2 零收益（见下「SFT v3 首轮落地实测」）⇒ `--epochs 1` 即可，
+# 省约 1.5h；交付物仍是 epoch1/（与 final 逐位同权重）
 python -m rlab.sft --data rlab_out/sft_budget_v3.jsonl \
   --model_path /root/Qwen3.5-4B --out_dir rlab_out/sft_budget_v3 \
-  --lr 1e-5 --epochs 2 --optim_8bit
+  --lr 1e-5 --epochs 1 --optim_8bit
 ```
 
 验收仍评 `epoch1/epoch2/final`，主判据是 held-out `acc/fmt`；另把 collector 见过题
 与完全未见题分开报告，防“广覆盖”退化成训练题记忆。**边界**：v3 是当前无外部
 teacher 条件下的最优自举；追加4次仍无正确轨迹的稳定错题不会进入 SFT。要继续突破
 这部分，必须换更强 teacher，或先用 RL 探索产生非零概率正确轨迹，再回灌下一轮 SFT。
+
+#### SFT v3 首轮落地实测（2026-10-12）
+
+**采集与编码**：6501 条采集轨迹（first 4000 / retry 2501）→ 正确 3767 条、覆盖
+**3563/4000 题**；`sft_data` 出 **5343 条 / 3560 题**（real_tool 3557、low_budget 1783、
+zero_call 3），low_budget 占 **33.4%**。
+
+- **`--max_seq_len` 必须抬到 12288**：9216 下 `丢 {'overlong': 330}`（6.2%），且被丢的
+  正是 **retry 才找到的长解法**（v3 的核心增量）。抬到 12288 后 `overlong 0`，
+  14.64M token、assistant 占 63.8%、编码 402s。训练 666 updates（2 epoch × 333）。
+
+**读数**（N=293 / seed 42 / gpu_mem 0.78 / sp632ef7 / proto=True，同批）：
+
+| 臂 | updates | acc | fmt | 条件精度 | 输出token | 轮次 |
+|---|---|---|---|---|---|---|
+| v2 epoch1 | 186 | 78.5 | 89.4 | 87.8% | — | — |
+| v2 final | 372 | 79.5 | 89.1 | 89.2% | — | — |
+| **v3 epoch1** | 333 | 76.8 | 92.2 | 83.3% | 2622 | 1.80 |
+| v3 final | 666 | 76.8 | 92.2 | 83.3% | 2765 | 2.19 |
+
+三条结论：
+
+1. **epoch2 零收益**：v3 `final` 与 `epoch1` 的 acc/fmt **逐位相同**（配对 b/c 只差 1 题），
+   代价是 token +5.4%、轮次 1.80→2.19 ⇒ **交付用 `epoch1/`；这类"广覆盖 + 自采样正确轨迹"
+   的数据 `--epochs 1` 已饱和**（v2 从 186→372 步也只多 +1.0pp、同样在噪声内
+   ⇒ 两版数据都不支持"多训更好"）。
+2. **v3 与 v2 在 acc 上打平、fmt 更高**：vs v2 final `McNemar p=0.341 (b=23/c=31)`、
+   vs v2 epoch1 `p=0.410` ⇒ −2.7pp 在噪声内。v3 真正换到的是 **fmt +3.1pp** 与
+   **6.7× 题面覆盖（741→3563 题）**。
+3. **★ 条件精度不能单独当证据（本次教训）**：表里 v3 的条件精度看着掉 5.9pp，但它只是
+   "acc 少 8 题 / fmt 多 9 题"（对照 v2 final）的商——acc 那一侧本身在噪声内（配对 p=0.34~0.41）。
+   曾据此误判"v3 退化 / 格式换推理"，并先怀疑 low_budget 剂量；实测剂量
+   **34.6%（v2）→ 33.4%（v3）几乎未变，假设当场否证**。判这一格必须先对 acc 做同题配对检验。
+
+**dev 的结构性盲区**：collector 已剔 train∩dev，两臂都没见过 dev 这 293 题 ⇒ dev 只能读出
+"收尾行为装得好不好"（fmt），**覆盖的价值在 dev 上测不出来**，它只能在训练池（`--split train`）
+或 RL 段显现——RL 池 4000 题里 3563 已被 v3 覆盖，而 p9 的 SFT 只覆盖 741 题中的 532 题。
+
+**进 RL**：`--model_path rlab_out/sft_budget_v3/epoch1`（多模态壳，不需要 `final_mm`），
+其余照 §④ 定版；`--epochs` 只需 1。
 
 ### ② SFT 训练（4B，H20 单卡，千条级数据约半小时内）
 
@@ -954,6 +996,12 @@ python -m rlab.sft --data rlab_out/sft_budget_v2.jsonl \
 
 ⇒ 评测时**三个 ckpt 都评**（`final` / `epoch1` / `epoch2`），**条件精度 `acc/fmt`
 是主判据，acc 只作观测**（N=293 下 <4pp 不判）。
+
+**⚠ 前提（2026-10-12 补，v3 实测教训）**：条件精度是两个率的**商**——acc 侧只要落在噪声内，
+它就会把噪声放大成假机制（v3：acc −2.7pp（配对 p=0.34，噪声内）+ fmt +3.1pp → 商掉 5.9pp）。
+**判"格式换推理"之前必须对 acc 做同题配对检验**
+（`python -m rlab.analysis --eval-json A --pair-json B --pair-a … --pair-b …`，per-item 默认落盘），
+否则这一格读到的是商，不是机制。
 
 **【2026-10-11 落地实测·两个坑已修】**
 
