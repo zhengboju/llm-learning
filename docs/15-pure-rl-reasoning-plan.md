@@ -1,6 +1,7 @@
 # 纯 RL 解题能力优化方案：正确性课程、探索与净增量验收
 
-> 日期：2026-10-15；状态：**方案已落文档，新增控制接口尚未实现，尚无新实验结论**。
+> 日期：2026-10-15；状态：**P0（信号观测）与 P1（同档探测/严格指纹）接口已实现**，
+> P2/P3 未实现，尚无新实验结论。
 > 当前运行：`rlab_new/native_p10_best`（SFT v3 epoch1 → RL），不是
 > [旧 p10 报告](p10-diagnosis.md)中的 `rlab_out/retool_math_p10`。
 > 范围：只优化 RL，不加入 teacher 轨迹，不新增 SFT，不把蒸馏收益算成 RL 收益。
@@ -147,7 +148,20 @@ python -m rlab.analysis \
 `passrate` 累计跨权重版本的题级统计，且没有完整 overlong 结果；它是历史观测，
 **不是当前 checkpoint 的固定次数通过率表**。现阶段不把 `--merge_out` 自动回填当课程控制。
 
-下一步需增加下面四项观测，均按当前会话与最近200微步窗口统计：
+**已落地（2026-10-15）**：rollout 每波采样带进程级 `attempt_id`；record 的 ok/uniform
+行与 traj dump 行落 `attempt_id`/`task_mask`/`adv_task`/`adv_aux`/`adv_local_mag`
+（旧 record 无这些列，下游按 None 降级）。聚合入口：
+
+```bash
+python -m rlab.sigstats --record rlab_new/native_p10_best/record.jsonl \
+    --traj rlab_new/native_p10_best/traj.jsonl --gas 8 --window 200
+```
+
+输出 M_raw/M_task/M_uploaded、全对/全错仍上传（辅助驱动）计数、符号翻转红线计数、
+token/update 与 token/任务混合上传组。注意：`adv_aux = adv − adv_task` 在
+group_std 下不是精确线性拆分，只作幅度诊断。
+
+以下四项观测的口径定义（sigstats 按当前会话与最近200个 ok 组窗口统计）：
 
 - **M_raw**：已完成且可评分的同题组中，`0<n_correct<n` 的比例；
 - **M_task**：应用当前任务 mask 后仍有对有错的比例，同时保留有效样本数分布；
@@ -230,35 +244,33 @@ k=8 很粗：0/8 不能证明永远不会（独立二项模型下一侧95%上界
 
 | 优先级 | 任务 | 已存在部分 | 尚缺/验收要求 |
 |---|---|---|---|
-| P0 | 固定全量 held-out | eval 的 `--proto_from`、per-item与配对分析 | 难度课程会自动筛dev；主评测明确绕过课程筛选，固定qk集合 |
-| P0 | 正确性有效组观测 | record acc数组、q_status、gen_version；traj dump含丢弃 | attempt id、任务mask、纯任务/辅助优势、完整attempt/token计数 |
-| P1 | 同档固定k探测 | `probe_difficulty` k/双卡/断点与预算CLI | 增加 `--from_run_info`；继承native_stop_at_call、采样/引擎全档；训练集候选契约与权重指纹 |
-| P1 | 静态课程 | `--difficulty_path` + 开区间 `--difficulty_band` | 当前只告警指纹不符，应先核对并严格阻断混表；保留/缺失比例落盘 |
+| P0 | 固定全量 held-out | eval 的 `--proto_from`、per-item与配对分析 | ✅ 协议身份项已在 `_meta.eval_protocol`；主评测固定完整题集（难度课程 run 的主评测不得继承筛选，核对方式见阶段A） |
+| P0 | 正确性有效组观测 | record acc数组、q_status、gen_version；traj dump含丢弃 | ✅ 已实现：attempt_id/task_mask/adv_task/adv_aux/adv_local_mag 落 record+traj；`rlab/sigstats.py` 聚合（含 token/update 成本口径） |
+| P1 | 同档固定k探测 | `probe_difficulty` k/双卡/断点与预算CLI | ✅ 已实现：`--from_run_info`（含 native_stop_at_call、温度/top_p/top_k、引擎档回读）、`--pool train` 训练池候选契约、probe_meta 增 nsc/model_path/pool 指纹 |
+| P1 | 静态课程 | `--difficulty_path` + 开区间 `--difficulty_band` | ✅ 已实现：训练入口指纹不符 strict 阻断（eval/旧表兼容不阻断）；保留/缺失统计落 `out_dir/difficulty_filter.json` |
 | P2 | 动态75/15/10混采 | QuestionScheduler在线拉黑/TTL | acc分桶、带配比的采样、退役/回流、可复现小集重探 |
 | P3 | 有限16次探索 | 多采样rollout基础设施 | 桶内新seed、固定批、成本上限与回流，不混成常规8条组 |
 | P3 | 正确性与辅助优势解耦 | 现有局部tool credit | A_task/A_aux分离接线、符号/梯度/归一化探针 |
 
-**特别限制**：当前 `probe_difficulty` 没有 `--from_run_info` 或 `--native_stop_at_call` CLI。
-现有代码用preset，再手动覆盖部分参数；当前训练却显式开了调用边界硬停。
-此外现有探针把train+dev合成候选再截max_questions，不能把它叫作“4000训练题”。
-因此先补P1，不能用旧探针省略参数产出表后宣称已与当前训练同档。
-
-以下是**P1完成后的计划接口**，当前版本不可直接执行；不是此次文档提交已增加的CLI：
+~~特别限制~~（2026-10-15 已解除）：`probe_difficulty` 现有 `--from_run_info`
+（协议/提示/预算/温度/top_p/top_k/native_stop_at_call/引擎档全量回读，
+CLI 显式参数仍优先）、`--native_stop_at_call` 与 `--pool train`
+（只探按题面去重后的训练池，dev 不进候选）。探测命令：
 
 ```bash
-# 计划接口：--from_run_info 尚待开发。MODEL由阶段A选定；每卡输出必须不同。
+# MODEL 由阶段A选定；每卡 --out 必须不同。--pool train = 4000 题全部来自训练池。
 MODEL=rlab_out/sft_budget_v3/epoch1
 PROTO=rlab_new/native_p10_best/run_info.json
 
 for GPU in 0 1; do
   CUDA_VISIBLE_DEVICES=$GPU python -m rlab.probe_difficulty \
-    --model_path "$MODEL" --from_run_info "$PROTO" \
+    --model_path "$MODEL" --from_run_info "$PROTO" --pool train \
     --k 8 --max_questions 4000 --questions_per_wave 16 --seed 42 \
     --shard_index "$GPU" --shard_count 2 --gpu_mem 0.78 \
     --out "rlab_out/p11_difficulty.$GPU.jsonl" &
 done
 wait
-# 合并前需核对两job退出成功、题目无重叠、同权重同协议、每题k=8且train∩dev为空。
+# 合并前需核对两job退出成功、题目无重叠、同权重同协议、每题k=8。
 cat rlab_out/p11_difficulty.0.jsonl rlab_out/p11_difficulty.1.jsonl \
   > rlab_out/p11_difficulty.jsonl
 ```
@@ -305,7 +317,9 @@ P0/P1就绪后先跑静态正确性课程：
 ## 8. 执行顺序与当前停止点
 
 1. **现在**：当前p10 checkpoint与SFT起点做阶段A全量held-out对照；CPU看历史通过率。
-2. **下一项开发**：P0正确性有效组/完整成本观测 + P1同档固定k训练池探测。
+2. ~~下一项开发~~（2026-10-15 已完成）：P0正确性有效组/完整成本观测（sigstats）
+   + P1同档固定k训练池探测（--from_run_info/--pool train/strict 指纹）。
+   **下一步是执行**：等卡空闲跑阶段A评测与 `--pool train` 探测表；pod 需 git pull。
 3. **第一轮课程实验**：现有difficulty过滤的静态边界子池，统一主评测和成本口径。
 4. **课程兑现后**：动态混采/困难题回流，随后正确性与辅助优势解耦；只加已验证需要的部分。
 5. 当前运行未完成上述held-out验收；未宣布p10解题能力提升、p11新配置有效或teacher补题完成。

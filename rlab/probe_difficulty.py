@@ -204,6 +204,21 @@ def main():
     ap.add_argument("--system_prompt_file", default=None,
                     help="用文件内容整体替换系统提示（**必须与训练同源**：难度表是"
                          "『模型×提示×预算』三者的联合产物，提示不同就是另一张表）")
+    # 【2026-10-15 doc15 P1】--from_run_info：协议/提示/预算/采样/引擎全档从训练
+    # run_info.json 回读，不再靠"手动覆盖部分参数"（旧做法漏了 native_stop_at_call
+    # ——当前训练显式开了调用边界硬停，探针却没这个 CLI，表描述的是另一套终止结构）。
+    # 优先级：CLI 显式 > run_info > preset（与 eval_vllm_one 同一约定）。
+    ap.add_argument("--from_run_info", default=None,
+                    help="训练 run 的 run_info.json（或所在目录）：协议档/系统提示/"
+                         "预算四件套/token预算档/温度/top_p/top_k/native_stop_at_call/"
+                         "引擎档全部从这里回读；CLI 显式参数仍优先。缺 config 键 fail-fast")
+    ap.add_argument("--native_stop_at_call", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="调用边界硬停（须与训练同档；None=随 --from_run_info/preset）")
+    ap.add_argument("--pool", choices=("train_dev", "train"), default="train_dev",
+                    help="候选池：train_dev=训练池+dev 联探（历史行为，供 eval 过滤用表）；"
+                         "train=只探去重后的训练池（doc15 阶段C 课程表契约——dev 不进"
+                         "候选，训练集候选数以打印为准）")
     ap.add_argument("--chat_template_kwargs", default=None,
                     help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
                          '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
@@ -273,12 +288,40 @@ def main():
     # preset 系统提示也随档切换（native → system_prompt_retool_math_native，
     # "提示是协议的一半"在探针侧同样成立）。下方的 --round_gen_tokens 等预算覆盖
     # 仍走旧路径（get_config 之后直接改 cfg + validate_retool_budget 重校）。
+    # ---- 【2026-10-15 doc15 P1】--from_run_info 回读 ----
+    # 协议档先于 get_config（它决定要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档）；
+    # 其余键在 get_config 之后、CLI 覆盖块之前落入，保住 "CLI > run_info > preset"。
+    _ri_cfg = {}
+    if args.from_run_info:
+        _ri_path = args.from_run_info
+        if os.path.isdir(_ri_path):
+            _ri_path = os.path.join(_ri_path, "run_info.json")
+        with open(_ri_path, encoding="utf-8") as _f:
+            _ri_cfg = (json.load(_f).get("config") or {})
+        if not _ri_cfg:
+            raise SystemExit(f"[probe] --from_run_info {_ri_path} 里没有 config"
+                             "（run_info 契约：完整配方在 config 键下）")
+        print(f"[probe] 协议/预算/采样档回读自 {_ri_path}（CLI 显式参数仍优先）")
     _cfg_over = {"model_path": args.model_path, "use_wandb": False, "seed": args.seed}
-    if args.tool_protocol is not None:
-        _cfg_over["tool_protocol"] = args.tool_protocol
-    if args.native_tool_style is not None:
-        _cfg_over["native_tool_style"] = args.native_tool_style
+    _tp_v = args.tool_protocol if args.tool_protocol is not None \
+        else _ri_cfg.get("tool_protocol")
+    if _tp_v is not None:
+        _cfg_over["tool_protocol"] = _tp_v
+    _ns_v = args.native_tool_style if args.native_tool_style is not None \
+        else _ri_cfg.get("native_tool_style")
+    if _ns_v is not None:
+        _cfg_over["native_tool_style"] = _ns_v
     cfg = get_config("retool_math", **_cfg_over)
+    # run_info 回读层（CLI 覆盖块在其后，显式值仍赢）：
+    for _k in ("round_gen_tokens", "max_rounds", "max_context_tokens",
+               "max_prompt_length", "max_traj_tokens", "answer_reserve",
+               "budget_hint", "native_stop_at_call", "temperature",
+               "top_p", "top_k", "chat_template_kwargs", "data_task",
+               "vllm_gen_kwargs"):
+        if _ri_cfg.get(_k) is not None:
+            cfg[_k] = _ri_cfg[_k]
+    if _ri_cfg.get("system_prompt"):
+        cfg["system_prompt"] = _ri_cfg["system_prompt"]
     if args.data_task:
         cfg["data_task"] = args.data_task
     if args.temp is not None:
@@ -301,6 +344,8 @@ def main():
         cfg["answer_reserve"] = args.answer_reserve
     if args.budget_hint is not None:
         cfg["budget_hint"] = args.budget_hint
+    if args.native_stop_at_call is not None:
+        cfg["native_stop_at_call"] = args.native_stop_at_call
     if args.system_prompt_file:
         # 提示是协议的一半：本探针出的表只对"同提示 + 同预算 + 同模型"的训练有效。
         # 打印指纹，便于与训练启动行的 `signature=...-sp<hash6>` 逐字对上。
@@ -333,10 +378,25 @@ def main():
     from rlab.rollout import build_prompt, multi_turn_rollout_group
 
     QAs = load_qas(cfg["data_task"])
+    if args.pool == "train":
+        # 【2026-10-15 doc15 P1 训练池候选契约】课程表只描述训练分布：按题面
+        # 去重后的训练池，dev 不进候选——旧行为"train+dev 合探再截 max_questions"
+        # 不能叫"4000 训练题"。DAPO-Math 源数据每题重复 100~400 份，去重保序。
+        _seen, _pool = set(), []
+        for _q in QAs:
+            _qs = str(_q["Q"])
+            if _qs not in _seen:
+                _seen.add(_qs)
+                _pool.append(_q)
+        if len(_pool) != len(QAs):
+            print(f"[probe] 训练池按题面去重 {len(QAs)} -> {len(_pool)} 题")
+        QAs = _pool
+        print(f"[probe] --pool train：候选 = 训练池 {len(QAs)} 题（不含 dev；"
+              f"eval 过滤用表请另跑 --pool train_dev）")
     # 【2026-09-22 分布对齐】同时探 dev 集，让 eval 的 test split 能用同一张表
     # 过滤到同一 difficulty_band → 训练/评测同分布 → 不被 p≈0 题稀释。
     # dev 是 held-out：探针只用 base 估计难度，不参与训练，不泄露。
-    if cfg["data_task"] in ("dapo_math", "dapo-math-17k", "math_dapo"):
+    elif cfg["data_task"] in ("dapo_math", "dapo-math-17k", "math_dapo"):
         from rlab.data import load_dapo_math_dev
         _dev = load_dapo_math_dev()
         _train_qs = {q["Q"] for q in QAs}
@@ -383,6 +443,13 @@ def main():
     # 检测（训练签名已有 -t<sha6> 表指纹，闭环缺半边：表自己不含协议指纹）。
     probe_meta = {
         "model": os.path.basename(args.model_path.rstrip("/")),
+        # 【2026-10-15 doc15 P1】权重指纹补全路径：basename 只有 "epoch1" 这类
+        # 通用名，跨 run 撞名无法分辨；训练端 expected_meta 同源比对。
+        "model_path": str(args.model_path),
+        # 【2026-10-15 doc15 P1】调用边界硬停进指纹：开/关改变终止结构（硬停 vs
+        # 续写），同模型同预算下通过率是两个分布——旧探针连这个 CLI 都没有。
+        "nsc": int(bool(cfg.get("native_stop_at_call"))),
+        "pool": args.pool,   # 候选池出处（train / train_dev），混表可见
         "k": args.k,
         "rounds": cfg["max_rounds"], "round_tokens": cfg["round_gen_tokens"],
         "ctx": cfg["max_context_tokens"], "temp": cfg["temperature"],
@@ -420,17 +487,24 @@ def main():
             raise SystemExit("[probe] --vllm_gen_kwargs 必须是 JSON dict（整体替换语义）")
     _env_bi = str(os.environ.get("VLLM_BATCH_INVARIANT", "")).strip().lower() not in (
         "", "0", "false")
-    _bi = bool(args.vllm_batch_invariant) or _env_bi
+    # 【2026-10-15 doc15 P1】确定性档/attention backend 也从 run_info 回读：
+    # 引擎档不同 = 另一个采样实现，表指纹管不到这层，只能靠同档构造。
+    _ri_bi = bool(_ri_cfg.get("vllm_batch_invariant"))
+    _bi = bool(args.vllm_batch_invariant) or _env_bi or _ri_bi
+    _ab = args.vllm_attention_backend or _ri_cfg.get("vllm_attention_backend")
+    if _ri_bi and not args.vllm_batch_invariant and not _env_bi:
+        print("[probe] 确定性档继承自 run_info（vllm_batch_invariant=True）"
+              "——与训练同档是铁律", flush=True)
     if _env_bi and not args.vllm_batch_invariant:
         print(f"[probe] 检测到环境里继承的 VLLM_BATCH_INVARIANT="
               f"{os.environ.get('VLLM_BATCH_INVARIANT')!r}（多半是训练 run 留下的 export）"
               f"——探针按**确定性档**对齐（与训练同档是铁律）。不想开就先 "
               f"`unset VLLM_BATCH_INVARIANT` 再跑。", flush=True)
-    batch_invariant_guard(_bi, args.vllm_attention_backend)   # 缺 backend 在引擎构造前拦下
+    batch_invariant_guard(_bi, _ab)   # 缺 backend 在引擎构造前拦下
     if _bi:
         os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    if args.vllm_attention_backend:
-        _gk.update(attention_backend_kwargs(args.vllm_attention_backend))
+    if _ab:
+        _gk.update(attention_backend_kwargs(_ab))
     _vllm_path = cfg.get("vllm_model_path") or cfg["model_path"]
     if gdn_backend_missing(_vllm_path, _gk):
         print("[probe][警告] 引擎参数里没有 gdn_prefill_backend → Qwen3.5 的 GDN prefill "

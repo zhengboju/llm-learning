@@ -178,6 +178,17 @@ def group_ok(scores: torch.Tensor) -> bool:
     raise ValueError(f"组分数必须是(B,)或(B,T)，收到 {tuple(scores.shape)}")
 
 
+def _sig_fields(sig):
+    """record.jsonl 的信号观测列（2026-10-15，doc15 阶段B）：task_mask/adv_task/
+    adv_aux/adv_local_mag。sig 缺失（非 retool 路径/旧代码）→ 全 None，下游按
+    "字段为 None"降级，新旧 record 可同表混读。"""
+    sig = sig or {}
+    return {"task_mask": sig.get("task_mask"),
+            "adv_task": sig.get("adv_task"),
+            "adv_aux": sig.get("adv_aux"),
+            "adv_local_mag": sig.get("adv_local_mag")}
+
+
 def sampling_discard_counts(attempts: int, uploaded: int, uniform: int,
                             overlong: int, prompt_overlong: int):
     """返回（真实丢弃数，未归因丢弃数），统一采样统计与熔断口径。
@@ -1222,7 +1233,7 @@ def retool_context_overlong(per_sample_ids, plen, max_context_tokens):
 
 
 def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
-                      completion_lens=None):
+                      completion_lens=None, signal_out=None):
     """阶段2 打分（模块级纯函数，CPU 可测）。
 
     索引契约（2026-09-08 真机 IndexError 教训）：asst_texts/code_stats 必须是
@@ -1359,7 +1370,26 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                                    dtype=torch.float32)
         adv = compute_advantages(rewards, n, cfg["adv_mode"], sample_mask=sample_mask)
     else:
+        sample_mask = None
         adv = compute_advantages(rewards, n, cfg["adv_mode"])
+    if signal_out is not None:
+        # 【2026-10-15 正确性信号观测（doc15 阶段B）】上传判据是**最终 advantage**
+        # （含辅助/局部项），不是 acc——uploaded≠正确性混合组。要回答"更新里有
+        # 多少是正确性对比信号"，必须把任务部分单独算一遍：
+        #   task_mask = 任务 mask（overlong_filter 排除截断/废调用后的有效样本）
+        #   adv_task  = 仅 ±1 正确性在同一 mask/adv_mode 下的 advantage
+        #   adv_aux   = adv − adv_task（长度/代码/效率等辅助项残差；group_std 下
+        #               不是精确线性拆分，只作幅度诊断，不冒充梯度因果分解）
+        _task_r = torch.tensor([2.0 * float(a) - 1.0 for a in acc_s],
+                               dtype=torch.float32)
+        _adv_task = compute_advantages(_task_r, n, cfg["adv_mode"],
+                                       sample_mask=sample_mask)
+        signal_out["task_mask"] = ([0 if e else 1 for e in excl]
+                                   if sample_mask is not None
+                                   else [1] * len(acc_s))
+        signal_out["adv_task"] = [round(float(x), 6) for x in _adv_task]
+        signal_out["adv_aux"] = [round(float(a) - float(t), 6)
+                                 for a, t in zip(adv, _adv_task)]
     return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 
@@ -1388,7 +1418,7 @@ def trunc_in_call_flag(text: str, style: str = "auto") -> int:
 
 
 def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
-                  clen=None, gen_version=None, t=None):
+                  clen=None, gen_version=None, t=None, attempt_id=None):
     """把一条轨迹打成可落盘的一行（纯函数，CPU 可测；2026-10-02）。
 
     **段级**而不是拼接文本：B/C 桶判读的核心问题正是"末段写了什么、有多长"，
@@ -1423,7 +1453,7 @@ def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
             _d["body"] = s["body"]      # 纯回包（模板包装之外的那部分）
         _segs.append(_d)
     return {"t": t if t is not None else time.time(), "Q": Q, "A": A, "qk": qk,
-            "status": status, "gen_version": gen_version,
+            "status": status, "gen_version": gen_version, "attempt_id": attempt_id,
             "acc": acc, "fmt": fmt,
             "clen": int(clen) if clen is not None else sum(s["len"] for s in _segs),
             "code_used": int(_st.get("code_used", 0)),
@@ -1439,7 +1469,7 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                          inputs, prompts_text, prompt_ids, plen,
                          sampling_params, steps_elapsed=0, verify_logps=None,
                          prompts_messages=None, traj_sink=None,
-                         code_runner=None):
+                         code_runner=None, attempt_id=None):
     """多轮 rollout → 打分 → 按题拆分的上传就绪结果（模块级，FakeGen CPU 可测）。
 
     【2026-09-10 结构修改·采样并发与按题拆分】一次调用处理 len(inputs) 道题
@@ -1463,6 +1493,11 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
     `traj_sink`（可选 list）：非 None 时把**每条轨迹**（含未上传的 uniform /
     overlong）按 `traj_dump_row` 追加进去，由调用方落盘。默认 None = 零成本
     （连字符串都不拼），故不影响任何既有调用点。
+
+    `attempt_id`（可选）：本次采样波的进程级唯一序号（2026-10-15，doc15 阶段B）。
+    同题同 gen_version 可多次 attempt（uniform 插回重采），组标识必须含它，
+    否则 record 里同 (qk, gen_version) 的多组无法区分。每个返回项与每条 traj
+    dump 行都带上它。
     adv 通常为 (B,) 序列级；启用 tool_call_cost/tool_waste_penalty 后为 (B,T)
     逐token任务优势+工具动作成本（losses._adv_broadcast 原生支持）。
     （plen = **本题** prompt 的真实长度——每道题先剥掉左 pad 再建批，见
@@ -1538,7 +1573,8 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                     segs_i[j], Q=inputs[i]["Q"], A=inputs[i]["A"], qk=_qks[i],
                     status=status, stats=code_stats[i * n + j], clen=clen_i[j],
                     acc=None if acc_list is None else float(acc_list[j]),
-                    fmt=None if fmt_list is None else float(fmt_list[j])))
+                    fmt=None if fmt_list is None else float(fmt_list[j]),
+                    attempt_id=attempt_id))
 
         # 【2026-10-03 校验① 跳过档】任一轨迹被 PromptMismatchError 终止 →
         # 本题**整组**丢弃（num_pre_Q 契约不允许训练缺条的组）。这是采样随机
@@ -1556,20 +1592,29 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             _sink("overlong")
             results.append({"status": "overlong"})
             continue
+        _sig = {}   # 正确性信号观测（doc15 阶段B）：task_mask/adv_task/adv_aux
         adv_i, acc_i, fmt_i, cu_i, ck_i, phase = retool_score_flat(
             [inputs[i]], asst_texts[i * n:(i + 1) * n],
             code_stats[i * n:(i + 1) * n], cfg, steps_elapsed=steps_elapsed,
-            completion_lens=clen_i)
+            completion_lens=clen_i, signal_out=_sig)
         _stats_i = code_stats[i * n:(i + 1) * n]
         _trunc_i = [int(s["trunc_final"]) for s in _stats_i]
         _call_cost = float(cfg.get("tool_call_cost", 0.0) or 0.0)
         _waste_pen = float(cfg.get("tool_waste_penalty", 0.0) or 0.0)
         _trunc_tail = float(cfg.get("trunc_tail_penalty", 0.0) or 0.0)
         if _call_cost > 0.0 or _waste_pen > 0.0 or _trunc_tail > 0.0:
+            _adv_seq = adv_i   # 序列级基线（tool credit 前），算局部项幅度用
             adv_i = tool_credit_advantages(
                 adv_i, segs_i, mask_i.shape[1],
                 call_cost=_call_cost, waste_penalty=_waste_pen,
                 trunc_flags=_trunc_i, trunc_tail_penalty=_trunc_tail)
+            # 局部项幅度 = token 级输出偏离"序列基线广播"的绝对量（仅 loss mask
+            # 内的 assistant 位计入；工具回包/pad 位恒 0 不算偏离）。
+            _loc = ((adv_i - _adv_seq.unsqueeze(1)).abs()
+                    * mask_i.float()).sum(dim=1)
+            _sig["adv_local_mag"] = [round(float(x), 4) for x in _loc]
+        else:
+            _sig["adv_local_mag"] = [0.0] * n
         # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
         # 与超长分流；2026-09-10 起不再连坐同批其他题）
         if not group_ok(adv_i):
@@ -1597,7 +1642,9 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                             # 【2026-10-02】"调用写到一半被预算切"也如实上送
                             "tric": [int(s.get("trunc_in_call", 0))
                                      for s in code_stats[i * n:(i + 1) * n]],
-                            "qk": _qks[i], "Q": inputs[i]["Q"]})
+                            "qk": _qks[i], "Q": inputs[i]["Q"],
+                            # 【2026-10-15 doc15 阶段B】组标识与正确性信号观测
+                            "attempt_id": attempt_id, "sig": _sig})
             continue
         if use_vllm_logps:
             gen_logps_i = gen_logps_from_segs(segs_i)
@@ -1614,6 +1661,8 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                         "fmt": fmt_i, "cu": cu_i, "ck": ck_i, "phase": phase,
                         "qk": _qks[i], "Q": inputs[i]["Q"],
                         "clen": clen_i,
+                        # 【2026-10-15 doc15 阶段B】组标识与正确性信号观测
+                        "attempt_id": attempt_id, "sig": _sig,
                         # 【2026-10-02】段长画像（见上方 _segl 注释）：
                         # segl = assistant 段长表，tsegl = 工具段长表
                         "segl": _segl, "tsegl": _tsegl,
@@ -2039,13 +2088,31 @@ def gen_worker(Q, cfg: dict):
             # 跳组（plen 超限不采）且进 overlong 参考系（ctx − plen），换它探的
             # 表与当前训练分布不符（与预算档/协议档同一类静默混表）。
             "max_prompt_length": int(cfg.get("max_prompt_length", 0) or 0),
+            # 【2026-10-15 doc15 P1】调用边界硬停与权重全路径进比对：nsc 改变
+            # 终止结构；basename 的 model 撞名（epoch1）无法分辨跨 run 权重。
+            "nsc": int(bool(cfg.get("native_stop_at_call"))),
+            "model_path": str(cfg["model_path"]),
         }
-        _table = load_difficulty_table(cfg["difficulty_path"], expected_meta=_expected_meta)
+        # 【2026-10-15 doc15 P1】训练入口严格阻断混表：告警会被"忽略习惯"淹掉
+        # （k 误报教训），用错表的课程比没有课程更糟。旧表（无 probe_meta）仍可
+        # 加载但会给一次醒目警告。
+        _table = load_difficulty_table(cfg["difficulty_path"],
+                                       expected_meta=_expected_meta, strict=True)
         _lo, _hi = cfg.get("difficulty_band", (0.0, 1.0))
         QAs, _dstat = filter_qas_by_difficulty(QAs, _table, lo=_lo, hi=_hi)
         print(f"[rollout] 难度过滤 band=({_lo},{_hi}): {_dstat['total']} -> {_dstat['kept']} 题"
               f"（全错 {_dstat['p_zero']} / 全对 {_dstat['p_one']} / 区间外 {_dstat['band_out']}"
               f" / 表中缺失 {_dstat['missing']}）")
+        # 【2026-10-15 doc15 P1】保留/缺失比例落盘：过滤即选择，候选/保留/缺失
+        # 题数必须可事后核对，不能只存在于滚动日志里。
+        try:
+            with open(os.path.join(cfg["out_dir"], "difficulty_filter.json"),
+                      "w", encoding="utf-8") as _df:
+                json.dump({"difficulty_path": cfg["difficulty_path"],
+                           "band": [_lo, _hi], **_dstat}, _df,
+                          ensure_ascii=False, indent=2)
+        except OSError as _e:
+            print(f"[rollout][警告] 难度过滤统计落盘失败（不影响训练）: {_e}")
         if not QAs:
             raise RuntimeError(
                 "[rollout] 难度过滤后训练池为空——重跑 rlab.probe_difficulty 刷新探针表，"
@@ -2275,6 +2342,9 @@ def gen_worker(Q, cfg: dict):
     n_traj_bad = 0     # 无法序列化而跳过的行（见下；绝不因此中断训练）
     uploaded_total = 0
     rollout_seq = [0]   # 全局递增的 rollout 计数（丢组重采的 seed 盐，防同 seed 复采）
+    # 【2026-10-15 doc15 阶段B】采样波次序号：同题同 gen_version 可多次 attempt
+    # （uniform 插回重采），record/traj 的组标识必须含它才能区分（qk+版本不够）。
+    attempt_seq = [0]
     samp_stats = {"attempts": 0, "uniform": 0, "overlong": 0,
                   "prompt_overlong": 0, "proto_mismatch": 0}
     _pad_logged = [False]   # 剥左 pad 的可见性只打一次（见 retool 分支）
@@ -2343,12 +2413,13 @@ def gen_worker(Q, cfg: dict):
                 # → 按题打分/拆分 → 每题独立上传批（mask 已按段边界算好）
                 sps = make_retool_sps(len(inputs) * cfg["num_pre_Q"], rollout_seq[0])
                 _sink = [] if ftraj is not None else None
+                attempt_seq[0] += 1   # 每波唯一：同题重采也拿到新 attempt_id
                 results = collect_retool_group(
                     vllm_gen, tokenizer, cfg, compute_gen_logps,
                     inputs, prompts_text, prompt_ids, plen, sps,
                     steps_elapsed=pushes[0] * cfg["gen_update_steps"],
                     verify_logps=_verifier, prompts_messages=_pmsgs,
-                    traj_sink=_sink)
+                    traj_sink=_sink, attempt_id=attempt_seq[0])
                 if _sink:
                     # gen_version 由调用方补（rollout 循环看不到权重推送计数）：
                     # 轨迹与训练 step 的对应关系全靠它，缺了就无法按"哪版权重"分层。
@@ -2419,6 +2490,9 @@ def gen_worker(Q, cfg: dict):
                                 "trunc_in_call": res.get("tric", []),
                                 "qk": res.get("qk"), "q_status": "uniform",
                                 "gen_version": policy_version[0],
+                                # 【2026-10-15 doc15 阶段B】组标识 + 信号观测
+                                "attempt_id": res.get("attempt_id"),
+                                **_sig_fields(res.get("sig")),
                                 "phase": "dropped"}, ensure_ascii=False) + "\n")
                     elif res["status"] == "overlong":
                         samp_stats["overlong"] += 1
@@ -2494,6 +2568,9 @@ def gen_worker(Q, cfg: dict):
                     # 否则 p≈0 题在 record 里不可见，band 漂移观测有偏）
                     "qk": r.get("qk"), "q_status": "ok",
                     "gen_version": policy_version[0],
+                    # 【2026-10-15 doc15 阶段B】组标识 + 信号观测
+                    "attempt_id": r.get("attempt_id"),
+                    **_sig_fields(r.get("sig")),
                     "phase": r["phase"]}, ensure_ascii=False) + "\n")
                 health.observe(r["acc"].tolist(), r["fmt"].tolist(), r["clen"], r["cu"],
                                r["trunc"], r.get("inv"))

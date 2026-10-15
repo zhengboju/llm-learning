@@ -404,7 +404,8 @@ def _strip_dapo_template(q: str) -> str:
 # 静态过滤出清"base 从未做对过的题"，在线调度出清"当前学不动的题"。
 
 
-def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
+def load_difficulty_table(path: str, expected_meta: dict = None,
+                          strict: bool = False) -> dict:
     """读 probe_difficulty.py 产出的 jsonl -> {Q: 行dict}（含 k/n_correct/fmt_rate…）。
 
     坏行静默跳过（探针是逐行追加写，崩溃可能留下截断行）；缺 k/n_correct 或
@@ -412,9 +413,11 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
     missing 口径），不允许半行数据混进训练池。
 
     expected_meta：训练端传入的当前协议指纹（model/rounds/round_tokens/ctx/
-    temp/sp）。表是"模型×提示×预算"的联合产物（M4，2026-09-18）——行自带的
-    probe_meta 若与当前协议不一致，说明这张表不是当前协议下探的（换预算/提示
-    续跑同一 --out 会静默混表），告警但不 fail-fast（旧表无 probe_meta 仍可用）。
+    temp/sp/nsc/model_path）。表是"模型×提示×预算"的联合产物（M4，2026-09-18）
+    ——行自带的 probe_meta 若与当前协议不一致，说明这张表不是当前协议下探的
+    （换预算/提示续跑同一 --out 会静默混表）。strict=False 告警但不 fail-fast
+    （旧表无 probe_meta 仍可用）；strict=True（训练入口，doc15 P1）在**任何**
+    指纹键不符时 raise——告警会被"忽略习惯"淹掉，混表课程比没有课程更糟。
 
     【2026-09-20 修复·k 不参与比对】`k` 在两端语义不同：探针端是"每题探测几条"
     （probe_difficulty 的 --k，默认 4），训练端曾传 `num_pre_Q`（=8）——两个数
@@ -424,6 +427,8 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
     不改变"这张表描述的是哪个协议"，故从指纹里剔除。"""
     table = {}
     warned = set()
+    mismatched = {}   # strict 模式收集：键 -> (表值, 期望值) 首见
+    n_meta_rows = 0
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -438,6 +443,7 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
             if q and isinstance(k, int) and k > 0 and isinstance(nc, int) and 0 <= nc <= k:
                 table[str(q)] = r
                 if expected_meta and r.get("probe_meta"):
+                    n_meta_rows += 1
                     # k 刻意不在比对清单里（两端语义不同，见 docstring）
                     # 【2026-09-25】新增 tool_protocol：围栏档与原生档的通过率是
                     # 两个分布（同模型同提示下 base 调用率 87.5% vs ~48%），换协议
@@ -450,17 +456,32 @@ def load_difficulty_table(path: str, expected_meta: dict = None) -> dict:
                     # 跳组（plen 超限不采）且进 overlong 参考系（ctx − plen），换它
                     # 探的表与当前训练分布不符。旧表无该键 → `_rv is None` → 不告警
                     # （旧表兼容，与新键加入前行为一致）。
+                    # 【2026-10-15 doc15 P1】新增 nsc/model_path：调用边界硬停改变
+                    # 终止结构（旧探针没这个 CLI，表与训练可能不同档）；basename 的
+                    # model 撞名无法分辨跨 run 的 epoch1。旧表无键 → None → 跳过。
                     for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
                                 "tool_protocol", "max_traj_tokens", "answer_reserve",
-                                "max_prompt_length"):
+                                "max_prompt_length", "nsc", "model_path"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:
                             warned.add(_fk)
-                            print(f"[data][警告] 难度表 probe_meta[{_fk}] 与当前协议不符: "
-                                  f"表中 {_rv!r} ≠ 当前 {_ev!r} —— 这张表不是当前"
-                                  f"『模型×提示×预算』下探的（换协议续跑同一 --out 会静默"
-                                  f"混表）；核对 --difficulty_path 是否给错表。")
+                            if strict:
+                                mismatched[_fk] = (_rv, _ev)
+                            else:
+                                print(f"[data][警告] 难度表 probe_meta[{_fk}] 与当前协议不符: "
+                                      f"表中 {_rv!r} ≠ 当前 {_ev!r} —— 这张表不是当前"
+                                      f"『模型×提示×预算』下探的（换协议续跑同一 --out 会静默"
+                                      f"混表）；核对 --difficulty_path 是否给错表。")
+    if strict and expected_meta and mismatched:
+        raise ValueError(
+            "[data] 难度表协议指纹与当前训练不符（strict），拒绝混表："
+            + "；".join(f"{k} 表中{v[0]!r}≠当前{v[1]!r}" for k, v in mismatched.items())
+            + "。核对 --difficulty_path 是否给错表，或用当前 run 的 "
+              "--from_run_info 重跑 probe_difficulty。")
+    if strict and expected_meta and table and n_meta_rows == 0:
+        print("[data][警告] 难度表所有行都没有 probe_meta（2026-09-18 前的旧表）"
+              "——无法校验协议指纹，strict 也无法自证；建议用 --from_run_info 重探。")
     return table
 
 

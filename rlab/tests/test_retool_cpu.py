@@ -1182,8 +1182,8 @@ def test_difficulty_filter():
           and "LLM(model=_vllm_path, gpu_memory_utilization=args.gpu_mem, **_gk)" in _psrc)
     check("probe 有一致性档入口 + 缺 backend 时引擎构造前 fail-fast",
           '"--vllm_batch_invariant"' in _psrc
-          and "batch_invariant_guard(_bi, args.vllm_attention_backend)" in _psrc
-          and "attention_backend_kwargs(args.vllm_attention_backend)" in _psrc)
+          and "batch_invariant_guard(_bi, _ab)" in _psrc
+          and "attention_backend_kwargs(_ab)" in _psrc)
     check("probe 识别继承的 VLLM_BATCH_INVARIANT（真机就是被它撞死的）",
           'os.environ.get("VLLM_BATCH_INVARIANT"' in _psrc
           and 'os.environ["VLLM_BATCH_INVARIANT"] = "1"' in _psrc)
@@ -1228,7 +1228,7 @@ def test_difficulty_filter():
         _tbl3 = load_difficulty_table(_p2, expected_meta={**_meta, "sp": "deadbe"})
         check("expected_meta 不匹配（换提示续跑同表）→ 仍加载（不 fail-fast，旧表兼容）"
               "但触发告警", set(_tbl3) == {"a"})
-        _tbl4 = load_difficulty_table(_p2)   # 无 expected_meta（训练端不传）→ 零告警
+        _tbl4 = load_difficulty_table(_p2)   # 无 expected_meta（eval/probe续跑不传）→ 零告警
         check("无 expected_meta → 不校验（旧调用方零变化）", set(_tbl4) == {"a"})
     print()
 
@@ -5780,6 +5780,129 @@ def test_gen_death_diagnostics():
     print()
 
 
+def test_signal_observation():
+    """【2026-10-15 doc15 阶段B + P1】正确性信号观测与课程表严格指纹。"""
+    print("[N3] doc15 落地：信号观测列 / sigstats 聚合 / probe --from_run_info / strict 指纹")
+    import inspect as _inss
+    from rlab.rollout import retool_score_flat, _sig_fields
+    import rlab.rollout as _RO
+    import rlab.probe_difficulty as _PD
+    from rlab.data import load_difficulty_table
+    from rlab.sigstats import group_signal
+
+    _cfg = {"num_pre_Q": 4, "adv_mode": "group_mean", "data_task": "dapo_math",
+            "reward_switch_step": 10**9, "overlong_buffer": 64,
+            "max_gen_tokens": 2048, "max_rounds": 8, "max_traj_tokens": 12288,
+            "max_context_tokens": 13312, "max_prompt_length": 1024,
+            "overlong_filter": True}
+    _in1 = [{"Q": "q", "A": "42"}]
+    _asst = ["答案 \\boxed{42}", "答案 \\boxed{41}",
+             "答案 \\boxed{42}", "答案 \\boxed{40}"]
+    _st = [{"trunc_final": 0, "code_wasted": 0, "code_used": 1, "code_ok": 1}
+           for _ in range(4)]
+    _sig = {}
+    _adv, _acc, _fmt, _cu, _ck, _ph = retool_score_flat(
+        _in1, _asst, _st, _cfg, 0, completion_lens=[100] * 4, signal_out=_sig)
+    check("signal_out 三键齐全且 adv = adv_task + adv_aux（group_mean 线性成立）",
+          set(_sig) == {"task_mask", "adv_task", "adv_aux"}
+          and all(abs(float(a) - (t + u)) < 1e-5
+                  for a, t, u in zip(_adv, _sig["adv_task"], _sig["adv_aux"])))
+    _sig2 = {}
+    retool_score_flat(_in1, ["答案 \\boxed{42}"] * 4, _st, _cfg, 0,
+                      completion_lens=[100] * 4, signal_out=_sig2)
+    check("全对组 adv_task 全零（纯正确性无对比信号）",
+          all(v == 0 for v in _sig2["adv_task"]))
+    _st3 = [dict(s) for s in _st]
+    _st3[1]["trunc_final"] = 1
+    _sig3 = {}
+    _adv3, *_ = retool_score_flat(_in1, _asst, _st3, _cfg, 0,
+                                  completion_lens=[100] * 4, signal_out=_sig3)
+    check("overlong_filter：截断样本 task_mask=0 且 adv=0（排除口径一致）",
+          _sig3["task_mask"][1] == 0 and float(_adv3[1]) == 0.0)
+    check("_sig_fields(None) 全 None 降级（旧路径/旧 record 可读）",
+          _sig_fields(None) == {"task_mask": None, "adv_task": None,
+                                "adv_aux": None, "adv_local_mag": None})
+    _rsrc = _inss.getsource(_RO)
+    check("collect_retool_group 收 attempt_id 且 record 两路（ok/uniform）都落组标识+信号列",
+          "attempt_id=None):" in _rsrc and "attempt_id=attempt_seq[0]" in _rsrc
+          and _rsrc.count('**_sig_fields(') >= 2
+          and '"attempt_id": res.get("attempt_id")' in _rsrc
+          and '"attempt_id": r.get("attempt_id")' in _rsrc)
+    check("traj_dump_row 带 attempt_id（dump 与 record 同口径组标识）",
+          "attempt_id=None" in _inss.getsource(_RO.traj_dump_row)
+          and '"attempt_id": attempt_id' in _inss.getsource(_RO.traj_dump_row))
+
+    # sigstats 聚合：全对仍传（辅助驱动）必须单独计数，uploaded≠正确性混合组
+    _rows = [
+        {"q_status": "ok", "acc": [1, 1, -1, -1], "clen": [100] * 4,
+         "task_mask": [1] * 4, "adv_task": [1, 1, -1, -1],
+         "adv_aux": [0.1] * 4, "adv_local_mag": [0.5] * 4, "attempt_id": 1},
+        {"q_status": "ok", "acc": [1] * 4, "clen": [200] * 4,
+         "task_mask": [1] * 4, "adv_task": [0] * 4,
+         "adv_aux": [0.3, -0.1, -0.1, -0.1], "adv_local_mag": [1.0] * 4,
+         "attempt_id": 2},
+        {"q_status": "uniform", "acc": [-1] * 4, "clen": [300] * 4,
+         "task_mask": [1] * 4, "adv_task": [0] * 4, "adv_aux": [0] * 4,
+         "adv_local_mag": [0] * 4, "attempt_id": 3},
+        {"q_status": "ok", "acc": [1, -1, 1, -1], "clen": [150] * 4,
+         "attempt_id": 4},   # 旧格式：无信号列 → 计入不可判，不当 0
+    ]
+    _g = group_signal(_rows)
+    check("sigstats：M_raw/M_task/M_uploaded 三层口径",
+          _g["m_raw"] == 2 and _g["scored"] == 4
+          and _g["up_task_mixed"] == 1 and _g["up_scored"] == 2
+          and _g["with_sig"] == 3)
+    check("sigstats：全对仍传（辅助驱动上传）单独计数",
+          _g["up_allcorrect_aux"] == 1 and _g["up_allwrong_aux"] == 0)
+    check("sigstats：token 口径 = ok+uniform 的 clen 总和",
+          _g["tok_ok"] == 1800 and _g["tok_uniform"] == 1200)
+
+    # probe --from_run_info / --native_stop_at_call / --pool train
+    _psrc2 = _inss.getsource(_PD.main)
+    check("probe 有 --from_run_info/--native_stop_at_call/--pool 三入口",
+          '"--from_run_info"' in _psrc2 and '"--native_stop_at_call"' in _psrc2
+          and '"--pool"' in _psrc2)
+    check("probe run_info 缺 config → fail-fast（不静默回落 preset）",
+          'raise SystemExit(f"[probe] --from_run_info' in _psrc2)
+    check("probe run_info 回读含 native_stop_at_call 与引擎档（同档铁律补全）",
+          '"native_stop_at_call"' in _psrc2
+          and '_ri_cfg.get("vllm_batch_invariant")' in _psrc2
+          and '_ri_cfg.get("vllm_attention_backend")' in _psrc2)
+    check("probe --pool train：按题面去重且不联探 dev",
+          'args.pool == "train"' in _psrc2 and "训练池按题面去重" in _psrc2)
+    check("probe_meta 指纹含 nsc/model_path/pool（表自证出处）",
+          '"nsc": int(bool(cfg.get("native_stop_at_call")))' in _psrc2
+          and '"model_path": str(args.model_path)' in _psrc2)
+
+    # strict 指纹：训练入口阻断混表，非 strict 保持告警兼容
+    with tempfile.TemporaryDirectory() as td:
+        _p = os.path.join(td, "t.jsonl")
+        _m = {"model": "m", "rounds": 6, "round_tokens": 2048, "ctx": 13312,
+              "temp": 1.0, "sp": "abc", "tool_protocol": "native",
+              "max_traj_tokens": 12288, "answer_reserve": 1024,
+              "max_prompt_length": 1024, "nsc": 1, "model_path": "/root/x/epoch1"}
+        with open(_p, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"Q": "q1", "A": "a", "k": 8, "n_correct": 3,
+                                "probe_meta": _m}) + "\n")
+        check("strict + 指纹匹配 → 正常加载",
+              set(load_difficulty_table(_p, expected_meta=dict(_m),
+                                        strict=True)) == {"q1"})
+        try:
+            load_difficulty_table(_p, expected_meta={**_m, "nsc": 0}, strict=True)
+            check("strict + 指纹不符 → raise", False)
+        except ValueError:
+            check("strict + 指纹不符（nsc 换档）→ raise 阻断混表", True)
+        check("非 strict + 指纹不符 → 告警但仍加载（eval/旧调用方兼容）",
+              set(load_difficulty_table(_p, expected_meta={**_m, "nsc": 0})) == {"q1"})
+    check("训练入口 strict=True + expected_meta 含 nsc/model_path",
+          'expected_meta=_expected_meta, strict=True' in _rsrc
+          and '"nsc": int(bool(cfg.get("native_stop_at_call")))' in _rsrc
+          and '"model_path": str(cfg["model_path"])' in _rsrc)
+    check("难度过滤统计落盘 difficulty_filter.json（保留/缺失可事后核对）",
+          '"difficulty_filter.json"' in _rsrc)
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -5837,6 +5960,7 @@ if __name__ == "__main__":
     test_sampling_discard_stats()
     test_tool_credit_assignment()
     test_gen_death_diagnostics()
+    test_signal_observation()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
