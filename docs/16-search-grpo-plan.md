@@ -36,7 +36,12 @@ prompt + tools=[SEARCH_TOOL] → [LLM 生成] → parse_assistant 判定 kind="t
   - `SEARCH_TOOL`：与 `CODE_TOOL` 同构的工具声明 dict（name=`search`，参数=`query`，description 强调 top-k 摘要、每次调用独立），经 `apply_chat_template(tools=[SEARCH_TOOL])` 进 prompt。
   - 解析/回包/拼接**全部复用** `parse_assistant` / `tool_message` / `build_next_prompt`，`--tool_protocol native --native_tool_style function`（Qwen3.5-4B 实测形态，docs/09 §10.5）。**不新增任何自造标签**；通用化方式 = 工具声明与执行器参数化（name → executor 映射），解析层零改动。
   - 基座对 search 的**零先验缺口**需 probe 验证：base 对 code_interpreter 调用率 100%，但对没见过的 `search` 工具声明未必——M1 用 native_probe 同型脚本先测（调用率 <50% 则先做轻量 SFT 或 few-shot 声明注入，这本身是一个可发表的单变量发现）。
-- **检索后端**：本地 Wikipedia 2018 dump 索引，首选 flashrag 自带索引（e5/bm25 双档）；pod 无外网，禁止依赖在线搜索 API。索引体积 ~20G 需先核实 pod 磁盘。检索结果在拼接口消毒（sanitize_tool_text 同位）。
+- **检索后端（定版：独立服务，网络部署）**：检索服务作为**独立 HTTP 服务**部署在训练 pod 之外的服务器上（索引 ~20G 不占训练机磁盘/RAM），训练侧只持有一个 endpoint URL：
+  - **服务侧**：flashrag retriever 或自研 FastAPI 薄封装（BM25 优先、e5 可选），接口 `POST /search {query, top_k} → [{title, text}]`，支持**批量查询**（一次 rollout group 的 N 个 query 合并成一个请求，防延迟爆炸）。
+  - **训练侧**：新增配置键 `search_endpoint`（URL）+ `search_timeout`/`search_top_k`；executor = 带重试（限次）的 HTTP 客户端；**启动时 fail-fast** 探活（endpoint 不通直接拒训，不进 rollout 才超时）；mock executor（本地小语料/固定回包）供 CPU 测试与本地开发，接口与 HTTP 版同型——沿用「上游真实输出喂下游」的接缝纪律。
+  - **降级档**：`search_endpoint=local:<path>` 支持 pod 本地索引（磁盘富余时省网络往返）；两档由配置切换，rollout 代码零分叉。
+  - **网络前提核实（M1 探针第一项）**：pod → 目标服务器的连通性与往返延迟（pod HF 不通是外网限制，内网/办公网一般可达，但**必须先实测**）；检索延迟直接进 rollout 墙钟，实测后再定批量与并发参数。
+  - 检索结果在拼接口消毒（sanitize_tool_text 同位）；网络返回同样是注入面，消毒点不变。
 - **rollout**：多轮生成与训练逐 token 同一序列（prompt_token_ids 续写）。轮数上限建议 8~15，`--max_context_tokens` 按 docs/04 公式重算后定版。
 - **reward 设计空间**（单变量实验）：
   - R0 纯结果奖励：EM 0/1（基线，Search-R1 原版）
@@ -55,7 +60,7 @@ prompt + tools=[SEARCH_TOOL] → [LLM 生成] → parse_assistant 判定 kind="t
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M1 环境 | Wikipedia 索引落 pod、SEARCH_TOOL 声明接入、search 先验 probe、rollout 链路跑通 | 单 batch 多轮检索 rollout 完成；base 对 search 的调用率有实测数（go/no-go） |
+| M1 环境 | pod→检索服务器连通性实测、检索服务独立部署（Wikipedia 索引落服务器）、SEARCH_TOOL 声明接入、search 先验 probe、rollout 链路跑通 | 单 batch 多轮检索 rollout 完成；base 对 search 的调用率有实测数（go/no-go）；检索延迟有实测数 |
 | M2 基线复现 | GRPO+R0 在 NQ 上复现 Search-R1 量级（4B 目标 EM≥35%） | 对照基线显著提升（配对检验 p<0.05） |
 | M3 算法对照 | 六算法在 agentic 设定的对照实验 + reward 设计 R0~R3 单变量矩阵 | docs 级结论（含 ±4pp 方差声明、近平局双 seed） |
 | M4 深度扩展（选一） | 多跳推理强化（HotpotQA 主训）/ 检索奖励塑形深挖 / 上下文压缩机制 | OOD 泛化增益可复现 |
@@ -64,8 +69,9 @@ prompt + tools=[SEARCH_TOOL] → [LLM 生成] → parse_assistant 判定 kind="t
 
 | 风险 | 预案 |
 |---|---|
-| 检索索引体积/内存超 pod 限制（RAM 60G） | 先核实磁盘；索引用 mmap 模式；BM25 优先于稠密向量（省显存） |
-| rollout 延迟爆炸（检索串行） | 检索服务常驻+批量接口；先画数据流实际发生次数再优化 |
+| pod→检索服务器网络不通/延迟高 | M1 第一项实测；不通则降级 `local:` 档（需核实 pod 磁盘放 20G 索引，mmap 模式） |
+| 检索服务单点故障拖死训练 | 启动 fail-fast 探活 + 限次重试 + 服务侧进程守护；训练中途失联按「精确 0%/平坦」签名当场停 |
+| rollout 延迟爆炸（检索串行） | 检索服务常驻+批量接口（group 内 N 个 query 合并请求）；先画数据流实际发生次数再优化 |
 | reward hacking：重复检索刷格式分 | R3 次数惩罚；监控「平均检索轮数」平坦/异常作 bug 签名 |
 | 检索结果注入污染打分域 | 打分只取 assistant 答案段；工具段剥离后评分 |
 | 4B 模型多跳能力上限 | M4 前先做 probe：SFT 基线在 HotpotQA 的上限测量，再定 RL 目标 |
