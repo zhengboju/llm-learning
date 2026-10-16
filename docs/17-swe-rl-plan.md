@@ -22,6 +22,30 @@
 
 **决策规则**：先做 L0 probe（SFT 基线 + GRPO），若 SFT 基线在 L0 上 <20% 修复率，说明 4B 能力不足以支撑 RL 信号密度，项目降级为纯研究性，不投入全量。
 
+## 2.5 工具需求（两层分清楚）
+
+### 模型侧动作空间（agent 可用的"工具"）
+
+| 层 | 动作空间 | 说明 |
+|---|---|---|
+| L0 / SWE-RL 原版 | **无工具，单轮 patch-only**：模型读 issue+定位提示，直接输出 diff | SWE-RL（Meta）的原始设定——环境交互只有一次"提交 patch"。**这意味着 L0 不走多轮框架**，工程量比 Search-GRPO 小得多 |
+| L1（可选扩展） | + 只读 shell：`grep`/`cat`/`ls`/`find`（定位用，只读降风险） | 走 docs/09 原生工具协议多轮框架，与 Search-GRPO 合流（M4） |
+| L2 | + `str_replace_editor` / `submit`（SWE-bench agent 标准动作集） | 仅当 L1 有显著效应再上 |
+
+**关键认知**：SWE-RL 的 RL 价值在「奖励来自真实测试执行」，不在工具数量。起步坚持 patch-only——单轮、reward 链路最短、与现有 GRPO 训练管线几乎零改动。
+
+### 基础设施侧工具链（本项目要建/要有的）
+
+| 工具 | 作用 | 复用/新建 |
+|---|---|---|
+| **patch 校验器** | `git apply --check` + 实际 apply，输出 apply 成功率（格式指标，与能力指标拆开报） | 新建（薄，~百行） |
+| **pytest 执行器** | 跑 F2P（fail-to-pass）+ P2P 测试，带超时/资源上限，解析结果判 reward | 新建；复用 ReTool 沙箱的消毒与资源限制思路 |
+| **沙箱隔离** | docker per-instance（标准）→ pod 不可行时降级 venv/conda + 进程级 rlimit | M1 探针定版 |
+| **环境构建管线** | 按 instance 的 install spec 预构建依赖环境，构建失败即剔除落盘 | 新建（SWE-Gym 已带 spec，工程量在执行编排） |
+| **repo 检索**（可选） | BM25 文件/符号检索，给模型定位提示（L0 可人工给定位，跳过此项） | flashrag 思路可迁移，非必需 |
+| **数据工具** | SWE-Gym / R2E 拉取（pod HF 不通 → modelscope 垫片，沿用 data.py 惯例）；L0 合成 bug 生成器 | 部分复用 |
+| **F2P 评测 runner** | SWE-bench harness 或自研；N≥300 配对协议照旧 | 自研为主 |
+
 ## 3. 系统架构
 
 ```

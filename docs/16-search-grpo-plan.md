@@ -2,6 +2,7 @@
 
 > 状态：规划 | 前置：docs/02（ReTool）、docs/09（工具协议）、docs/15（纯 RL 解题路线）
 > 定位：从「单轮/代码交织 RLVR」推进到「多轮、环境交互、稀疏奖励」的 agentic RL，复现并超越 Search-R1 范式。
+> **协议定版：原生工具协议**（docs/09 路线，search = 一个原生工具声明），不自造围栏标签。
 
 ## 1. 背景与动机
 
@@ -16,7 +17,7 @@
 
 | 现有资产 | 复用方式 |
 |---|---|
-| ReTool 多轮协议/标签解析（rlab._FORMAT_RE） | search 协议同构；**标签字节铁律照常**：绝不手写标签字面量，从 _FORMAT_RE 派生 |
+| **原生工具协议全套**（docs/09：CODE_TOOL 声明、`parse_assistant`、`build_next_prompt` token 增量拼接、`tool_message`、双形态解析） | **search 声明为一个原生工具**（与 code_interpreter 同构的 tool declaration），不自造 `<search>` 围栏——Qwen3.5-4B 实测 function 形态、base 调用率先验 100%（§10.5.1），自造协议要从零教起（p1–p11 失败根因） |
 | 六算法实现（GRPO/DAPO/CISPO/GSPO/RF++） | agentic 设定下的算法对照——社区尚无人系统做过，是本项目的净产出之一 |
 | retool_math 显存/vLLM 经验 | 多轮检索 rollout 更长，docs/04 公式表直接迁移重算 |
 | 评测协议（N≥300、固定 seed、配对检验、条件指标 acc/fmt） | agentic 噪声更大，纪律即差异化优势 |
@@ -25,14 +26,17 @@
 ## 3. 系统架构
 
 ```
-prompt → [LLM 生成] → 含 <search>query</search>？
-            ↑ 是 → [检索后端 top-k] → 结果消毒注入 → 续写（token id 续写，禁文本重 tokenize）
-            ↓ 否（含答案标签）
+prompt + tools=[SEARCH_TOOL] → [LLM 生成] → parse_assistant 判定 kind="tool"（search 调用）？
+            ↑ 是 → [检索后端 top-k] → tool_message 消毒注入 → build_next_prompt token 增量续写
+            ↓ 否（kind="answer"，含答案）
         [EM/F1 打分] → reward → GRPO 家族更新
 ```
 
-- **检索后端**：本地 Wikipedia 2018 dump 索引，首选 flashrag 自带索引（e5/bm25 双档）；pod 无外网，禁止依赖在线搜索 API。索引体积 ~20G 需先核实 pod 磁盘。
-- **协议设计**：`<search>...</search>` 查询、`<information>...</information>` 注入段（工具输出不当答案、不进 loss——沿用 ReTool 打分域规则）、答案标签复用现有格式。检索结果在拼接口消毒（sanitize_tool_text 同位）。
+- **协议（定版：原生工具协议，docs/09 路线）**：
+  - `SEARCH_TOOL`：与 `CODE_TOOL` 同构的工具声明 dict（name=`search`，参数=`query`，description 强调 top-k 摘要、每次调用独立），经 `apply_chat_template(tools=[SEARCH_TOOL])` 进 prompt。
+  - 解析/回包/拼接**全部复用** `parse_assistant` / `tool_message` / `build_next_prompt`，`--tool_protocol native --native_tool_style function`（Qwen3.5-4B 实测形态，docs/09 §10.5）。**不新增任何自造标签**；通用化方式 = 工具声明与执行器参数化（name → executor 映射），解析层零改动。
+  - 基座对 search 的**零先验缺口**需 probe 验证：base 对 code_interpreter 调用率 100%，但对没见过的 `search` 工具声明未必——M1 用 native_probe 同型脚本先测（调用率 <50% 则先做轻量 SFT 或 few-shot 声明注入，这本身是一个可发表的单变量发现）。
+- **检索后端**：本地 Wikipedia 2018 dump 索引，首选 flashrag 自带索引（e5/bm25 双档）；pod 无外网，禁止依赖在线搜索 API。索引体积 ~20G 需先核实 pod 磁盘。检索结果在拼接口消毒（sanitize_tool_text 同位）。
 - **rollout**：多轮生成与训练逐 token 同一序列（prompt_token_ids 续写）。轮数上限建议 8~15，`--max_context_tokens` 按 docs/04 公式重算后定版。
 - **reward 设计空间**（单变量实验）：
   - R0 纯结果奖励：EM 0/1（基线，Search-R1 原版）
@@ -51,7 +55,7 @@ prompt → [LLM 生成] → 含 <search>query</search>？
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M1 环境 | Wikipedia 索引落 pod、search 协议、rollout 链路跑通 | 单 batch 多轮检索 rollout 完成，标签 roundtrip 回查通过 |
+| M1 环境 | Wikipedia 索引落 pod、SEARCH_TOOL 声明接入、search 先验 probe、rollout 链路跑通 | 单 batch 多轮检索 rollout 完成；base 对 search 的调用率有实测数（go/no-go） |
 | M2 基线复现 | GRPO+R0 在 NQ 上复现 Search-R1 量级（4B 目标 EM≥35%） | 对照基线显著提升（配对检验 p<0.05） |
 | M3 算法对照 | 六算法在 agentic 设定的对照实验 + reward 设计 R0~R3 单变量矩阵 | docs 级结论（含 ±4pp 方差声明、近平局双 seed） |
 | M4 深度扩展（选一） | 多跳推理强化（HotpotQA 主训）/ 检索奖励塑形深挖 / 上下文压缩机制 | OOD 泛化增益可复现 |
