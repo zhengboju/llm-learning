@@ -1614,11 +1614,16 @@ def test_protocol_wiring_static():
     check("probe_difficulty：--tool_protocol/--native_tool_style CLI 入口存在",
           'ap.add_argument("--tool_protocol"' in pd
           and 'ap.add_argument("--native_tool_style"' in pd)
+    # 【2026-10-15 上游改名后的断言同步】probe_difficulty 的协议档回读层把取值收口到
+    # `_tp_v`（CLI 优先、其次 run_info），旧断言匹配的字面量 `args.tool_protocol` 已
+    # 不存在 → 本项长期假红（真回归会被"已知红"淹掉）。改为锁**契约本身**：协议档在
+    # get_config 之前落进 _cfg_over（NATIVE_PROTOCOL_DEFAULTS 与原生提示靠它触发）。
+    # 【docs/16】算法档同理收口到 _algo_v（search_qa 档要用 search 工具的预算/提示）。
     check("probe_difficulty：协议档先落 overrides 再进 get_config（顺序敏感锁）",
-          '_cfg_over["tool_protocol"] = args.tool_protocol' in pd
-          and 'get_config("retool_math", **_cfg_over)' in pd
-          and pd.index('_cfg_over["tool_protocol"] = args.tool_protocol')
-          < pd.index('cfg = get_config("retool_math", **_cfg_over)'))
+          '_cfg_over["tool_protocol"] = _tp_v' in pd
+          and 'get_config(_algo_v, **_cfg_over)' in pd
+          and pd.index('_cfg_over["tool_protocol"] = _tp_v')
+          < pd.index('cfg = get_config(_algo_v, **_cfg_over)'))
     check("probe_difficulty：结尾训练启用提示带协议档（防忘带 --tool_protocol）",
           '"--tool_protocol {_tp}"' in pd or 'f"--tool_protocol {_tp}' in pd)
     # 功能侧锚点：native 档 get_config 自动套预算档 + 原生提示（探针"同档"的来源；

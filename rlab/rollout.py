@@ -45,15 +45,17 @@ from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
 from rlab.losses import compute_advantages, forward_per_token_logps
 from rlab.model_loading import load_causal_lm, resolve_load_config
-from rlab.protocol import (CODE_TOOL, NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
+from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON,
                            PromptMismatchError,
                            RETOOL_STOP_KWARGS as _RETOOL_STOP_KWARGS,
-                           TOOL_END, TOOL_START, assert_native_sampling_ban,
+                           TOOL_END, TOOL_NAME, TOOL_START,
+                           assert_native_sampling_ban,
                            build_next_prompt, encode_batch,
                            extract_python_blocks, initial_messages, make_call_id,
                            make_bytes_list, native_special_ban_words,
-                           parse_assistant, render_chat_ids,
+                           native_tool, parse_assistant, render_chat_ids,
+                           resolve_tool_decls,
                            sanitize_tool_text, segment_mask_from_spans,
                            tensor_to_bytes, tool_message,
                            # 【2026-10-02 trunc_in_call】调用块的开/闭标记**从协议
@@ -64,6 +66,7 @@ from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          group_eff_bonus, group_eff_penalty,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math, group_length_penalty)
+from rlab.search_qa import total_reward_search_qa
 from rlab.sandbox import run_code
 from rlab.sync import need_text_to_mm_remap, remap_text_to_multimodal, sync_weights_into_vllm
 
@@ -91,23 +94,25 @@ _DEEPSPEED_ENV_KEYS = [
 
 def build_prompt(question: str, system_prompt: str, tokenizer,
                  chat_template_kwargs: dict | None = None,
-                 tools: bool = False) -> str:
+                 tools: bool | list = False) -> str:
     """单轮 prompt 模板。
 
     chat_template_kwargs 透传 apply_chat_template（Qwen3.5 系需
     {"enable_thinking": false}，见 config.chat_template_kwargs 注释）。
-    tools=True 时把 CODE_TOOL 声明进模板（原生协议用，docs/09 §2.2）。
-    默认 False —— 围栏家族（p1–p11）的 prompt 逐字节不变，回退位真的能回退。"""
+    tools=True 时把 CODE_TOOL 声明进模板（原生协议用，docs/09 §2.2）；
+    tools=[声明,...] 时按给定声明（多工具泛化，docs/16）。
+    默认 False —— 围栏家族（p1~p11）的 prompt 逐字节不变，回退位真的能回退。"""
+    _decls = resolve_tool_decls(tools)
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": system_prompt},
          {"role": "user", "content": question}],
         tokenize=False, add_generation_prompt=True,
-        **({"tools": [CODE_TOOL]} if tools else {}),
+        **({"tools": _decls} if _decls else {}),
         **(chat_template_kwargs or {}))
 
 
 def build_prompt_ids(messages: list, tokenizer, chat_template_kwargs: dict | None = None,
-                     tools: bool = False) -> list:
+                     tools: bool | list = False) -> list:
     """多轮消息 → prompt token ids（**生成端唯一入口**，与 build_next_prompt 同源）。
 
     【为什么必须单独一个函数】原生协议下 build_next_prompt 内部会用
@@ -152,7 +157,8 @@ def build_prompt_batch(inputs, cfg: dict, tokenizer, prompts_messages=None):
     ctkw = cfg.get("chat_template_kwargs")
     if native:
         msgs = prompts_messages or prompt_messages_for(inputs, cfg)
-        ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
+        _decls = [native_tool_of(cfg).declaration]
+        ids = [build_prompt_ids(m, tokenizer, ctkw, tools=_decls) for m in msgs]
         # 文本仅供日志/记录（原生档实际喂 vLLM 的是 token ids）
         texts = [tokenizer.decode(t, skip_special_tokens=False) for t in ids]
         plen = max(len(t) for t in ids)
@@ -533,6 +539,16 @@ def is_native_protocol(cfg: dict) -> bool:
     return tool_protocol_of(cfg) == TOOL_PROTOCOL_NATIVE
 
 
+def native_tool_of(cfg: dict):
+    """本 run 的原生工具（docs/16：search_qa 用 search，其余用 code_interpreter）。
+
+    名字由 cfg["native_tool_name"] 给（缺省 code_interpreter），未知名字由
+    protocol.native_tool fail-fast——静默回落会让"配了 search 工具却在渲染代码
+    工具"变成一次没有任何报错的空转（模型看得到 code_interpreter 声明、执行器
+    却是检索）。"""
+    return native_tool(cfg.get("native_tool_name") or TOOL_NAME)
+
+
 def budget_hint_line(left: int, call_need: int) -> str:
     """剩余额度提示行（纯函数，CPU 可测）——分档，给模型**可执行**的信息。
 
@@ -588,6 +604,11 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     if style not in ("auto", NATIVE_STYLE_FUNCTION, NATIVE_STYLE_JSON):
         raise ValueError(f"[rollout] 未知 native_tool_style={style!r}（可选 auto/"
                          f"{NATIVE_STYLE_FUNCTION}/{NATIVE_STYLE_JSON}）")
+    # 【docs/16 多工具】工具名/参数名/声明由 cfg 决定（缺省 = code_interpreter/code，
+    # 历史路径逐位不变）。executor 由调用方以 code_runner 注入（search_qa 传检索 runner）。
+    _tool = native_tool_of(cfg)
+    _tname, _tparam = _tool.name, _tool.param
+    _tdecls = [_tool.declaration]
     # 假 </think> + special token 禁言 fail-fast（事故 C/D，docs/09 §10.6.3/§10.6.4）：
     # 缺禁言时"会不会炸校验①"是随机事件（哪一条采样在第几步吐出 </think> 或
     # special token），真机形态是运行几十/上百步后 abort——入口断言把失败提前到
@@ -609,7 +630,7 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     _ans_res = max(1, int(cfg.get("answer_reserve", 0) or 0))
     # 每样本状态：messages（协议用）/ prompt_ids（生成端喂 vLLM 的真实序列）/ 调用数
     msgs = [list(m) for m in prompts_messages]
-    ctx_ids = [build_prompt_ids(m, tokenizer, ctkw, tools=True) for m in msgs]
+    ctx_ids = [build_prompt_ids(m, tokenizer, ctkw, tools=_tdecls) for m in msgs]
     segs = [[] for _ in range(n)]
     code_stats = [{"code_used": 0, "code_ok": 0, "code_wasted": 0,
                    "invalid_final": 0, "ctx_full": 0, "trunc_final": 0,
@@ -675,7 +696,7 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     # 判：本分支只置 trunc_final，A 桶（trunc∩invalid）在 token 档
                     # 恒 0，不单独记就永久分不出"调用被墙切"与"纯散文被墙切"。
                     code_stats[i]["trunc_in_call"] = trunc_in_call_flag(
-                        open_raw[i], style)
+                        open_raw[i], style, _tname, _tparam)
                     open_ids[i], open_raw[i], open_lps[i] = [], "", []
             active = _still
             if not active:
@@ -717,7 +738,8 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                 # 序列推进：ctx_ids = 轮起点 + 本轮累积（下一块从这个位置续生成）
                 ctx_ids[i] = [*turn_ctx[i], *open_ids[i]]
                 if fin == "length" and parse_assistant(
-                        open_raw[i].strip(), style=style).kind != "tool":
+                        open_raw[i].strip(), style=style, tool_name=_tname,
+                        param=_tparam).kind != "tool":
                     # 被单轮上限切断 → 同一轮继续写（不落段、不解析、不终局）。
                     # 这是本档与旧版最本质的差别：旧版这里 trunc_final=1 且剩余
                     # 轮数整段作废（A/B 桶高发的结构性原因）。
@@ -737,7 +759,8 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
             # 与参考实现一致：chat template 会 strip assistant 内容，解析与结束
             # 边界计算都用 strip 后的文本，否则 canonical 位置对不上。
             asst_text = raw_text.strip()
-            parsed = parse_assistant(asst_text, style=style)
+            parsed = parse_assistant(asst_text, style=style, tool_name=_tname,
+                                     param=_tparam)
             # 整轮落成**一个** assistant 段（续写的多块合成一段）：mask 只认
             # assistant 区间，一段或几块等价；合成一段让"生成序列 == 训练序列"
             # 的逐 token 断言仍成立（工具段由 build_next_prompt 从轮起点追加）。
@@ -812,11 +835,12 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     # "再调用会不会被执行"直接告诉它。
                     _left = max(0, traj_budget - (len(ctx_ids[i]) - p0[i]) - len(body) // 2)
                     body += budget_hint_line(_left, _obs_est + _ans_res)
-                call_id = make_call_id(0, i, code_stats[i]["code_used"])
-                obs_msg = tool_message(call_id, body)
+                call_id = make_call_id(0, i, code_stats[i]["code_used"], _tname)
+                obs_msg = tool_message(call_id, body, _tname)
                 try:
                     nxt = build_next_prompt(tokenizer, msgs_before, turn_ctx[i],
-                                            comp_ids, obs_msg, ctkw)
+                                            comp_ids, obs_msg, ctkw,
+                                            tools=_tdecls)
                 except PromptMismatchError as e:
                     # 【2026-10-03 校验① 跳过档】文本不同源若是**采样随机事件**
                     # （事故 C/D 类：模型偶发吐出协议外字节），中断整场训练太贵
@@ -901,7 +925,8 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                 code_stats[i]["trunc_final"] = 1
                 # 与循环内"预算耗尽"分支同口径：安全阀耗尽也是"没写完就停"，
                 # 切点落在未闭合调用块里同样要单列（否则又混进 B 桶）。
-                code_stats[i]["trunc_in_call"] = trunc_in_call_flag(_txt, style)
+                code_stats[i]["trunc_in_call"] = trunc_in_call_flag(
+                    _txt, style, _tname, _tparam)
         full_text = ["".join(s["text"] for s in segs_i) for segs_i in segs]
     else:
         # 旧口径：末段被单轮上限切断即 trunc_final。token 预算档下该口径由循环内的
@@ -1263,6 +1288,10 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     assert len(asst_texts) == len(inputs) * n, \
         f"轨迹数 {len(asst_texts)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
     is_math = cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo")
+    # 【docs/16 Search-GRPO】QA 任务：EM/F1（别名取最大）outcome-only，与 math 同域
+    # （reward=±1）。判据用 data_task 而非 algo：任务口径与算法名解耦（同一算法可
+    # 跑不同任务），换任务忘改打分口径=拿 GSM8K 正则判 QA 答案，是 silent 全错。
+    is_qa = cfg.get("data_task") == "search_qa"
     # overlong 参考系 = 可写满的多轮总预算（min(max_rounds×round_gen_tokens,
     # max_context_tokens−max_prompt_length)），非单轮 max_gen_tokens——否则要么
     # 用满预算的轨迹被整额扣分，要么 trigger 落在丢弃线之外变成死开关
@@ -1284,7 +1313,21 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
         for j in range(n):
             idx = i * n + j
             _tf = code_stats[idx].get("trunc_final", 0)
-            if is_math:
+            if is_qa:
+                # golds 优先取 aliases（上游 prepare 保留别名），缺则回落 A
+                _golds = inp.get("aliases") or [inp.get("A")]
+                sc = total_reward_search_qa(
+                    _golds, asst_texts[idx],
+                    completion_len=(completion_lens[idx] if completion_lens is not None else 0),
+                    max_gen_tokens=_ol_ref,
+                    overlong_buffer=cfg["overlong_buffer"],
+                    overlong_shaping=cfg.get("overlong_shaping", False),
+                    trunc_final=_tf,
+                    trunc_shaping=_trunc_w)
+                # 检索调用记账（与 code_ok/code_used 同列，analysis/record 零改动）
+                sc["code_used"] = code_stats[idx]["code_used"]
+                sc["code_ok"] = code_stats[idx]["code_ok"]
+            elif is_math:
                 sc = total_reward_retool_math(
                     inp["A"], asst_texts[idx], code_ok=code_stats[idx]["code_ok"],
                     completion_len=(completion_lens[idx] if completion_lens is not None else 0),
@@ -1393,7 +1436,8 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     return (adv, torch.tensor(acc_s), torch.tensor(fmt_s), cu, ck, phase)
 
 
-def trunc_in_call_flag(text: str, style: str = "auto") -> int:
+def trunc_in_call_flag(text: str, style: str = "auto",
+                       tool_name: str = TOOL_NAME, param: str = "code") -> int:
     """预算/轮长用尽时，模型是否正处在**未写完的调用块**里（0/1）。纯函数，CPU 可测。
 
     【为什么必须有这个字段（2026-10-02）】token 预算档下"预算耗尽"只置
@@ -1414,7 +1458,8 @@ def trunc_in_call_flag(text: str, style: str = "auto") -> int:
     t = text.strip()
     if t.count(_CALL_OPEN) <= t.count(_CALL_CLOSE):
         return 0
-    return int(parse_assistant(t, style=style).kind == "invalid")
+    return int(parse_assistant(t, style=style, tool_name=tool_name,
+                               param=param).kind == "invalid")
 
 
 def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
@@ -1950,7 +1995,8 @@ def gen_worker(Q, cfg: dict):
     # 【副本档位判定前置】这两行只读 cfg、与引擎无关——提前到 LLM() 之前，好让 A1
     # 护栏在任何 GPU 分配**之前**拦下（否则要先花 ~1 分钟把 vLLM 起起来才崩，2026-09-14
     # 实机就是这么白烧了 2.5 分钟才看到一条 transformers 内部 traceback）。
-    _use_vllm_logps = bool(cfg.get("vllm_gen_logps")) and cfg["algo"] in ("retool", "retool_math")
+    _use_vllm_logps = bool(cfg.get("vllm_gen_logps")) and cfg["algo"] in (
+        "retool", "retool_math", "search_qa")
     _verify_budget = int(cfg.get("verify_gen_logps", 0) or 0)
     # 【2026-09-15 实锤】Qwen3.5-4B + vLLM v0.19.1 + triton GDN prefill 下，vLLM 采样
     # logprobs 不可复现（同一命令两次：token 一致率 2.91%，|Δlogp| p99=5.79、max=14.5）。
@@ -2092,6 +2138,10 @@ def gen_worker(Q, cfg: dict):
             # 终止结构；basename 的 model 撞名（epoch1）无法分辨跨 run 权重。
             "nsc": int(bool(cfg.get("native_stop_at_call"))),
             "model_path": str(cfg["model_path"]),
+            # 【docs/16】工具名与任务档进比对：换工具就是换任务/换分布（search 与
+            # code_interpreter 的通过率不可互推）。旧表无这两个键 → 跳过（兼容）。
+            "native_tool_name": str(cfg.get("native_tool_name") or "code_interpreter"),
+            "data_task": str(cfg.get("data_task")),
         }
         # 【2026-10-15 doc15 P1】训练入口严格阻断混表：告警会被"忽略习惯"淹掉
         # （k 误报教训），用错表的课程比没有课程更糟。旧表（无 probe_meta）仍可
@@ -2120,6 +2170,18 @@ def gen_worker(Q, cfg: dict):
         if len(QAs) < cfg["q_pool_reset_floor"]:
             print(f"[rollout] 警告: 过滤后池子 {len(QAs)} 题 < q_pool_reset_floor="
                   f"{cfg['q_pool_reset_floor']}（QuestionScheduler 的重置机制会很活跃）")
+    # 【docs/16 Search-GRPO】检索执行器：训练侧只持 endpoint（索引 ~20G 部署在训练机
+    # 之外的独立服务上，见 docs/16 §3）。**启动探活 fail-fast**——服务不通就在第 0 秒
+    # 拒训，而不是让每条轨迹的执行超时变成"任务全错"的静默零分（本项目最贵的一类：
+    # 基础设施故障伪装成模型能力差）。
+    _search_runner = None
+    if cfg.get("data_task") == "search_qa":
+        from rlab.search_client import make_search_runner
+        _search_runner = make_search_runner(cfg)
+        _search_runner.check_health()
+        print(f"[rollout] 检索服务已探活: {cfg.get('search_endpoint')}"
+              f"（top_k={cfg.get('search_top_k')}，超时 {cfg.get('search_timeout')}s，"
+              f"并发 {cfg.get('sandbox_workers')}）", flush=True)
     ref_server = cfg["ref_server"]
     pushes = [0]   # 权重推送次数（每 gen_update_steps 优化步一次；近似 optimizer step）
     last_fp = [None]   # 上次推送的权重指纹（两次相同 = 训练端权重没在变）
@@ -2238,7 +2300,14 @@ def gen_worker(Q, cfg: dict):
         n = cfg["num_pre_Q"]
         for i, inp in enumerate(inputs):
             for j, a in enumerate(answers[i * n:(i + 1) * n]):
-                if cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo"):
+                if cfg.get("data_task") == "search_qa":
+                    sc = total_reward_search_qa(
+                        inp.get("aliases") or [inp.get("A")], a,
+                        completion_len=completion_lens[i * n + j],
+                        max_gen_tokens=cfg["max_gen_tokens"],
+                        overlong_buffer=cfg["overlong_buffer"],
+                        overlong_shaping=cfg["overlong_shaping"])
+                elif cfg.get("data_task") in ("dapo_math", "dapo-math-17k", "math_dapo"):
                     sc = total_reward_math(inp["A"], a,
                                            completion_len=completion_lens[i * n + j],
                                            max_gen_tokens=cfg["max_gen_tokens"],
@@ -2321,7 +2390,7 @@ def gen_worker(Q, cfg: dict):
     os.makedirs(os.path.dirname(os.path.abspath(cfg["record_path"])), exist_ok=True)
     fout = open(cfg["record_path"], "a", encoding="utf-8")
     uploaded_total = 0
-    is_retool = cfg["algo"] in ("retool", "retool_math")
+    is_retool = cfg["algo"] in ("retool", "retool_math", "search_qa")
     # 【2026-10-02 轨迹全量落盘】record.jsonl 只有统计，看不到"模型写了什么"。
     # 开启后写 <out_dir>/traj.jsonl：**含被丢弃的 attempt**（uniform/overlong）
     # ——那两类整组不进 record，是记录口径幸存者偏差的主体。逐 attempt flush：
@@ -2419,7 +2488,8 @@ def gen_worker(Q, cfg: dict):
                     inputs, prompts_text, prompt_ids, plen, sps,
                     steps_elapsed=pushes[0] * cfg["gen_update_steps"],
                     verify_logps=_verifier, prompts_messages=_pmsgs,
-                    traj_sink=_sink, attempt_id=attempt_seq[0])
+                    traj_sink=_sink, attempt_id=attempt_seq[0],
+                    code_runner=_search_runner)
                 if _sink:
                     # gen_version 由调用方补（rollout 循环看不到权重推送计数）：
                     # 轨迹与训练 step 的对应关系全靠它，缺了就无法按"哪版权重"分层。
@@ -2688,7 +2758,8 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="rlab 生成端独立运行（分进程模式）")
     ap.add_argument("--algo", required=True,
-                    choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool", "retool_math"))
+                    choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp",
+                             "retool", "retool_math", "search_qa"))
     ap.add_argument("--gen_device", type=int, default=0)
     ap.add_argument("--model_path", default=None)
     ap.add_argument("--port", type=int, default=59875)

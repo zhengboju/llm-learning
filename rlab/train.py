@@ -178,6 +178,18 @@ def run_signature(cfg: dict) -> str:
     olr_tag = f"-olr{_olr}" if _olr > 0 else ""
     once_tag = "-cs1" if cfg.get("code_shaping_once") else ""
     hint_tag = "-bh1" if (cfg.get("budget_hint") and _mtj > 0) else ""
+    # 【docs/16 Search-GRPO】工具身份进签名：换工具（code_interpreter→search）就是换
+    # 协议的另一半——同一份预算/提示下，模板声明、解析正则、执行器三处都变，生成序列
+    # 与任务分布完全不同。约定同 tp_tag：**缺省 code_interpreter 时一个字符都不加**
+    # （历史签名串逐字不变）。
+    _ntn = cfg.get("native_tool_name") or "code_interpreter"
+    toolname_tag = f"-tn{_ntn}" if _ntn != "code_interpreter" else ""
+    # 检索知识库身份进签名：索引不同 = 环境不同（同一 recipe 在不同语料上的通过率是
+    # 两个分布，与 difficulty 表的"模型×提示×预算×协议"同类）。只取 endpoint 的
+    # 短哈希——完整 URL 会把签名撑长且可能含主机名，但"换服务/换索引"必须可分辨。
+    _sep = cfg.get("search_endpoint")
+    search_tag = ("-se" + hashlib.sha1(str(_sep).encode("utf-8")).hexdigest()[:6]
+                  if _sep else "")
     # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
     # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
     # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
@@ -222,7 +234,7 @@ def run_signature(cfg: dict) -> str:
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
             f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}"
-            f"{once_tag}{hint_tag}{_opt_tag}")
+            f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -251,6 +263,12 @@ def write_run_info(path: str, cfg: dict) -> None:
             # ckpt 会被围栏档协议评（序列/终止结构完全不同 → 测的是另一个模型）。
             "tool_protocol": cfg.get("tool_protocol"),
             "native_tool_style": cfg.get("native_tool_style"),
+            # 【docs/16】工具名与检索服务身份落 run_info：eval 端要回读"该用哪个工具、
+            # 哪个知识库"才能同档评测（缺了它 search_qa 的 ckpt 会被 code 工具档评）。
+            "native_tool_name": cfg.get("native_tool_name"),
+            "native_tool_param": cfg.get("native_tool_param"),
+            "search_endpoint": cfg.get("search_endpoint"),
+            "search_top_k": cfg.get("search_top_k"),
             "native_stop_at_call": cfg.get("native_stop_at_call"),
             "trunc_shaping": cfg.get("trunc_shaping"),
             "overlong_shaping": cfg.get("overlong_shaping"),
@@ -302,7 +320,11 @@ _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      "gq",
                      # 【2026-09-29】prompt 上限（budget 第四件套）同属优化器段：
                      # 不登记则 CLI 改过它的 run 中途重启会被自己的护栏拦死。
-                     "mp")
+                     "mp",
+                     # 【docs/16 Search-GRPO】工具名（-tnsearch）与检索服务身份
+                     # （-se<hash6>）同属优化器段：不登记则 search_qa 的 run 崩溃后
+                     # 重启会被自己的护栏判成"换了配方"而拒跑（正在跑的 run 无法续跑）。
+                     "tn", "se")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -1106,6 +1128,26 @@ def main():
                          "（默认关 = 模型自然吐 im_end）。只在 base 冒烟看到"
                          "'调用后还继续瞎写'时才开（那是原生协议唯一的结构性"
                          "负奖励入口）")
+    # 【docs/16 Search-GRPO】检索服务（独立部署，训练机只持 endpoint）与检索参数。
+    # endpoint 是 search_qa 的**必需项**（config 里 fail-fast），且必须进签名——
+    # 换索引/换服务就是换环境（同一 recipe 在不同知识库上的通过率是两个分布，
+    # 与 difficulty 表的"模型×提示×预算×协议"同类）。
+    ap.add_argument("--search_endpoint", default=None,
+                    help="检索服务地址：http://<host>:<port>（独立部署，docs/16 §3）"
+                         "或 local:<索引路径>（pod 本地档）。search_qa 必填，"
+                         "训练启动时探活失败即拒训")
+    ap.add_argument("--search_top_k", type=int, default=None,
+                    help="每次检索返回的段落数（默认 3）")
+    ap.add_argument("--search_timeout", type=float, default=None,
+                    help="单次检索超时秒数（默认 10.0）：检索延迟直接进 rollout 墙钟")
+    ap.add_argument("--search_retries", type=int, default=None,
+                    help="网络类失败的限次重试（默认 1；'检索为空'不算失败，是合法结果）")
+    ap.add_argument("--search_auth_env", default=None,
+                    help="可选 bearer 鉴权的**环境变量名**（如 SEARCH_BEARER_TOKEN）"
+                         "——令牌本身只留在环境里，不进配置/落盘/日志")
+    ap.add_argument("--native_tool_name", default=None,
+                    help="原生工具名（默认 code_interpreter；search_qa 用 search）。"
+                         "驱动模板声明/解析/执行器三处，改错即三处错配")
     # 【2026-09-23 补 CLI 缺口·采样协议三件套】temperature/top_k/top_p 此前只能改
     # config.py preset —— 而 preset 偏离不进 run_signature 的优化器段（签名只对 CLI
     # 偏离追加字符），改源码的 run 会与旧 ckpt 撞同一个 out_dir（--num_pre_Q 4
@@ -1357,6 +1399,19 @@ def main():
         overrides["native_tool_style"] = args.native_tool_style
     if args.native_stop_at_call is not None:
         overrides["native_stop_at_call"] = args.native_stop_at_call
+    # 【docs/16】检索服务接线（在 get_config 之前落 override——endpoint 的 fail-fast
+    # 与预算校验都按最终 cfg 判）
+    if args.search_endpoint is not None:
+        overrides["search_endpoint"] = args.search_endpoint
+    if args.search_top_k is not None: overrides["search_top_k"] = args.search_top_k
+    if args.search_timeout is not None:
+        overrides["search_timeout"] = args.search_timeout
+    if args.search_retries is not None:
+        overrides["search_retries"] = args.search_retries
+    if args.search_auth_env is not None:
+        overrides["search_auth_env"] = args.search_auth_env
+    if args.native_tool_name is not None:
+        overrides["native_tool_name"] = args.native_tool_name
     if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
     # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
     if args.temperature is not None: overrides["temperature"] = args.temperature

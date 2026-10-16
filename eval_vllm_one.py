@@ -40,7 +40,7 @@ parser.add_argument("--split", default="test", choices=["test", "train"],
 parser.add_argument("--show", type=int, default=0, help="打印前N个原始回答")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/dapo/retool/retool_math 等；指定后自动决定 prompt/预算/奖励口径。未指定时由 --retool 推断")
-parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"], help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
+parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math", "search_qa"], help="评测数据集；None=自动（retool_math→dapo_math，search_qa→search_qa，其余→gsm8k）")
 # 【2026-09-12】per-item 落盘默认开：run2 评完只留聚合计数，导致 m200−BASE 的 +5.0pp
 # 无法做同题配对的 McNemar（未配对检验 p≈0.11、白丢功效），事后无法补救。
 parser.add_argument("--dump_items", action=argparse.BooleanOptionalAction, default=True,
@@ -75,6 +75,11 @@ parser.add_argument("--proto_from", default=None,
                     help="协议来源目录（含 run_info.json）；None=从 --model 自己的 run_info 回读。"
                          "供 BASE 等无 run_info 的裸模型复用『被测 checkpoint 的训练协议』，"
                          "保证 Δacc 同档（2026-09-17）。")
+# 【docs/16 Search-GRPO】检索服务地址：None=从 ckpt 的 run_info 回读 search_endpoint。
+# 评测与训练必须用**同一个知识库**（换索引 = 换环境，与 vk/sp 那两次口径漂移同类）。
+parser.add_argument("--search_endpoint", default=None,
+                    help="检索服务地址（http://host:port 或 local:<索引路径>）；"
+                         "None=回读 ckpt 的 run_info.search_endpoint。search_qa 必填")
 # 【2026-09-20 采样档可复现性】确定性档开关：默认 None=从 run_info 回读训练档
 # （采样评测不开则同权重重跑漂移 ~2pp，实测 BASE 63.1→61.1）。两个键必须成对，
 # 只开 batch_invariant 不给 backend 会在引擎构造时 RuntimeError（已 fail-fast 前拦）。
@@ -117,9 +122,13 @@ if args.algo is None:
 # 归一化：retool_math 必须带下划线
 if args.algo == "retool-math":
     args.algo = "retool_math"
-is_retool_family = args.algo in ("retool", "retool_math")
+is_retool_family = args.algo in ("retool", "retool_math", "search_qa")
 if args.eval_task is None:
-    args.eval_task = "dapo_math" if args.algo == "retool_math" else "gsm8k"
+    args.eval_task = ("dapo_math" if args.algo == "retool_math"
+                      else "search_qa" if args.algo == "search_qa" else "gsm8k")
+# 【docs/16】search_qa 的检索服务身份必须从 ckpt 回读/显式给出（同档评测）：
+# 换了知识库就不是同一个环境（与 gpu_mem/sp 那两次事故同类的口径漂移）。
+_SEARCH_EP = args.search_endpoint
 
 # ---- 预算/轮次自动对齐训练配置 ----
 from rlab.config import get_config as _get_config, BASE as _BASE_CFG
@@ -347,6 +356,15 @@ elif args.eval_task == "dapo_math":
         print(f"  [eval][警告] 训练 run_info 无 difficulty_path → "
               f"{args.split} split 按全量池抽（含 p≈0 题，效果被稀释）")
     print(f"  dapo_math [{args.split}]: {len(test_data)} 题")
+elif args.eval_task == "search_qa":
+    # 【docs/16】held-out = dev.jsonl（prepare_search_qa 产物）。**绝不回落训练池**
+    # ——同池污染是本项目已发生两次的事故（2026-09-09 / 09-16），dev 缺失就是错。
+    from rlab.search_qa import load_search_qa_dev, load_search_qa_train
+    if args.split == "test":
+        test_data = load_search_qa_dev()
+    else:
+        test_data = load_search_qa_train()
+    print(f"  search_qa [{args.split}]: {len(test_data)} 题")
 else:
     raise ValueError(f"未知 eval_task {args.eval_task}")
 
@@ -377,7 +395,18 @@ print(f"  chat_template_kwargs={_ctkw}（经训练端 build_prompt 单点同源�
 # 【2026-09-25 原生协议】tools 声明必须与训练同档：原生档 prompt 里多一段工具
 # 声明，围栏档没有。用错档 = 测另一个协议的另一个模型（本文件已两次同类事故）。
 _native = _tool_protocol != "fence"
-_tools_flag = bool(_native)
+# 【docs/16】评测用的工具声明必须与训练同源：search_qa 的 ckpt 用 search 工具训练，
+# 若 eval 仍声明 code_interpreter，则"工具声明段不同 → prompt 不同源 → 模型看到的是
+# 另一个工具"，测出来的是另一个模型（本文件已有两次同类口径事故）。
+_native_tool = None
+if _native:
+    from rlab.protocol import native_tool as _native_tool_fn
+    _native_tool = _native_tool_fn(_rcfg.get("native_tool_name") or "code_interpreter")
+    if args.eval_task == "search_qa" and _native_tool.name != "search":
+        raise SystemExit(
+            f"[eval] eval_task=search_qa 但 ckpt 的工具名是 {_native_tool.name!r}"
+            "——训练的检索 ckpt 必须用 search 工具声明评（docs/16）。")
+_tools_flag = [_native_tool.declaration] if _native else False
 prompts = [_build_prompt(item["Q"], system_prompt, tokenizer, _ctkw, tools=_tools_flag)
            for item in sample]
 # 原生档的多轮 messages（与 prompt 渲染同源；协议分支要它，围栏档不需要）
@@ -415,7 +444,7 @@ _gen_budget = (_mtj_eval + 512 if (is_retool_family and _mtj_eval > 0)
 # 的探针结论）。所以原生档按 ids 量长度，围栏档保持历史文本口径逐字不变。
 if _native:
     from rlab.rollout import build_prompt_ids as _bpids
-    _plens = [len(_bpids(m, tokenizer, _ctkw, tools=True)) for m in _prompt_msgs]
+    _plens = [len(_bpids(m, tokenizer, _ctkw, tools=_tools_flag)) for m in _prompt_msgs]
 else:
     _plens = [len(tokenizer(_p, add_special_tokens=False)["input_ids"]) for _p in prompts]
 _kept, _dropped_long, _dropped_plen = [], 0, 0
@@ -587,6 +616,28 @@ llm = LLM(model=_model_for_vllm, gpu_memory_utilization=args.gpu_mem,
           max_model_len=args.max_len, dtype="bfloat16", **_vllm_kwargs)
 
 code_used = code_ok = None
+# 【docs/16 Search-GRPO】评测的检索执行器：与训练**同一个**客户端（同 endpoint、
+# 同 top_k、同超时），启动探活 fail-fast——服务不通时若静默当成"检索为空"，评估
+# 出来的就是"模型不会答题"而不是"服务没起来"（本文件最忌讳的静默口径漂移）。
+_eval_search_runner = None
+if args.eval_task == "search_qa":
+    from rlab.search_client import make_search_runner as _mk_sr
+    _ep = _SEARCH_EP or _rcfg.get("search_endpoint")
+    if not _ep:
+        raise SystemExit(
+            "[eval] eval_task=search_qa 需要检索服务：ckpt 的 run_info 里没有 "
+            "search_endpoint，请显式传 --search_endpoint http://<host>:<port>"
+            "（或 local:<索引路径>）")
+    _eval_search_runner = _mk_sr({
+        "search_endpoint": _ep,
+        "search_top_k": _rcfg.get("search_top_k", 3),
+        "search_timeout": _rcfg.get("search_timeout", 10.0),
+        "search_retries": _rcfg.get("search_retries", 1),
+        "search_auth_env": _rcfg.get("search_auth_env"),
+    })
+    _h = _eval_search_runner.check_health()
+    print(f"  [eval] 检索服务已探活: {_ep}｜corpus_id={_h['corpus_id'][:12]}…"
+          f"｜文档 {_h['documents']}｜top_k={_rcfg.get('search_top_k', 3)}")
 # 【2026-09-18 采样评测】--val_n>1 时每题采样 val_n 条（Average@N，参考项目口径）。
 # greedy（val_n=1）保持历史行为逐位不变：retool 家族贪心（temp=0）→ 多轮生成；
 # 非 retool 贪心 → 单轮生成。采样档（val_n>1）：
@@ -650,6 +701,10 @@ if is_retool_family:
               # 靠它选分支（缺键 = "fence" = 历史行为），不能靠"调用点记得传"。
               "tool_protocol": _tool_protocol,
               "native_tool_style": _rcfg.get("native_tool_style") or "auto",
+              # 【docs/16】工具名/参数名同源回读：驱动解析与渲染（缺它 → 用 code 档
+              # 去解析 search 调用 → 全 invalid → 全题零分，而日志只看到 acc 平坦）。
+              "native_tool_name": _rcfg.get("native_tool_name") or "code_interpreter",
+              "native_tool_param": _rcfg.get("native_tool_param") or "code",
               "native_stop_at_call": bool(_rcfg.get("native_stop_at_call")),
               "max_context_tokens": _rcfg.get("max_context_tokens", 8192),
               "chat_template_kwargs": _ctkw,
@@ -683,11 +738,18 @@ if is_retool_family:
     else:
         _probe_msgs = None
     _segs, _full, code_stats = multi_turn_rollout_group(
-        llm, sp_mt, tokenizer, _probe_prompts, mt_cfg, prompts_messages=_probe_msgs)
+        llm, sp_mt, tokenizer, _probe_prompts, mt_cfg, prompts_messages=_probe_msgs,
+        code_runner=_eval_search_runner)
     answers = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                for segs_i in _segs]
     # 打分域：retool_math 剥离代码块（与训练端 total_reward_retool_math 同口径）
-    answers = [_strip_code_blocks(a) for a in answers]
+    # 【docs/16】search_qa 剥调用块（与 search_qa._final_answer_text 同口径——载荷里
+    # 的 boxed 是脚手架，不得当答案）。
+    if args.eval_task == "search_qa":
+        from rlab.search_qa import _final_answer_text as _strip_calls
+        answers = [_strip_calls(a) for a in answers]
+    else:
+        answers = [_strip_code_blocks(a) for a in answers]
     code_used = [s["code_used"] for s in code_stats]
     code_ok = [s["code_ok"] for s in code_stats]
     # 【2026-10-01 效率口径落盘】平均 token / 平均工具轮数此前**一个都没进 eval json**
@@ -754,6 +816,14 @@ for i, item in enumerate(sample):
                 gt = item["A"].split("####")[-1].strip()
                 a = reward_correct_gsm8k(ans, gt)
                 f = reward_format_gsm8k(ans)
+            elif args.eval_task == "search_qa":
+                # 【docs/16】与训练端 total_reward_search_qa 同口径：多别名取最大 EM
+                # （±1 域）；fmt = 是否给出 \boxed{} 收尾。**绝不用 dapo 的数学口径**
+                # 评 QA（math_verify 会把 "Shakespeare" 判成无答案 → 全错）。
+                from rlab.search_qa import evaluate_search_answer as _eval_qa
+                _m = _eval_qa(item.get("aliases") or [item["A"]], ans)
+                a = 2.0 * _m["em"] - 1.0
+                f = 2.0 * _m["format"] - 1.0
             else:
                 gt = str(item["A"]).strip()
                 a = reward_correct_boxed_eval(ans, gt)

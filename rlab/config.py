@@ -141,6 +141,47 @@ ALGO_DEFAULTS = {
                         # 证明是协议问题非权重）。训练 CLI --chat_template_kwargs
                         # 仍可覆盖；GSM8K 家族（Qwen2.5）模板忽略该上下文键。
                         chat_template_kwargs={"enable_thinking": False}),
+    # =====================================================================
+    # 【docs/16 Search-GRPO】多轮检索推理（agentic RL）
+    # =====================================================================
+    # 与 retool_math 同族（loss/adv/rollout 机制全同，见 losses.compute_loss 的
+    # search_qa 分支与 ALGO_DEFAULTS 注释）：差异全在 **工具** 与 **任务/打分**：
+    #   · 工具 = search（原生声明，docs/16 §3），执行器是独立 HTTP 检索服务；
+    #   · 任务 = NQ/HotpotQA 式事实问答，奖励 = EM（±1），outcome-only。
+    # 预算档（docs/16 §3）：检索回包比沙箱 stdout 长得多，tool_result_max_chars
+    # 抬到 1500（3 段 × ~500 字符）；轮数给到 8（多跳题需要多次改写查询），单轮
+    # 512（查询与短答都很短，长预算只会被"写散文"烧掉）。
+    # 预算自洽（validate_retool_budget 强制）：
+    #     max_rounds(8) × round_gen_tokens(512) + max_prompt_length(1024) + 预留
+    #     = 4096 + 1024 + 7×766 = 10482 ≤ max_context_tokens(14336) ✅
+    "search_qa": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
+                      loss_norm="sample_mean", data_task="search_qa",
+                      num_pre_Q=8, train_micro_batch_size_per_gpu=8,
+                      temperature=1.0, top_k=-1,
+                      gen_questions_per_attempt=4, sandbox_workers=8,
+                      # 原生工具协议 + search 工具（名字驱动声明/解析/执行器三处）
+                      tool_protocol="native",
+                      native_tool_name="search", native_tool_param="query",
+                      # 预算四件套
+                      max_context_tokens=14336, round_gen_tokens=512,
+                      max_rounds=8, max_prompt_length=1024, max_gen_tokens=8192,
+                      # 检索回包预算：3 段 × ~500 字符（估算见 validate_retool_budget
+                      # 的 //2+16 折算），抬到 1500 让整段摘要进上下文
+                      tool_result_max_chars=1500,
+                      retool_stop=False,      # 原生档自然停在 im_end
+                      # 长度控制与 retool_math 同档（outcome-only + overlong filter）
+                      overlong_shaping=True, overlong_buffer=256,
+                      trunc_shaping=0.0, overlong_filter=True,
+                      # outcome-only：不给检索次数/成功率的 shaping（先看基线涌现，
+                      # docs/16 §3 R0 档；R1~R3 是后续单变量实验，不预置）
+                      code_w=0.0, code_attempt_w=0.0, len_penalty_w=0.0,
+                      tool_call_cost=0.0, tool_waste_penalty=0.0,
+                      trunc_tail_penalty=0.0,
+                      reward_switch_step=1000000000,
+                      # eval：held-out dev（NQ dev / HotpotQA dev）由
+                      # prepare_search_qa 落盘，eval_vllm_one 按 search_qa 打分
+                      eval_during_training=False,
+                      chat_template_kwargs={"enable_thinking": False}),
 }
 
 BASE = dict(
@@ -507,6 +548,22 @@ BASE = dict(
     # 那种样本 parse 判 invalid → 无 boxed → reward -1，是原生协议唯一的结构性
     # 负奖励入口（docs/09 §0.1 症状③ 的对应形态）。
     native_stop_at_call=False,
+    # 【docs/16 Search-GRPO】原生工具名/参数名：native 档渲染与解析都按它走。
+    # 缺省 code_interpreter/code = 历史路径逐字不变；search_qa preset 改成
+    # search/query（声明在 protocol.SEARCH_TOOL）。未知名字由 protocol.native_tool
+    # fail-fast（静默回落 = 渲染代码工具却接检索执行器，最贵的一类空转）。
+    native_tool_name="code_interpreter",
+    native_tool_param="code",
+    # ---- 检索服务（docs/16 §3：独立部署在训练机之外，训练侧只持 endpoint）----
+    # HTTP URL（"http://host:port"）或 "local:<index_path>"（pod 本地档，省网络往返）。
+    # 训练前必须探活：不通直接拒训，绝不让基础设施故障伪装成"模型全错"。
+    search_endpoint=None,
+    search_top_k=3,          # 每次检索返回的段落数
+    search_timeout=10.0,     # 单次检索超时（秒）；检索延迟直接进 rollout 墙钟
+    search_retries=1,        # 网络类失败的限次重试（不含"检索为空"——那是合法结果）
+    # 可选 bearer 鉴权：**存环境变量名**而不是令牌本身（密钥绝不进配置/落盘/日志）。
+    # None = 不鉴权（内网独立部署的常见形态）。
+    search_auth_env=None,
     # 【2026-09-08 代码灭绝教训】280 太紧：代码块约占 80-150 token，写代码的样本
     # 极易在轮内写不完围栏 → 完整块检测不到 → 残缺结尾 → fmt=-1 且无答案——
     # "写代码"被结构性惩罚、几步内灭绝（真机两轮 code_rate=0 的根因）。
@@ -603,6 +660,33 @@ _RETOOL_MATH_SYSTEM_NATIVE = (
 )
 system_prompt_retool_math_native = _RETOOL_MATH_SYSTEM_NATIVE
 
+# 【docs/16 Search-GRPO】检索问答的原生提示。与 math 版同一套原则：**不讲协议格式**
+# （工具声明由 chat template 的 tools 段提供），只讲"什么时候用、怎么用、怎么收尾"。
+# 零标签字面量：本串不含任何尖括号标签字节。
+_SEARCH_QA_SYSTEM_NATIVE = (
+    "You answer fact-seeking questions with help from a Wikipedia search tool.\n"
+    "Use the search tool whenever the answer depends on a fact you are not certain "
+    "about (people, dates, places, numbers, titles). Write a short keyword query — "
+    "entity names work better than full sentences.\n\n"
+    "How to use the search tool:\n"
+    "- Call it with a `query` string. Call it at most once per assistant turn, then "
+    "wait for the passages.\n"
+    "- Each call returns a few passages formatted as `[n] title: text`. They may be "
+    "irrelevant or incomplete: check whether they actually support an answer, and "
+    "rephrase the query if not.\n"
+    "- Calls are independent: nothing is remembered between calls, so repeat any "
+    "context you still need.\n"
+    "- If two passages conflict, prefer the more specific one and say so in your "
+    "reasoning.\n\n"
+    "Answer with the shortest exact answer you can support (a name, a date, a "
+    "number — not a sentence). When you have it, end with exactly one line in this "
+    "format:\n"
+    "\\boxed{<your final answer>}\n"
+    "Do not call the tool and give the final answer in the same turn."
+)
+system_prompt_search_qa_native = _SEARCH_QA_SYSTEM_NATIVE
+
+
 # 原生协议的预算档（docs/09 §5.1 档 A，实跑 validate_retool_budget 核对）：
 #   max_rounds(5) × round_gen_tokens(1024) + max_prompt_length(1024) + 预留(798) = 7208 ≤ 8192 ✅
 # 依据：参考实现 max_code_calls=4 / max_assistant_turns=6 / 单回合 1024 / 轨迹 ≤8192。
@@ -672,6 +756,9 @@ def default_system_prompt(algo: str, tool_protocol: str = "fence") -> str:
     if algo == "retool_math":
         return (system_prompt_retool_math_native if tool_protocol == "native"
                 else system_prompt_retool_math)
+    # 【docs/16】search_qa 只有原生档（检索工具必须由模板的 tools 段声明）
+    if algo == "search_qa":
+        return system_prompt_search_qa_native
     if algo == "retool":
         return system_prompt_retool
     return BASE["system_prompt"]
@@ -719,7 +806,8 @@ def validate_retool_budget(cfg: dict) -> int:
     工具段预留：每轮工具输出 ≤ tool_result_max_chars 字符，按最坏 2 字符/token
     （ASCII 密集 token 的保守下界）折算，加 TOOL_START/END 标记开销。
     """
-    if not cfg.get("algo", "").startswith("retool"):
+    if not (cfg.get("algo", "").startswith("retool")
+            or cfg.get("algo") == "search_qa"):
         return 0
     rounds = int(cfg.get("max_rounds", 1) or 1)
     per_round = int(cfg.get("round_gen_tokens", 0) or 0)
@@ -859,17 +947,22 @@ def get_config(algo: str, **overrides) -> dict:
     # （multi_turn_rollout_group / collect_retool_group）才是它的消费点，单轮路径
     # 从不读它。在 grpo/dapo 上传 native = 用户以为开了原生工具协议、实际什么都没
     # 发生（本项目最贵的一类 bug：成功的表象由空动作伪造）。当场拦下。
-    if cfg.get("tool_protocol") == "native" and not algo.startswith("retool"):
+    # 【docs/16】search_qa 是同样走多轮路径的第三个消费者，故一并放行。
+    if cfg.get("tool_protocol") == "native" and not algo.startswith("retool") \
+            and algo != "search_qa":
         raise ValueError(
-            f"[config] tool_protocol='native' 只对 retool 家族有效，当前 algo="
-            f"{algo!r} 走单轮路径（从不读该键）→ 传了等于没传。\n"
-            f"  要跑原生工具协议：--algo retool_math（或 retool）。")
+            f"[config] tool_protocol='native' 只对 retool 家族有效（search_qa 亦可），"
+            f"当前 algo={algo!r} 走单轮路径（从不读该键）→ 传了等于没传。\n"
+            f"  要跑原生工具协议：--algo retool_math（或 retool / search_qa）。")
     for _key in ("tool_call_cost", "tool_waste_penalty", "trunc_tail_penalty",
                  "len_eff_penalty_w"):
         if float(cfg.get(_key, 0.0) or 0.0) < 0.0:
             raise ValueError(f"[config] {_key} 必须 >= 0，收到 {cfg.get(_key)!r}")
     # 原生协议预算档（docs/09 §5.1 档 A）。显式 override 优先（CLI 单变量微调位）。
-    if cfg.get("tool_protocol") == "native":
+    # 【docs/16 例外】search_qa 自带一套检索档预算（8×512/14336，回包更长、轮数更多），
+    # 不能被这套为 code 工具调的默认值静默覆盖——那正是本项目最忌讳的"preset 被默认
+    # 档悄悄改掉"（改完表现为预算不自洽 fail-fast，或更糟：能跑但预算口径不是你要的）。
+    if cfg.get("tool_protocol") == "native" and algo != "search_qa":
         for _k, _v in NATIVE_PROTOCOL_DEFAULTS.items():
             if _k not in overrides:
                 cfg[_k] = _v
@@ -877,6 +970,8 @@ def get_config(algo: str, **overrides) -> dict:
     if algo == "retool" and "system_prompt" not in overrides:
         cfg["system_prompt"] = system_prompt_retool
     if algo == "retool_math" and "system_prompt" not in overrides:
+        cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
+    if algo == "search_qa" and "system_prompt" not in overrides:
         cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
     # 预算档系统提示段（preset 与 --system_prompt_file 自定义提示都吃）：必须发生在
     # override 合并之后，且幂等（marker 判重），详见 inject_budget_prompt docstring。
@@ -925,6 +1020,28 @@ def get_config(algo: str, **overrides) -> dict:
     # 【2026-09-29 prompt 上限校验·防采样空转】见 validate_max_prompt_length 的
     # 事故说明（0/负数 → 每题都跳组 → 训练端零产出空转）。
     validate_max_prompt_length(cfg)
+    # 【docs/16】search_qa 的检索服务必须显式给出 endpoint（fail-fast 在启动期）：
+    # 缺它就等于每条轨迹都执行失败 → 全题无答案 → 训练"跑得动但学不到"，而日志里
+    # 看不到任何异常（只表现为 acc 平坦 = 本项目认定的系统性 bug 签名）。
+    if cfg.get("algo") == "search_qa":
+        _ep = cfg.get("search_endpoint")
+        if not (isinstance(_ep, str) and _ep.strip()):
+            raise ValueError(
+                "[config] search_qa 必须指定检索服务 endpoint（--search_endpoint）。\n"
+                "  形态：http://<host>:<port>（独立部署，docs/16 §3）或 local:<索引路径>。\n"
+                "  启动索引：python -m rlab.search_server build-index <corpus.jsonl> "
+                "<index.sqlite>，再 python -m rlab.search_server serve <index.sqlite> "
+                "--host 0.0.0.0 --port 8000")
+        if cfg.get("tool_protocol") != "native":
+            raise ValueError(
+                "[config] search_qa 只支持 tool_protocol='native'"
+                f"（检索工具必须由 chat template 的 tools 段声明），当前 "
+                f"{cfg.get('tool_protocol')!r}。")
+        _tn = cfg.get("native_tool_name")
+        if _tn != "search":
+            raise ValueError(
+                f"[config] search_qa 的 native_tool_name 必须是 'search'，当前 {_tn!r}"
+                "（该键驱动模板声明/解析/执行器三处，改错即三处错配）。")
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
     # 【2026-09-18 H2 护栏】vllm_gen_logps 档位：N=0 是 docs/07 实锤的坏路径

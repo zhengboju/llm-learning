@@ -32,6 +32,12 @@ def load_qas(task: str = "gsm8k", fixture: bool = False):
         return load_gsm8k_train()
     if task in ("dapo_math", "dapo-math-17k", "math_dapo"):
         return load_dapo_math_train()
+    # 【docs/16 Search-GRPO】QA 池走 search_qa 模块（带 aliases，EM/F1 打分用）。
+    # 注意：search_qa 的行**多一个 aliases 键**（打分取最大别名），与上面两族的
+    # {Q,A} 契约并存——require_qa_rows 的 Q/A 铁律仍然成立。
+    if task == "search_qa":
+        from rlab.search_qa import load_search_qa_train
+        return load_search_qa_train()
     raise KeyError(f"未知任务 {task!r}（阶段2/3 扩展 retool/search 任务时在此注册）")
 
 
@@ -459,9 +465,13 @@ def load_difficulty_table(path: str, expected_meta: dict = None,
                     # 【2026-10-15 doc15 P1】新增 nsc/model_path：调用边界硬停改变
                     # 终止结构（旧探针没这个 CLI，表与训练可能不同档）；basename 的
                     # model 撞名无法分辨跨 run 的 epoch1。旧表无键 → None → 跳过。
+                    # 【docs/16 Search-GRPO】新增 native_tool_name/data_task：换工具
+                    # （code→search）就是换任务，同模型同提示下通过率是两个分布；
+                    # 旧表无这两个键 → None → 跳过（旧表兼容）。
                     for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
                                 "tool_protocol", "max_traj_tokens", "answer_reserve",
-                                "max_prompt_length", "nsc", "model_path"):
+                                "max_prompt_length", "nsc", "model_path",
+                                "native_tool_name", "data_task"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

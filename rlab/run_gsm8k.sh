@@ -10,6 +10,10 @@
 # 示例:
 #   bash rlab/run_gsm8k.sh dapo /root/Qwen2.5-3B
 #   bash rlab/run_gsm8k.sh rfpp /root/Qwen2.5-3B        # 自动切 ref_server --mode rfpp
+#   bash rlab/run_gsm8k.sh search_qa /root/Qwen3.5-4B --search_endpoint http://10.0.0.9:8000
+#     （Search-GRPO：检索服务**独立部署**在训练机之外，本脚本不启动它；
+#      先 python -m rlab.search_server build-index corpus.jsonl index.sqlite
+#      再 python -m rlab.search_server serve index.sqlite --host 0.0.0.0 --port 8000）
 # 卡位可用环境变量覆盖: REF_GPU=0 TRAIN_GPU=1 bash rlab/run_gsm8k.sh ...
 set -e
 ALGO=${1:?用法: run_gsm8k.sh <algo> [model_path] [train.py 参数...]}
@@ -22,7 +26,7 @@ shift; shift || true
 #   撞 429（重试 213s）→ 120s /health 超时 → 报"ref_server 没起来"，真因被藏两层。
 #   合约是位置参数，这里当场拦，不留 120s 的假诊断。
 case "$ALGO" in
-  -*) echo "[run] 致命错误: 第 1 个参数必须是算法名（grpo/dapo/cispo/gspo/rfpp/retool/retool_math），"
+  -*) echo "[run] 致命错误: 第 1 个参数必须是算法名（grpo/dapo/cispo/gspo/rfpp/retool/retool_math/search_qa），"
       echo "[run]   收到 '$ALGO' —— 看起来把 train.py 的 flag 传成位置参数了。"
       echo "[run]   用法: bash $0 <algo> [model_path] [train.py 参数...]"
       echo "[run]   例:   bash $0 retool_math rlab_out/sft_budget_v3/epoch1 --max_traj_tokens 12288 …"

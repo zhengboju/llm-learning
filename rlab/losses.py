@@ -214,7 +214,7 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
 
     norm = cfg.get("loss_norm", "sample_mean")
 
-    if algo in ("grpo", "retool", "dapo", "rfpp"):
+    if algo in ("grpo", "retool", "dapo", "rfpp", "search_qa"):
         per_token_loss = -(pg_term - kl_term)
         if norm == "sample_mean":       # GRPO/retool：样本级（每条样本 token 平均后再 batch 平均）
             per_sample = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1).clamp(min=1))
@@ -283,4 +283,5 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
     return _finalize(loss, None, ratio, mask, lo=lo, hi=hi)
 
 
-ALGOS = ("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool", "retool_math")
+ALGOS = ("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool",
+         "retool_math", "search_qa")

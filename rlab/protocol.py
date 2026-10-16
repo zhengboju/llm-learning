@@ -134,6 +134,92 @@ _TOOL_OPEN, _TOOL_CLOSE = _RE_TOOL_CALL_ANY.pattern.split(".*?")
 # 字面量**从正则派生**（零标签字面量铁律：全模块只此一处真源）。
 NATIVE_CALL_STOP = _TOOL_CLOSE
 
+# =====================================================================
+# 多工具泛化（Search-GRPO，docs/16）：解析/声明/回包按 (工具名, 参数名) 参数化
+# =====================================================================
+# function 形态的正则骨架**从上面已有的 code_interpreter 正则拆出来**，不手写第二份
+# 标签字面量（零标签字面量铁律：全模块只此一处真源）。拆法：先按工具名切两段，
+# 剩余段里 `code`（参数名）恰好出现一次；任何一步切不成 2 段都是上游正则改了形状，
+# 当场 ValueError（import 即炸），而不是静默产出错位的正则。
+_FN_PRE, _FN_REST = _RE_TOOL_CALL_FUNCTION.pattern.split(TOOL_NAME)
+_FN_MID, _FN_POST = _FN_REST.split("code")
+
+SEARCH_TOOL_NAME = "search"
+SEARCH_PARAM = "query"
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": SEARCH_TOOL_NAME,
+        "description": (
+            "Search a Wikipedia knowledge base and return the most relevant passages.\n"
+            "- Use it to look up facts you are not sure about before answering\n"
+            "- Write a short, specific keyword query (entity names work best)\n"
+            "- Each call is independent; results are not remembered between calls\n"
+            "- Returns up to a few passages, each as `[n] title: text`; may return "
+            "nothing relevant, in which case rephrase the query"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                SEARCH_PARAM: {
+                    "type": "string",
+                    "description": "The search query.",
+                }
+            },
+            "required": [SEARCH_PARAM],
+        },
+    },
+}
+
+
+@dataclass(frozen=True)
+class NativeTool:
+    """一个原生工具 = 名字 + 唯一字符串参数名 + 渲染进模板的声明。"""
+
+    name: str
+    param: str
+    declaration: dict
+
+
+NATIVE_TOOLS = {
+    TOOL_NAME: NativeTool(TOOL_NAME, "code", CODE_TOOL),
+    SEARCH_TOOL_NAME: NativeTool(SEARCH_TOOL_NAME, SEARCH_PARAM, SEARCH_TOOL),
+}
+
+
+def native_tool(name: str) -> NativeTool:
+    """按工具名取 NativeTool；未知名 fail-fast（静默回落到 code_interpreter 会让
+    "配了 search 却在渲染代码工具"这类错配变成没有任何报错的空转）。"""
+    try:
+        return NATIVE_TOOLS[name]
+    except KeyError:
+        raise KeyError(f"未知原生工具 {name!r}，可选 {sorted(NATIVE_TOOLS)}") from None
+
+
+def resolve_tool_decls(tools):
+    """tools 形参归一：True→[CODE_TOOL]（历史默认）；声明列表→原样；假值→None。"""
+    if tools is True:
+        return [CODE_TOOL]
+    if not tools:
+        return None
+    return list(tools)
+
+
+_FN_RE_CACHE = {}
+
+
+def _function_call_re(tool_name: str, param: str):
+    """function 形态的调用正则（按 (工具名, 参数名) 缓存）。
+    默认 (code_interpreter, code) 的结果与 `_RE_TOOL_CALL_FUNCTION` 逐字相同
+    （tests 锁死），故旧路径零行为变化。"""
+    key = (tool_name, param)
+    rx = _FN_RE_CACHE.get(key)
+    if rx is None:
+        rx = re.compile(_FN_PRE + re.escape(tool_name) + _FN_MID + re.escape(param)
+                        + _FN_POST, re.DOTALL)
+        _FN_RE_CACHE[key] = rx
+    return rx
+
 # 【2026-09-28 假 </think> 禁言·事故 C 根因修复】原生协议采样端必须禁掉的 token。
 # 形态（真机 abort，长度 2301 vs 2303，分歧位 863）：
 #   enable_thinking=False 档的生成提示以**预填的空 think 段**（<think>\n\n</think>\n\n）
@@ -240,18 +326,19 @@ class ParsedAssistant:
     style: str | None = None
 
 
-def _code_from_json_call(blob: str):
-    """Qwen2.5 JSON 形态：{"name": ..., "arguments": {"code": ...}} → code。
+def _code_from_json_call(blob: str, tool_name: str = TOOL_NAME, param: str = "code"):
+    """Qwen2.5 JSON 形态：{"name": ..., "arguments": {param: ...}} → 载荷字符串。
 
     arguments 在模板里既可能是 dict、也可能是 JSON 字符串（自造消息进模板时
-    常见），两种都吃；name 不匹配 / 没有 code / JSON 坏 → None（=调用非法）。"""
+    常见），两种都吃；name 不匹配 / 没有 param / JSON 坏 → None（=调用非法）。
+    默认 (code_interpreter, code) 即历史行为。"""
     try:
         obj = json.loads(blob)
     except (ValueError, TypeError):
         return None
     if not isinstance(obj, Mapping):
         return None
-    if str(obj.get("name") or obj.get("function") or "") != TOOL_NAME:
+    if str(obj.get("name") or obj.get("function") or "") != tool_name:
         return None
     args = obj.get("arguments")
     if isinstance(args, str):
@@ -261,11 +348,11 @@ def _code_from_json_call(blob: str):
             return None
     if not isinstance(args, Mapping):
         return None
-    code = args.get("code")
+    code = args.get(param)
     return code if isinstance(code, str) else None
 
 
-def _find_call(text: str, style: str):
+def _find_call(text: str, style: str, tool_name: str = TOOL_NAME, param: str = "code"):
     """按指定形态找**唯一**一个完整调用，返回 (start, end, code)；不合法 → None。
 
     【合法性判据是**形态无关**的，分两层】
@@ -281,7 +368,7 @@ def _find_call(text: str, style: str):
         return None                      # 多层结构非法：与风格无关
     b0, b1 = blocks[0].start(), blocks[0].end()
     if style == NATIVE_STYLE_FUNCTION:
-        ms = list(_RE_TOOL_CALL_FUNCTION.finditer(text))
+        ms = list(_function_call_re(tool_name, param).finditer(text))
         if len(ms) != 1:
             return None
         code = ms[0].group(1).strip()
@@ -290,13 +377,14 @@ def _find_call(text: str, style: str):
         ms = list(_RE_TOOL_CALL_JSON.finditer(text))
         if len(ms) != 1:
             return None
-        code = _code_from_json_call(ms[0].group(1))
+        code = _code_from_json_call(ms[0].group(1), tool_name, param)
         code = code.strip() if isinstance(code, str) else ""
         return (b0, b1, code) if code else None
     raise KeyError(f"未知 tools 形态 {style!r}，可选 {NATIVE_STYLES}")
 
 
-def parse_assistant(text: str, style: str = "auto") -> ParsedAssistant:
+def parse_assistant(text: str, style: str = "auto", tool_name: str = TOOL_NAME,
+                    param: str = "code") -> ParsedAssistant:
     """把 assistant 文本识别成代码调用 / 最终回答 / 非法输出。
 
     style: "auto"（逐形态试，先 function 后 json）或 NATIVE_STYLES 之一。
@@ -311,7 +399,7 @@ def parse_assistant(text: str, style: str = "auto") -> ParsedAssistant:
     text = text or ""
     styles = NATIVE_STYLES if style == "auto" else (style,)
     for st in styles:
-        hit = _find_call(text, st)
+        hit = _find_call(text, st, tool_name, param)
         if hit is not None:
             return ParsedAssistant(kind="tool", content=text[:hit[0]].strip(),
                                    code=hit[2], style=st)
@@ -320,7 +408,8 @@ def parse_assistant(text: str, style: str = "auto") -> ParsedAssistant:
         content=text.strip(), style=None)
 
 
-def derive_tool_style(rendered: str) -> str:
+def derive_tool_style(rendered: str, tool_name: str = TOOL_NAME,
+                      param: str = "code") -> str:
     """从**实测渲染结果**派生该用哪种解析形态（docs/09 §1.2 的 Q2）。
 
     输入 = 模板渲染出的、含一次 code_interpreter 调用的文本（见
@@ -328,29 +417,31 @@ def derive_tool_style(rendered: str) -> str:
     "解析器与模板不同源"这一整类 bug 重新长回来（本项目被标签管道改写坑过三次）。
     """
     for st in NATIVE_STYLES:
-        if _find_call(rendered, st) is not None:
+        if _find_call(rendered, st, tool_name, param) is not None:
             return st
     raise ValueError(
-        "[protocol] 实测渲染里找不到可解析的 code_interpreter 调用——"
+        f"[protocol] 实测渲染里找不到可解析的 {tool_name} 调用——"
         f"两种形态都试过（{NATIVE_STYLES}）。\n"
         f"  渲染片段（前 800 字符）：{rendered[:800]!r}\n"
         f"  处置：看 Q2 的实际形态，把新形态加进 NATIVE_STYLES/_find_call"
         f"（不要改现有正则去凑）。")
 
 
-def tool_message(call_id: str, content: str) -> dict:
+def tool_message(call_id: str, content: str, name: str = TOOL_NAME) -> dict:
     """构造一条结构化工具结果消息（role:"tool"，与参考实现同构）。
 
     content 必须已经 sanitize_tool_text 消毒（沙箱 stdout 是模型经 print
     间接可控的通道——注入面不因协议从围栏换成原生而消失，消毒点不变）。"""
     return {"role": "tool", "tool_call_id": str(call_id),
-            "name": TOOL_NAME, "content": content}
+            "name": name, "content": content}
 
 
-def make_call_id(question_index: int, group_index: int, call_no: int) -> str:
+def make_call_id(question_index: int, group_index: int, call_no: int,
+                 prefix: str = "code") -> str:
     """调用 id（参考实现同构）。唯一性由 (题, 组内轨迹, 第几次) 三元组保证——
-    回包按 id 归属，错位会让 observation 落到别的轨迹上下文里。"""
-    return f"code-{int(question_index)}-{int(group_index)}-{int(call_no)}"
+    回包按 id 归属，错位会让 observation 落到别的轨迹上下文里。
+    prefix 仅区分工具（默认 code，历史 id 逐字不变）。"""
+    return f"{prefix}-{int(question_index)}-{int(group_index)}-{int(call_no)}"
 
 
 def initial_messages(system_prompt: str, question: str) -> list:
@@ -367,9 +458,10 @@ def render_chat_ids(tokenizer, messages: list, add_generation_prompt: bool,
     不同 transformers 版本返回 list / tensor / {"input_ids": ...} / 嵌套，
     统一收口在这里（参考实现的 _render_chat 同款）。"""
     kw = dict(chat_template_kwargs or {})
+    _decls = resolve_tool_decls(tools)
     rendered = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=add_generation_prompt,
-        **({"tools": [CODE_TOOL]} if tools else {}), **kw)
+        **({"tools": _decls} if _decls else {}), **kw)
     if isinstance(rendered, Mapping):
         rendered = rendered["input_ids"]
     if hasattr(rendered, "tolist"):
@@ -515,7 +607,8 @@ class PromptMismatchError(ValueError):
 def build_next_prompt(tokenizer, messages_before_assistant: list,
                       previous_prompt_tokens: list, completion_tokens: list,
                       next_tool_message: dict,
-                      chat_template_kwargs: dict | None = None) -> list:
+                      chat_template_kwargs: dict | None = None,
+                      tools=True) -> list:
     """token-in token-out 续写序列（docs/09 §3，本方案最易错处）。
 
     返回 = previous_prompt_tokens + completion_tokens
@@ -541,7 +634,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
     global _RENDER_TOLERANCE_WARNED
     prev = [int(t) for t in previous_prompt_tokens]
     canonical_prompt = render_chat_ids(tokenizer, messages_before_assistant, True,
-                                       chat_template_kwargs)
+                                       chat_template_kwargs, tools=tools)
     if canonical_prompt != prev:
         # 【两级判据】token 序列全等 → 通过（原路径，零开销）。不等时**退到文本层面**：
         #   文本（去空白）相同 → 容忍（模板 strip 与 BPE 段边界合并都是固有差异）；
@@ -646,7 +739,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
     placeholder = {"role": "assistant", "content": "x"}
     with_placeholder = [*messages_before_assistant, placeholder]
     canonical_end = render_chat_ids(tokenizer, with_placeholder, False,
-                                    chat_template_kwargs)
+                                    chat_template_kwargs, tools=tools)
     canonical_action = [*canonical_prompt, *encoded_text_tokens(tokenizer, "x")]
     if canonical_end[:len(canonical_action)] != canonical_action:
         raise ValueError(
@@ -656,7 +749,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
     closing = canonical_end[len(canonical_action):]
 
     canonical_next = render_chat_ids(tokenizer, [*with_placeholder, next_tool_message],
-                                     True, chat_template_kwargs)
+                                     True, chat_template_kwargs, tools=tools)
     if canonical_next[:len(canonical_end)] != canonical_end:
         raise ValueError(
             "[protocol] 加入 tool observation 后 chat template 改写了历史消息"
@@ -673,7 +766,7 @@ def build_next_prompt(tokenizer, messages_before_assistant: list,
         _probe = dict(next_tool_message)
         _probe["content"] = ""
         _empty_len = len(render_chat_ids(tokenizer, [*with_placeholder, _probe], True,
-                                         chat_template_kwargs))
+                                         chat_template_kwargs, tools=tools))
         if len(canonical_next) <= _empty_len:
             raise ValueError(
                 "[protocol] chat template 未把 tool 回包渲染进 observation"

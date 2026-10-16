@@ -5552,8 +5552,11 @@ def test_sampling_discard_stats():
     check("累计与窗口口径都调用统一真实丢弃函数",
           src.count("sampling_discard_counts(") >= 2
           and '_dd = _discarded - _mark["d"]' in src)
+    # 【断言同步】实现后来把"其他"改成 `其他 {_other - _pm}`（协议校验单列后从其他里
+    # 扣除），旧字面量 `其他 {_other}` 不再出现 → 本项长期假红（真回归被"已知红"淹掉）。
+    # 锁契约本身：四个归因桶的名字都必须在日志里出现，"其他"桶仍打印具体数值。
     check("日志显式区分轨迹超长 / prompt超限 / 其他",
-          "轨迹超长" in src and "prompt超限" in src and "其他 {_other}" in src)
+          "轨迹超长" in src and "prompt超限" in src and "其他 {" in src)
     print()
 
 

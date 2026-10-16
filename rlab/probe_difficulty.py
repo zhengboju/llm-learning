@@ -215,6 +215,13 @@ def main():
     ap.add_argument("--native_stop_at_call", action=argparse.BooleanOptionalAction,
                     default=None,
                     help="调用边界硬停（须与训练同档；None=随 --from_run_info/preset）")
+    # 【docs/16 Search-GRPO】算法档：难度表是"模型×提示×预算×协议×工具"的联合产物，
+    # search_qa 的工具/打分/数据源与 retool_math 完全不同——用 retool_math 探出的表
+    # 描述的是另一个任务（且 search 调用会被代码沙箱执行、QA 答案被数学口径判错）。
+    ap.add_argument("--algo", default=None, choices=("retool_math", "search_qa"),
+                    help="探针算法档：None=随 --from_run_info 的 algo，再回落 retool_math")
+    ap.add_argument("--search_endpoint", default=None,
+                    help="search_qa 档的检索服务地址（None=回读 run_info/preset）")
     ap.add_argument("--pool", choices=("train_dev", "train"), default="train_dev",
                     help="候选池：train_dev=训练池+dev 联探（历史行为，供 eval 过滤用表）；"
                          "train=只探去重后的训练池（doc15 阶段C 课程表契约——dev 不进"
@@ -303,6 +310,10 @@ def main():
                              "（run_info 契约：完整配方在 config 键下）")
         print(f"[probe] 协议/预算/采样档回读自 {_ri_path}（CLI 显式参数仍优先）")
     _cfg_over = {"model_path": args.model_path, "use_wandb": False, "seed": args.seed}
+    # 【docs/16】算法档：CLI > run_info > retool_math（历史行为）
+    _algo_v = args.algo or _ri_cfg.get("algo") or "retool_math"
+    if _algo_v not in ("retool_math", "search_qa"):
+        _algo_v = "retool_math"
     _tp_v = args.tool_protocol if args.tool_protocol is not None \
         else _ri_cfg.get("tool_protocol")
     if _tp_v is not None:
@@ -311,7 +322,11 @@ def main():
         else _ri_cfg.get("native_tool_style")
     if _ns_v is not None:
         _cfg_over["native_tool_style"] = _ns_v
-    cfg = get_config("retool_math", **_cfg_over)
+    # search_qa 的 endpoint 必须显式给或从 run_info 回读（config 层会 fail-fast）
+    _ep_v = args.search_endpoint or _ri_cfg.get("search_endpoint")
+    if _ep_v is not None:
+        _cfg_over["search_endpoint"] = _ep_v
+    cfg = get_config(_algo_v, **_cfg_over)
     # run_info 回读层（CLI 覆盖块在其后，显式值仍赢）：
     for _k in ("round_gen_tokens", "max_rounds", "max_context_tokens",
                "max_prompt_length", "max_traj_tokens", "answer_reserve",
@@ -376,6 +391,18 @@ def main():
     from rlab.protocol import initial_messages
     from rlab.reward import overlong_ref_tokens, total_reward_retool_math
     from rlab.rollout import build_prompt, multi_turn_rollout_group
+    # 【docs/16 Search-GRPO】QA 档的探针必须用**检索执行器 + QA 打分**：用代码沙箱接
+    # search 调用会条条执行失败、用数学口径打分会让每个答案判错——产出的难度表是
+    # 一张全 0 的表，而它正是训练池过滤的依据（用错表比没有课程更糟）。
+    _is_qa = cfg.get("data_task") == "search_qa"
+    _search_runner = None
+    if _is_qa:
+        from rlab.search_client import make_search_runner
+        from rlab.search_qa import total_reward_search_qa
+        _search_runner = make_search_runner(cfg)
+        _search_runner.check_health()
+        print(f"[probe] 检索服务已探活: {cfg.get('search_endpoint')}"
+              f"（top_k={cfg.get('search_top_k')}）", flush=True)
 
     QAs = load_qas(cfg["data_task"])
     if args.pool == "train":
@@ -399,6 +426,16 @@ def main():
     elif cfg["data_task"] in ("dapo_math", "dapo-math-17k", "math_dapo"):
         from rlab.data import load_dapo_math_dev
         _dev = load_dapo_math_dev()
+        _train_qs = {q["Q"] for q in QAs}
+        _dev_new = [q for q in _dev if q["Q"] not in _train_qs]
+        QAs = QAs + _dev_new
+        print(f"[probe] 训练池 {len(QAs) - len(_dev_new)} 题 + dev {len(_dev_new)} 题"
+              f" = {len(QAs)} 题联合探针")
+    elif cfg["data_task"] == "search_qa":
+        # 【docs/16】与 dapo 同一条分布对齐逻辑：eval 的 test split 用同一张表过滤到
+        # 同一 band，训练/评测同分布（dev 是 held-out，探针只估难度、不参与训练）。
+        from rlab.search_qa import load_search_qa_dev
+        _dev = load_search_qa_dev()
         _train_qs = {q["Q"] for q in QAs}
         _dev_new = [q for q in _dev if q["Q"] not in _train_qs]
         QAs = QAs + _dev_new
@@ -462,6 +499,10 @@ def main():
         # 【2026-09-25】协议档（围栏/原生）——同模型同提示下两档的通过率是两个
         # 分布，行必须自证，否则换档续跑同一 --out 会静默混表。
         "tool_protocol": _tp,
+        # 【docs/16】工具名进指纹：换工具（code→search）就是换任务/换分布，同模型同
+        # 提示下通过率完全不同——不进指纹则换工具续跑同一 --out 会静默混表。
+        "native_tool_name": str(cfg.get("native_tool_name") or "code_interpreter"),
+        "data_task": str(cfg.get("data_task")),
         # 【2026-09-29】预算档（轮数 / token）——同协议同模型下两档的通过率分布不同
         # （终止结构不同），换档续跑同一 --out 会静默混表。
         "max_traj_tokens": _mtj,
@@ -554,17 +595,25 @@ def main():
         n_traj += len(group_prompts)
         segs, texts, code_stats = multi_turn_rollout_group(
             vllm_gen, sps, tokenizer, group_prompts, cfg,
-            prompts_messages=(group_msgs or None))
+            prompts_messages=(group_msgs or None),
+            code_runner=_search_runner)
         for qi, x in enumerate(wave):
             for j in range(k):
                 idx = qi * k + j
                 asst_text = "".join(s["text"] for s in segs[idx] if s["kind"] == "assistant")
                 clen = sum(len(s["ids"]) for s in segs[idx])   # 全长口径（与训练一致）
-                sc = total_reward_retool_math(
-                    x["A"], asst_text, code_ok=code_stats[idx]["code_ok"],
-                    completion_len=clen, max_gen_tokens=overlong_ref_tokens(cfg),
-                    overlong_buffer=cfg["overlong_buffer"],
-                    overlong_shaping=cfg.get("overlong_shaping", False))
+                if _is_qa:
+                    sc = total_reward_search_qa(
+                        x.get("aliases") or [x["A"]], asst_text,
+                        completion_len=clen, max_gen_tokens=overlong_ref_tokens(cfg),
+                        overlong_buffer=cfg["overlong_buffer"],
+                        overlong_shaping=cfg.get("overlong_shaping", False))
+                else:
+                    sc = total_reward_retool_math(
+                        x["A"], asst_text, code_ok=code_stats[idx]["code_ok"],
+                        completion_len=clen, max_gen_tokens=overlong_ref_tokens(cfg),
+                        overlong_buffer=cfg["overlong_buffer"],
+                        overlong_shaping=cfg.get("overlong_shaping", False))
                 trunc = code_stats[idx]["trunc_final"]
                 rows.append({"Q": x["Q"], "A": x["A"], "acc": sc["acc"],
                              "fmt": sc["format"], "trunc": trunc,
@@ -610,8 +659,10 @@ def main():
                     f"--tool_protocol {_tp} --native_tool_style {_style}，否则 "
                     "load_difficulty_table 的指纹比对会告警（且不拦截）")
     print(f"[probe] 表已写出: {args.out}\n"
-          f"[probe] 训练启用: bash rlab/run_gsm8k.sh retool_math <model> "
-          f"--difficulty_path {args.out}" + _tp_tail)
+          f"[probe] 训练启用: bash rlab/run_gsm8k.sh {_algo_v} <model> "
+          f"--difficulty_path {args.out}"
+          + (f" --search_endpoint {_ep_v}" if _algo_v == "search_qa" and _ep_v else "")
+          + _tp_tail)
 
 
 if __name__ == "__main__":

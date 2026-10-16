@@ -1,8 +1,17 @@
 # Search-GRPO：多轮检索推理智能体的 RL 训练（项目方案）
 
-> 状态：规划 | 前置：docs/02（ReTool）、docs/09（工具协议）、docs/15（纯 RL 解题路线）
+> 状态：**代码已落地（M1 完成），待 pod 真机验收**——运行手册见
+> [docs/18-search-grpo-runbook.md](18-search-grpo-runbook.md)。
+> 前置：docs/02（ReTool）、docs/09（工具协议）、docs/15（纯 RL 解题路线）
 > 定位：从「单轮/代码交织 RLVR」推进到「多轮、环境交互、稀疏奖励」的 agentic RL，复现并超越 Search-R1 范式。
 > **协议定版：原生工具协议**（docs/09 路线，search = 一个原生工具声明），不自造围栏标签。
+>
+> **落地情况**：检索服务（`rlab/search_server.py`，独立部署、SQLite FTS5）、客户端与
+> runner（`rlab/search_client.py`，HTTP/local 同语义、故障必抛）、QA 打分与数据
+> （`rlab/search_qa.py`）、数据准备（`rlab/prepare_search_qa.py`）、`search_qa`
+> preset 与训练/评测/探针接线全部完成；44 项 CPU 回归 + 145 项全仓回归通过。
+> **未做**：真机（GPU）验收——base 对 search 的调用率、训练增益、显存与检索延迟
+> 均未测；奖励塑形 R1~R3 与 M4 多跳强化未做（本次只落地 R0）。
 
 ## 1. 背景与动机
 
