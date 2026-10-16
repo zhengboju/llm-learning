@@ -28,7 +28,7 @@
 
 | 层 | 动作空间 | 说明 |
 |---|---|---|
-| L0 / SWE-RL 原版 | **无工具，单轮 patch-only**：模型读 issue+定位提示，直接输出 diff | SWE-RL（Meta）的原始设定——环境交互只有一次"提交 patch"。**这意味着 L0 不走多轮框架**，工程量比 Search-GRPO 小得多 |
+| L0 / SWE-RL 原版 | **无工具，单轮 patch-only**：模型读 issue+**已定位的局部代码**（L0=单函数+单测；L1=oracle 文件，过长按相关函数窗口截断），直接输出 diff | SWE-RL（Meta）的原始设定——环境交互只有一次"提交 patch"。**这意味着 L0 不走多轮框架**，工程量比 Search-GRPO 小得多。**注意：不放整库**——真实仓库 MB 级远超 context 预算，「整库不可放」是 L2 才用工具自定位的原因 |
 | L1（可选扩展） | + 只读 shell：`grep`/`cat`/`ls`/`find`（定位用，只读降风险） | 走 docs/09 原生工具协议多轮框架，与 Search-GRPO 合流（M4） |
 | L2 | + `str_replace_editor` / `submit`（SWE-bench agent 标准动作集） | 仅当 L1 有显著效应再上 |
 
