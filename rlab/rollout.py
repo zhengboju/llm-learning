@@ -1433,8 +1433,15 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
         #   adv_task  = 仅 ±1 正确性在同一 mask/adv_mode 下的 advantage
         #   adv_aux   = adv − adv_task（长度/代码/效率等辅助项残差；group_std 下
         #               不是精确线性拆分，只作幅度诊断，不冒充梯度因果分解）
-        _task_r = torch.tensor([2.0 * float(a) - 1.0 for a in acc_s],
-                               dtype=torch.float32)
+        # 【2026-10-19 修复·尺度错 2 倍】acc_s 来自 reward_correct_boxed /
+        # reward_correct，**已经是 {+1,−1} 域**（不是 0/1）。这里再套 `2a−1`
+        # 会得到 {+1,−3}，使 adv_task 整体放大 2 倍、adv_aux 被系统性偏移：
+        # 6对2错组实测 adv_task=[+1,+1,...,−3,−3]（真值应为 +0.5/−1.5），
+        # 于是 sigstats 报出「正确性为正被压成非正」的假翻转（p11 那 1/80）。
+        # 该列是纯诊断列（不进 loss），修复后历史 record 的 adv_task/adv_aux
+        # 需按 `(x/2−0.5)` 与 `adv − adv_task` 重算；符号翻转判据只在修复后的
+        # run 上有效。
+        _task_r = torch.tensor([float(a) for a in acc_s], dtype=torch.float32)
         _adv_task = compute_advantages(_task_r, n, cfg["adv_mode"],
                                        sample_mask=sample_mask)
         signal_out["task_mask"] = ([0 if e else 1 for e in excl]

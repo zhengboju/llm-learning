@@ -2098,6 +2098,18 @@ def test_overlong_ref_and_opt_cli():
           "样本先被丢 → penalty 永不生效",
           _old_ref > 8192 and overlong_penalty(9200, _old_ref, 64) > 0.0
           and 9200 > 8192)
+    # 【2026-10-19 诊断列尺度】adv_task 必须直接用 acc_s（已是 ±1 域），不能再套
+    # 2a−1——否则 6对2错组算成 +1.0/−3.0（真值 +0.5/−1.5），adv_aux 被系统性偏移，
+    # sigstats 会报出假翻转（p11 实测的 1/80 即此）。
+    from rlab.losses import compute_advantages as _ca
+    import torch as _t
+    _acc = [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0]
+    _new = _ca(_t.tensor(_acc), 8, 'group_mean')
+    _old = _ca(_t.tensor([2.0 * a - 1.0 for a in _acc]), 8, 'group_mean')
+    check("adv_task 尺度：直接用 acc_s → 6对2错 正确+0.5 / 错误-1.5",
+          abs(float(_new[0]) - 0.5) < 1e-6 and abs(float(_new[3]) + 1.5) < 1e-6)
+    check("adv_task 反证：套 2a−1 得到 +1.0/−3.0（历史 record 错尺度，勿回退）",
+          abs(float(_old[0]) - 1.0) < 1e-6 and abs(float(_old[3]) + 3.0) < 1e-6)
     # 【2026-10-19】幅度护栏：封顶值必须可压到 1.0 以下，否则「答对但写长」会被
     # 这条软护栏压成负优势（p11 实测 21/321 翻转，doc15 §7 停线）。
     check("幅度护栏：默认封顶 1.0 与旧行为逐位相同",
