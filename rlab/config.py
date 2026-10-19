@@ -937,6 +937,36 @@ def validate_max_prompt_length(cfg: dict) -> None:
             f"调小到库内多数题之下同样会空转，需配合实测的 plen 分布。")
 
 
+def validate_guard_conflicts(cfg: dict) -> dict:
+    """正确性优先档的**互斥项净化**（纯函数，CPU 可测）：返回被归零的键列表。
+
+    【2026-10-19 实测冲突】tool_credit_advantages 对截断末段是**覆盖**语义
+    （`val = -ttp`, 见 rollout.py:1241），不是叠加——它的设计前提是
+    "截断轨迹 base_adv 恒为 0（已被 sample_mask 排除出组均值）"，即 ttp 是给
+    '零信号轨迹' 补的一点局部负信用。
+
+    而 task_adv_guard + trunc_counts_as_wrong 让截断样本以 acc=−1 进组均值，
+    base_adv 变成真实组内负优势（6对2错组 = −1.5，实测净负信用 −1350）。此时
+    末段覆盖会把强信号**替换**成弱信号（ttp0.2 → 净负信用 −630，砍掉 53%）：
+        tcw=T, ttp=0   → −1350（正确）
+        tcw=T, ttp=0.2 →  −630（自相矛盾）
+
+    同理 tool_waste_penalty 的 `wasted` 分支也是覆盖语义，而 code_wasted 在 tcw
+    下同样进组统计。故 guard 档下两者一律归零，并打印明确原因——静默保留会让
+    "惩罚强度"变成不可预期的配置组合，而这正是本项目反复出事的形态。
+    """
+    zeroed = []
+    if not cfg.get("task_adv_guard"):
+        return zeroed
+    if not cfg.get("trunc_counts_as_wrong", True):
+        return zeroed
+    for _k in ("trunc_tail_penalty", "tool_waste_penalty"):
+        if float(cfg.get(_k, 0.0) or 0.0) > 0.0:
+            cfg[_k] = 0.0
+            zeroed.append(_k)
+    return zeroed
+
+
 def validate_retool_budget(cfg: dict) -> int:
     """多轮预算自洽校验（纯函数，CPU 可测）。返回工具段预留 token 数。
 
@@ -1275,6 +1305,15 @@ def get_config(algo: str, **overrides) -> dict:
                 "（该键驱动模板声明/解析/执行器三处，改错即三处错配）。")
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
+    # 【2026-10-19】正确性优先档的互斥项净化（ttp/twp 与 tcw 的覆盖语义冲突）
+    _zeroed = validate_guard_conflicts(cfg)
+    if _zeroed:
+        cfg["_guard_zeroed"] = _zeroed
+        print(f"[config][守卫] task_adv_guard + trunc_counts_as_wrong 已生效，"
+              f"自动归零 {_zeroed}：tool_credit_advantages 对截断末段/废码是"
+              f"**覆盖**语义（为 base_adv=0 的旧口径设计），而 tcw 下截断样本已有"
+              f"真实组内负优势（实测净负信用 −1350 vs 覆盖后 −630），保留会削掉"
+              f"一半惩罚。", flush=True)
     # 【docs/17 SWE-RL L0】判分执行器的 fail-fast（纯配置层，不碰文件/子进程）。
     if cfg.get("algo") == "swe_l0" or cfg.get("data_task") == "swe_l0":
         _swe = _validate_swe_l0_config(cfg)

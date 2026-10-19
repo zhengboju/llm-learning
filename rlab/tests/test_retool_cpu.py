@@ -2149,6 +2149,38 @@ def test_overlong_ref_and_opt_cli():
     check("裁剪只做去均值+限幅：全零 aux 原样返回",
           all(abs(x) < 1e-12 for x in _cac([0.0] * _n, 3, _n))
           and _cac([0.0] * _n, 0, _n) == [0.0] * _n)
+    # 【2026-10-19 互斥项净化】ttp/twp 与 tcw 的覆盖语义冲突：ttp 是为"截断轨迹
+    # base_adv=0"的旧口径补的局部负信用，而 tcw 下截断样本已有真实组内负优势
+    # （6对2错 = −1.5）。实测净负信用 tcw+T,ttp=0 → −1350；加上 ttp0.2 → −630
+    # （末段被**覆盖**掉，砍 53%）。故 guard 档下必须自动归零，否则惩罚强度变成
+    # 不可预期的配置组合。
+    from rlab.config import validate_guard_conflicts as _vgc
+    _z = _vgc({"task_adv_guard": True, "trunc_counts_as_wrong": True,
+               "trunc_tail_penalty": 0.2, "tool_waste_penalty": 0.2})
+    check("守卫净化：guard+tcw 下 ttp/twp 自动归零",
+          _z == ["trunc_tail_penalty", "tool_waste_penalty"])
+    _c4 = {"task_adv_guard": True, "trunc_counts_as_wrong": True,
+           "trunc_tail_penalty": 0.0, "tool_waste_penalty": 0.0}
+    check("守卫净化：已是 0 时不报告（幂等）", _vgc(_c4) == [])
+    check("守卫净化：无 guard 时不动（旧行为逐位相同）",
+          _vgc({"trunc_tail_penalty": 0.2, "tool_waste_penalty": 0.2}) == [])
+    check("守卫净化：guard 但 tcw 关闭时不动（ttp 仍是唯一信号）",
+          _vgc({"task_adv_guard": True, "trunc_counts_as_wrong": False,
+                "trunc_tail_penalty": 0.2}) == [])
+    # tool_credit_advantages 的覆盖语义本身就是冲突根源，锁死这条行为
+    from rlab.rollout import tool_credit_advantages as _tca
+    _segs = [[{"kind": "assistant", "ids": list(range(300))},
+              {"kind": "tool", "ids": list(range(80))},
+              {"kind": "assistant", "ids": list(range(600))}]]
+    _base = _t.tensor([-1.5])
+    _pa0 = _tca(_base, _segs, 980, trunc_flags=[1], trunc_tail_penalty=0.0)
+    _pa2 = _tca(_base, _segs, 980, trunc_flags=[1], trunc_tail_penalty=0.2)
+    check("覆盖语义反证：ttp>0 时末段被覆盖成 -0.30（不是叠加到 -1.5）",
+          abs(float(_pa2[0][-1]) + 0.30) < 1e-6
+          and abs(float(_pa0[0][-1]) + 1.5) < 1e-6)
+    check("覆盖语义后果：ttp=0.2 让截断样本净负信用从 -1350 掉到 -630",
+          abs(float(_pa0[0].sum()) + 1350.0) < 1e-3
+          and abs(float(_pa2[0].sum()) + 630.0) < 1e-3)
     # 【2026-10-19】幅度护栏：封顶值必须可压到 1.0 以下，否则「答对但写长」会被
     # 这条软护栏压成负优势（p11 实测 21/321 翻转，doc15 §7 停线）。
     check("幅度护栏：默认封顶 1.0 与旧行为逐位相同",
