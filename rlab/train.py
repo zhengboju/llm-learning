@@ -1306,7 +1306,7 @@ def main():
                     default=None,
                     help="【结构护栏】长度罚只作用于未通过轨迹。cap 调小挡不住"
                          "『6/8 组 task 优势仅 +0.50 < overlong 0.5+len_eff 0.1』这类"
-                         "结构性翻转（p11b 实测 1.9%）；开启后答对的轨迹无论多长都"
+                         "结构性翻转（p11b 实测 1.9%%）；开启后答对的轨迹无论多长都"
                          "不会被长度项翻负。默认关（旧行为逐位相同）")
     ap.add_argument("--overlong_max_penalty", type=float, default=None,
                     help="overlong_penalty 的封顶值（默认 1.0=旧行为）。1.0 的满幅 =="
@@ -1327,6 +1327,9 @@ def main():
                     default=None,
                     help="截断/废码按答错计入组统计并吃负梯度（默认开，但只在 "
                          "--task_adv_guard 下生效）。关掉=回到旧口径（截断样本零梯度）")
+    ap.add_argument("--gen_gpu_mem", type=float, default=None,
+                    help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
+                         "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
     ap.add_argument("--vllm_gen_kwargs", default=None,
                     help='JSON dict **整体替换** vLLM 引擎构造参数（键名用下划线形态）。'
                          '默认已含 \'{"gdn_prefill_backend": "triton"}\'——Qwen3.5 的 '
