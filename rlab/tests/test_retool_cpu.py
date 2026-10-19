@@ -2098,6 +2098,30 @@ def test_overlong_ref_and_opt_cli():
           "样本先被丢 → penalty 永不生效",
           _old_ref > 8192 and overlong_penalty(9200, _old_ref, 64) > 0.0
           and 9200 > 8192)
+    # 【2026-10-19】幅度护栏：封顶值必须可压到 1.0 以下，否则「答对但写长」会被
+    # 这条软护栏压成负优势（p11 实测 21/321 翻转，doc15 §7 停线）。
+    check("幅度护栏：默认封顶 1.0 与旧行为逐位相同",
+          all(overlong_penalty(cl, 8192, 2048)
+              == min(max((cl - 6144) / 2048.0, 0.0), 1.0)
+              for cl in (0, 6144, 7000, 8192, 9000, 12288)))
+    check("幅度护栏：0.5 档封顶生效、未到 trigger 仍不罚",
+          overlong_penalty(12288, 8192, 2048, 0.5) == 0.5
+          and overlong_penalty(6144, 8192, 2048, 0.5) == 0.0)
+    # 结构性不变量（这就是护栏的全部意义）：0.5 档下「答对 + 顶满罚」仍有正优势
+    _good = "final \\boxed{42}"
+    _old = total_reward_retool_math("42", _good, completion_len=11000,
+                                    max_gen_tokens=8192, overlong_buffer=2048,
+                                    overlong_shaping=True, overlong_max_penalty=1.0)
+    _new = total_reward_retool_math("42", _good, completion_len=11000,
+                                    max_gen_tokens=8192, overlong_buffer=2048,
+                                    overlong_shaping=True, overlong_max_penalty=0.5)
+    check("幅度护栏不变量：答对+顶满罚 旧封顶 reward<=0（被抹平），0.5 档 reward>0",
+          _old["reward"] <= 0.0 < _new["reward"])
+    check("幅度护栏：答错侧方向不变（只会更负）",
+          total_reward_retool_math("43", _good, completion_len=11000,
+                                   max_gen_tokens=8192, overlong_buffer=2048,
+                                   overlong_shaping=True,
+                                   overlong_max_penalty=0.5)["reward"] < 0.0)
     # 【2026-09-12】trunc 靶向 shaping：总长惩罚够不到的单轮 prose 轨迹靠它反向
     from rlab.reward import trunc_penalty, total_reward_retool_math
     check("trunc_penalty：weight=0 → 恒 0（其他算法协议零变化）",

@@ -1341,6 +1341,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     max_gen_tokens=_ol_ref,
                     overlong_buffer=cfg["overlong_buffer"],
                     overlong_shaping=cfg.get("overlong_shaping", False),
+                    # 【2026-10-19】幅度护栏：封顶值（默认 1.0=旧行为）。1.0 的满幅
+                    # == 正确性全域，会把"答对但写长"压成负优势（p11 实测 21 例）。
+                    overlong_max_penalty=float(cfg.get("overlong_max_penalty", 1.0) or 1.0),
                     # 末段被轮长上限切断 → 额外扣分（prose 路径唯一够得到的长度反向信号）
                     trunc_final=_tf,
                     trunc_shaping=_trunc_w,

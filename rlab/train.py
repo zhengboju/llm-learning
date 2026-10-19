@@ -176,6 +176,11 @@ def run_signature(cfg: dict) -> str:
     lep_tag = f"-lep{_lepw:g}" if _lepw > 0.0 else ""
     _olr = int(cfg.get("overlong_ref", 0) or 0)
     olr_tag = f"-olr{_olr}" if _olr > 0 else ""
+    # 【2026-10-19 overlong 幅度护栏进签名】封顶值改变 reward 值域（1.0 的满幅能
+    # 推翻正确性优势，0.5 不能）——是行为级变量，不进签名则两档撞同一 out_dir。
+    # 约定同 stop_tag：等于旧默认 1.0 时一个字符都不加，历史签名串逐字不变。
+    _omp = float(cfg.get("overlong_max_penalty", 1.0) or 1.0)
+    omp_tag = f"-omp{_omp:g}" if abs(_omp - 1.0) > 1e-9 else ""
     once_tag = "-cs1" if cfg.get("code_shaping_once") else ""
     hint_tag = "-bh1" if (cfg.get("budget_hint") and _mtj > 0) else ""
     # 【docs/16 Search-GRPO】工具身份进签名：换工具（code_interpreter→search）就是换
@@ -257,7 +262,7 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}"
+            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}"
             f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{swe_tag}{_opt_tag}")
 
 
@@ -318,6 +323,9 @@ def write_run_info(path: str, cfg: dict) -> None:
             "len_penalty_gate": cfg.get("len_penalty_gate"),
             "len_eff_w": cfg.get("len_eff_w"),
             "len_eff_penalty_w": cfg.get("len_eff_penalty_w"),
+            # 【2026-10-19】overlong 幅度护栏（1.0=旧行为）——eval/诊断端据此判断
+            # "答对但写长"的轨迹是否仍有正优势
+            "overlong_max_penalty": cfg.get("overlong_max_penalty"),
             "difficulty_path": cfg.get("difficulty_path"),
             "difficulty_band": cfg.get("difficulty_band"),
             "lr": cfg.get("lr"),
@@ -354,6 +362,8 @@ _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      # 【2026-10-19】reward 切换点（-rs0）同属优化器段：不登记则
                      # hot 档的 run 中途重启会被 guard_ckpt_collision 误判外来签名。
                      "rs",
+                     # 【2026-10-19】overlong 幅度护栏（-omp0.5）同属优化器段。
+                     "omp",
                      # 【docs/16 Search-GRPO】工具名（-tnsearch）与检索服务身份
                      # （-se<hash6>）同属优化器段：不登记则 search_qa 的 run 崩溃后
                      # 重启会被自己的护栏判成"换了配方"而拒跑（正在跑的 run 无法续跑）。
@@ -1278,6 +1288,11 @@ def main():
                          "默认 1e9=全程 cold(1,2,2)——那是为 base 冷启动教格式设计的；"
                          "从 SFT 出发 fmt 已到 93%%，fmt×2.0 权重纯放大噪声维度梯度。"
                          "传 0 = 全程 hot(2,1,1)，正确性主导（p11 配方）")
+    ap.add_argument("--overlong_max_penalty", type=float, default=None,
+                    help="overlong_penalty 的封顶值（默认 1.0=旧行为）。1.0 的满幅 =="
+                         "正确性奖励全域（±1），会把'答对但写长'的轨迹压成负优势"
+                         "（p11 实测 21/321 翻转，doc15 §7 停线）。0.5 = 保留半个"
+                         "正确性幅度的正优势，答错侧方向不变。只在 overlong_shaping 开时生效")
     ap.add_argument("--gen_gpu_mem", type=float, default=None,
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
@@ -1485,6 +1500,8 @@ def main():
     if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
     if args.reward_switch_step is not None:
         overrides["reward_switch_step"] = args.reward_switch_step
+    if args.overlong_max_penalty is not None:
+        overrides["overlong_max_penalty"] = args.overlong_max_penalty
     # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
     if args.temperature is not None: overrides["temperature"] = args.temperature
     if args.top_k is not None: overrides["top_k"] = args.top_k

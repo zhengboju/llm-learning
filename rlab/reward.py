@@ -135,12 +135,26 @@ def reward_format_retool(answer: str) -> float:
     return reward_format(strip_code_blocks(answer))
 
 
-def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64) -> float:
-    """DAPO overlong shaping：超过 (max-buffer) 后线性扣分，封顶 1.0。"""
+def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64,
+                     max_penalty: float = 1.0) -> float:
+    """DAPO overlong shaping：超过 (max-buffer) 后线性扣分，封顶 max_penalty。
+
+    【2026-10-19 幅度护栏·max_penalty】封顶 1.0 时本项满幅 == 正确性奖励的全部
+    幅度（retool_math 的 reward 域就是 ±1），而它在 group_mean 下按组内相对位置
+    生效 ⇒ **答对但写得长的轨迹可以被这一个"软护栏"压成负优势**。p11 实测：
+    536 条轨迹里 175 条（32.6%）吃罚、132 条（24.6%）顶满，被压的 correct 样本
+    task=+0.5~+1.14 全被翻成非正（doc15 §7 明文禁止的翻转）。
+
+    结构性事实：overlong 是**护栏不是目标**——它的职责是"别烧预算写散文"，
+    没有资格推翻"这题做对了"。因此正确性优先档（overlong_guard=True）把上限
+    压到 max_penalty（默认 0.5），使「答对 + 顶满罚」仍保留半个正确性幅度的正
+    优势，而「答错 + 顶满罚」只会更负（方向不变，符合惩罚本意）。
+
+    max_penalty=1.0 时与旧行为逐位相同（旧 checkpoint/历史 run 口径不变）。"""
     trigger = max_gen_tokens - buffer
     if completion_len <= trigger:
         return 0.0
-    return min((completion_len - trigger) / buffer, 1.0)
+    return min((completion_len - trigger) / buffer, float(max_penalty))
 
 
 def overlong_ref_tokens(cfg: dict) -> int:
@@ -435,7 +449,8 @@ def group_eff_penalty(group_rewards: list, group_lens: list,
 
 def total_reward_math(ground_truth: str, answer: str, *,
                       completion_len: int = 0, max_gen_tokens: int = 8192,
-                      overlong_buffer: int = 64, overlong_shaping: bool = False) -> dict:
+                      overlong_buffer: int = 64, overlong_shaping: bool = False,
+                      overlong_max_penalty: float = 1.0) -> dict:
     """数学 outcome-only：只看末尾 \\boxed{} 是否与 gt 数学等价（±1），无格式分。"""
     acc = reward_correct_boxed(ground_truth, answer)
     # fmt 沿用 boxed 是否存在作监控（1=抽到 boxed，-1=无），但不进 reward
@@ -443,7 +458,8 @@ def total_reward_math(ground_truth: str, answer: str, *,
     r = acc
     pen = 0.0
     if overlong_shaping:
-        pen = overlong_penalty(completion_len, max_gen_tokens, overlong_buffer)
+        pen = overlong_penalty(completion_len, max_gen_tokens, overlong_buffer,
+                               max_penalty=overlong_max_penalty)
         r -= pen
     return {"reward": r, "acc": acc, "format": fmt, "overlong": pen}
 
@@ -451,6 +467,7 @@ def total_reward_math(ground_truth: str, answer: str, *,
 def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0,
                              completion_len: int = 0, max_gen_tokens: int = 8192,
                              overlong_buffer: int = 64, overlong_shaping: bool = False,
+                             overlong_max_penalty: float = 1.0,
                              trunc_final: int = 0, trunc_shaping: float = 0.0,
                              code_used: int = 0, code_attempt_w: float = 0.0,
                              code_w: float = 0.0, max_rounds: int = 8,
@@ -483,7 +500,8 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
     base = total_reward_math(ground_truth, strip_code_blocks(answer),
                              completion_len=completion_len,
                              max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
-                             overlong_shaping=overlong_shaping)
+                             overlong_shaping=overlong_shaping,
+                             overlong_max_penalty=overlong_max_penalty)
     tp = trunc_penalty(trunc_final, trunc_shaping)
     if tp:
         base["reward"] = base["reward"] - tp
