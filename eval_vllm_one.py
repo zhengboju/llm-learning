@@ -123,9 +123,13 @@ if args.algo is None:
 if args.algo == "retool-math":
     args.algo = "retool_math"
 is_retool_family = args.algo in ("retool", "retool_math", "search_qa")
+# 【docs/17 SWE-RL L0】单轮 patch-only：**不是** retool 家族（没有工具、没有多轮），
+# 但判分是真实测试执行，故有自己的一条分支（数据源/prompt/判分三处都不同）。
+is_swe_l0 = args.algo == "swe_l0"
 if args.eval_task is None:
     args.eval_task = ("dapo_math" if args.algo == "retool_math"
-                      else "search_qa" if args.algo == "search_qa" else "gsm8k")
+                      else "search_qa" if args.algo == "search_qa"
+                      else "swe_l0" if is_swe_l0 else "gsm8k")
 # 【docs/16】search_qa 的检索服务身份必须从 ckpt 回读/显式给出（同档评测）：
 # 换了知识库就不是同一个环境（与 gpu_mem/sp 那两次事故同类的口径漂移）。
 _SEARCH_EP = args.search_endpoint
@@ -167,7 +171,14 @@ if is_retool_family:
         args.max_tokens = _rcfg.get("max_gen_tokens", 512)
 else:
     if args.max_len is None:
-        args.max_len = 1280
+        # 【docs/17 SWE-RL L0】单轮档的长度上限也要按 preset 算：swe_l0 的提示
+        # 里含完整目标文件 + 完整测试文件（prompt 2048）+ 生成 1536 →
+        # 硬编码 1280 会让 eval 端**一题都装不下**（全被下面的剔题线剔掉，
+        # 或撞 vLLM max_model_len 崩进程）。l0 档按 preset 的预算算，GSM8K
+        # 家族保持历史值 1280（口径逐字不变）。
+        args.max_len = (_rcfg.get("max_prompt_length", 400)
+                        + _rcfg.get("max_context_tokens", 2200)
+                        if is_swe_l0 else 1280)
     if args.max_tokens is None:
         args.max_tokens = _rcfg.get("max_gen_tokens", 512)
     if args.max_rounds is None:
@@ -184,7 +195,7 @@ _sp_run = _run_cfg.get("system_prompt")
 # 【2026-09-25】preset 提示必须按**被测协议**取：原生档的默认提示与围栏版不同
 # （删围栏措辞），拿错一份 = eval 用围栏措辞去问一个原生档训出来的模型。
 _sp_preset = _default_system_prompt(args.algo, _tool_protocol)
-if args.algo not in ("retool_math", "retool"):
+if args.algo not in ("retool_math", "retool", "search_qa", "swe_l0"):
     _sp_preset = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
  The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
 
@@ -365,6 +376,16 @@ elif args.eval_task == "search_qa":
     else:
         test_data = load_search_qa_train()
     print(f"  search_qa [{args.split}]: {len(test_data)} 题")
+elif args.eval_task == "swe_l0":
+    # 【docs/17】held-out = dev.jsonl（prepare_swe_l0 按**源种子分组**切，同种子
+    # 派生的变体不跨集）。**绝不回落训练池**——同池污染在本项目已发生两次
+    # （2026-09-09 / 09-16）。
+    from rlab.swe_l0 import load_swe_l0_dev, load_swe_l0_train
+    if args.split == "test":
+        test_data = load_swe_l0_dev()
+    else:
+        test_data = load_swe_l0_train()
+    print(f"  swe_l0 [{args.split}]: {len(test_data)} 个 instance")
 else:
     raise ValueError(f"未知 eval_task {args.eval_task}")
 
@@ -797,6 +818,38 @@ else:
     code_stats = None
 
 # ---------- 评分 ----------
+# 【docs/17 SWE-RL L0】判分执行器：与训练**同一套**（rlab.swe_l0.total_reward_swe_l0
+# + 同一超时/内存上限从 run_info 回读），而不是另外写一遍。"评测与训练同口径"
+# 是本项目反复踩过的坑（gpu_mem 0.20 vs 0.78 差 7pp；sp 回落让 fmt 从 70% 掉到
+# 34%）——判分口径（超时算不算失败、apply 失败算不算 0）同属这一类。
+if args.eval_task == "swe_l0":
+    from rlab.swe_l0 import (make_workdir_factory as _mkwd,
+                             spec_of as _swe_spec, total_reward_swe_l0 as _swe_total)
+    _swe_timeout = float(_rcfg.get("swe_test_timeout", 60.0) or 60.0)
+    _swe_mem = int(_rcfg.get("swe_test_mem_mb", 2048) or 2048)
+    _swe_root = _rcfg.get("swe_work_root")
+    print(f"  [eval][swe_l0] 判分口径（与训练同源回读）：超时 {_swe_timeout:.0f}s"
+          f"｜内存上限 {_swe_mem}MB｜临时根 {_swe_root or '系统临时目录'}")
+    _swe_cache = {}
+
+    def _swe_exec(item, answer):
+        """判一条轨迹；**同题同 patch 只测一次**（评测侧同样付费）。
+
+        缓存键用 patch 文本本身（不是 hash：hash 只在进程内稳定，而这里不需要
+        跨进程，直接比文本更简单且无碰撞）。
+        """
+        from rlab.rollout import extract_patch_text as _extract
+        patch = _extract(answer)
+        key = (str(item.get("id") or item["Q"]), patch)
+        if key in _swe_cache:
+            return _swe_cache[key]
+        res = _swe_total(_swe_spec(item), patch, _mkwd(item, _swe_root),
+                         timeout=_swe_timeout, mem_mb=_swe_mem)
+        _swe_cache[key] = res
+        return res
+else:
+    _swe_exec = None
+
 # 【2026-09-09 审查修复】空答案计入分母记 0 分——旧版 `if len(ans.strip())==0: continue`
 # 把"只写代码没写答案/输出为空"的样本剔出分母，模型退化时反而美化 acc。
 # 【2026-09-18 采样口径】--val_n>1 时 answers 是 [题][采样] 平铺（每题 val_n 条）：
@@ -804,13 +857,25 @@ else:
 acc, fmt, both, n_valid = 0.0, 0.0, 0.0, 0
 items = []      # per-item 明细（--dump_items，默认开）：供 analysis.py 配对检验/分层
 _sample_scores = []   # 【2026-10-02】per-**轨迹** (a, f)：轨迹 dump 要标出"哪条死了"
+# 【docs/17 SWE-RL L0】逐轨迹判分明细（apply 成败/F2P 通过数/测试耗时）：
+# 条件修复率与"测试成本"两个辅指标（docs/17 §4）都要靠它，不能只留聚合值。
+_swe_rows = []
 for i, item in enumerate(sample):
     n_valid += 1
     a_avg = f_avg = 0.0
     for k in range(args.val_n):
         ans = answers[i * args.val_n + k] if _sampling else answers[i]
         a = f = 0.0     # 空答案计入分母记 0 分（见上方审查修复注释）
-        if len(ans.strip()) > 0:
+        # 【docs/17】swe_l0 的空答案也必须**真的判一次**：空 patch 会走 apply 失败
+        # 分支（apply_ok=0），那是"格式指标"的一条真实读数——若按空字符串跳过，
+        # 条件修复率的分母会系统性偏小（只统计"写了点什么"的轨迹）。
+        # 其余任务保持"空答案直接记 0"的历史口径逐字不变。
+        if args.eval_task == "swe_l0":
+            _sr = _swe_exec(item, ans)
+            a = 2.0 * float(_sr["acc"]) - 1.0
+            f = 2.0 * float(_sr["format"]) - 1.0
+            _swe_rows.append({"id": item.get("id"), **_sr})
+        elif len(ans.strip()) > 0:
             # ground_truth 归一：gsm8k 带 ####，dapo 直接答案
             if args.eval_task == "gsm8k":
                 gt = item["A"].split("####")[-1].strip()
@@ -986,6 +1051,42 @@ if args.dump_items:
 # "采样档虚高 val_n 倍"的错在长度上同样会犯（会把平均长度报成 n×短）。
 result["avg_ans_tokens"] = (sum(_traj_asst) / len(_traj_asst)) if _traj_asst else 0.0
 result["avg_clen"] = (sum(_traj_clen) / len(_traj_clen)) if _traj_clen else 0.0
+# 【docs/17 SWE-RL L0】三件事必须落盘并对齐 docs/17 §4 的主/辅指标：
+#   · apply 成功率（格式指标）——分母是**轨迹数**，与 code_rate 同一处分母约定
+#   · 条件修复率 = 修复率 / apply 成功率（**两个率的商**，不是分数）
+#   · 平均单次判分耗时——决定 batch 大小与"一个 reward 多贵"的直接读数
+# trajectory 级明细也落盘（--dump_items 之外单独给）：条件修复率的分母来源必须可复核。
+if args.eval_task == "swe_l0" and _swe_rows:
+    _n = len(_swe_rows)
+    _applied = sum(1 for r in _swe_rows if r.get("apply_ok"))
+    _fixed = sum(1 for r in _swe_rows if float(r.get("acc", 0.0)) >= 1.0)
+    _dur = [float(r.get("duration", 0.0) or 0.0) for r in _swe_rows]
+    result["swe_apply_rate"] = _applied / _n
+    result["swe_fixed"] = _fixed
+    result["swe_n_traj"] = _n
+    # 条件修复率 = 修好的 / 能 apply 的（apply 失败不是"修不对"，它没资格进分子分母）
+    result["swe_cond_fix_rate"] = (_fixed / _applied) if _applied else 0.0
+    result["swe_avg_test_seconds"] = sum(_dur) / _n if _n else 0.0
+    result["swe_stat"] = {
+        "apply_stage": {s: sum(1 for r in _swe_rows if r.get("apply_stage") == s)
+                        for s in sorted({r.get("apply_stage") for r in _swe_rows
+                                         if r.get("apply_stage")})},
+        "f2p_pass_total": sum(int(r.get("f2p_pass", 0)) for r in _swe_rows),
+        "f2p_total": sum(int(r.get("f2p_total", 0)) for r in _swe_rows),
+        "p2p_broken_total": sum(int(r.get("p2p_broken", 0)) for r in _swe_rows),
+    }
+    # 条件修复率是**两个率的商**（AGENTS.md）：既不能单独当机制证据，也不能用
+    # acc 的不显著去否证它——故三项一起落盘。
+    print(f"  [swe_l0] apply 成功率 {result['swe_apply_rate'] * 100:.1f}%"
+          f"｜修复率 {_fixed / _n * 100:.1f}%（{_fixed}/{_n}）"
+          f"｜**条件修复率 {result['swe_cond_fix_rate'] * 100:.1f}%**"
+          f"｜平均判分 {result['swe_avg_test_seconds']:.2f}s")
+    print(f"  [swe_l0] apply 归因 {result['swe_stat']['apply_stage']}"
+          f"｜F2P 通过 {result['swe_stat']['f2p_pass_total']}/"
+          f"{result['swe_stat']['f2p_total']}"
+          f"｜P2P 回归 {result['swe_stat']['p2p_broken_total']} 条")
+    if args.dump_items:
+        result["swe_rows"] = _swe_rows
 if is_retool_family and n_valid:
     # 【2026-09-19 修复·采样档除数】code_used 长度 = n_valid*val_n（每题 val_n 条轨迹）
     # 旧版除以 n_valid 导致 val_n=8 时显示值是真实值的 8 倍（p8: 401.5% 实为 50.2%）

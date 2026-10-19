@@ -182,6 +182,66 @@ ALGO_DEFAULTS = {
                       # prepare_search_qa 落盘，eval_vllm_one 按 search_qa 打分
                       eval_during_training=False,
                       chat_template_kwargs={"enable_thinking": False}),
+    # =====================================================================
+    # 【docs/17 SWE-RL】L0：合成 bug 的仓库级修复（patch-only 单轮）
+    # =====================================================================
+    # L0 = HumanEvalFix 式合成 bug：单函数 + 单测现成 + **定位已给出**
+    # （docs/17 §2 的难度分层第一档）。动作空间是**单轮 patch-only**：模型读
+    # issue + 已定位的局部代码 + 测试，直接输出一个 diff，没有工具调用
+    # （docs/17 §2.5 定版："L0 不走多轮框架，工程量比 Search-GRPO 小得多"）。
+    #
+    # 因此本 preset 与 search_qa/retool_math **结构上不同**：
+    #   · 走**单轮**路径（不设 tool_protocol=native、不进多轮 rollout），
+    #     故不需要 max_rounds/round_gen_tokens 那一套，预算就是一次生成长度；
+    #   · 奖励来自**真实测试执行**（git apply + pytest），不是文本正则；
+    #   · 生成长度要装得下整个 diff：L0 是单函数级改动，但模型会先"想一想"，
+    #     1536 是一条 diff（通常 20~60 行）+ 简短推理的合理上限；
+    #   · max_prompt_length 要大：提示里含**完整的目标文件 + 完整测试文件**
+    #     （L0 的定位是给定的，这是它的定义，不是泄漏）——8 条种子实测
+    #     提示约 900~2500 字符，折 token 后给 2048 有余量。
+    # 预算自洽：单轮路径无轮数乘积，max_context_tokens 只需 ≥
+    #     max_prompt_length + max_gen_tokens = 2048 + 1536 = 3584；给 4096。
+    #
+    # 【为什么 verdict 里没有 code_w/len_* 任何 shaping】L0 的 reward 是
+    # F2P 硬判据（docs/17 §3）：patch 长度与"修对没修对"无关，给长度项只会
+    # 引入"短 patch 骗分"的捷径；工具信用项更是完全没有受力面（单轮无工具）。
+    "swe_l0": dict(beta=0.04, clip_low=0.2, clip_high=0.28, adv_mode="group_mean",
+                   loss_norm="sample_mean", data_task="swe_l0",
+                   num_pre_Q=8, train_micro_batch_size_per_gpu=8,
+                   temperature=1.0, top_k=-1,
+                   # 【刻意不设 gen_questions_per_attempt】它是**多轮**路径的吞吐杠杆
+                   # （rollout 的 use_qqueue = is_retool and multi_q>1），而 L0 走单轮、
+                   # 从不读它 —— 在 preset 里写一个好看的 4 只会让"调了没反应"变成
+                   # 又一个静默空转（本项目最贵的一类 bug）。L0 每次 attempt 采
+                   # Q_batch_size×num_pre_Q = 1×8 条轨迹；要提吞吐就抬 num_pre_Q
+                   # （它同时扩组内 patch 多样性，对本任务是净收益）。
+                   # 单轮 patch 生成：不声明工具、不走多轮
+                   tool_protocol="fence",
+                   # 【单轮的显式标注】它同时被 rollout 的 is_retool 判据与
+                   # rlab.swe_l0 的判分路径读；写死 1 让"这是单轮"在配置层就成立，
+                   # 而不是靠"没人传 --max_rounds"。
+                   max_rounds=1,
+                   max_context_tokens=4096, max_prompt_length=2048,
+                   max_gen_tokens=1536,
+                   # 长度控制项全部关闭（见上方"为什么没有 shaping"）
+                   overlong_shaping=False, overlong_filter=False,
+                   trunc_shaping=0.0, code_w=0.0, code_attempt_w=0.0,
+                   len_penalty_w=0.0, tool_call_cost=0.0,
+                   tool_waste_penalty=0.0, trunc_tail_penalty=0.0,
+                   reward_switch_step=1000000000,
+                   # 测试执行是本项目**最贵的一步**（docs/17 §1：
+                   # reward 成本比 math 高 2~3 个数量级）：
+                   #   · 同组相同 patch 只测一次（dedup_group_indices）
+                   #   · 硬超时兜底，单条实例不许拖死 rollout
+                   #   · 并发数 = 组内不同 patch 数上限（num_pre_Q），
+                   #     再大没有受力面（一个组最多 8 条）
+                   swe_test_timeout=60.0,
+                   swe_test_mem_mb=2048,
+                   swe_test_workers=8,
+                   swe_work_root=None,   # 判分用的临时仓库根（None=系统临时目录）
+                   # eval：held-out dev（prepare_swe_l0 按源种子分组切）
+                   eval_during_training=False,
+                   chat_template_kwargs={"enable_thinking": False}),
 }
 
 BASE = dict(
@@ -564,6 +624,22 @@ BASE = dict(
     # 可选 bearer 鉴权：**存环境变量名**而不是令牌本身（密钥绝不进配置/落盘/日志）。
     # None = 不鉴权（内网独立部署的常见形态）。
     search_auth_env=None,
+    # ---- SWE-RL L0（docs/17）：patch 判分执行器 ----
+    # 判分 = git apply + pytest 跑 F2P/P2P（rlab/swe_l0.py）。它是本项目**最贵**
+    # 的一步（docs/17 §1：reward 成本比 math 高 2~3 个数量级），故三项都可调：
+    #   · swe_test_timeout 硬上限兜底（单条实例不许挂死 rollout）；
+    #   · swe_test_mem_mb 子进程内存上限（Linux RLIMIT_AS，best-effort）；
+    #   · swe_test_workers 并发（= 同时执行的判分数；组内已按 patch 去重，
+    #     实际并发 ≤ num_pre_Q）；
+    #   · swe_work_root 判分用的临时仓库根（None=系统临时目录；pod 上若 /tmp
+    #     是 tmpfs，要指到磁盘目录，否则 8 条并发各写一份仓库会吃掉内存）。
+    # 数值不参与签名：它们是**资源参数**不是配方（与 gpu_mem 同类；改了不影响
+    # "这份权重是哪套协议训的"）。但 swe_test_timeout 会改变"超时算不算失败"，
+    # 边界上影响 reward——故它进签名（见 train.run_signature）。
+    swe_test_timeout=60.0,
+    swe_test_mem_mb=2048,
+    swe_test_workers=8,
+    swe_work_root=None,
     # 【2026-09-08 代码灭绝教训】280 太紧：代码块约占 80-150 token，写代码的样本
     # 极易在轮内写不完围栏 → 完整块检测不到 → 残缺结尾 → fmt=-1 且无答案——
     # "写代码"被结构性惩罚、几步内灭绝（真机两轮 code_rate=0 的根因）。
@@ -686,6 +762,35 @@ _SEARCH_QA_SYSTEM_NATIVE = (
 )
 system_prompt_search_qa_native = _SEARCH_QA_SYSTEM_NATIVE
 
+# 【docs/17 SWE-RL L0】补丁修复的原生提示。与 math/search 版同一套原则：只讲
+# **任务与输出形态**（issue+代码+测试 → 一个 diff），不讲协议标签（L0 无工具，
+# 无模板 tools 段）。
+# 【为什么在这里再强调一遍"只输出 diff"】L0 的动作空间就是一段 patch
+# （docs/17 §2.5），而 4B base 会倾向"解释我怎么改"而不是"给出可 apply 的
+# diff"——实测口径（docs/17 §1 第 3 条）把格式错误率列为主要瓶颈，原因就是
+# 这个先验缺口。提示里把"只输出一个 diff 块、不要改测试、只动目标文件"三条
+# 写死，是把格式失败率压到最低的唯一免费手段（SFT 前）。
+# 零标签字面量：本串不含任何尖括号标签字节。
+_SWE_L0_SYSTEM_NATIVE = (
+    "You are an expert Python programmer fixing a bug in a small repository.\n"
+    "You will be given a bug report, the current content of the file to fix, and "
+    "the test file that defines the expected behaviour.\n\n"
+    "How to answer:\n"
+    "- Produce a unified diff that changes ONLY the file named in the report. Do not "
+    "modify or add tests.\n"
+    "- The diff must be `git apply -p1` compatible: it starts with `--- a/path` and "
+    "`+++ b/path`, then one or more `@@ -start,count +start,count @@` hunks whose "
+    "context lines carry one leading space, removed lines a leading `-`, added lines "
+    "a leading `+`.\n"
+    "- Include enough unchanged context lines around each change that the patch "
+    "applies to the current file exactly as shown.\n"
+    "- Keep the change minimal: fix the reported behaviour, leave working behaviour "
+    "alone.\n"
+    "- Output the diff inside a single fenced code block tagged `diff`, and output "
+    "nothing else: no explanation before or after it.\n"
+)
+system_prompt_swe_l0_native = _SWE_L0_SYSTEM_NATIVE
+
 
 # 原生协议的预算档（docs/09 §5.1 档 A，实跑 validate_retool_budget 核对）：
 #   max_rounds(5) × round_gen_tokens(1024) + max_prompt_length(1024) + 预留(798) = 7208 ≤ 8192 ✅
@@ -759,6 +864,10 @@ def default_system_prompt(algo: str, tool_protocol: str = "fence") -> str:
     # 【docs/16】search_qa 只有原生档（检索工具必须由模板的 tools 段声明）
     if algo == "search_qa":
         return system_prompt_search_qa_native
+    # 【docs/17】swe_l0 是单轮 patch-only：没有工具声明，提示与协议档无关
+    # （tool_protocol 对它是死键——传了也不会有工具段）。
+    if algo == "swe_l0":
+        return system_prompt_swe_l0_native
     if algo == "retool":
         return system_prompt_retool
     return BASE["system_prompt"]
@@ -926,6 +1035,88 @@ def _check_round_budget_hint(cfg: dict, mtj: int, per_round: int) -> None:
                   f"或至少开 --native_stop_at_call。")
 
 
+def _validate_swe_l0_config(cfg: dict) -> dict:
+    """SWE-RL L0 的配置校验（纯函数，CPU 可测）。返回一份自证 dict。
+
+    【为什么必须 fail-fast 在这里】L0 的 reward 来自**真实测试执行**：配置错了
+    不会报错，只会让每条轨迹都拿 -1（= acc 平坦 0%），而那正是本项目认定的
+    系统性 bug 签名。能在第 0 秒拦下的错，绝不留到训练中期去"从曲线反推"。
+    """
+    out = {}
+    # ① 单轮路径：多轮专属键传了也没有受力面（静默空转是本项目最贵的一类 bug）
+    if (cfg.get("tool_protocol") or "fence") != "fence":
+        raise ValueError(
+            "[config] swe_l0 是**单轮 patch-only**（docs/17 §2.5），不支持 "
+            f"tool_protocol={cfg.get('tool_protocol')!r}：它那条路径只声明工具、"
+            "多轮续写，而 L0 的动作空间就是一段 diff，没有工具可调。\n"
+            "  用 --tool_protocol fence（默认）跑 L0；多轮工具是 L1/L2 的事。")
+    if int(cfg.get("max_rounds", 1) or 1) != 1:
+        raise ValueError(
+            f"[config] swe_l0 必须 max_rounds=1（单轮），当前 "
+            f"{cfg.get('max_rounds')}——多轮在 L0 下没有定义：末轮才有最终 diff，"
+            f"前面几轮产出无人消费，只会白烧生成预算。")
+    # ② 生成长度必须装得下一条 diff
+    _gen = int(cfg.get("max_gen_tokens", 0) or 0)
+    if _gen < 512:
+        raise ValueError(
+            f"[config] swe_l0 的 max_gen_tokens={_gen} 太小：一条单函数 diff "
+            f"（含上下文行）通常 300~800 token，加推理会更多。建议 ≥1024。")
+    # ③ 预算自洽：单轮路径下 prompt + 生成必须在上下文保险丝内
+    _ctx = int(cfg.get("max_context_tokens", 0) or 0)
+    _plen = int(cfg.get("max_prompt_length", 0) or 0)
+    if _ctx > 0 and _plen + _gen > _ctx:
+        raise ValueError(
+            f"[config] swe_l0 预算不自洽：max_prompt_length({_plen}) + "
+            f"max_gen_tokens({_gen}) = {_plen + _gen} > "
+            f"max_context_tokens({_ctx})。\n"
+            f"  后果：用满生成预算的合法轨迹会被判超长整组丢弃 → 采样空转"
+            f"（2026-09-12 事故的同类形态，只是换成了单轮路径）。\n"
+            f"  改法：max_context_tokens ≥ {_plen + _gen}，或降 max_prompt_length。")
+    # ④ 判分执行器的资源项必须可用（0/负数会让每条都超时或 OOM）
+    _to = float(cfg.get("swe_test_timeout", 0) or 0)
+    if _to <= 0:
+        raise ValueError(
+            f"[config] swe_test_timeout 必须 > 0（当前 {_to}）：0 会让每次测试"
+            f"立即超时 → 所有轨迹 -1（acc 平坦 0% 的系统性签名）。")
+    _mem = int(cfg.get("swe_test_mem_mb", 0) or 0)
+    if _mem < 256:
+        raise ValueError(
+            f"[config] swe_test_mem_mb={_mem} 太小：跑 pytest 至少要 ~256MB "
+            f"（import pytest 本身就要 80~120MB），否则每条都 OOM → 全 -1。")
+    _wrk = int(cfg.get("swe_test_workers", 0) or 0)
+    if _wrk <= 0:
+        raise ValueError(
+            f"[config] swe_test_workers 必须 > 0（当前 {_wrk}）：它是判分并发，"
+            f"0 会让组内每个 patch 串行判，rollout 墙钟被测试执行主导。")
+    # ⑤ 单轮路径不消费的键：传了等于没传（静默空转是本项目最贵的一类 bug）
+    _gq = int(cfg.get("gen_questions_per_attempt", 1) or 1)
+    if _gq > 1:
+        raise ValueError(
+            f"[config] swe_l0 走**单轮**路径，不读 gen_questions_per_attempt="
+            f"{_gq}（rollout 的 use_qqueue 要求 is_retool，L0 恒 False）→ "
+            f"传了等于没传。\n"
+            f"  要提生成吞吐/组内多样性：抬 --num_pre_Q（一次 attempt 采的轨迹数），"
+            f"它才真的改 vLLM 并发与组内 patch 分布。")
+    # ⑥ 长度项/工具信用项在 L0 无受力面：>0 只会引入"短 patch 骗分"的捷径
+    for _key in ("code_w", "code_attempt_w", "len_penalty_w", "tool_call_cost",
+                 "tool_waste_penalty", "trunc_tail_penalty", "len_eff_w",
+                 "len_eff_penalty_w"):
+        _v = float(cfg.get(_key, 0.0) or 0.0)
+        if _v > 0.0:
+            raise ValueError(
+                f"[config] swe_l0 不支持 {_key}={_v}：L0 的 reward 是 F2P 硬判据"
+                f"（docs/17 §3），patch 长度与'修对没修对'无关，长度/工具项在这里"
+                f"只会开出一条'写短 patch 骗分包'的捷径。\n"
+                f"  要试 shaping 请另起 algo 名并写清它是哪个变量的单变量实验。")
+    out["max_gen_tokens"] = _gen
+    out["max_prompt_length"] = _plen
+    out["max_context_tokens"] = _ctx
+    out["swe_test_timeout"] = _to
+    out["swe_test_mem_mb"] = _mem
+    out["swe_test_workers"] = _wrk
+    return out
+
+
 def get_config(algo: str, **overrides) -> dict:
     """合并 BASE + 算法 preset + 显式覆盖，返回冻结配置 dict。"""
     if algo not in ALGO_DEFAULTS:
@@ -972,6 +1163,10 @@ def get_config(algo: str, **overrides) -> dict:
     if algo == "retool_math" and "system_prompt" not in overrides:
         cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
     if algo == "search_qa" and "system_prompt" not in overrides:
+        cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
+    # 【docs/17】swe_l0 的提示与协议档无关（单轮、无工具声明），同样只在未显式
+    # 覆盖时套 preset。
+    if algo == "swe_l0" and "system_prompt" not in overrides:
         cfg["system_prompt"] = default_system_prompt(algo, cfg["tool_protocol"])
     # 预算档系统提示段（preset 与 --system_prompt_file 自定义提示都吃）：必须发生在
     # override 合并之后，且幂等（marker 判重），详见 inject_budget_prompt docstring。
@@ -1044,6 +1239,10 @@ def get_config(algo: str, **overrides) -> dict:
                 "（该键驱动模板声明/解析/执行器三处，改错即三处错配）。")
     # 多轮预算自洽（fail-fast；见 validate_retool_budget 的事故说明）
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
+    # 【docs/17 SWE-RL L0】判分执行器的 fail-fast（纯配置层，不碰文件/子进程）。
+    if cfg.get("algo") == "swe_l0" or cfg.get("data_task") == "swe_l0":
+        _swe = _validate_swe_l0_config(cfg)
+        cfg["_swe_check"] = _swe
     # 【2026-09-18 H2 护栏】vllm_gen_logps 档位：N=0 是 docs/07 实锤的坏路径
     # （logprobs=0 只报被采样 token，在 vLLM v0.19.1 + Qwen3.5 GDN 上 prefill 位
     # 单点差 6.8 nat、与 torch 独立重算不符），正确用法需 N≥1（top-K 里挑被采样

@@ -214,7 +214,9 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
 
     norm = cfg.get("loss_norm", "sample_mean")
 
-    if algo in ("grpo", "retool", "dapo", "rfpp", "search_qa"):
+    if algo in ("grpo", "retool", "dapo", "rfpp", "search_qa", "swe_l0"):
+        # 【docs/17】swe_l0 与 grpo 同 loss 形状（group_mean + sample_mean）：
+        # 变的是 rollout 的动作空间与奖励来源（patch + 真实测试），不是策略目标。
         per_token_loss = -(pg_term - kl_term)
         if norm == "sample_mean":       # GRPO/retool：样本级（每条样本 token 平均后再 batch 平均）
             per_sample = (per_token_loss * mask).sum(dim=1).div(mask.sum(dim=1).clamp(min=1))
@@ -284,4 +286,4 @@ def compute_loss(algo: str, policy_logps: torch.Tensor, gen_logps: torch.Tensor,
 
 
 ALGOS = ("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp", "retool",
-         "retool_math", "search_qa")
+         "retool_math", "search_qa", "swe_l0")

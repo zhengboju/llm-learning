@@ -10,6 +10,8 @@
     python -m rlab.eval --models ./rlab_out/grpo/step_300      # 不带 name 自动取路径末3段
     python -m rlab.eval --retool --models retool300=./rlab_out/retool/step_300
     python -m rlab.eval --algo retool_math --models m20=./rlab_out/retool_math/step_20  # 自动切 dapo_math+boxed
+    python -m rlab.eval --algo swe_l0 --n 60 --models s200=./rlab_out/swe_l0_p1/step_200
+        # SWE-RL L0：自动切 swe_l0 数据集 + F2P/P2P 真实测试判分（docs/17）
 """
 import argparse
 import os
@@ -45,8 +47,8 @@ def main():
                     help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
     ap.add_argument("--algo", type=str, default=None,
                     help="算法名：grpo/retool/retool_math；指定后自动决定 prompt/预算/奖励口径与数据集")
-    ap.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"],
-                    help="评测数据集；None=自动（retool_math→dapo_math，其余→gsm8k）")
+    ap.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math", "search_qa", "swe_l0"],
+                    help="评测数据集；None=自动（retool_math→dapo_math，search_qa→search_qa，swe_l0→swe_l0，其余→gsm8k）")
     ap.add_argument("--val_n", type=int, default=1,
                     help="每题采样数（>1=Average@N 采样评测，参考项目口径；retool_math 建议 8-12）")
     # 【2026-09-20 采样档可复现性】确定性档透传（None=各模型随自己的训练 run_info）。

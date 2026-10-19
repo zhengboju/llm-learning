@@ -28,6 +28,7 @@ import json
 import os
 import queue as _queue
 import random
+import re
 import time
 from collections import deque
 
@@ -69,6 +70,12 @@ from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
 from rlab.search_qa import total_reward_search_qa
 from rlab.sandbox import run_code
 from rlab.sync import need_text_to_mm_remap, remap_text_to_multimodal, sync_weights_into_vllm
+
+# 【docs/17 SWE-RL L0】模型回答里 patch 的围栏提取（三反引号 + 语言名 diff/patch）。
+# 与 protocol._PY_FENCE_RE 同一构造方式（围栏不是格式标签，反引号不参与那条铁律）；
+# 语言名做成 alternation，因为模型会写 ```diff 也会写 ```patch。
+_PATCH_FENCE_RE = re.compile(
+    r"```(?:diff|patch)[ \t]*\r?\n(.*?)```", re.DOTALL)
 
 # 工具协议档位（docs/09-native-tool-protocol.md）：
 #   "fence"  = p1–p11 的 python 围栏 + [TOOL RESULT] 文本回填（逐位可复现，回退位）
@@ -1462,6 +1469,111 @@ def trunc_in_call_flag(text: str, style: str = "auto",
                                param=param).kind == "invalid")
 
 
+def extract_patch_text(answer: str) -> str:
+    """从模型回答里取**要判分的那段 patch**（纯函数，CPU 可测）。
+
+    【为什么不能直接用整段回答】L0 的动作空间是一段 diff（docs/17 §2.5），但
+    模型会先写一段"我怎么改"的说明再给 diff。把整段塞给 `git apply` 必然
+    失败——于是"格式失败"与"修不对"混成一个 0，条件修复率（= 修复率/apply
+    成功率）就失去意义（docs/17 §3 明确要求两者拆开报）。
+
+    取法（按优先级，全部只做**文本层**的挑选，不做任何"猜模型意图"的修补）：
+      1. 有 ```diff / ```patch 围栏 → 取**最后一个**完整围栏块的内容；
+      2. 没有围栏但正文里能找到 `--- a/`（或 `--- ` + `+++ ` 相邻行）→
+         从第一个 `--- ` 行取到文末；
+      3. 都不满足 → 返回全文（让 apply 阶段去失败并如实归因，而不是在这里
+         静默丢成空串）。
+
+    【为什么取最后一个围栏块】模型常见的形态是"先草稿（划掉）→ 再最终版"；
+    取第一个会把被自己否定的草稿拿去判分。
+
+    【零标签字面量铁律】围栏正则从 `protocol._PY_FENCE_RE` 的**同一条构造方式**
+    派生（```` ``` ```` 三反引号不是格式标签，但围栏语言名含可变部分），
+    本函数只拼普通文本，不引入任何尖括号标签字面量。
+    """
+    text = answer or ""
+    # 1) ```diff / ```patch 围栏（允许 ~~~ 或 ``` 任意反引号数 ≥3）
+    blocks = list(_PATCH_FENCE_RE.finditer(text))
+    if blocks:
+        return blocks[-1].group(1).strip("\n") + "\n"
+    # 2) 无围栏：从第一个 diff 头取到文末
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.startswith("--- ") or line.startswith("diff --git "):
+            return "\n".join(lines[idx:]).strip("\n") + "\n"
+    # 3) 交给 apply 去失败（保持原文，不静默丢）
+    return text
+
+
+def score_group_swe_l0(inputs, answers, cfg, *, test_executor=None) -> tuple:
+    """SWE-RL L0 的组打分（模块级纯逻辑，CPU 可测）。返回 (adv, acc, fmt, stats)。
+
+    与 `score_group`（生成端内嵌的那个）的分工：本函数把"判分"与"advantage
+    归一"拆开并暴露 `test_executor` 注入位——CPU 测试用 mock，真机用
+    `rlab.swe_l0.total_reward_swe_l0`。
+
+    三条本项目的硬纪律都在这里
+    ------------------------
+    1. **组内相同 patch 只测一次**（docs/17 §3：测试执行是最贵的一步）。
+       去重后把首条的结论广播给同指纹的其余轨迹——它们的 reward 必须**相同**
+       （同一段 patch 在同一仓库上判两次必然同结果，重测纯属浪费）。
+    2. **apply 失败单独计数**（`stats["apply_ok"]`）：它是格式指标，与能力指标
+       分开报，条件修复率 = acc 率 / apply 成功率（docs/17 §3）。
+    3. **零方差组照样交给外层判丢弃**：本函数不解释"全错"，只如实返回
+       acc/fmt；丢弃逻辑在调用方（`group_ok`），口径单一。
+
+    test_executor(spec_row, patch_text) -> dict（含 reward/acc/format/apply_ok…）
+    """
+    n = int(cfg["num_pre_Q"])
+    assert len(answers) == len(inputs) * n, \
+        f"轨迹数 {len(answers)} != 题数{len(inputs)}×num_pre_Q{n}（检查是否漏了扩样）"
+    if test_executor is None:
+        from rlab.swe_l0 import make_workdir_factory, spec_of, total_reward_swe_l0
+        _timeout = float(cfg.get("swe_test_timeout", 60.0) or 60.0)
+        _mem = int(cfg.get("swe_test_mem_mb", 2048) or 2048)
+        _root = cfg.get("swe_work_root")
+
+        def test_executor(row, patch_text):
+            return total_reward_swe_l0(
+                spec_of(row), patch_text, make_workdir_factory(row, _root),
+                timeout=_timeout, mem_mb=_mem)
+    from rlab.swe_l0 import dedup_group_indices
+    rewards, acc_s, fmt_s = [], [], []
+    apply_ok, stages, durations = [], [], []
+    n_tested = 0      # 实际执行的判分次数（去重后）
+    n_trajs = 0       # 轨迹总数（= 理论上"不去重"要判的次数）
+    for i, inp in enumerate(inputs):
+        group_answers = answers[i * n:(i + 1) * n]
+        patches = [extract_patch_text(a) for a in group_answers]
+        plan = dedup_group_indices(patches)
+        # plan 的键 = 每个 distinct patch 的首次下标 → 键数就是真实判分次数
+        n_tested += len(plan)
+        n_trajs += len(patches)
+        results = {}
+        for head, dupes in plan.items():
+            res = test_executor(inp, patches[head])
+            for k in dupes:
+                results[k] = res
+        for j in range(n):
+            sc = results[j]
+            rewards.append(float(sc["reward"]))
+            acc_s.append(float(sc["acc"]))
+            fmt_s.append(float(sc.get("format", 0.0)))
+            apply_ok.append(1 if sc.get("apply_ok") else 0)
+            stages.append(str(sc.get("apply_stage", "")))
+            durations.append(float(sc.get("duration", 0.0) or 0.0))
+    stats = {"apply_ok": apply_ok, "apply_stage": stages,
+             "test_duration": durations,
+             # 实际判分次数 vs 轨迹数：去重省下的量 = n_trajs − n_tested。
+             # 这是"测试执行是本项目最贵一步"的吞吐证据（docs/17 §1），
+             # 也是决定 batch 大小的输入（先量化单 reward 成本再定 batch）。
+             "n_tested": n_tested,
+             "n_trajs": n_trajs}
+    rewards_t = torch.tensor(rewards, dtype=torch.float32)
+    adv = compute_advantages(rewards_t, n, cfg["adv_mode"])
+    return adv, torch.tensor(acc_s), torch.tensor(fmt_s), stats
+
+
 def traj_dump_row(segs_i, *, Q, A, qk, status, stats=None, acc=None, fmt=None,
                   clen=None, gen_version=None, t=None, attempt_id=None):
     """把一条轨迹打成可落盘的一行（纯函数，CPU 可测；2026-10-02）。
@@ -2291,11 +2403,27 @@ def gen_worker(Q, cfg: dict):
     _verifier = (LogpsVerifier(_verify_budget, on_finish=_free_torch_copy)
                  if (_use_vllm_logps and _verify_budget > 0) else None)
 
+    # 【docs/17 SWE-RL L0】判分统计的传递槽（score_group 是内嵌函数，返回值
+    # 签名被三处共用，不能只为 L0 改成四元组）。每次打分写入一次，下面的
+    # record 行消费它。非 L0 时恒为空 dict（旧 record 行逐字不变）。
+    _swe_stat = [{}]
+
     def score_group(inputs, answers, completion_lens):
         """打分。返回 (scores, acc_s, fmt_s)。
 
         scores = advantage（非 rfpp，已组内归一化）或原始 reward（rfpp）。
+
+        【docs/17 SWE-RL L0】走**独立分支**：reward 来自真实测试执行
+        （git apply + pytest），判分入口是 `score_group_swe_l0`（模块级，
+        FakeExec 可测）。与其余分支的关键差别：
+          · 它需要返回第四个东西（判分统计），故用单独的解包而非改三处签名；
+          · 组内相同 patch 只测一次（测试执行是最贵的一步）；
+          · completion_lens 不参与（L0 无长度项，见 config.swe_l0 注释）。
         """
+        if cfg.get("data_task") == "swe_l0":
+            adv, acc, fmt, st = score_group_swe_l0(inputs, answers, cfg)
+            _swe_stat[0] = st
+            return adv, acc, fmt
         rewards, acc_s, fmt_s = [], [], []
         n = cfg["num_pre_Q"]
         for i, inp in enumerate(inputs):
@@ -2658,10 +2786,23 @@ def gen_worker(Q, cfg: dict):
             xdata = encode_batch(meta, merged_ids, adv, gen_logps, acc_s, fmt_s)
             requests.post(f"{ref_server}/upload", data=xdata)
             uploaded_total += 1
+            # 【docs/17 SWE-RL L0】判分统计进 record（**只在 L0 档追加键**：
+            # 其余任务的 record 行逐字不变，历史断言与旧 analysis 不受影响）。
+            # `apply_ok` 是条件修复率的分母来源（docs/17 §3：修复率/apply 成功率），
+            # `n_tested` vs `n_trajs` 是"组内去重省了多少次判分"的吞吐证据。
+            _extra = {}
+            if cfg.get("data_task") == "swe_l0" and _swe_stat[0]:
+                _st = _swe_stat[0]
+                _extra = {"apply_ok": _st.get("apply_ok", []),
+                          "apply_stage": _st.get("apply_stage", []),
+                          "test_duration": _st.get("test_duration", []),
+                          "n_tested": _st.get("n_tested"),
+                          "n_trajs": _st.get("n_trajs")}
             fout.write(json.dumps({
                 "t": time.time(), "algo": cfg["algo"],
                 "acc": acc_s.tolist(), "fmt": fmt_s.tolist(),
-                "clen": [len(t) for t in ans_token_ids]}, ensure_ascii=False) + "\n")
+                "clen": [len(t) for t in ans_token_ids], **_extra},
+                ensure_ascii=False) + "\n")
             health.observe(acc_s.tolist(), fmt_s.tolist(),
                            [len(t) for t in ans_token_ids])
         # 【2026-09-12 反压①：外层轮次零产出熔断】内层循环到 max_attempts 仍没攒到
@@ -2759,7 +2900,10 @@ def main():
     ap = argparse.ArgumentParser(description="rlab 生成端独立运行（分进程模式）")
     ap.add_argument("--algo", required=True,
                     choices=("grpo", "dapo", "dr_grpo", "cispo", "gspo", "rfpp",
-                             "retool", "retool_math", "search_qa"))
+                             "retool", "retool_math", "search_qa",
+                             # 【docs/17】SWE-RL L0：单轮 patch-only，走单轮生成
+                             # 路径（is_retool 对它为 False），但判分是测试执行
+                             "swe_l0"))
     ap.add_argument("--gen_device", type=int, default=0)
     ap.add_argument("--model_path", default=None)
     ap.add_argument("--port", type=int, default=59875)

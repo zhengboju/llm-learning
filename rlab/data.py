@@ -38,7 +38,14 @@ def load_qas(task: str = "gsm8k", fixture: bool = False):
     if task == "search_qa":
         from rlab.search_qa import load_search_qa_train
         return load_search_qa_train()
-    raise KeyError(f"未知任务 {task!r}（阶段2/3 扩展 retool/search 任务时在此注册）")
+    # 【docs/17 SWE-RL L0】patch 修复池走 swe_l0 模块（带 files/tests/f2p/p2p）。
+    # 注意：swe_l0 的行**多四个键**（files/tests/f2p/p2p），判分靠它们而不是 A——
+    # 但 Q/A 铁律仍然成立（require_qa_rows 照样过），因为 A 是"修好的定义"
+    # 的自然语言锚点，缺了它会让"这题怎么算修好"变成不可见的隐含约定。
+    if task == "swe_l0":
+        from rlab.swe_l0 import load_swe_l0_train
+        return load_swe_l0_train()
+    raise KeyError(f"未知任务 {task!r}（阶段2/3 扩展 retool/search/swe 任务时在此注册）")
 
 
 def _patch_verification_mode():
@@ -471,7 +478,11 @@ def load_difficulty_table(path: str, expected_meta: dict = None,
                     for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
                                 "tool_protocol", "max_traj_tokens", "answer_reserve",
                                 "max_prompt_length", "nsc", "model_path",
-                                "native_tool_name", "data_task"):
+                                "native_tool_name", "data_task",
+                                # 【docs/17】swe_l0 的表同样是"模型×提示×预算×
+                                # 判分口径"的联合产物：测试超时/内存上限变了，
+                                # "超时算失败"的边界就变了 → 通过率是另一个分布。
+                                "swe_test_timeout"):
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

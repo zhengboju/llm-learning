@@ -1,7 +1,21 @@
 # SWE-RL：仓库级代码修复的 RL 训练（项目方案）
 
-> 状态：规划 | 前置：docs/02（ReTool 沙箱）、docs/16（Search-GRPO，agentic RL 共用多轮框架）
+> 状态：**L0 代码已落地（M1 的 CPU 侧完成），待 pod 真机验收**——运行手册见
+> [docs/19-swe-rl-l0-runbook.md](19-swe-rl-l0-runbook.md)。
+> 前置：docs/02（ReTool 沙箱）、docs/16（Search-GRPO，agentic RL 共用多轮框架）
 > 定位：以「真实仓库 issue → patch → 单测验证」为环境的 RL，奖励=F2P 单测通过，代表工作 SWE-RL（Meta）、R2E、SWE-Gym。
+>
+> **落地情况（L0 档）**：种子语料（8 个手写 bug 类）+ 合成变异生成器
+> （`rlab/swe_l0_synth.py`）+ patch 校验器（`git apply --check` + 实 apply，
+> 失败分 5 档归因）+ pytest 执行器（JUnit XML，子进程 + RLIMIT）+ F2P/P2P 判分
+> + 组内 patch 去重 + `swe_l0` preset 与九条 fail-fast + 训练/评测接线全部完成。
+> 池子生成走**执行验收**（原始码全绿 + buggy 至少一条红 → 实测 F2P/P2P），
+> 本机实跑：手写 8 + 合成 40 通过、13 剔除 → train 29 / dev 19。
+> **58 项 L0 CPU 回归 + 全仓 198 项回归通过**（含"真 git apply + 真 pytest"的
+> 端到端接缝测试）。
+> **未做**：真机（GPU）验收——base 的 diff 产出率、训练增益、显存、判分墙钟
+> 均未测；**L1/L2 全部未做**（按 §2 的决策规则，L1 要等 L0 出现显著效应）；
+> docker per-instance 隔离未做（L0 的 instance 自包含，子进程 + rlimit 够用）。
 
 ## 1. 背景与动机
 
@@ -66,12 +80,17 @@ issue 描述 + 仓库快照 → [LLM 生成 patch（diff 格式）]
 
 ## 5. 里程碑
 
-| 里程碑 | 内容 | 验收 |
-|---|---|---|
-| M1 环境探针 | pod 沙箱方案定版（docker vs venv）、SWE-Gym 一个 instance 端到端跑通 | 单个 issue→patch→测试闭环，耗时/内存有数据 |
-| M2 L0 训练 | 合成 bug 池 + GRPO 训练 | vs SFT 基线配对检验显著 |
-| M3 L1 迁移 | SWE-Gym 子集训练 + 评测 | 修复率显著超基线，条件修复率报告 |
-| M4 与 Search-GRPO 合流 | 共用 agentic RL 框架抽象（多轮 rollout/环境接口/reward 插件化） | 两项目跑在同一框架上，沉淀 docs 级框架结论 |
+| 里程碑 | 内容 | 验收 | 状态 |
+|---|---|---|---|
+| M1 环境探针 | pod 沙箱方案定版（docker vs venv）、SWE-Gym 一个 instance 端到端跑通 | 单个 issue→patch→测试闭环，耗时/内存有数据 | **L0 侧完成**（git+pytest 子进程，非 docker）；pod 耗时/内存待测 |
+| M2 L0 训练 | 合成 bug 池 + GRPO 训练 | vs SFT 基线配对检验显著 | 代码就绪，**待真机** |
+| M3 L1 迁移 | SWE-Gym 子集训练 + 评测 | 修复率显著超基线，条件修复率报告 | 未启（前置：L0 出现 >5pp 效应） |
+| M4 与 Search-GRPO 合流 | 共用 agentic RL 框架抽象（多轮 rollout/环境接口/reward 插件化） | 两项目跑在同一框架上，沉淀 docs 级框架结论 | 未启；L0 的 `test_executor` 注入位是 reward 插件化雏形 |
+
+> **落地说明**：L0 的"环境"不需要 docker——8 个种子的 instance 都是自包含的单文件
+> （不装依赖、不联网），判分在**独立子进程 + RLIMIT**（Linux）里跑就够，这正是
+> §2 把 L0 列为"4B 起步训练池"的理由（绕开 docker 构建成本）。L1 起必须换
+> docker/venv per-instance（§2.5）。详见 [docs/19](19-swe-rl-l0-runbook.md) §5。
 
 ## 6. 风险与预案
 

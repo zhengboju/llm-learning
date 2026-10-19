@@ -190,6 +190,25 @@ def run_signature(cfg: dict) -> str:
     _sep = cfg.get("search_endpoint")
     search_tag = ("-se" + hashlib.sha1(str(_sep).encode("utf-8")).hexdigest()[:6]
                   if _sep else "")
+    # 【docs/17 SWE-RL L0】判分口径进签名：`swe_test_timeout` 改变"超时算不算失败"
+    # ——它是 reward 曲面的边界，不是资源参数（同预算档/提示档的性质）。缺省
+    # 60.0 时一个字符都不加，历史签名串逐字不变。
+    _swe_to = float(cfg.get("swe_test_timeout", 60.0) or 60.0)
+    swe_tag = (f"-swt{_swe_to:g}"
+               if (cfg.get("algo") == "swe_l0" and abs(_swe_to - 60.0) > 1e-9)
+               else "")
+    # 数据池身份也进签名：L0 池是按种子生成的（换池 = 换题目分布 = 换实验），
+    # 与 search_endpoint（换知识库）同类。只在 L0 档出现。
+    if cfg.get("algo") == "swe_l0":
+        try:
+            from rlab.swe_l0 import swe_l0_dir
+            _pool = os.path.join(swe_l0_dir(), "train.jsonl")
+            if os.path.exists(_pool):
+                _sz = os.path.getsize(_pool)
+                swe_tag += "-swp" + hashlib.sha1(
+                    f"{_pool}:{_sz}".encode("utf-8")).hexdigest()[:6]
+        except Exception:
+            pass
     # 【2026-09-20 签名覆盖优化器层】此前签名只含 algo/ts/ol/预算/步数/lr/难度表/
     # vk/sp/stop —— 而 `beta`/`GAS`/`num_pre_Q`/`seed`/`temperature`/`adv_mode`/
     # `max_context_tokens` 等 18 个生效超参改了签名**一个字符都不变**，于是
@@ -234,7 +253,7 @@ def run_signature(cfg: dict) -> str:
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
             f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}"
-            f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{_opt_tag}")
+            f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{swe_tag}{_opt_tag}")
 
 
 def write_run_info(path: str, cfg: dict) -> None:
@@ -269,6 +288,12 @@ def write_run_info(path: str, cfg: dict) -> None:
             "native_tool_param": cfg.get("native_tool_param"),
             "search_endpoint": cfg.get("search_endpoint"),
             "search_top_k": cfg.get("search_top_k"),
+            # 【docs/17 SWE-RL L0】判分口径进 run_info：eval 端必须能回读到
+            # "该用哪套超时/内存上限去判 patch"，否则同一个 ckpt 在训练期与评测期
+            # 的修复率会因为"超时算不算失败"不同而不可比（本文件已有多次
+            # 同档评测事故的注释）。
+            "swe_test_timeout": cfg.get("swe_test_timeout"),
+            "swe_test_mem_mb": cfg.get("swe_test_mem_mb"),
             "native_stop_at_call": cfg.get("native_stop_at_call"),
             "trunc_shaping": cfg.get("trunc_shaping"),
             "overlong_shaping": cfg.get("overlong_shaping"),
@@ -324,7 +349,11 @@ _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      # 【docs/16 Search-GRPO】工具名（-tnsearch）与检索服务身份
                      # （-se<hash6>）同属优化器段：不登记则 search_qa 的 run 崩溃后
                      # 重启会被自己的护栏判成"换了配方"而拒跑（正在跑的 run 无法续跑）。
-                     "tn", "se")
+                     "tn", "se",
+                     # 【docs/17】SWE-RL L0 的判分口径段（-swt 超时 / -swp 池身份）
+                     # 同属优化器段：不登记则 L0 的 run 崩溃后重启会被自己的护栏
+                     # 判成"换了配方"而拒跑。
+                     "swt", "swp")
 
 
 def _is_opt_suffix(suffix: str) -> bool:
@@ -1067,7 +1096,11 @@ def main():
                          "撞轮长上限即预算用尽，续写分支不可达（二者同数）。")
     ap.add_argument("--budget_hint", action=argparse.BooleanOptionalAction, default=None,
                     help="token 预算档下把剩余额度写进每次工具回包（默认开）——"
-                         "C 桶（额度耗尽还在调用）占 ok 族无 boxed 的 70%，本质是"
+                         # 【`%%` 是必须的】argparse 的 help 串会走 `%` 格式化：
+                         # 裸写 `70%` 会让 `--help` 自己抛
+                         # "unsupported format character"，整个 CLI 帮助不可用
+                         # （本项目实测过；不是本行特有，任何 help 里带裸 % 都炸）。
+                         "C 桶（额度耗尽还在调用）占 ok 族无 boxed 的 70%%，本质是"
                          "信息不对称：模型看不到'还剩多少'")
     ap.add_argument("--traj_dump", action=argparse.BooleanOptionalAction, default=None,
                     help="轨迹全量落盘（默认关）：写 <out_dir>/traj.jsonl，**段级**"
@@ -1148,6 +1181,21 @@ def main():
     ap.add_argument("--native_tool_name", default=None,
                     help="原生工具名（默认 code_interpreter；search_qa 用 search）。"
                          "驱动模板声明/解析/执行器三处，改错即三处错配")
+    # 【docs/17 SWE-RL L0】判分执行器（git apply + pytest）的资源与口径三件套。
+    # 测试执行是本项目最贵的一步（docs/17 §1），这三个旋钮直接决定 rollout 墙钟
+    # 与"超时算不算失败"的边界，必须能从命令行做单变量实验。
+    ap.add_argument("--swe_test_timeout", type=float, default=None,
+                    help="单次判分（跑一遍 F2P+P2P）的硬超时秒数（默认 60）。"
+                         "它进签名——超时边界改变 reward 曲面，不是纯资源参数")
+    ap.add_argument("--swe_test_mem_mb", type=int, default=None,
+                    help="判分子进程内存上限 MB（默认 2048；Linux RLIMIT_AS，"
+                         "Windows 不生效）")
+    ap.add_argument("--swe_test_workers", type=int, default=None,
+                    help="判分并发数（默认 8 = num_pre_Q 上限：一个组最多 8 条轨迹，"
+                         "组内相同 patch 已去重，再大没有受力面）")
+    ap.add_argument("--swe_work_root", default=None,
+                    help="判分临时仓库根目录（None=系统临时目录）。pod 上若 /tmp 是 "
+                         "tmpfs，务必指到磁盘目录——8 条并发各写一份仓库会吃内存")
     # 【2026-09-23 补 CLI 缺口·采样协议三件套】temperature/top_k/top_p 此前只能改
     # config.py preset —— 而 preset 偏离不进 run_signature 的优化器段（签名只对 CLI
     # 偏离追加字符），改源码的 run 会与旧 ckpt 撞同一个 out_dir（--num_pre_Q 4
@@ -1412,6 +1460,15 @@ def main():
         overrides["search_auth_env"] = args.search_auth_env
     if args.native_tool_name is not None:
         overrides["native_tool_name"] = args.native_tool_name
+    # 【docs/17 SWE-RL L0】判分执行器三件套
+    if args.swe_test_timeout is not None:
+        overrides["swe_test_timeout"] = args.swe_test_timeout
+    if args.swe_test_mem_mb is not None:
+        overrides["swe_test_mem_mb"] = args.swe_test_mem_mb
+    if args.swe_test_workers is not None:
+        overrides["swe_test_workers"] = args.swe_test_workers
+    if args.swe_work_root is not None:
+        overrides["swe_work_root"] = args.swe_work_root
     if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
     # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
     if args.temperature is not None: overrides["temperature"] = args.temperature

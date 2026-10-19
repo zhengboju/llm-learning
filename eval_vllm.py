@@ -39,8 +39,8 @@ parser.add_argument("--split", default="test", choices=["test", "train"],
                     help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
-parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math；自动决定 prompt/预算/奖励口径")
-parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math"], help="评测数据集；None=自动")
+parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math/search_qa/swe_l0；自动决定 prompt/预算/奖励口径")
+parser.add_argument("--eval_task", type=str, default=None, choices=["gsm8k", "dapo_math", "search_qa", "swe_l0"], help="评测数据集；None=自动")
 # 【2026-09-18 采样评测】透传给 eval_vllm_one.py：--val_n>1 启用 Average@N（参考项目口径）
 parser.add_argument("--val_n", type=int, default=1, help="每题采样数（>1=Average@N 采样评测）")
 # 【2026-09-20 采样档可复现性】确定性档统一覆盖（None=各子进程随自己的 run_info）
