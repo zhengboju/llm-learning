@@ -236,6 +236,11 @@ def run_signature(cfg: dict) -> str:
                        # （seed 盐按 题数×num_pre_Q 消耗，采样序列随之错位）。
                        # 不进签名则不同并发数的 run 撞同一 out_dir → step_N 静默覆盖。
                        ("gen_questions_per_attempt", "gq"),
+                       # 【2026-10-19】reward_switch_step 进签名：切换点改变 reward
+                       # 值域权重结构（cold(1,2,2) vs hot(2,1,1)），是行为级变量；
+                       # 等于 preset（retool_math=1e9 全程 cold）时一个字符都不加，
+                       # 历史签名串逐字不变。
+                       ("reward_switch_step", "rs"),
                        # 【2026-09-29 budget 第四件套进签名】max_prompt_length 此前
                        # 只能改 config 源码，改它**一个签名字符都不变** → 两个不同
                        # prompt 上限的 run 撞同一 out_dir，step_N 静默覆盖（P1 事故
@@ -346,6 +351,9 @@ _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      # 【2026-09-29】prompt 上限（budget 第四件套）同属优化器段：
                      # 不登记则 CLI 改过它的 run 中途重启会被自己的护栏拦死。
                      "mp",
+                     # 【2026-10-19】reward 切换点（-rs0）同属优化器段：不登记则
+                     # hot 档的 run 中途重启会被 guard_ckpt_collision 误判外来签名。
+                     "rs",
                      # 【docs/16 Search-GRPO】工具名（-tnsearch）与检索服务身份
                      # （-se<hash6>）同属优化器段：不登记则 search_qa 的 run 崩溃后
                      # 重启会被自己的护栏判成"换了配方"而拒跑（正在跑的 run 无法续跑）。
@@ -1265,6 +1273,11 @@ def main():
                     help="尝试级 shaping：写出可执行代码块就给 code_attempt_w 小分"
                          "（不依赖 code_ok），对冲代码路径风险不对称的理性压灭"
                          "（p6 实测 code%% 50→3）。默认取 preset（0=关闭，旧行为）")
+    ap.add_argument("--reward_switch_step", type=int, default=None,
+                    help="cold→hot 奖励权重切换点（optimizer step）。retool_math preset "
+                         "默认 1e9=全程 cold(1,2,2)——那是为 base 冷启动教格式设计的；"
+                         "从 SFT 出发 fmt 已到 93%%，fmt×2.0 权重纯放大噪声维度梯度。"
+                         "传 0 = 全程 hot(2,1,1)，正确性主导（p11 配方）")
     ap.add_argument("--gen_gpu_mem", type=float, default=None,
                     help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
                          "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
@@ -1470,6 +1483,8 @@ def main():
     if args.swe_work_root is not None:
         overrides["swe_work_root"] = args.swe_work_root
     if args.code_attempt_w is not None: overrides["code_attempt_w"] = args.code_attempt_w
+    if args.reward_switch_step is not None:
+        overrides["reward_switch_step"] = args.reward_switch_step
     # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
     if args.temperature is not None: overrides["temperature"] = args.temperature
     if args.top_k is not None: overrides["top_k"] = args.top_k
