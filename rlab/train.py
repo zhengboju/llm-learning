@@ -181,6 +181,14 @@ def run_signature(cfg: dict) -> str:
     # 约定同 stop_tag：等于旧默认 1.0 时一个字符都不加，历史签名串逐字不变。
     _omp = float(cfg.get("overlong_max_penalty", 1.0) or 1.0)
     omp_tag = f"-omp{_omp:g}" if abs(_omp - 1.0) > 1e-9 else ""
+    # 【2026-10-19 overlong 作用域进签名】只罚失败轨迹改变了 reward 值域（答对侧
+    # 不再吃长度罚）= 行为级变量。约定同 stop_tag：关闭时一个字符都不加。
+    ofo_tag = "-ofo1" if cfg.get("overlong_fail_only") else ""
+    # 【2026-10-19 正确性优先档进签名】三件套改变 advantage 的构造方式（裁剪/截断
+    # 入统计/uniform 判据），是行为级变量。约定同 stop_tag：关闭时一个字符都不加。
+    tag_tag = ("-tag" + f"{float(cfg.get('aux_clip_alpha', 0.5)):g}"
+               + ("-tcw0" if not cfg.get("trunc_counts_as_wrong", True) else "")
+               if cfg.get("task_adv_guard") else "")
     once_tag = "-cs1" if cfg.get("code_shaping_once") else ""
     hint_tag = "-bh1" if (cfg.get("budget_hint") and _mtj > 0) else ""
     # 【docs/16 Search-GRPO】工具身份进签名：换工具（code_interpreter→search）就是换
@@ -262,7 +270,7 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}"
+            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}{ofo_tag}{tag_tag}"
             f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{swe_tag}{_opt_tag}")
 
 
@@ -326,6 +334,10 @@ def write_run_info(path: str, cfg: dict) -> None:
             # 【2026-10-19】overlong 幅度护栏（1.0=旧行为）——eval/诊断端据此判断
             # "答对但写长"的轨迹是否仍有正优势
             "overlong_max_penalty": cfg.get("overlong_max_penalty"),
+            "overlong_fail_only": cfg.get("overlong_fail_only"),
+            "task_adv_guard": cfg.get("task_adv_guard"),
+            "aux_clip_alpha": cfg.get("aux_clip_alpha"),
+            "trunc_counts_as_wrong": cfg.get("trunc_counts_as_wrong"),
             "difficulty_path": cfg.get("difficulty_path"),
             "difficulty_band": cfg.get("difficulty_band"),
             "lr": cfg.get("lr"),
@@ -364,6 +376,8 @@ _OPT_TAG_PREFIXES = ("b", "g", "n", "u", "T", "a", "c", "sd", "of",
                      "rs",
                      # 【2026-10-19】overlong 幅度护栏（-omp0.5）同属优化器段。
                      "omp",
+                     # 【2026-10-19】overlong 作用域（-ofo1）同属优化器段。
+                     "ofo",
                      # 【docs/16 Search-GRPO】工具名（-tnsearch）与检索服务身份
                      # （-se<hash6>）同属优化器段：不登记则 search_qa 的 run 崩溃后
                      # 重启会被自己的护栏判成"换了配方"而拒跑（正在跑的 run 无法续跑）。
@@ -1288,14 +1302,31 @@ def main():
                          "默认 1e9=全程 cold(1,2,2)——那是为 base 冷启动教格式设计的；"
                          "从 SFT 出发 fmt 已到 93%%，fmt×2.0 权重纯放大噪声维度梯度。"
                          "传 0 = 全程 hot(2,1,1)，正确性主导（p11 配方）")
+    ap.add_argument("--overlong_fail_only", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="【结构护栏】长度罚只作用于未通过轨迹。cap 调小挡不住"
+                         "『6/8 组 task 优势仅 +0.50 < overlong 0.5+len_eff 0.1』这类"
+                         "结构性翻转（p11b 实测 1.9%）；开启后答对的轨迹无论多长都"
+                         "不会被长度项翻负。默认关（旧行为逐位相同）")
     ap.add_argument("--overlong_max_penalty", type=float, default=None,
                     help="overlong_penalty 的封顶值（默认 1.0=旧行为）。1.0 的满幅 =="
                          "正确性奖励全域（±1），会把'答对但写长'的轨迹压成负优势"
                          "（p11 实测 21/321 翻转，doc15 §7 停线）。0.5 = 保留半个"
                          "正确性幅度的正优势，答错侧方向不变。只在 overlong_shaping 开时生效")
-    ap.add_argument("--gen_gpu_mem", type=float, default=None,
-                    help="覆盖 vLLM 显存占比（默认 0.45 是 3B 时代标定；Qwen3.5 "
-                         "多模态实现实测超支 ~15G，4B 建议 0.30 给 ref/torch 腾位）")
+    ap.add_argument("--task_adv_guard", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="【正确性优先档总开关】开启后三件事同时生效：辅助项按"
+                         "±alpha·task_adv_margin 裁剪（正确>0>错误成为结构恒等）、"
+                         "截断/废码按答错计入组统计（不再免费）、uniform 判据改用"
+                         "任务维度方差（全对/全错组直接丢）。只在 adv_mode=group_mean "
+                         "下裁剪。默认关（旧行为逐位相同）")
+    ap.add_argument("--aux_clip_alpha", type=float, default=None,
+                    help="辅助项裁剪系数 alpha（默认 0.5）：aux 限 ±alpha·margin，"
+                         "margin=2·min(c,n−c)/n。0.5 保留正确样本一半余量")
+    ap.add_argument("--trunc_counts_as_wrong", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="截断/废码按答错计入组统计并吃负梯度（默认开，但只在 "
+                         "--task_adv_guard 下生效）。关掉=回到旧口径（截断样本零梯度）")
     ap.add_argument("--vllm_gen_kwargs", default=None,
                     help='JSON dict **整体替换** vLLM 引擎构造参数（键名用下划线形态）。'
                          '默认已含 \'{"gdn_prefill_backend": "triton"}\'——Qwen3.5 的 '
@@ -1502,6 +1533,14 @@ def main():
         overrides["reward_switch_step"] = args.reward_switch_step
     if args.overlong_max_penalty is not None:
         overrides["overlong_max_penalty"] = args.overlong_max_penalty
+    if args.overlong_fail_only is not None:
+        overrides["overlong_fail_only"] = args.overlong_fail_only
+    if args.task_adv_guard is not None:
+        overrides["task_adv_guard"] = args.task_adv_guard
+    if args.aux_clip_alpha is not None:
+        overrides["aux_clip_alpha"] = args.aux_clip_alpha
+    if args.trunc_counts_as_wrong is not None:
+        overrides["trunc_counts_as_wrong"] = args.trunc_counts_as_wrong
     # 【2026-09-23】采样协议/题目调度 CLI 透传（与上面 add_argument 一一对应）
     if args.temperature is not None: overrides["temperature"] = args.temperature
     if args.top_k is not None: overrides["top_k"] = args.top_k

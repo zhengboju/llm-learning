@@ -2110,6 +2110,45 @@ def test_overlong_ref_and_opt_cli():
           abs(float(_new[0]) - 0.5) < 1e-6 and abs(float(_new[3]) + 1.5) < 1e-6)
     check("adv_task 反证：套 2a−1 得到 +1.0/−3.0（历史 record 错尺度，勿回退）",
           abs(float(_old[0]) - 1.0) < 1e-6 and abs(float(_old[3]) + 3.0) < 1e-6)
+    # 【2026-10-19 正确性优先档】翻转必须成为"结构不可能"而非"监控指标"。
+    # task_adv_margin = 2·min(c,n−c)/n 是两侧中较小的单侧余量；clip_aux_centered
+    # 把 aux 去均值后裁剪到 ±alpha·margin ⇒ 正确>0>错误 恒成立（含最坏全反向 aux）。
+    from rlab.reward import task_adv_margin as _tam, clip_aux_centered as _cac
+    _n = 8
+    check("task_adv_margin 表：c=1/7→0.25、4/4→1.00、0 与 n→0",
+          abs(_tam(1, _n) - 0.25) < 1e-9 and abs(_tam(7, _n) - 0.25) < 1e-9
+          and abs(_tam(4, _n) - 1.0) < 1e-9
+          and _tam(0, _n) == 0.0 and _tam(8, _n) == 0.0)
+    _flip = []
+    import random as _rnd
+    _rnd.seed(0)
+    for _c in range(1, _n):
+        _acc = [1.0] * _c + [-1.0] * (_n - _c)
+        _m = sum(_acc) / _n
+        _t = [a - _m for a in _acc]
+        for _tr in range(200):
+            if _tr == 0:
+                _aux = [-2.0 if a > 0 else 2.0 for a in _acc]      # 最坏：全反向
+            elif _tr == 1:
+                _aux = [2.0 if a > 0 else -2.0 for a in _acc]
+            else:
+                _aux = [_rnd.uniform(-2.0, 2.0) for _ in range(_n)]
+            _ac = _cac(_aux, _c, _n, alpha=0.5)
+            for _i in range(_n):
+                _adv = _t[_i] + _ac[_i]
+                if _acc[_i] > 0 and _adv <= 0:
+                    _flip.append((_c, "correct", _adv))
+                if _acc[_i] < 0 and _adv >= 0:
+                    _flip.append((_c, "wrong", _adv))
+    check("裁剪后：c=1..7 × 200 组极端 aux 全部无翻转（正确>0>错误 结构恒等）",
+          not _flip)
+    check("反证：不裁剪时同一最坏 aux 会把正确样本翻负（说明裁剪是真作用）",
+          any(_t[0] + (-2.0) <= 0 for _c in (1, 2, 3)
+              for _t in [[a - sum([1.0] * _c + [-1.0] * (_n - _c)) / _n
+                          for a in [1.0] * _c + [-1.0] * (_n - _c)]]))
+    check("裁剪只做去均值+限幅：全零 aux 原样返回",
+          all(abs(x) < 1e-12 for x in _cac([0.0] * _n, 3, _n))
+          and _cac([0.0] * _n, 0, _n) == [0.0] * _n)
     # 【2026-10-19】幅度护栏：封顶值必须可压到 1.0 以下，否则「答对但写长」会被
     # 这条软护栏压成负优势（p11 实测 21/321 翻转，doc15 §7 停线）。
     check("幅度护栏：默认封顶 1.0 与旧行为逐位相同",

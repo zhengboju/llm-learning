@@ -136,7 +136,8 @@ def reward_format_retool(answer: str) -> float:
 
 
 def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64,
-                     max_penalty: float = 1.0) -> float:
+                     max_penalty: float = 1.0, passed=None,
+                     fail_only: bool = False) -> float:
     """DAPO overlong shaping：超过 (max-buffer) 后线性扣分，封顶 max_penalty。
 
     【2026-10-19 幅度护栏·max_penalty】封顶 1.0 时本项满幅 == 正确性奖励的全部
@@ -145,16 +146,70 @@ def overlong_penalty(completion_len: int, max_gen_tokens: int, buffer: int = 64,
     536 条轨迹里 175 条（32.6%）吃罚、132 条（24.6%）顶满，被压的 correct 样本
     task=+0.5~+1.14 全被翻成非正（doc15 §7 明文禁止的翻转）。
 
-    结构性事实：overlong 是**护栏不是目标**——它的职责是"别烧预算写散文"，
-    没有资格推翻"这题做对了"。因此正确性优先档（overlong_guard=True）把上限
-    压到 max_penalty（默认 0.5），使「答对 + 顶满罚」仍保留半个正确性幅度的正
-    优势，而「答错 + 顶满罚」只会更负（方向不变，符合惩罚本意）。
+    【2026-10-19 fail_only·结构保证】cap=0.5 后仍有 ~2% 翻转残留，因为 6/8 组
+    正确样本的 task 优势只有 +0.50，而 overlong(0.5)+len_eff_pen(0.1)=0.55 > 0.50
+    ——这是**组越均衡、task 优势越小、越容易被长度项压翻**的结构性矛盾，调 cap
+    只能逼近不能根除（cap 再降则长度约束失效）。正解是改变作用域：overlong 是
+    **护栏不是目标**，它的职责是"答不出来时别烧预算写散文"，与 MiMo
+    group_length_penalty 同一条原则（只罚未通过）。`fail_only=True` 时只有
+    `passed=False` 的轨迹吃罚 ⇒ 「答对」在任何长度下都不会被长度项翻负，是
+    **结构性保证**而非调参碰巧。
 
-    max_penalty=1.0 时与旧行为逐位相同（旧 checkpoint/历史 run 口径不变）。"""
+    passed=None 且 fail_only=True → 视为未通过（保守：不改变现有失败侧行为）。
+    fail_only=False 时与旧行为逐位相同（历史 run/ckpt 口径不变）。"""
     trigger = max_gen_tokens - buffer
     if completion_len <= trigger:
         return 0.0
+    if fail_only and passed:
+        return 0.0
     return min((completion_len - trigger) / buffer, float(max_penalty))
+
+
+def task_adv_margin(n_correct: int, n: int, adv_mode: str = "group_mean"):
+    """「正确 vs 错误」两侧中**较小**的单侧余量（纯函数）。
+
+    group_mean 下正确样本 task adv = 2(n−c)/n、错误样本 = −2c/n，间距恒为 2。
+    裁剪要保护的是**两侧都不会被 aux 越过 0**，故取较小者：
+
+        c=1/7 → 0.25（错侧）   c=4/4 → 1.00
+        c=2/6 → 0.50（错侧）   c=6/2 → 0.50（对侧）
+        c=3/5 → 0.75（错侧）   c=7/1 → 0.25（对侧）
+
+    即 min(2c/n, 2(n−c)/n) = 2·min(c, n−c)/n —— 组越均衡越大，越极端越小，
+    正对应"极端组里少数派最容易被动摇"。
+
+    全对/全错（c=0 或 c=n）没有正确性对比 → 返回 0.0（调用方据此判定任务维度
+    零方差）。group_std 下不存在该解析余量，训练侧裁剪只在 group_mean 开启。
+    """
+    if n <= 0 or n_correct <= 0 or n_correct >= n:
+        return 0.0
+    return 2.0 * float(min(n_correct, n - n_correct)) / float(n)
+
+
+def clip_aux_centered(aux: list, n_correct: int, n: int,
+                      alpha: float = 0.5) -> list:
+    """把组内辅助项**去均值后**裁剪到 ±alpha·margin（纯函数）。
+
+    【要解决的结构性矛盾】正确样本的 task 余量随组通过率升高而变小（c=7/8 只剩
+    0.25），而辅助项（长度/工具/效率）按次数累加、幅度不受组约束 ⇒ 组越均衡越
+    容易被辅助项压翻符号。p11 实测 21/321、p11b 1.9% 都是这一条。调 cap/减权只能
+    逼近不能根除（为守住 c=7 就得把 aux 压到 0.125，长度约束随之失效）。
+
+    【做法】正确性优先档：aux 先**组内去均值**（去掉它想表达的"全组一起变好/变差"
+    那部分——那部分在 group_mean 下本来就会被减掉，留着只会制造虚假组内差异），
+    再裁剪到 ±alpha·margin。alpha=0.5 时正确样本的余量至少保留一半，且
+    「正确 > 0 > 错误」成为结构恒等式而非调参碰巧。
+
+    c=0/n（无正确性对比）→ 原样返回（此时没有可被保护的正确性信号）。
+    """
+    if n <= 0 or len(aux) != n or n_correct <= 0 or n_correct >= n:
+        return list(aux)
+    margin = task_adv_margin(n_correct, n)
+    if margin <= 0.0 or alpha <= 0.0:
+        return list(aux)
+    lim = float(alpha) * margin
+    mean = sum(float(a) for a in aux) / n
+    return [max(-lim, min(lim, float(a) - mean)) for a in aux]
 
 
 def overlong_ref_tokens(cfg: dict) -> int:
@@ -450,7 +505,8 @@ def group_eff_penalty(group_rewards: list, group_lens: list,
 def total_reward_math(ground_truth: str, answer: str, *,
                       completion_len: int = 0, max_gen_tokens: int = 8192,
                       overlong_buffer: int = 64, overlong_shaping: bool = False,
-                      overlong_max_penalty: float = 1.0) -> dict:
+                      overlong_max_penalty: float = 1.0,
+                      overlong_fail_only: bool = False) -> dict:
     """数学 outcome-only：只看末尾 \\boxed{} 是否与 gt 数学等价（±1），无格式分。"""
     acc = reward_correct_boxed(ground_truth, answer)
     # fmt 沿用 boxed 是否存在作监控（1=抽到 boxed，-1=无），但不进 reward
@@ -459,7 +515,8 @@ def total_reward_math(ground_truth: str, answer: str, *,
     pen = 0.0
     if overlong_shaping:
         pen = overlong_penalty(completion_len, max_gen_tokens, overlong_buffer,
-                               max_penalty=overlong_max_penalty)
+                               max_penalty=overlong_max_penalty,
+                               passed=(acc > 0.0), fail_only=overlong_fail_only)
         r -= pen
     return {"reward": r, "acc": acc, "format": fmt, "overlong": pen}
 
@@ -468,6 +525,7 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
                              completion_len: int = 0, max_gen_tokens: int = 8192,
                              overlong_buffer: int = 64, overlong_shaping: bool = False,
                              overlong_max_penalty: float = 1.0,
+                             overlong_fail_only: bool = False,
                              trunc_final: int = 0, trunc_shaping: float = 0.0,
                              code_used: int = 0, code_attempt_w: float = 0.0,
                              code_w: float = 0.0, max_rounds: int = 8,
@@ -501,7 +559,8 @@ def total_reward_retool_math(ground_truth: str, answer: str, *, code_ok: int = 0
                              completion_len=completion_len,
                              max_gen_tokens=max_gen_tokens, overlong_buffer=overlong_buffer,
                              overlong_shaping=overlong_shaping,
-                             overlong_max_penalty=overlong_max_penalty)
+                             overlong_max_penalty=overlong_max_penalty,
+                             overlong_fail_only=overlong_fail_only)
     tp = trunc_penalty(trunc_final, trunc_shaping)
     if tp:
         base["reward"] = base["reward"] - tp

@@ -470,6 +470,29 @@ BASE = dict(
     # 0.5 = 「答对 + 顶满罚」仍留半个正确性幅度的正优势；答错侧方向不变（只更负）。
     # 1.0 = 旧行为逐位相同（历史 run/ckpt 口径不变）。进签名（改 reward 值域）。
     overlong_max_penalty=1.0,
+    # 【2026-10-19 overlong 作用域·结构性护栏】True 时长度罚**只作用于未通过轨迹**
+    # （False=旧行为，全部轨迹都罚）。
+    #
+    # 【为什么 cap 调小不够】p11b（cap 0.5）实测仍有 1.9% 翻转：6/8 组正确样本的
+    # task 优势只有 +0.50，而 overlong(0.5)+len_eff_pen(0.1)=0.55 > 0.50。组越
+    # 均衡（课程越集中在近界题）task 优势越小、越容易被长度项压翻 —— 这是
+    # **结构性矛盾**，调 cap 只能逼近不能根除（再降则长度约束失效）。
+    # 正解是改作用域：overlong 是护栏不是目标，职责是"答不出来时别烧预算写散文"
+    # ——与 MiMo group_length_penalty 同一条原则（只罚未通过，见 reward.py:262）。
+    # 开启后「答对」在任何长度下都不会被长度项翻负（结构性保证）。
+    overlong_fail_only=False,
+    # 【2026-10-19 正确性优先档·三件套】task_adv_guard 是这一组的总开关，开启后：
+    #   ①aux_clip_alpha>0：辅助项去均值后裁剪到 ±alpha·task_adv_margin（c=1/7 组
+    #     余量 0.25 → aux 限 ±0.125；c=4/4 → ±0.5）。「正确>0>错误」成为结构恒等。
+    #   ②trunc_counts_as_wrong：截断/废码不再从组统计移除（写爆预算=没答完=acc−1，
+    #     吃真实负梯度）。旧口径下它 sw=0、adv=0，长度约束在梯度上是免费的。
+    #   ③uniform 判据改用任务维度方差：acc 全同的组直接丢（对准确率只贡献噪声）；
+    #     旧判据"最终 advantage 有方差"让 aux 驱动它们上传（p10: 1000 组 uniform=0，
+    #     其中 59.5% 零正确性信号）。
+    # 只在 adv_mode=group_mean 下裁剪（group_std 的间距被 std 归一化，无解析余量）。
+    task_adv_guard=False,
+    aux_clip_alpha=0.5,
+    trunc_counts_as_wrong=True,
     # 【2026-09-29 效率激励·补正向】通过轨迹内部的**组内相对**长度奖励权重
     # （0 = 关闭 = 旧行为逐位相同）。
     #

@@ -65,6 +65,7 @@ from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
                            _TOOL_OPEN as _CALL_OPEN, _TOOL_CLOSE as _CALL_CLOSE)
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          group_eff_bonus, group_eff_penalty,
+                         clip_aux_centered,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math, group_length_penalty)
 from rlab.search_qa import total_reward_search_qa
@@ -1344,6 +1345,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
                     # 【2026-10-19】幅度护栏：封顶值（默认 1.0=旧行为）。1.0 的满幅
                     # == 正确性全域，会把"答对但写长"压成负优势（p11 实测 21 例）。
                     overlong_max_penalty=float(cfg.get("overlong_max_penalty", 1.0) or 1.0),
+                    # 【2026-10-19】作用域护栏：只罚未通过轨迹（结构性保证答对不被
+                    # 长度项翻负；见 config.overlong_fail_only 的推导）
+                    overlong_fail_only=bool(cfg.get("overlong_fail_only", False)),
                     # 末段被轮长上限切断 → 额外扣分（prose 路径唯一够得到的长度反向信号）
                     trunc_final=_tf,
                     trunc_shaping=_trunc_w,
@@ -1417,7 +1421,19 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     # 又因 sw=0 零梯度（"末轮写调用"永远拿不到直接惩罚），与 sw 注释声称的
     # "它们 adv=0" 矛盾。修复后：组统计与 loss 归一化排除**同一人群**
     # （trunc_final OR code_wasted），旧行为仅在 overlong_filter 关闭时保留。
+    # 【2026-10-19 正确性优先档·三项结构改动】正确性优先档（task_adv_guard）下：
+    #   ①截断/废码**不再从组统计移除**（trunc_counts_as_wrong）：写爆预算=没答完
+    #     =acc −1，让它吃真实负梯度。旧口径下截断样本 sw=0、adv=0，"写爆预算"
+    #     在梯度上是**免费**的——这是长度无界爬升的唯一结构性通道。
+    #   ②辅助项裁剪到 ±alpha·margin（clip_aux_centered）：组越均衡正确样本余量
+    #     越小（c=7/8 只剩 0.25），而 aux 按次数累加不受组约束 ⇒ 结构性地压翻。
+    #   ③uniform 判据改用**任务维度**方差：acc 全同的组对准确率只贡献噪声，
+    #     旧判据"最终 advantage 有方差"会让 aux 驱动它们照常上传（p10 60%）。
+    _guard = bool(cfg.get("task_adv_guard", False))
+    _trunc_in_stats = _guard and bool(cfg.get("trunc_counts_as_wrong", False))
     excl = [1 if (tf or wf) else 0 for tf, wf in zip(trunc_finals, wasted_flags)]
+    if _trunc_in_stats:
+        excl = [0] * n
     if _do_filter and any(excl):
         sample_mask = torch.tensor([0 if e else 1 for e in excl],
                                    dtype=torch.float32)
@@ -1425,6 +1441,17 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
     else:
         sample_mask = None
         adv = compute_advantages(rewards, n, cfg["adv_mode"])
+    _n_correct = sum(1 for a in acc_s if a and a > 0)
+    if _guard and cfg.get("adv_mode") == "group_mean":
+        # 任务优势口径（用于裁剪与 uniform 判据）
+        _task_r = torch.tensor([float(a) for a in acc_s], dtype=torch.float32)
+        _adv_task = compute_advantages(_task_r, n, "group_mean")
+        if 0 < _n_correct < n:
+            _aux = [float(a) - float(t) for a, t in zip(adv, _adv_task)]
+            _aux_c = clip_aux_centered(_aux, _n_correct, n,
+                                       alpha=float(cfg.get("aux_clip_alpha", 0.5)))
+            adv = torch.tensor([float(t) + c for t, c in zip(_adv_task, _aux_c)],
+                               dtype=torch.float32)
     if signal_out is not None:
         # 【2026-10-15 正确性信号观测（doc15 阶段B）】上传判据是**最终 advantage**
         # （含辅助/局部项），不是 acc——uploaded≠正确性混合组。要回答"更新里有
@@ -1438,9 +1465,9 @@ def retool_score_flat(inputs, asst_texts, code_stats, cfg, steps_elapsed,
         # 会得到 {+1,−3}，使 adv_task 整体放大 2 倍、adv_aux 被系统性偏移：
         # 6对2错组实测 adv_task=[+1,+1,...,−3,−3]（真值应为 +0.5/−1.5），
         # 于是 sigstats 报出「正确性为正被压成非正」的假翻转（p11 那 1/80）。
-        # 该列是纯诊断列（不进 loss），修复后历史 record 的 adv_task/adv_aux
-        # 需按 `(x/2−0.5)` 与 `adv − adv_task` 重算；符号翻转判据只在修复后的
-        # run 上有效。
+        # 该列是纯诊断列（不进 loss）。组均值口径下 t_bug ≡ 2·t_true（精确），
+        # 故历史 record 的真实 task 优势 = adv_task/2；翻转判据 (t>0 且 t+a<=0)
+        # 与尺度无关（t+a ≡ adv，偏差自动抵消），历史 run 的翻转计数仍然有效。
         _task_r = torch.tensor([float(a) for a in acc_s], dtype=torch.float32)
         _adv_task = compute_advantages(_task_r, n, cfg["adv_mode"],
                                        sample_mask=sample_mask)
@@ -1784,7 +1811,14 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
             _sig["adv_local_mag"] = [0.0] * n
         # 零方差组（全对/全错，adv 恒 0 无梯度）：按题判定（2026-09-09 起
         # 与超长分流；2026-09-10 起不再连坐同批其他题）
-        if not group_ok(adv_i):
+        # 【2026-10-19 正确性优先档】判据改用**任务维度**方差：acc 全同（全对/全错）
+        # 的组对准确率只贡献噪声，旧判据"最终 advantage 有方差"会让 aux 驱动它们
+        # 照常上传（p10 实测 1000 组里 uniform=0、其中 59.5% 是零正确性信号）。
+        if cfg.get("task_adv_guard", False):
+            _keep = 0 < sum(1 for a in acc_i if a and a > 0) < n
+        else:
+            _keep = group_ok(adv_i)
+        if not _keep:
             # 【2026-10-02】丢弃组也进轨迹 dump——它们不进 record.jsonl，
             # 却是"硬题是怎么死的"的唯一证据。
             _sink("uniform", acc_i, fmt_i)
