@@ -332,6 +332,11 @@ def main():
                "max_prompt_length", "max_traj_tokens", "answer_reserve",
                "budget_hint", "native_stop_at_call", "temperature",
                "top_p", "top_k", "chat_template_kwargs", "data_task",
+               # 【2026-10-20】通告预算必须回读：它决定系统提示里的数字、`[budget]`
+               # 剩余额度与执行阈值三处。漏了它 → 探针按 max_traj_tokens 通告而
+               # 训练按 budget_target 通告 → 两张不同分布的表（难度表只对同提示
+               # 同预算的模型有效，这是"表是协议的一半"的又一处）。
+               "budget_target",
                "vllm_gen_kwargs"):
         if _ri_cfg.get(_k) is not None:
             cfg[_k] = _ri_cfg[_k]
@@ -386,6 +391,11 @@ def main():
     # "合法配置"定义与训练漂移——本文件正是 get_config 之后直接改 cfg 的形态。
     validate_max_prompt_length(cfg)
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
+    # 【2026-10-20】通告预算的两条硬约束（同上：探针路径必须与训练同源校验，
+    # 否则"合法配置"的定义在两条路径间漂移——本文件正是 get_config 之后改 cfg 的形态）
+    from rlab.config import budget_target_tokens as _bt_tokens, \
+        validate_budget_target as _vbt
+    _vbt(cfg)
 
     from rlab.data import load_qas, load_difficulty_table
     from rlab.protocol import initial_messages

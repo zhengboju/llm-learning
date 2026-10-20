@@ -220,7 +220,9 @@ if _sp_sig and _sp_sha != _sp_sig:
 # 【2026-09-29 token 预算档】档位必须打印：它换的是**终止结构**（预算判据取代末轮
 # 判据、切断改续写、回包注入额度），不是普通数值——与 gpu_mem/协议档同级。
 _budget_src = (f"token档(轨迹{int(_rcfg.get('max_traj_tokens', 0) or 0)}tok"
-               f"+作答预留{int(_rcfg.get('answer_reserve', 0) or 0)})"
+               f"+作答预留{int(_rcfg.get('answer_reserve', 0) or 0)}"
+               # 【2026-10-20】通告数字与保险丝并列打印：两者不同才是锚生效
+               f"+通告{int(_rcfg.get('budget_target', 0) or 0) or '同轨迹'})"
                if int(_rcfg.get("max_traj_tokens", 0) or 0) > 0
                else f"轮数档({args.max_rounds}轮×{args.round_tokens}tok)")
 print(f"[eval] 协议来源: run_info={'有' if _run else '无（preset 默认）'} "
@@ -735,6 +737,12 @@ if is_retool_family:
               # ckpt（轨迹长度/终止点/答案截断率全不同）＝测的是另一套协议下的模型。
               # 这正是 docs/09 §8 那条"改档必须同步"的纪律在新档上的延续。
               "max_traj_tokens": _mtj_eval,
+              # 【2026-10-20】通告预算必须一起回读：它决定系统提示里的数字、
+              # `[budget]` 剩余额度与 `_can` 执行阈值三处。漏了它 → eval 按
+              # max_traj_tokens 通告而训练按 budget_target 通告 → 同一个 ckpt
+              # 在两边被"告知"了不同的预算，轨迹长度与终止点不可比（与
+              # round_gen_tokens 缺键退化成 400 是同一类"评测不同档"事故）。
+              "budget_target": int(_rcfg.get("budget_target", 0) or 0),
               "answer_reserve": int(_rcfg.get("answer_reserve", 0) or 0),
               "budget_hint": bool(_rcfg.get("budget_hint")),
               # 【2026-09-29 单轮上限必须一起传】token 档下每轮额度是

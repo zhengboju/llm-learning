@@ -168,6 +168,12 @@ def run_signature(cfg: dict) -> str:
     # 约定同 stop_tag/of_tag：只在开启/偏离时追加，历史签名串逐字不变。
     _mtj = int(cfg.get("max_traj_tokens", 0) or 0)
     mtj_tag = f"-mtj{_mtj}-ar{int(cfg.get('answer_reserve', 0) or 0)}" if _mtj > 0 else ""
+    # 【2026-10-20 通告预算进签名】budget_target 改变模型的三个预算信道（提示里的
+    # 数字 / `[budget]` 剩余额度 / `_can` 执行阈值），是**生成端行为级**变量：
+    # 同一份 max_traj_tokens 下，8192 与 12288 两个承诺产出的轨迹长度与终止点不同。
+    # 约定同 stop_tag：=0（用 max_traj_tokens，历史行为）时一个字符都不加。
+    _bt = int(cfg.get("budget_target", 0) or 0)
+    bt_tag = f"-bt{_bt}" if _bt > 0 else ""
     _lew = float(cfg.get("len_eff_w", 0.0) or 0.0)
     lew_tag = f"-lew{_lew:g}" if _lew > 0.0 else ""
     # 正确且超组内 ref 的 capped 惩罚独立成档：不与 MiMo 失败样本惩罚共用键，
@@ -270,7 +276,7 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}{ofo_tag}{tag_tag}"
+            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{bt_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}{ofo_tag}{tag_tag}"
             f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{swe_tag}{_opt_tag}")
 
 
@@ -334,6 +340,9 @@ def write_run_info(path: str, cfg: dict) -> None:
             # 【2026-10-19】overlong 幅度护栏（1.0=旧行为）——eval/诊断端据此判断
             # "答对但写长"的轨迹是否仍有正优势
             "overlong_max_penalty": cfg.get("overlong_max_penalty"),
+            # 【2026-10-20】通告预算：eval/诊断端据此还原"模型看到的数字"与
+            # "真实保险丝"的关系（两者不同才是锚生效）
+            "budget_target": cfg.get("budget_target"),
             "overlong_fail_only": cfg.get("overlong_fail_only"),
             "task_adv_guard": cfg.get("task_adv_guard"),
             "aux_clip_alpha": cfg.get("aux_clip_alpha"),
@@ -1171,6 +1180,15 @@ def main():
                          "max_rounds×round_gen_tokens）。自动值在预算给满的档下"
                          "远高于真实用量（实测 10240 vs 2811）→ shaping 是死开关；"
                          "本开关把它改成**目标长度**，让长度压力真正可达")
+    # 【2026-10-20】通告预算：模型看到的预算数字（0 = 用 max_traj_tokens 的旧行为）。
+    # p9 §7.6 的锚机制（承诺紧、余量松）+5.2pp acc / +4.1pp fmt，但那条腿此前只靠
+    # 提示文本，`[budget]` 回包与 `_can` 判据仍漏出真实总量 → 题一难就失效。
+    ap.add_argument("--budget_target", type=int, default=None,
+                    help="通告给模型的轨迹预算（0=用 max_traj_tokens，旧行为）。"
+                         ">0 时把系统提示的数字、[budget] 剩余额度、调用执行阈值"
+                         "三处统一到它，max_traj_tokens 退化为纯保险丝（模型看不见）"
+                         "→ 「承诺紧、余量松」结构性成立。必须 < max_traj_tokens，"
+                         "且 ≥ answer_reserve+工具回包估算")
     ap.add_argument("--retool_stop", action=argparse.BooleanOptionalAction, default=None,
                     help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
                          "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
@@ -1501,6 +1519,10 @@ def main():
     if args.trunc_tail_penalty is not None:
         overrides["trunc_tail_penalty"] = args.trunc_tail_penalty
     if args.overlong_ref is not None: overrides["overlong_ref"] = args.overlong_ref
+    # 【2026-10-20】通告预算必须在 get_config 之前落 override：inject_budget_prompt
+    # 在 get_config 内部就要读它（提示里的数字），晚一步就会写进旧数字。
+    if args.budget_target is not None:
+        overrides["budget_target"] = args.budget_target
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     # 【2026-09-25 原生工具协议】tool_protocol 必须先落进 overrides——get_config
     # 靠它决定要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感）。

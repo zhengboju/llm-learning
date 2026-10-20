@@ -195,7 +195,7 @@ def synthesize_low_budget(turns, call_need: int, rng: random.Random):
 
 def compose_system_prompt(system_prompt_file=None, max_traj_tokens=8192,
                           answer_reserve=1024, tool_result_max_chars=500,
-                          run_info_path=None):
+                          run_info_path=None, budget_target=0):
     """与训练/probe 同一入口装配系统提示（含预算段自动注入）。
 
     返回 (sp, sha6, call_need, src)。优先级：--system_prompt_file >
@@ -223,21 +223,30 @@ def compose_system_prompt(system_prompt_file=None, max_traj_tokens=8192,
         answer_reserve = int(rc.get("answer_reserve") or answer_reserve)
         tool_result_max_chars = int(rc.get("tool_result_max_chars")
                                     or tool_result_max_chars)
+        # 【2026-10-20】通告预算也必须回读：它决定提示里的数字。漏了它 → SFT 合成
+        # 样本的系统提示说 max_traj_tokens（如 12288）而 RL 训练说 budget_target
+        # （如 8192）→ 教出来的收尾点与线上协议错位（合成样本的整个价值就是
+        # "在线上真实预算下该怎么收尾"）。
+        budget_target = int(rc.get("budget_target") or budget_target)
         src = f"run_info:{run_info_path}"
     else:
         base_sp = None
     call_need = tool_result_max_chars // 2 + 16 + answer_reserve
+    _bt = int(budget_target or 0)
     if base_sp is None:
         ov = dict(use_wandb=False, tool_protocol="native",
                   max_traj_tokens=int(max_traj_tokens),
                   answer_reserve=int(answer_reserve),
                   max_context_tokens=int(max_traj_tokens) + 1024,
                   budget_hint=True)
+        if _bt > 0:
+            ov["budget_target"] = _bt
         sp = get_config("retool_math", **ov)["system_prompt"]
     else:
         c = {"system_prompt": base_sp, "budget_hint": True,
              "max_traj_tokens": int(max_traj_tokens),
              "answer_reserve": int(answer_reserve),
+             "budget_target": _bt,
              "tool_protocol": "native"}
         inject_budget_prompt(c)
         sp = c["system_prompt"]

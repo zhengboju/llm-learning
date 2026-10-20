@@ -2063,7 +2063,9 @@ def test_eval_thinking_switch():
 
 def test_overlong_ref_and_opt_cli():
     print("[X] overlong 参考系修复 + 优化超参 CLI：retool 多轮总预算 ≠ 单轮 max_gen_tokens")
-    from rlab.reward import overlong_ref_tokens, overlong_penalty, total_reward_math
+    from rlab.reward import (overlong_ref_tokens, overlong_penalty,
+                             total_reward_math, total_reward_retool_math,
+                             trunc_penalty)
     # 【2026-09-12 语义变更】参考系不再是裸的 rounds×per_round，而是"可写满的总预算"
     # = min(rounds×per_round, max_context_tokens − max_prompt_length)，防止在
     # 预算不自洽的配置下 trigger 落到 overlong 丢弃线之外（那样它永远够不着 → 死开关）。
@@ -2122,10 +2124,15 @@ def test_overlong_ref_and_opt_cli():
     _flip = []
     import random as _rnd
     _rnd.seed(0)
+    # ⚠ 变量名不叫 _t：上面 `import torch as _t` 还要在下面用（2026-10-20 修掉的
+    # 真 bug——列表遮蔽了 torch 模块，`_t.tensor(...)` 报 'list' object has no
+    # attribute 'tensor'。这类遮蔽不报错、只在执行到下游才炸，是本项目"精确 0%/
+    # 恒常数"之外另一类"静默错误的形状"）。
+    _task_adv = []
     for _c in range(1, _n):
         _acc = [1.0] * _c + [-1.0] * (_n - _c)
         _m = sum(_acc) / _n
-        _t = [a - _m for a in _acc]
+        _task_adv = [a - _m for a in _acc]
         for _tr in range(200):
             if _tr == 0:
                 _aux = [-2.0 if a > 0 else 2.0 for a in _acc]      # 最坏：全反向
@@ -2135,7 +2142,7 @@ def test_overlong_ref_and_opt_cli():
                 _aux = [_rnd.uniform(-2.0, 2.0) for _ in range(_n)]
             _ac = _cac(_aux, _c, _n, alpha=0.5)
             for _i in range(_n):
-                _adv = _t[_i] + _ac[_i]
+                _adv = _task_adv[_i] + _ac[_i]
                 if _acc[_i] > 0 and _adv <= 0:
                     _flip.append((_c, "correct", _adv))
                 if _acc[_i] < 0 and _adv >= 0:
@@ -2143,9 +2150,9 @@ def test_overlong_ref_and_opt_cli():
     check("裁剪后：c=1..7 × 200 组极端 aux 全部无翻转（正确>0>错误 结构恒等）",
           not _flip)
     check("反证：不裁剪时同一最坏 aux 会把正确样本翻负（说明裁剪是真作用）",
-          any(_t[0] + (-2.0) <= 0 for _c in (1, 2, 3)
-              for _t in [[a - sum([1.0] * _c + [-1.0] * (_n - _c)) / _n
-                          for a in [1.0] * _c + [-1.0] * (_n - _c)]]))
+          any(_ta[0] + (-2.0) <= 0 for _c in (1, 2, 3)
+              for _ta in [[a - sum([1.0] * _c + [-1.0] * (_n - _c)) / _n
+                           for a in [1.0] * _c + [-1.0] * (_n - _c)]]))
     check("裁剪只做去均值+限幅：全零 aux 原样返回",
           all(abs(x) < 1e-12 for x in _cac([0.0] * _n, 3, _n))
           and _cac([0.0] * _n, 0, _n) == [0.0] * _n)
@@ -2206,7 +2213,10 @@ def test_overlong_ref_and_opt_cli():
                                    overlong_shaping=True,
                                    overlong_max_penalty=0.5)["reward"] < 0.0)
     # 【2026-09-12】trunc 靶向 shaping：总长惩罚够不到的单轮 prose 轨迹靠它反向
-    from rlab.reward import trunc_penalty, total_reward_retool_math
+    # ⚠ import 已合并到函数开头（见 2066 行）：任何函数内的 `from ... import X`
+    # 都会把 X 变成整个函数的局部名，前面 2195-2212 行对它的调用会抛
+    # UnboundLocalError——不是语法错误，只在执行到那几行时炸（2026-10-20 修掉）。
+    from rlab.reward import trunc_penalty
     check("trunc_penalty：weight=0 → 恒 0（其他算法协议零变化）",
           trunc_penalty(1, 0.0) == 0.0 and trunc_penalty(0, 0.5) == 0.0)
     check("trunc_penalty：trunc_final=1 → weight", trunc_penalty(1, 0.5) == 0.5)
@@ -6013,6 +6023,193 @@ def test_signal_observation():
     print()
 
 
+def test_budget_target_announcement():
+    """[AQ] 通告预算（budget_target）：模型看得见的数字必须三处一致。
+
+    【为什么这组必须存在】p9 §7.6 的锚机制（提示 8192 / 上限 12288"承诺紧、余量
+    松"）+5.2pp acc / +4.1pp fmt，但那条腿此前**只靠提示文本**：`[budget]` 回包与
+    `_can` 执行判据仍按 max_traj_tokens 算，模型一旦读到"11600 tokens left"就把
+    余量当预算花掉。p9 没暴露是因为题简单（avg_clen 2602）；p11c 进难度带后
+    avg_clen 6056~8056、B 桶 272/272 全部 clen≥0.9·cap。
+    ⇒ 若哪天有人把这三处中的任一处改回 max_traj_tokens，锚会**静默失效**，
+    而所有指标（acc/fmt/trunc）都只表现为"题变难了"。本组锁的就是这条。
+    """
+    print("[AQ] 通告预算 budget_target（三信道一致 + 两条 fail-fast + 签名）")
+    from rlab.config import (budget_target_tokens, inject_budget_prompt,
+                             validate_budget_target)
+    from rlab.train import run_signature
+    from rlab.rollout import budget_hint_line as _bhl
+    from rlab.tests.test_native_protocol import (MockTok, _json_form, _SPStub,
+                                                 _TOOL_OPEN, _TOOL_CLOSE)
+    from rlab.protocol import NATIVE_BAD_WORDS
+    from rlab.rollout import multi_turn_rollout_group, prompt_messages_for
+
+    # ---------- 1. 纯函数：0 = 旧行为（历史签名/行为逐位不变）----------
+    check("budget_target_tokens：0 → 返回 max_traj_tokens（历史行为逐位不变）",
+          budget_target_tokens({"max_traj_tokens": 16384, "budget_target": 0})
+          == 16384
+          and budget_target_tokens({"max_traj_tokens": 16384}) == 16384)
+    check("budget_target_tokens：>0 → 返回承诺值（与保险丝解耦）",
+          budget_target_tokens({"max_traj_tokens": 16384, "budget_target": 6144})
+          == 6144)
+
+    # ---------- 2. 三个信道说的是同一个数字 ----------
+    _cfg = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                      max_traj_tokens=16384, budget_target=6144,
+                      answer_reserve=1024, budget_hint=True,
+                      max_context_tokens=17408)
+    # ①系统提示
+    check("信道①：系统提示写的是**承诺**6144（不是保险丝 16384）",
+          "6144 tokens" in _cfg["system_prompt"]
+          and "16384 tokens" not in _cfg["system_prompt"])
+    # ②回包：[budget] 的 left 必须从承诺算起 → 首轮刚用完一点时不会报 15xxx
+    # ③执行判据：承诺 − used − obs ≥ reserve
+    # 三者都走 announce_budget，用源码断言锁"没有第二份口径"（rollout 里不该再出现
+    # 裸 traj_budget 参与这两处）
+    _ro = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "rlab", "rollout.py"), encoding="utf-8").read()
+    check("信道②：[budget] 剩余额度按承诺算（announce_budget 而非 traj_budget）",
+          "announce_budget\n                                - (len(ctx_ids[i]) - p0[i])"
+          in _ro)
+    check("信道③：执行判据按承诺算（announce_budget − used − obs ≥ reserve）",
+          "_can = (announce_budget - _used_tokens(i) - _obs_est) >= _ans_res" in _ro)
+    check("announce_budget 收敛到单点真相 budget_target_tokens()",
+          "announce_budget = budget_target_tokens(cfg) or traj_budget" in _ro)
+    # 保险丝语义不变：停止生成 / trunc_final 仍按 traj_budget（承诺只影响"通告"，
+    # 不影响"这条轨迹最长多长"——否则承诺就等于硬砍预算，锚机制退化成截断）
+    check("保险丝不被替换：预算耗尽判 trunc_final 仍用 traj_budget",
+          "if _used_tokens(i) < traj_budget:" in _ro)
+
+    # ---------- 3. 两条 fail-fast（都是"不报错、只是白跑"的形态）----------
+    check("校验：0 直接放行，不碰历史档",
+          validate_budget_target({"max_traj_tokens": 0, "budget_target": 0}) is None)
+    try:
+        validate_budget_target({"max_traj_tokens": 8192, "budget_target": 12288,
+                                "answer_reserve": 1024})
+        check("校验：通告 > 保险丝 必须 raise（提示说谎→必撞墙）", False)
+    except ValueError as e:
+        check("校验：通告 > 保险丝 必须 raise（提示说谎→必撞墙）",
+              "比真实保险丝还大" in str(e))
+    try:
+        validate_budget_target({"max_traj_tokens": 8192, "budget_target": 300,
+                                "answer_reserve": 1024,
+                                "tool_result_max_chars": 500})
+        check("校验：连一次调用都装不下 必须 raise（否则全员废码）", False)
+    except ValueError as e:
+        check("校验：连一次调用都装不下 必须 raise（否则全员废码）",
+              "code_wasted" in str(e))
+    try:
+        validate_budget_target({"max_traj_tokens": 0, "budget_target": 4096})
+        check("校验：轮数档（mtj=0）下给 budget_target 必须 raise", False)
+    except ValueError as e:
+        check("校验：轮数档（mtj=0）下给 budget_target 必须 raise",
+              "需要 token 预算档" in str(e))
+
+    # ---------- 4. 签名：只在开启时出现（历史串逐字不变）----------
+    _sig_on = run_signature(_cfg)
+    check("签名带 -bt6144（生成端行为级变量，防撞 out_dir）",
+          "-bt6144" in _sig_on)
+    _cfg_off = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                         max_traj_tokens=16384, answer_reserve=1024,
+                         budget_hint=True, max_context_tokens=17408)
+    check("budget_target=0 → 签名里没有 -bt（历史签名逐字不变）",
+          "-bt" not in run_signature(_cfg_off))
+
+    # ---------- 5. FakeGen 端到端：承诺生效时调用被拒、回包报的是承诺余量 ----------
+    t = MockTok()
+
+    def fake_run(code, timeout=None, mem_mb=None, max_chars=None):
+        return {"ok": True, "display": "42", "error_type": None}
+
+    class _C:
+        def __init__(self, text, fr="stop"):
+            self.text, self.token_ids = text, t.encode(text)
+            self.finish_reason = fr
+
+    class _O:
+        def __init__(self, text, fr="stop"):
+            self.outputs = [_C(text, fr)]
+
+    class FakeGen:
+        def __init__(self, rounds):
+            self.rounds, self.r = rounds, 0
+
+        def generate(self, prompts, sps, use_tqdm=False):
+            texts = self.rounds[min(self.r, len(self.rounds) - 1)]
+            self.r += 1
+            assert len(texts) == len(prompts)
+            return [_O(*x) if isinstance(x, tuple) else _O(x) for x in texts]
+
+    def mk_cfg(**kw):
+        c = {"max_rounds": 5, "max_context_tokens": 17408, "round_gen_tokens": 64,
+             "sandbox_timeout": 1.0, "sandbox_mem_mb": 64,
+             "tool_result_max_chars": 200, "tool_protocol": "native",
+             "native_tool_style": "auto", "sandbox_workers": 1,
+             "system_prompt": "SYS"}
+        c.update(kw)
+        return c
+
+    _call = "think\n" + _json_form("print(6*7)")
+
+    def _run(cfg, texts):
+        fg = FakeGen(texts)
+        sg, ff, cs = multi_turn_rollout_group(
+            fg, [_SPStub(list(NATIVE_BAD_WORDS))] * 2, t, ["P"] * 2, cfg,
+            code_runner=fake_run,
+            prompts_messages=prompt_messages_for([{"Q": "Q1"}], cfg) * 2)
+        return sg, cs
+
+    # 承诺恰好装不下一次调用（obs≈116 + reserve=400 > 承诺 500）→ 调用不执行
+    _c_tight = mk_cfg(max_traj_tokens=100000, budget_target=500,
+                      answer_reserve=400, budget_hint=True)
+    _sg_t, _cs_t = _run(_c_tight, [[_call, _call], ["\\boxed{42}"] * 2])
+    check("承诺生效：装不下时调用不执行 → code_wasted=1（promise 才是真阈值）",
+          _cs_t[0]["code_wasted"] >= 1)
+    # 同样的预算几何，但承诺放开到 100000 → 调用执行（对照：差异只能来自承诺）
+    _c_wide = mk_cfg(max_traj_tokens=100000, budget_target=100000,
+                     answer_reserve=400, budget_hint=True)
+    _sg_w, _cs_w = _run(_c_wide, [[_call, _call], ["\\boxed{42}"] * 2])
+    check("同一保险丝下承诺放开 → 调用执行（唯一变量是 budget_target）",
+          _cs_w[0]["code_used"] >= 1 and _cs_w[0]["code_wasted"] == 0)
+
+    # 回包里报的余量：承诺 4096 时首轮后应 ≈4096−调用文本−obs，不可能出现 >4096
+    _c_hint = mk_cfg(max_traj_tokens=100000, budget_target=4096,
+                     answer_reserve=400, budget_hint=True)
+    _sg_h, _ = _run(_c_hint, [[_call, _call], ["\\boxed{42}"] * 2])
+    _tool_txt = "".join(s["text"] for s in _sg_h[0] if s["kind"] == "tool")
+    import re as _re
+    _lefts = [int(x) for x in _re.findall(r"\[budget\] (\d+) tokens left", _tool_txt)]
+    check("回包余量从承诺 4096 起算（绝不会报出 >4096，这正是 p11c 的漏洞形态）",
+          bool(_lefts) and all(v <= 4096 for v in _lefts))
+    # 历史档（budget_target=0）不得受本改动影响：同配置下 left 仍从 mtj 起算
+    _c_old = mk_cfg(max_traj_tokens=100000, answer_reserve=400, budget_hint=True)
+    _sg_o, _ = _run(_c_old, [[_call, _call], ["\\boxed{42}"] * 2])
+    _tool_o = "".join(s["text"] for s in _sg_o[0] if s["kind"] == "tool")
+    _lefts_o = [int(x) for x in _re.findall(r"\[budget\] (\d+) tokens left", _tool_o)]
+    check("budget_target 缺省 → 回包余量仍从 max_traj_tokens 起算（零行为漂移）",
+          bool(_lefts_o) and all(v > 4096 for v in _lefts_o))
+
+    # ---------- 6. 提示注入与 eval/probe 回读（跨入口不得各写一遍）----------
+    _cf = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "rlab", "config.py"), encoding="utf-8").read()
+    check("inject_budget_prompt 用 budget_target_tokens()（不是裸 max_traj_tokens）",
+          "mtj=budget_target_tokens(cfg)," in _cf)
+    _pb = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "rlab", "probe_difficulty.py"), encoding="utf-8").read()
+    check("probe_difficulty 回读 budget_target（否则探的表与训练不同分布）",
+          '"budget_target",' in _pb and "validate_budget_target" in _pb
+          or "_vbt(cfg)" in _pb)
+    _ev = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "eval_vllm_one.py"), encoding="utf-8").read()
+    check("eval 把 budget_target 传进 mt_cfg（否则评测与训练通告不同预算）",
+          '"budget_target": int(_rcfg.get("budget_target", 0) or 0),' in _ev)
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -6071,6 +6268,7 @@ if __name__ == "__main__":
     test_tool_credit_assignment()
     test_gen_death_diagnostics()
     test_signal_observation()
+    test_budget_target_announcement()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

@@ -40,7 +40,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from rlab.config import get_config
+from rlab.config import budget_target_tokens, get_config
 from rlab.data import filter_qas_by_difficulty, load_difficulty_table, load_qas
 from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
@@ -631,6 +631,17 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     traj_budget = int(cfg.get("max_traj_tokens", 0) or 0)
     tok_mode = traj_budget > 0
     _hint = bool(cfg.get("budget_hint", False)) and tok_mode
+    # 【2026-10-20 通告预算 vs 真实上限】traj_budget 是**保险丝**（决定何时停止生成、
+    # 何时置 trunc_final），announce_budget 是**告诉模型的承诺**。两者错开时
+    # （承诺紧、余量松）p9 §7.6 实测 +5.2pp acc / +4.1pp fmt 且更省 token。
+    #
+    # 关键：模型的预算认知有三个信道——系统提示的数字、下面 budget_hint_line 里的
+    # `left`、以及 `_can` 执行阈值。三者必须说同一个数，否则"锚"立刻失效：
+    # p11c 实测提示写 8192 而回包按 12288 报剩余额度，avg_clen 从 2602 涨到
+    # 6056~8056、B 桶（散文撞墙）272/272 全部 clen≥0.9·cap。
+    # 收敛到 budget_target_tokens() 单一来源（budget_target=0 → 等于 traj_budget，
+    # 历史行为逐位不变）。
+    announce_budget = budget_target_tokens(cfg) or traj_budget
     # 执行一次调用的预算开销估算：工具回包（obs）+ 之后作答的空间（reserve）。
     # 执行判据（_can）与分档提示（budget_hint_line）共用同一口径——提示里说的
     # 阈值必须就是真实阈值，否则模型学到的是错误判据。
@@ -787,7 +798,10 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
             # 执行一次调用要花掉两笔：工具回包（obs）+ 之后作答的空间
             # （answer_reserve），两者都装得下才执行。
             if tok_mode:
-                _can = (traj_budget - _used_tokens(i) - _obs_est) >= _ans_res
+                # 用 **announce_budget**（承诺）而不是 traj_budget（保险丝）判：真实阈值
+                # 必须就是提示里说的那个数，否则模型学到的判据是假的（p11c：提示
+                # 8192 而这里按 12288 放行，模型于是一路写到 11k 才被拒）。
+                _can = (announce_budget - _used_tokens(i) - _obs_est) >= _ans_res
             else:
                 _can = (not is_final_round
                         and code_stats[i]["code_used"] < max_code_calls)
@@ -841,7 +855,8 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
                     # 【2026-10-09】分档化（budget_hint_line）：p6/p7 上 C_wasted 仍占
                     # 无 boxed ~50%——只报剩余额度不够，模型算不准执行阈值，必须把
                     # "再调用会不会被执行"直接告诉它。
-                    _left = max(0, traj_budget - (len(ctx_ids[i]) - p0[i]) - len(body) // 2)
+                    _left = max(0, announce_budget
+                                - (len(ctx_ids[i]) - p0[i]) - len(body) // 2)
                     body += budget_hint_line(_left, _obs_est + _ans_res)
                 call_id = make_call_id(0, i, code_stats[i]["code_used"], _tname)
                 obs_msg = tool_message(call_id, body, _tname)
