@@ -838,16 +838,26 @@ def no_boxed_bucket(fmt_ok: bool, trunc: int, wasted: int, invalid: int,
 
 
 def _credit_enabled(path: str) -> tuple:
-    """该 record 对应 run 启用了哪几项局部负优势：返回 (waste_credit, trunc_credit)。
+    """该 record 对应 run 里"截断/废码轨迹是否还有梯度"：返回 (waste_credit, trunc_credit)。
 
-    旧 run 缺键 → 都是 False（历史口径：trunc OR code_wasted 整行 sw=0）。
-    【2026-10-01】trunc_tail_penalty>0 后截断轨迹重新进 loss，零梯度人群随之缩小，
-    判读必须按 run_info 分档，否则会把"已有局部信用"记成"零梯度算力"。
+    【2026-10-20 语义升级·必须与 reward.sample_weights_for_loss 同口径】
+    这两个布尔回答的是"sw 是否为 1"，不是"ttp/twp 是否 >0"——旧版把两者混同，
+    于是 guard+tcw 档（ttp/twp 被自动归零，但负优势走组均值 acc=−1）会被读成
+    "零梯度"，而实际上下一步就要给它们记梯度。读数与代码反向是同类事故的温床
+    （本项目已因"配置标称≠实跑"出过多次事故）。
+
+    判据（与 sample_weights_for_loss 完全一致）：
+      · task_adv_guard + trunc_counts_as_wrong → 两者都为 True（sw≡1）；
+      · 否则 → 各自看 ttp/twp > 0。
+    旧 run 缺键 → (False, False)，历史口径逐位不变。
     """
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(path)),
                                "run_info.json"), encoding="utf-8") as f:
             cfg = (json.load(f) or {}).get("config") or {}
+        if (bool(cfg.get("task_adv_guard"))
+                and bool(cfg.get("trunc_counts_as_wrong"))):
+            return (True, True)
         return (float(cfg.get("tool_waste_penalty", 0.0) or 0.0) > 0.0,
                 float(cfg.get("trunc_tail_penalty", 0.0) or 0.0) > 0.0)
     except (OSError, ValueError, TypeError):
@@ -998,11 +1008,18 @@ def no_boxed_breakdown(path: str) -> dict:
     trunc∩invalid 全算进 trunc），故固化成子命令 + 测试。"""
     R = read_record(path)
     waste_credit, trunc_credit = _credit_enabled(path)
+    # guard+tcw 档：sw≡1（负优势来自组均值），零梯度人群为空——与 reward.
+    # sample_weights_for_loss 同一判据，避免"读数与代码反向"（旧版把 ttp/twp=0
+    # 直接读成"零梯度"，而该档下它们被有意归零、梯度反而**全部保留**）。
+    _rc = record_run_config(path)
+    guard_tcw = (bool(_rc.get("task_adv_guard"))
+                 and bool(_rc.get("trunc_counts_as_wrong")))
     n_tot = len(R["accs"])
     fams = R["fams"]
     res = {"n_samples": n_tot, "n_nobox": 0, "n_nobox_total": 0,
            "zero_grad_total": 0, "waste_credit": waste_credit,
            "trunc_credit": trunc_credit, "has_tric": R.get("has_tric", False),
+           "guard_tcw": guard_tcw,
            "families": {}}
     for fam in ("ok", "dropped"):
         idx = [i for i, v in enumerate(fams) if v == fam]
@@ -1070,7 +1087,9 @@ def summarize_no_boxed(path: str) -> str:
         out.append(f"| {label} | {f['n']} | {nb} | {nb / f['n'] * 100:.0f}% | "
                    + " | ".join(cells) + " |")
     out.append("")
-    if B.get("trunc_credit") and B.get("waste_credit"):
+    if B.get("guard_tcw"):
+        _zg_rule = "guard+tcw：负优势走组均值，trunc/废码都不再 sw=0"
+    elif B.get("trunc_credit") and B.get("waste_credit"):
         _zg_rule = "trunc/废调用都已有局部负优势"
     elif B.get("trunc_credit"):
         _zg_rule = "trunc 已有末段局部负优势；末轮废码 → sw=0"

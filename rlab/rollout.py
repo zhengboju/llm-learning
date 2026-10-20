@@ -66,6 +66,7 @@ from rlab.protocol import (NATIVE_BAD_WORDS, NATIVE_CALL_STOP,
 from rlab.reward import (overlong_ref_tokens, reward_phase, total_reward,
                          group_eff_bonus, group_eff_penalty,
                          clip_aux_centered,
+                         sample_weights_for_loss,
                          total_reward_math, total_reward_retool,
                          total_reward_retool_math, group_length_penalty)
 from rlab.search_qa import total_reward_search_qa
@@ -1904,15 +1905,25 @@ def collect_retool_group(vllm_gen, tokenizer, cfg, compute_gen_logps,
                                 for s in code_stats[i * n:(i + 1) * n]],
                         "ctxf": [int(s.get("ctx_full", 0))
                                  for s in code_stats[i * n:(i + 1) * n]],
-                        # sample_weight 只做整条轨迹过滤。两类结构性失败在拿到
-                        # 逐token局部负优势后必须重新纳入 loss，否则又回到
-                        # “判失败但零梯度”：废调用（tool_waste_penalty>0）与
-                        # 截断末段（trunc_tail_penalty>0）。关闭新机制时保持历史
-                        # 口径：trunc OR code_wasted 都整行清零。
+                        # sample_weight 只做整条轨迹过滤。**2026-10-20 起收敛到
+                        # reward.sample_weights_for_loss()**（单一真相）：旧口径
+                        # "trunc OR code_wasted → 整行清零"与 trunc_counts_as_wrong
+                        # 直接矛盾——tcw 的负优势走组均值（acc=−1）、不经 ttp/twp，
+                        # 而 ttp/twp 在 guard 档下已被 validate_guard_conflicts 归零
+                        # ⇒ 旧条件恒真 ⇒ sw 恒 0 ⇒ tcw 算出的 −1.75 被乘 0。
+                        # p11c 实测零梯度 563/2696（21%），正是无 boxed 的 96%。
+                        # guard+tcw 下 sw≡1（负优势来自组均值，无需排除）；
+                        # 其余档位与历史口径逐位相同。
                         "sw": torch.tensor(
-                            [0.0 if ((s["trunc_final"] and _trunc_tail <= 0.0) or
-                                     (s.get("code_wasted", 0) and _waste_pen <= 0.0))
-                             else 1.0 for s in _stats_i],
+                            sample_weights_for_loss(
+                                [s["trunc_final"] for s in _stats_i],
+                                [int(s.get("code_wasted", 0)) for s in _stats_i],
+                                trunc_tail_penalty=_trunc_tail,
+                                waste_penalty=_waste_pen,
+                                task_adv_guard=bool(cfg.get("task_adv_guard",
+                                                            False)),
+                                trunc_counts_as_wrong=bool(
+                                    cfg.get("trunc_counts_as_wrong", False))),
                             dtype=torch.float32),
                         "plen": plen_i})
         # 【2026-10-02】上传组的轨迹 dump（与上面 overlong/uniform 同一落盘口径）

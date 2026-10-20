@@ -5819,8 +5819,9 @@ def test_tool_credit_assignment():
           and 'overrides["trunc_tail_penalty"]' in src)
     ro_src = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
-    check("启用截断信用时 sw 不再整行清零截断轨迹",
-          '(s["trunc_final"] and _trunc_tail <= 0.0)' in ro_src)
+    check("rollout 的 sw 收敛到 reward.sample_weights_for_loss（单一真相）",
+          "sample_weights_for_loss(" in ro_src
+          and "from rlab.reward import" in ro_src)
     an_src = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "analysis.py"), encoding="utf-8").read()
     check("analysis 按 run_info 分档判定截断零梯度",
@@ -6210,6 +6211,107 @@ def test_budget_target_announcement():
     print()
 
 
+def test_loss_weight_guard_tcw():
+    """[AR] guard+tcw 下 sw 必须恒 1——否则 tcw 算出的负优势被乘 0。
+
+    【2026-10-20 缺陷】`trunc_counts_as_wrong` 的全部意义是"写爆预算=没答完=
+    acc−1，让它吃真实负梯度"，而它给的负优势走**组 adv**、不经 ttp/twp。
+    但 loss 侧 sw 的判据是 `(trunc and ttp<=0) or (cw and twp<=0)`，
+    而 guard 档下 validate_guard_conflicts 把 ttp/twp **强制归零**
+    （它们与 tcw 的覆盖语义冲突）⇒ 条件恒真 ⇒ sw 恒 0 ⇒ −1.75 × 0 = 0。
+
+    p11c 实测：零梯度 563/2696（21%），且这 21% 正是无 boxed 的 96%（B/C 桶）。
+    用户"每次都要最优配置"却仍拿到零梯度，根因就是这条**配置对、接线断**。
+    """
+    print("[AR] loss 权重 sample_weights_for_loss（guard+tcw 下 sw≡1）")
+    from rlab.reward import sample_weights_for_loss as W
+    from rlab.config import get_config, validate_guard_conflicts
+
+    # ---------- 1. 历史口径逐位不变（这是回归锁，不是新行为）----------
+    check("历史档（无 guard）：trunc → 0（旧行为逐位不变）",
+          W([1], [0]) == [0.0] and W([0], [1]) == [0.0])
+    check("历史档：正常轨迹 → 1", W([0], [0]) == [1.0])
+    check("历史档：ttp>0 → 截断不再清零（截断信用）",
+          W([1], [0], trunc_tail_penalty=0.1) == [1.0])
+    check("历史档：twp>0 → 废码不再清零（废调用信用）",
+          W([0], [1], waste_penalty=0.1) == [1.0])
+    # 混合样本（同时截断+废码）的逐标志语义：任一标志无信用即清零
+    check("历史档：截断有信用但废码无信用 → 仍清零（逐标志，不合并放行）",
+          W([1], [1], trunc_tail_penalty=0.1) == [0.0])
+    check("历史档：两个都有信用 → 放行",
+          W([1], [1], trunc_tail_penalty=0.1, waste_penalty=0.1) == [1.0])
+
+    # ---------- 2. guard + tcw：两者都不再清零（本次修复）----------
+    check("guard+tcw：trunc → 1（tcw 的负优势走组均值，无需排除）",
+          W([1], [0], task_adv_guard=True,
+            trunc_counts_as_wrong=True) == [1.0])
+    check("guard+tcw：废码 → 1",
+          W([0], [1], task_adv_guard=True,
+            trunc_counts_as_wrong=True) == [1.0])
+    check("guard+tcw：ttp/twp 即使仍是 0（被净化归零）也全放行",
+          W([1, 0, 0], [0, 1, 0], trunc_tail_penalty=0.0, waste_penalty=0.0,
+            task_adv_guard=True, trunc_counts_as_wrong=True) == [1.0, 1.0, 1.0])
+
+    # ---------- 3. guard 开但 tcw 关：退回历史口径（此时 ttp 是唯一信号）----------
+    check("guard 开 + tcw 关 → 截断仍清零（ttp 已被净化归零，确实无信号）",
+          W([1], [0], task_adv_guard=True,
+            trunc_counts_as_wrong=False) == [0.0])
+
+    # ---------- 4. 与真实 config 联动（净化归零后仍放行）----------
+    _c = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                    max_traj_tokens=12288, answer_reserve=1024,
+                    max_context_tokens=13312, budget_hint=True,
+                    task_adv_guard=True, trunc_counts_as_wrong=True,
+                    tool_waste_penalty=0.20)
+    check("真实 config：tool_waste_penalty 被净化归零（用户传的 0.20 不生效）",
+          float(_c["tool_waste_penalty"]) == 0.0)
+    _sw = W([1, 0, 0], [0, 1, 0],
+            trunc_tail_penalty=float(_c["trunc_tail_penalty"]),
+            waste_penalty=float(_c["tool_waste_penalty"]),
+            task_adv_guard=bool(_c["task_adv_guard"]),
+            trunc_counts_as_wrong=bool(_c["trunc_counts_as_wrong"]))
+    check("真实 config 下 sw 全 1（否则 tcw 的 −1.75 被乘 0）", _sw == [1.0] * 3)
+
+    # ---------- 5. 端到端：collect_retool_group 产出的 sw 真的变了 ----------
+    from rlab.rollout import retool_score_flat
+    n = 8
+    texts = ["x \\boxed{42}"] * 6 + ["x \\boxed{99}"] * 2
+    st = [{"code_used": 1, "code_ok": 1, "code_wasted": 0, "invalid_final": 0,
+           "ctx_full": 0, "trunc_final": 0, "trunc_in_call": 0, "err_types": []}
+          for _ in range(n)]
+    st[6]["trunc_final"] = 1
+    st[7]["code_wasted"] = 1
+    sig = {}
+    adv, *_ = retool_score_flat([{"Q": "q", "A": "42"}], texts, st, cfg_ar := _c,
+                                0, completion_lens=[6000] * n, signal_out=sig)
+    check("tcw 生效：截断/废码拿到真实组内负优势 −1.5（6对2错）",
+          abs(float(sig["adv_task"][6]) + 1.5) < 1e-6
+          and abs(float(sig["adv_task"][7]) + 1.5) < 1e-6)
+    _sw5 = W([s["trunc_final"] for s in st],
+             [int(s.get("code_wasted", 0)) for s in st],
+             trunc_tail_penalty=float(_c["trunc_tail_penalty"]),
+             waste_penalty=float(_c["tool_waste_penalty"]),
+             task_adv_guard=True, trunc_counts_as_wrong=True)
+    check("端到端：这两条的 sw=1 → 负优势真的进 loss（此前被乘 0）",
+          _sw5[6] == 1.0 and _sw5[7] == 1.0)
+
+    # ---------- 6. analysis 的读数必须与代码同向 ----------
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _d:
+        _ri = os.path.join(_d, "run_info.json")
+        with open(_ri, "w", encoding="utf-8") as f:
+            json.dump({"config": {"task_adv_guard": True,
+                                  "trunc_counts_as_wrong": True,
+                                  "tool_waste_penalty": 0.0,
+                                  "trunc_tail_penalty": 0.0}}, f)
+        _rec = os.path.join(_d, "record.jsonl")
+        open(_rec, "w").close()
+        from rlab.analysis import _credit_enabled
+        check("analysis：guard+tcw 档读成『两者都有梯度』（与代码同向，不是零梯度）",
+              _credit_enabled(_rec) == (True, True))
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -6269,6 +6371,7 @@ if __name__ == "__main__":
     test_gen_death_diagnostics()
     test_signal_observation()
     test_budget_target_announcement()
+    test_loss_weight_guard_tcw()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)

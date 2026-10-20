@@ -212,6 +212,43 @@ def clip_aux_centered(aux: list, n_correct: int, n: int,
     return [max(-lim, min(lim, float(a) - mean)) for a in aux]
 
 
+def sample_weights_for_loss(trunc_flags, wasted_flags, trunc_tail_penalty: float = 0.0,
+                            waste_penalty: float = 0.0,
+                            task_adv_guard: bool = False,
+                            trunc_counts_as_wrong: bool = False) -> list:
+    """整条轨迹的 loss 权重（0=从策略梯度与归一化里整行排除）。纯函数，CPU 可测。
+
+    【历史口径】trunc_final 或 code_wasted 的轨迹整行 sw=0。当时的理由是这两类
+    轨迹"任务结果不可信"（预算耗尽时可能还没作答），所以它们既不进组基线也不
+    贡献梯度；补偿手段是 `tool_credit_advantages` 给局部负优势（ttp/twp>0）。
+
+    【2026-10-20 逻辑缺口·本函数存在的原因】上面那条口径与 `trunc_counts_as_wrong`
+    直接矛盾：tcw 的**全部意义**是"写爆预算 = 没答完 = acc−1，让它吃真实负梯度"
+    （rollout.retool_score_flat 的 ① 注释），而它给的负优势走**组 adv**，不经过
+    ttp/twp。于是出现下面这种"配置全对、梯度为零"的死结：
+        ttp/twp 被 validate_guard_conflicts 归零（它们与 tcw 的覆盖语义冲突）
+        ⇒ sw 条件 (trunc and ttp<=0) 恒真 ⇒ sw 恒 0
+        ⇒ tcw 算出的 −1.75 被乘以 0 ⇒ 21% 样本的算力纯白烧
+    p11c 实测零梯度 563/2696（21%），且这 21% 正是无 boxed 的 96%（B/C 桶）。
+
+    【判据】只有"轨迹**没有**其它负信用来源"时才该整行排除：
+      · guard + tcw：截断/废码已以 acc=−1 进组均值（真实组内负优势）→ **不排除**；
+      · 否则：保持历史口径（ttp/twp>0 给局部负优势 → 纳入 loss；都关 → 排除）。
+    返回 [0.0/1.0, ...]，与输入等长。"""
+    out = []
+    for tf, wf in zip(trunc_flags, wasted_flags):
+        if task_adv_guard and trunc_counts_as_wrong:
+            # 负优势来自组均值（acc=−1），没有任何一项需要被排除
+            out.append(1.0)
+            continue
+        # 逐标志判定（与历史口径**逐位相同**：任一标志为真且没有对应局部信用
+        # 就整行排除。不能合并成"任一标志有信用就放行"——那会改变混合样本的行为）
+        excl = ((tf and trunc_tail_penalty <= 0.0)
+                or (wf and waste_penalty <= 0.0))
+        out.append(0.0 if excl else 1.0)
+    return out
+
+
 def overlong_ref_tokens(cfg: dict) -> int:
     """overlong shaping 的长度参考系（单点真相，retool/单轮两路共用）。
 
