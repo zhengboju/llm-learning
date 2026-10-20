@@ -97,12 +97,22 @@ ALGO_DEFAULTS = {
                         # →结果"错位与 42~55% 高截断（三轮 run 代码压灭的根因）。
                         # 关闭 = 回到 p6 旧协议（A/B 对照位）。
                         retool_stop=True,
-                        # 长度控制：overlong 现在可达（预算自洽）→ 打开。
-                        # 【2026-09-21 trunc_shaping 归零】overlong_filter=True 时
-                        # 截断样本 adv=0（从 advantage/组统计中移除），trunc_shaping
-                        # 只改截断样本的 reward 值但该值被 mask 跳过 → 零影响。
-                        # DAPO 消融：硬截断罚（无论 0 还是 0.5）都是 reward noise。
-                        overlong_shaping=True, overlong_buffer=256,
+                        # 【2026-10-20 精简复核】retool_math 的 reward 项现有 31 个
+                        # 相关键，实测**只有 overlong 有可读的组内施力**（0.353，
+                        # 正确性间距 2.0）；len_eff_w 0.049 / len_eff_penalty_w 0.031
+                        # 属噪音级；code 项在 code 率 98% 时是常数（零梯度）。
+                        # 本节按"准确率优先 + 同准确率下 token 越少越好"重新定值：
+                        # 保留的每一项都必须能回答"它改变组内排序吗、改多少"。
+                        overlong_shaping=True,
+                        # 【2026-10-20 buffer 256→2048】**这是本 preset 最贵的陷阱**：
+                        # trigger = overlong_ref − buffer，而 overlong_ref 缺省取
+                        # max_traj_tokens。mtj 常见的 12288 + buffer 256 → trigger
+                        # 12032，而生成撞 mtj 就整条停住（trunc_final）⇒ 模型几乎
+                        # **不可能**落在 12032~12288 这个 256 token 宽的受罚区
+                        # ⇒ 惩罚在真实分布上等于死开关（p11c 实测 25% 分位 clen
+                        # 11059 仍然罚 0）。2048 让 auto 档的 trigger 落到 83% 处，
+                        # 显式给 overlong_ref=8192 时 trigger=6144（实测有效区）。
+                        overlong_buffer=2048,
                         trunc_shaping=0.0,
                         # 【2026-09-21 DAPO overlong filtering】截断样本从 advantage
                         # 和组统计中移除（消融 +6 分，最稳定的长度控制组件）。
@@ -1024,6 +1034,95 @@ def validate_max_prompt_length(cfg: dict) -> None:
             f"调小到库内多数题之下同样会空转，需配合实测的 plen 分布。")
 
 
+def detect_dead_keys(cfg: dict) -> list:
+    """死键检测（纯函数，CPU 可测）：返回 [(key, 原因, 改法)]。
+
+    【为什么要在 get_config 里主动报（2026-10-20）】本项目最贵的一类 bug 不是
+    "配置错"，而是**"配置对、接线断"**——用户设了一个键，而它在当前组合下
+    被别的机制覆盖掉，日志里只有一行容易淹没的 print。已发生的实例：
+      · `--tool_waste_penalty 0.20` + `--task_adv_guard --trunc_counts_as_wrong`
+        → 被 validate_guard_conflicts 归零（用户以为在罚废码，实际完全由 tcw 承担）；
+      · `reward_cold_w/hot_w/switch_step` 在 retool_math 上**从来没被读过**
+        （该算法走 total_reward_retool_math，没有 phase 参数）；
+      · `len_penalty_gate/quantile` 在 len_penalty_w=0 时是纯占位。
+
+    本函数只做**结构性判定**（谁覆盖了谁、哪条路径不读它），不做"权重看起来
+    太小"这类主观判断——那些交给 `rlab.audit_config` 的实算施力表。
+    """
+    out = []
+    guard = bool(cfg.get("task_adv_guard"))
+    tcw = bool(cfg.get("trunc_counts_as_wrong"))
+    mtj = int(cfg.get("max_traj_tokens", 0) or 0)
+    algo = str(cfg.get("algo", ""))
+
+    if guard and tcw:
+        # ⚠ 必须同时看 `_guard_zeroed`：validate_guard_conflicts 在本函数**之前**
+        # 跑，已经把 ttp/twp 改成 0.0——只查当前值会永远判不到"用户设过它"。
+        # 这条正是 2026-10-20 那次事故的形态：用户传 --tool_waste_penalty 0.20，
+        # 归零后配置里读到 0.0，日志里没有任何"你设的值被丢弃"的痕迹。
+        _zeroed = set(cfg.get("_guard_zeroed") or [])
+        for k, why, how in (
+            ("trunc_tail_penalty",
+             "tool_credit_advantages 对截断末段是**覆盖**语义，而 tcw 让截断样本"
+             "以 acc=−1 进组均值（真实负优势 −1.5）→ 覆盖把强信号换成弱信号",
+             "删掉该 flag；负信用已由 trunc_counts_as_wrong 承担"),
+            ("tool_waste_penalty",
+             "同上（wasted 分支也是覆盖语义）",
+             "删掉该 flag；废码样本已以 acc=−1 进组均值"),
+        ):
+            if k in _zeroed or float(cfg.get(k, 0.0) or 0.0) > 0.0:
+                out.append((k, why, how))
+
+    _ol = bool(cfg.get("overlong_shaping"))
+    if _ol and float(cfg.get("len_penalty_w", 0.0) or 0.0) > 0.0:
+        out.append(("len_penalty_w",
+                    "只罚「未通过且长」，与 overlong(fail_only) 职责完全重叠；"
+                    "且 pass_gate=0.25 会让 c≤2/8 的组整段不生效",
+                    "overlong_shaping=True 时置 0"))
+    if float(cfg.get("len_penalty_w", 0.0) or 0.0) <= 0.0:
+        for k in ("len_penalty_quantile", "len_penalty_gate"):
+            out.append((k, "len_penalty_w=0，本项无行为意义", "无需处理（纯占位）"))
+
+    if algo == "retool_math":
+        for k in ("reward_cold_w", "reward_hot_w", "reward_switch_step"):
+            out.append((k,
+                        "retool_math 走 total_reward_retool_math，该函数没有 "
+                        "phase 参数（冷/热分档只在围栏版 total_reward_retool 生效）",
+                        "无需处理（preset 已设 switch_step=1e9，永久 cold）"))
+
+    if mtj <= 0:
+        for k in ("budget_target", "answer_reserve", "budget_hint"):
+            if cfg.get(k):
+                out.append((k, "未开 token 预算档（max_traj_tokens=0），"
+                               "本项无行为意义",
+                            "要么设 --max_traj_tokens，要么删掉该 flag"))
+    # 尝试级 shaping 的价值在于"对冲代码压灭"；若一次调用都没发生，
+    # 它与 code_w 都是恒 0（不是配置错，但用户该知道此刻它不产生梯度）
+    return out
+
+
+def _warn_dead_keys(cfg: dict) -> None:
+    """get_config 末尾主动打印死键（带改法），并把结果落进 cfg 供 run_info 记录。
+
+    【为什么只打印"有改法价值"的那些】`len_penalty_quantile/gate`、`reward_cold_w`
+    这类**结构性占位**（主权重为 0、或该算法根本不读）永远存在于 config 里，
+    每次都打会让真正的告警（ttp/twp 被覆盖）淹没在噪音中。判据：`改法`
+    不以"无需处理"开头的才打印——它们才是"你设了一个会骗你的值"。
+    """
+    dk = detect_dead_keys(cfg)
+    if not dk:
+        return
+    cfg["_dead_keys"] = [k for k, _w, _h in dk]
+    loud = [(k, w, h) for k, w, h in dk if not str(h).startswith("无需处理")]
+    if not loud:
+        return
+    lines = [f"[config][死键] 以下 {len(loud)} 项**设了但不生效**"
+             f"（本项目最贵的 bug 形态是「配置对、接线断」）："]
+    for k, why, how in loud:
+        lines.append(f"  · {k}：{why}\n      改法：{how}")
+    print("\n".join(lines), flush=True)
+
+
 def validate_guard_conflicts(cfg: dict) -> dict:
     """正确性优先档的**互斥项净化**（纯函数，CPU 可测）：返回被归零的键列表。
 
@@ -1408,6 +1507,9 @@ def get_config(algo: str, **overrides) -> dict:
     if cfg.get("algo") == "swe_l0" or cfg.get("data_task") == "swe_l0":
         _swe = _validate_swe_l0_config(cfg)
         cfg["_swe_check"] = _swe
+    # 【2026-10-20】死键主动告警（必须在 validate_guard_conflicts 之后：那些被
+    # 自动归零的键值已落定，本函数才判得准"设了但没生效"）。
+    _warn_dead_keys(cfg)
     # 【2026-09-18 H2 护栏】vllm_gen_logps 档位：N=0 是 docs/07 实锤的坏路径
     # （logprobs=0 只报被采样 token，在 vLLM v0.19.1 + Qwen3.5 GDN 上 prefill 位
     # 单点差 6.8 nat、与 torch 独立重算不符），正确用法需 N≥1（top-K 里挑被采样

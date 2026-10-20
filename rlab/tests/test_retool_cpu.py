@@ -6312,6 +6312,138 @@ def test_loss_weight_guard_tcw():
     print()
 
 
+def test_dead_keys_and_audit():
+    """[AT] 死键主动告警 + 配置体检工具（audit_config）。
+
+    【为什么这组必须存在（2026-10-20）】本项目最贵的 bug 不是"配置错"，而是
+    **"配置对、接线断"**：键设了、被别的机制静默覆盖、日志里没有任何痕迹。
+    已发生 4 次同类（ttp/twp 被 guard 归零、sw 恒 0、overlong 触发线贴保险丝、
+    reward_cold/hot_w 在 retool_math 上从未被读）。逐个开关推理抓不到，
+    必须靠"结构性死键检测 + 实算施力"两件工具。
+    """
+    print("[AT] 死键告警 detect_dead_keys + audit_config 体检")
+    from rlab.config import detect_dead_keys, get_config, BASE, ALGO_DEFAULTS
+
+    # ---------- 1. 结构性死键：guard+tcw 覆盖 ttp/twp ----------
+    _c = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                    max_traj_tokens=12288, answer_reserve=1024,
+                    max_context_tokens=13312, budget_hint=True,
+                    task_adv_guard=True, trunc_counts_as_wrong=True,
+                    tool_waste_penalty=0.20)
+    _dk = dict((k, (w, h)) for k, w, h in detect_dead_keys(_c))
+    check("死键：tool_waste_penalty 被 guard+tcw 覆盖，必须报出来",
+          "tool_waste_penalty" in _dk)
+    check("死键：报出的原因点名覆盖语义（不是泛泛的『可能无效』）",
+          "覆盖" in _dk.get("tool_waste_penalty", ("", ""))[0])
+    check("死键：附可执行的改法", bool(_dk.get("tool_waste_penalty", ("", ""))[1]))
+    # 归零后配置里读到 0.0，但必须靠 _guard_zeroed 记住"用户设过它"
+    check("死键：靠 _guard_zeroed 判断（只查当前值会永远判不到）",
+          _c.get("_guard_zeroed") and
+          "tool_waste_penalty" in _c["_guard_zeroed"])
+    check("死键结果落进 cfg 供 run_info 记录",
+          _c.get("_dead_keys") and "tool_waste_penalty" in _c["_dead_keys"])
+
+    # ---------- 2. retool_math 从不读的分档奖励三件套 ----------
+    check("死键：reward_switch_step 在 retool_math 上从未被读",
+          "reward_switch_step" in _dk)
+    check("死键：reward_cold_w / reward_hot_w 同理",
+          "reward_cold_w" in _dk and "reward_hot_w" in _dk)
+
+    # ---------- 3. len_penalty 的从属参数 ----------
+    check("死键：len_penalty_w=0 时 quantile/gate 无行为意义",
+          "len_penalty_quantile" in _dk and "len_penalty_gate" in _dk)
+
+    # ---------- 4. 不该误报：正常配置下 ttp/twp 不在死键里 ----------
+    _c2 = get_config("retool_math", use_wandb=False, max_traj_tokens=0)
+    _dk2 = [k for k, _w, _h in detect_dead_keys(_c2)]
+    check("不误报：无 guard 时 ttp/twp 不是死键（历史口径仍然有效）",
+          "trunc_tail_penalty" not in _dk2 and "tool_waste_penalty" not in _dk2)
+    # 轮数档（mtj=0）下设预算档专属键 → 必须报；注意 budget_target 走不到这里
+    # （validate_budget_target 会在 get_config 阶段直接 raise，见 test_budget_target），
+    # 所以用 answer_reserve / budget_hint 这两个**可达**的键做判据。
+    _c2b = get_config("retool_math", use_wandb=False, max_traj_tokens=0,
+                      answer_reserve=1024, budget_hint=True)
+    _dk2b = [k for k, _w, _h in detect_dead_keys(_c2b)]
+    check("误报防护：mtj=0 但设了 answer_reserve/budget_hint → 报『无预算档』",
+          "answer_reserve" in _dk2b and "budget_hint" in _dk2b)
+    check("误报防护：mtj=0 且没设这些键 → 一条都不报",
+          "answer_reserve" not in _dk2 and "budget_hint" not in _dk2)
+
+    # ---------- 5. 预算几何：受罚区间宽度才是『惩罚可不可达』的判据 ----------
+    from rlab.audit_config import budget_geometry
+    # 显式给 ref：auto 档（ref 缺省→取 mtj）是另一个场景，下面单独测
+    _cg = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                     max_traj_tokens=12288, budget_target=8192,
+                     answer_reserve=1024,
+                     max_context_tokens=13312, budget_hint=True,
+                     overlong_shaping=True, overlong_ref=8192,
+                     overlong_buffer=2048)
+    _g = budget_geometry(_cg)
+    check("几何：mtj=12288 / ref=8192 / buf=2048 → 触发线 6144",
+          _g["overlong_trigger"] == 6144 and _g["max_traj_tokens"] == 12288)
+    check("几何：受罚区间宽度 = 保险丝 − 触发线 = 6144（足够宽）",
+          _g["penalty_zone_width"] == 6144)
+    check("几何：通告与保险丝的差 = 模型看不见的溢出余量（budget_target 生效）",
+          _g["announce"] == 8192 and _g["announce_gap"] == 4096)
+    # 反证：旧 preset（overlong_ref 缺省+小 buffer）下区间只剩几百 token
+    _bad = dict(_cg)
+    _bad.update({"overlong_ref": 0, "overlong_buffer": 256,
+                 "max_traj_tokens": 12288, "max_context_tokens": 13312,
+                 "max_prompt_length": 1024})
+    _gb = budget_geometry(_bad)
+    check("几何反证：ref 缺省(→mtj 12288) + buffer 256 → 受罚区间仅 256 token",
+          _gb["penalty_zone_width"] == 256)
+    check("几何：区间 <1024 时覆盖率必然接近 0（实测样本几乎不命中）",
+          _gb["clen_hit_rate"] <= 0.25)
+
+    # ---------- 6. 逐项施力：谁真的改变组内排序 ----------
+    from rlab.audit_config import item_forces, token_level_forces
+    # 必须用**显式 ref** 的 cfg（_cg）：auto 档 ref=mtj=12288 → trigger 10240，
+    # 而默认 clen 样本最高 10600 → 大部分落在触发线附近，施力表不可读。
+    _f = {r["item"]: r for r in item_forces(_cg)}
+    check("施力：overlong 是唯一 >10% 的项（这是『有效』的门槛）",
+          _f["overlong"]["pct_of_task"] > 10.0
+          and all(v["pct_of_task"] <= 10.0 for k, v in _f.items()
+                  if k != "overlong"))
+    check("施力：两项长度效率项都 <5%（噪音级）",
+          _f["len_eff_w"]["pct_of_task"] < 5.0
+          and _f["len_eff_penalty_w"]["pct_of_task"] < 5.0)
+    # code 项在 code 率 98% 时全组同值 → 被组均值减掉 → 零梯度（float32 残差 ~6e-8）
+    # 必须单独构造带 code 权重 + 组内同调用次数的 cfg，否则会被判成"权重为 0"
+    _cc = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                     max_traj_tokens=12288, budget_target=8192,
+                     answer_reserve=1024, max_context_tokens=13312,
+                     budget_hint=True, overlong_shaping=True, overlong_ref=8192,
+                     overlong_buffer=2048, code_w=0.05, code_attempt_w=0.05,
+                     code_shaping_once=True)
+    _fc = {r["item"]: r for r in item_forces(_cc)}
+    check("施力：code 项在组内同调用次数时为零梯度（阈值 1e-6 而非 1e-9）",
+          _fc["code_w"]["span"] < 1e-6 and _fc["code_attempt_w"]["span"] < 1e-6
+          and "零梯度" in _fc["code_w"]["note"])
+    # token 级项必须单列，否则会被误报成零梯度
+    _tl = {r["item"]: r for r in token_level_forces(_cg)}
+    check("施力：tool_call_cost 走 token 级（单列，测得 0.04）",
+          abs(_tl["tool_call_cost"]["delta"] - 0.04) < 1e-6)
+    check("施力：ttp/twp 被归零 → token 级幅度也是 0（与死键一致）",
+          _tl["tool_waste_penalty"]["delta"] == 0.0)
+
+    # ---------- 7. preset 精简：overlong_buffer 必须远离『贴保险丝』 ----------
+    _pre = ALGO_DEFAULTS["retool_math"]
+    check("preset：overlong_buffer 已从 256 抬到 2048（避免触发线贴保险丝）",
+          int(_pre.get("overlong_buffer", 0)) == 2048)
+    check("preset：len_penalty_w 默认 0（与 overlong 职责重叠，默认不开）",
+          float(_pre.get("len_penalty_w", 0.0) or 0.0) == 0.0)
+    # 默认档（mtj>0 但没给 overlong_ref）下，触发线不能贴死保险丝
+    _d = get_config("retool_math", use_wandb=False, tool_protocol="native",
+                    max_traj_tokens=12288, answer_reserve=1024,
+                    max_context_tokens=13312, round_gen_tokens=2048,
+                    budget_hint=True)
+    _gd = budget_geometry(_d)
+    check("preset 默认档：受罚区间 = 2048 token（是旧 256 的 8 倍，可命中）",
+          _gd["penalty_zone_width"] == 2048)
+    print()
+
+
 if __name__ == "__main__":
     test_extract()
     test_mask_ab()
@@ -6372,6 +6504,7 @@ if __name__ == "__main__":
     test_signal_observation()
     test_budget_target_announcement()
     test_loss_weight_guard_tcw()
+    test_dead_keys_and_audit()
     test_pyflakes_undefined()
     print(f"\n全部通过：{len(PASS)} 项检查 ✅")
     sys.exit(0)
