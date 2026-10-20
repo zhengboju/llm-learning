@@ -41,6 +41,13 @@ def main():
                          "None=由 ckpt 的 run_info.json / rlab 配置推断")
     ap.add_argument("--split", default="test", choices=("test", "train"),
                     help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
+    # 【2026-10-20】难度过滤口径：课程 run 的 ckpt 默认会计按 difficulty_band 过滤，
+    # 那种 acc 与任何 band 不同的 run 不可比。主评测（看泛化/跨 run Δacc）用
+    # --no-difficulty_filter 走完整 held-out。
+    ap.add_argument("--difficulty_filter", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="难度过滤：None=随 ckpt 的 run_info（有表就过滤，历史行为）；"
+                         "--no-difficulty_filter=完整 split（跨 run 可比口径，主评测推荐）")
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
     ap.add_argument("--skip_base", action="store_true")
     ap.add_argument("--retool", action="store_true",
@@ -91,6 +98,9 @@ def main():
         cmd += ["--out", args.out]
     if args.dump_traj:
         cmd += ["--dump_traj"]
+    if args.difficulty_filter is not None:
+        cmd.append("--difficulty_filter" if args.difficulty_filter
+                   else "--no-difficulty_filter")
     if args.retool:
         cmd.append("--retool")
     if algo is not None:

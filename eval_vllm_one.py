@@ -75,6 +75,21 @@ parser.add_argument("--proto_from", default=None,
                     help="协议来源目录（含 run_info.json）；None=从 --model 自己的 run_info 回读。"
                          "供 BASE 等无 run_info 的裸模型复用『被测 checkpoint 的训练协议』，"
                          "保证 Δacc 同档（2026-09-17）。")
+# 【2026-10-20 评测口径开关】难度过滤此前是**无开关的隐式继承**：只要 ckpt 的
+# run_info 里有 difficulty_path 就自动过滤，且不区分表覆盖了哪些 split。
+# 两个真机后果（本次实测）：
+#   ① `--pool train` 探的表不含 dev → `--split test` 全部落 missing → 池 0 题 →
+#      ZeroDivisionError（不是"0 题评测"，是崩）；
+#   ② 更根本：过滤后的 acc 是「条件于难度带」的量，与任何 band 不同的历史/未来
+#      run 都不可比（p9 的 fmt 93.9% 就是跨池口径，本项目已为此出过两次事故）。
+# 故口径必须**显式可切**并落盘自证：默认 None = 历史行为（有表就过滤，兼容旧
+# 读数）；主评测建议 --no-difficulty_filter 走完整 held-out（唯一跨 run 可比口径）。
+parser.add_argument("--difficulty_filter", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="难度过滤：None=历史行为（run_info 有 difficulty_path 就按 "
+                         "difficulty_band 过滤）；--no-difficulty_filter=用完整 split"
+                         "（held-out 全量，跨 run 可比口径）；--difficulty_filter=强制"
+                         "过滤（表未覆盖该 split 时报错并给出改法）。")
 # 【docs/16 Search-GRPO】检索服务地址：None=从 ckpt 的 run_info 回读 search_endpoint。
 # 评测与训练必须用**同一个知识库**（换索引 = 换环境，与 vk/sp 那两次口径漂移同类）。
 parser.add_argument("--search_endpoint", default=None,
@@ -316,6 +331,9 @@ def reward_format_boxed(answer: str) -> float:
 
 # ---------- 数据集加载 ----------
 print(f"[1/3] 加载 {args.eval_task} {args.split} split ...")
+# 【2026-10-20】难度过滤口径记录（只有 dapo_math 分支会写 band/kept；其余任务
+# 恒为 off —— 落盘成一致形状，读端不必猜"这个键为什么缺"）。
+_df_record = {"mode": "off", "path": None, "band": None, "kept": None, "total": None}
 if args.eval_task == "gsm8k":
     try:
         from modelscope.msdatasets import MsDataset
@@ -348,8 +366,20 @@ elif args.eval_task == "dapo_math":
     else:
         test_data = load_dapo_math_train()
     # 两个 split 都用训练端同一套难度过滤（difficulty_path/band 从 run_info 回读）
+    # 【2026-10-20 开关化】口径必须显式：None=历史行为（有表就过滤）；False=完整
+    # split（held-out 全量，跨 run 可比）；True=强制过滤（表不覆盖则报错）。
     _dp = (_run_cfg.get("difficulty_path") or "")
-    if _dp:
+    _df_mode = getattr(args, "difficulty_filter", None)
+    # 【2026-10-20】口径落盘：过滤与否是**评测协议的一部分**（决定 acc 是"条件于
+    # 难度带"还是"全池"），不记进 eval_protocol 就无法事后核对 Δacc 是不是跨池比。
+    _df_record = {"mode": ("off" if _df_mode is False else
+                           "on" if _df_mode is True else "auto"),
+                  "path": _dp, "band": None, "kept": None, "total": None}
+    if _df_mode is False:
+        print(f"  [eval][{args.split}] 难度过滤 = 关（--no-difficulty_filter）："
+              f"用完整 {args.split} split，跨 run 可比口径")
+        _dp = ""
+    elif _dp:
         _lo, _hi = _run_cfg.get("difficulty_band", (0.0, 1.0))
         if not isinstance(_lo, (int, float)) or not isinstance(_hi, (int, float)):
             _lo, _hi = 0.0, 1.0
@@ -359,10 +389,39 @@ elif args.eval_task == "dapo_math":
             _tbl = {}
         if _tbl:
             test_data, _dstat = filter_qas_by_difficulty(test_data, _tbl, lo=_lo, hi=_hi)
+            _df_record.update({"band": (float(_lo), float(_hi)),
+                               "kept": _dstat["kept"], "total": _dstat["total"]})
             print(f"  [eval][{args.split}] 难度过滤 band=({_lo},{_hi}): "
                   f"{_dstat['total']} -> {_dstat['kept']} 题"
                   f"（p_zero {_dstat['p_zero']} / p_one {_dstat['p_one']} / "
                   f"band_out {_dstat['band_out']} / missing {_dstat['missing']}）")
+            # 【2026-10-20 fail-fast】表未覆盖本 split 时旧行为是静默留 0 题 →
+            # 下游 ZeroDivisionError（真机：`--pool train` 探的表不含 dev，
+            # `--split test` 1000 题全落 missing）。这是"过滤器存在但数据流不对"
+            # 的典型静默错误，必须在过滤点自己拦，不能交给下游除零崩。
+            if not test_data:
+                _hint = ("该表只探了训练池（probe --pool train，不含 dev/held-out）→ "
+                         "test split 无法用它过滤"
+                         if args.split == "test" else
+                         "该表没有覆盖本 split 的任何题")
+                raise SystemExit(
+                    f"[eval][错误] 难度过滤后 {args.split} split 为 0 题（表 {_dp}）：\n"
+                    f"  {_hint}。\n"
+                    f"  改法（三选一）：\n"
+                    f"    ① 主评测走完整 held-out：加 --no-difficulty_filter\n"
+                    f"    ② 用 --pool train_dev 重探（表同时覆盖训练池 + dev）\n"
+                    f"    ③ 换 --split train（只在训练池内评，是过拟合诊断口径，"
+                    f"不是泛化证据）")
+            # 【2026-10-20】部分覆盖同样是静默偏差：表只覆盖了本 split 的一小部分
+            # 时，过滤后的池子是"表覆盖 ∩ band"这个交集，既不是本 split 的代表性
+            # 抽样，也不是训练分布——acc 无法解释成任何一个有意义的量。
+            _miss = _dstat["missing"]
+            if _miss > 0.5 * max(1, _dstat["total"]):
+                print(f"  [eval][警告] 难度表只覆盖本 split 的 "
+                      f"{(_dstat['total'] - _miss) / _dstat['total'] * 100:.1f}%"
+                      f"（missing {_miss}/{_dstat['total']}）→ 过滤后的池子是"
+                      f"『表覆盖 ∩ band』的交集，不是本 split 的代表性抽样。\n"
+                      f"    要跨 run 可比的泛化读数请用 --no-difficulty_filter。")
         else:
             print(f"  [eval][警告] 难度表读不到（{_dp}）→ 按 {args.split} 全量池抽")
     else:
@@ -392,6 +451,15 @@ else:
     raise ValueError(f"未知 eval_task {args.eval_task}")
 
 random.seed(args.seed)
+# 【2026-10-20 除零修复】池为 0 时旧版直接 `1.96*0.5**0.5/0**0.5` → ZeroDivisionError，
+# 崩在噪声公式里、traceback 完全指不到"池子空了"这个真因（真机：难度表没覆盖 dev
+# → 1000 题全 missing → 0 题）。空池是配置/口径错误，必须带可执行改法 fail-fast。
+if not test_data:
+    raise SystemExit(
+        f"[eval][错误] {args.eval_task} 的 {args.split} split 过滤后为 0 题，无法评测。\n"
+        f"  常见原因：难度表只覆盖训练池（--pool train）而本 split 是 held-out；\n"
+        f"  或 --difficulty_band 与表的 pass_rate 分布无交集。\n"
+        f"  改法：加 --no-difficulty_filter 走完整 split，或换 --split train。")
 _n_take = min(args.n, len(test_data))
 if _n_take < args.n:
     # 【2026-09-09 审查修复】n 大于池子时旧版静默缩水：dev=50 时请求 300 实评 50，
@@ -1050,6 +1118,10 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
                             "proto_from_run_info": bool(_run),
                             "proto_src": _proto_src,
                             "max_prompt_length": _max_plen,
+                            # 【2026-10-20】难度过滤口径：acc 是"条件于难度带"还是
+                            # "全池"完全不同的量。缺这个键的旧 json 与带它的新 json
+                            # 不可直接比 Δacc（本项目已因跨池比较出过两次事故）。
+                            "difficulty_filter": _df_record,
                             "system_prompt_sha": _sp_sha}}
 if args.dump_items:
     result["items"] = items

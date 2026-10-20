@@ -37,6 +37,12 @@ parser.add_argument("--dump_traj", action=argparse.BooleanOptionalAction, defaul
                     help="落盘每条轨迹的段级文本（默认关，透传给 eval_vllm_one.py）")
 parser.add_argument("--split", default="test", choices=["test", "train"],
                     help="test=held-out（dapo_math=dev.jsonl；gsm8k=test split）；train=训练池抽样(过拟合诊断)")
+# 【2026-10-20】难度过滤口径透传：None=各子进程随自己的 run_info（历史行为）；
+# --no-difficulty_filter 让整条曲线都走完整 split（跨 run 可比口径）。
+parser.add_argument("--difficulty_filter", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="难度过滤：None=随各 ckpt 的 run_info（有表就过滤）；"
+                         "--no-difficulty_filter=完整 split（跨 run 可比口径）")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math/search_qa/swe_l0；自动决定 prompt/预算/奖励口径")
@@ -167,6 +173,10 @@ def run_one(gpu, idx, name, path):
         cmd += ["--eval_task", args.eval_task]
     if args.show:
         cmd += ["--show", str(args.show)]
+    # 【2026-10-20】难度过滤口径统一覆盖（None 不传 = 各子进程随 run_info）
+    if args.difficulty_filter is not None:
+        cmd += ["--difficulty_filter"] if args.difficulty_filter \
+            else ["--no-difficulty_filter"]
     if args.dump_traj:
         cmd += ["--dump_traj"]
     if args.mm_base:
@@ -240,6 +250,8 @@ results["_meta"] = {"base_path": base_path, "tuned": args.tuned, "n": args.n,
                     "seed": args.seed, "split": args.split, "algo": args.algo,
                     "eval_task": args.eval_task, "gpus": gpus, "per_gpu": args.per_gpu,
                     "mm_base": args.mm_base, "vllm_gen_kwargs": VLLM_KWARGS,
+                    # 【2026-10-20】None = 各模型随自己 run_info（同批内可能不同口径）
+                    "difficulty_filter": args.difficulty_filter,
                     "failures": [list(x) for x in failures],
                     "created": time.strftime("%Y-%m-%d %H:%M:%S")}
 with open(args.out, "w", encoding="utf-8") as f:

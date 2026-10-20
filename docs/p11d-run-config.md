@@ -29,6 +29,24 @@ p11c 拿到了全项目第一次「条件精度自己涨」（前 9 窗 58.9% �
 | 3 | **加** `--eval_during_training --eval_n 300` | 纯配置 | 唯一缺的表。p10 的 900s 超时已修为 3600，现在开是安全的 |
 | 4 | **换** `--out_dir rlab_new/native_p11d_anchor` | 纯配置 | p11c 目录已占用；签名多了 `-bt8192`，若同签名重跑会**静默覆盖 `step_N`**（p11 已踩过两次，数据链断） |
 
+### 2.1 评测口径：held-out 必须先关难度过滤（2026-10-20 补）
+
+内嵌评测（`--eval_during_training`）用的是 ckpt 的 `run_info`，而 `run_info` 里有
+`difficulty_path` → **自动按 `difficulty_band` 过滤**。这会直接毁掉本轮的唯一任务：
+
+| 问题 | 后果 |
+|---|---|
+| `test` split = `dev.jsonl`，而 `--difficulty_path` 是 `probe --pool train` 探的**只含训练池**的表 | dev 1000 题**全落 missing → 池 0 题**。旧版崩在 `1.96*0.5**0.5/0**0.5` 的 `ZeroDivisionError`，traceback 完全指不到"池子空了" |
+| 即使表覆盖 dev，过滤后 acc 是「**条件于难度带 0.125~0.625**」的量 | 与 p9（全量 17k，fmt 93.9%）以及任何 band 不同的 run **不可比**——本项目已因跨池比较出过两次事故（[p11-diagnosis §6](p11-diagnosis.md)） |
+
+**所以本轮主评测口径必须是完整 held-out**：加 `--no-difficulty_filter`。
+它已接线到三个入口（`eval_vllm_one.py` / `eval_vllm.py` / `rlab.eval`），并落盘
+`eval_protocol.difficulty_filter = {mode, path, band, kept, total}` 自证。
+
+> `--no-difficulty_filter` 只关**评测侧**过滤，训练池仍由 `--difficulty_path` 控制，
+> 两者互不影响：课程决定"学什么"，评测口径决定"跟谁比"。
+
+
 **其余全部保持不变**——包括 `--overlong_ref 8192 --overlong_buffer 2048`
 （你的显式值是对的：触发线 6144，实测覆盖 56% 样本，是唯一有效的长度项）。
 
@@ -67,6 +85,41 @@ REF_GPU=1 ATTN_IMPL=flash_attention_2 bash rlab/run_gsm8k.sh retool_math \
 - `--no-eval_during_training`（改为开启）
 - `--code_w 0.05`（与 `code_attempt_w` 重复；且在 code 率 98% 时两者都是零梯度）
 - `--tool_waste_penalty 0.20`（被自动归零）
+
+**内嵌评测的口径**：`--eval_during_training` 现在仍按 `run_info.difficulty_path`
+过滤，而那张表是 `--pool train` 探的（不含 dev）→ **test split 会 0 题**。
+先确认这一点：
+
+```bash
+# 训练前就该看到这个（表覆盖 dev 吗）
+python -c "
+import json
+t=[json.loads(l) for l in open('rlab_out/difficulty_v3e1_train.jsonl',encoding='utf-8') if l.strip()]
+m=[r.get('probe_meta') or {} for r in t[:5]]
+print('行数',len(t),'pool=',{x.get('pool') for x in m})
+"
+```
+
+- 若 `pool={'train'}` → 内嵌 test 评测会 0 题（已 fail-fast，但那是白跑一轮）。
+  正确做法：**内嵌只看训练池内趋势**（保留过滤），**泛化读数用手动 held-out + `--no-difficulty_filter`**：
+
+```bash
+python -m rlab.eval --algo retool_math \
+  --base_path=./rlab_out/sft_budget_v3/epoch1 \
+  --models step100=./rlab_new/native_p11d_anchor/step_100 \
+           step200=./rlab_new/native_p11d_anchor/step_200 \
+           step300=./rlab_new/native_p11d_anchor/step_300 \
+           step400=./rlab_new/native_p11d_anchor/step_400 \
+  --no-difficulty_filter \
+  --gpus 0,1 --gpu_mem 0.2
+```
+
+- 若 `pool={'train_dev'}` → 内嵌 test 可用，但 acc 仍是「条件于 band」的量，
+  跨 run 比较前必须核对两边 `eval_protocol.difficulty_filter.band` 相同。
+
+⚠ `--gpu_mem` 必须给 **0.2**（对齐 `run_info.eval_gpu_mem`），否则同权重同题
+差 +7.0pp（[docs/07](../docs/07-vllm-logprobs-non-determinism-4b.md) 已实测）。
+
 
 ---
 

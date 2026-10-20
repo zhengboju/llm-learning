@@ -1,0 +1,24 @@
+fix(eval): difficulty_filter 三态开关 + 空池 fail-fast（真机 1000->0 题崩溃）
+
+现象: python -m rlab.eval --algo retool_math ... --split test 默认
+  难度过滤 band=(0.125,0.625): 1000 -> 0 题（missing 1000）
+  -> ZeroDivisionError: float division by zero (eval_vllm_one.py:399)
+
+根因(两条叠加):
+  1. --difficulty_path 是 probe --pool train 探的表，只含训练池不含 dev；
+     而 eval 的 test split = dev.jsonl。表不覆盖 -> 全落 missing -> 池空。
+  2. 空池没有前置守卫，先到噪声公式 1.96*0.5**0.5/_n_take**0.5 -> 除零，
+     traceback 指不到「池子空了」这个真因。
+
+修复:
+  - eval_vllm_one/eval_vllm/rlab.eval 三入口加 --difficulty_filter 三态：
+    None=历史行为(有表就过滤) / --no-difficulty_filter=完整 split(跨 run 可比)
+    / --difficulty_filter=强制过滤(不覆盖则报错)
+  - 过滤点 fail-fast：0 题直接报表只探了训练池，并给三条改法
+  - 部分覆盖(missing 过半)告警：过滤池是「表覆盖 ∩ band」交集，非代表性抽样
+  - 随机抽样前加空池守卫，除零不可能再到达噪声公式
+  - eval_protocol 落盘 difficulty_filter={mode,path,band,kept,total}：
+    acc 是「条件于难度带」还是「全池」是协议的一部分，缺它无法核对跨池比较
+
+口径决策(p11d §2.1): 课程决定「学什么」(训练侧 --difficulty_path 不动)，
+  评测口径决定「跟谁比」(泛化读数必须 --no-difficulty_filter)。

@@ -2059,6 +2059,42 @@ def test_eval_thinking_switch():
     check("无 difficulty_path 时两端都告警（含 p≈0 稀释）",
           "含 p≈0 题，效果被稀释" in _ev_src)
 
+    # 【2026-10-20 评测口径开关】难度过滤此前是**无开关的隐式继承**，两个真机后果：
+    #   ① `--pool train` 探的表不含 dev → --split test 全 missing → 池 0 题 →
+    #      崩在 `1.96*0.5**0.5/0**0.5`，traceback 指不到"池子空了"；
+    #   ② 过滤后的 acc 是「条件于难度带」的量，与 band 不同的 run 不可比
+    #      （p9 的 fmt 93.9% 跨池比较事故）。
+    # 故口径必须显式可切 + 落盘自证 + 空池 fail-fast 带改法。
+    check("eval_one 有 --difficulty_filter 三态开关（None=历史行为）",
+          '"--difficulty_filter"' in _ev_src
+          and "action=argparse.BooleanOptionalAction" in _ev_src
+          and "_df_mode = getattr(args, \"difficulty_filter\", None)" in _ev_src)
+    check("--no-difficulty_filter 走完整 split（置空 _dp 跳过过滤）",
+          '_df_mode is False' in _ev_src
+          and '用完整 {args.split} split，跨 run 可比口径' in _ev_src)
+    check("过滤后池空 → fail-fast 且给三条可执行改法（不交给下游除零崩）",
+          "难度过滤后 {args.split} split 为 0 题" in _ev_src
+          and "① 主评测走完整 held-out" in _ev_src
+          and "--pool train_dev 重探" in _ev_src)
+    check("池空前置守卫在随机抽样之前（除零不再可能到达噪声公式）",
+          _ev_src.index("if not test_data:")
+          < _ev_src.index("_noise = 1.96 * (0.5 ** 0.5)"))
+    check("部分覆盖（missing 过半）也告警：过滤池不等于本 split 代表性抽样",
+          "_miss > 0.5 * max(1, _dstat[\"total\"])" in _ev_src)
+    check("难度过滤口径落盘 eval_protocol（mode/path/band/kept/total）",
+          '"difficulty_filter": _df_record' in _ev_src
+          and '{"mode": "off", "path": None, "band": None, "kept": None, "total": None}'
+          in _ev_src)
+    # 调度器与统一入口都透传（缺一层 = 主评测静默回到过滤口径，与本轮判据冲突）
+    _ev2_src2 = open(os.path.join(_root, "eval_vllm.py"), encoding="utf-8").read()
+    _rl_src2 = open(os.path.join(_root, "rlab", "eval.py"), encoding="utf-8").read()
+    check("调度器 eval_vllm.py 有 --difficulty_filter 并透传给 one",
+          '"--difficulty_filter"' in _ev2_src2
+          and 'if args.difficulty_filter is not None:' in _ev2_src2)
+    check("rlab.eval 透传 --difficulty_filter（含 --no- 形态）",
+          '"--difficulty_filter"' in _rl_src2
+          and '"--no-difficulty_filter"' in _rl_src2)
+
 
 
 def test_overlong_ref_and_opt_cli():
