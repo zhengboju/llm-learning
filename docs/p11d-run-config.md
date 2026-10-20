@@ -77,9 +77,14 @@ REF_GPU=1 ATTN_IMPL=flash_attention_2 bash rlab/run_gsm8k.sh retool_math \
   --max_context_tokens 13312 --traj_dump \
   --system_prompt_file rlab_out/sp_anchor8192.txt \
   --lr 1e-6 --seed 42 --steps 400 --save_steps 100 \
-  --eval_during_training --eval_n 300 \
+  --eval_during_training --eval_n 1000 \
   --out_dir rlab_new/native_p11d_anchor
 ```
+
+> `--eval_n 1000` 而不是 300：见 §5.1 的功效修订。N=293 的 MDE 是 6.3pp，
+> 判不了 +3pp 的效应；1000 题（dev 全量）把 MDE 压到 3.4pp。
+> 代价是每个 ckpt 的评测时间 ×3.4（共 4 个 ckpt × 2 split）。
+> 想省时间就只在 **step400** 上用 `--eval_n 1000` 单独复评一次。
 
 **删掉的三项**（相对你的原命令）：
 - `--no-eval_during_training`（改为开启）
@@ -157,13 +162,26 @@ python -m rlab.eval --algo retool_math \
 
 ### 5.1 硬判据（必须同批、同 seed、N≥300）
 
+> **⚠ 2026-10-20 功效修订（p11c held-out 实测后）**：
+> N=293 的**最小可检出效应（80% 功效）= 6.3pp**，@50% 功效 4.4pp。
+> 原判据"+3pp 且 p<0.05"**在 N=293 下不可达**——p9 的真实效应 +3.8pp
+> 就此被误判成"不显著"（p=0.161），p11c 的 +2.0pp 同样落在噪声里
+> （[p11-diagnosis §8.1](p11-diagnosis.md)）。
+> ⇒ **本轮两种做法都行，但必须选一种并写明**：
+> - **`--eval_n 1000`**（dev 全量）→ MDE 降到 **3.4pp**，能判 +3pp；代价是评测时间 ×3.4
+> - **`--eval_n 300 --val_n 8`** 采样档 → 配对均值检验 SE 降到 0.35×，
+>   但 acc 读数会整体位移（不可与贪心档并列，见 docs/14 §4.11）
+>
+> 二选一，不要混。**若时间允许，`--eval_n 1000` 更干净**（贪心档内自洽）。
+
 | 指标 | 判据 | 不接受 |
 |---|---|---|
-| **held-out acc** | 相对 `sft_budget_v3/epoch1` 起点 **+3pp 以上**（McNemar p<0.05） | "训练 acc 涨了" |
+| **held-out acc** | 相对 `sft_budget_v3/epoch1` 起点 **+3pp 以上**（McNemar p<0.05，**需 ≥N=1000**） | "训练 acc 涨了"；N=293 上的 p<0.05 |
 | **条件精度**（acc/fmt） | 相对 p11c 训练口径**不能回退** | 单看 acc 或 fmt |
 | **fmt** | ≥ 75%（**与 p9 的 93.9% 不可比**——池子不同，见 p11-diagnosis §6） | 跨池比较 |
 | **符号翻转** | 0（`sigstats` 的「正确性为正被压成非正」必须 0） | 有翻转还继续跑 |
 | **M_task** | ≥ 85% | — |
+| **工具轮数** | 记录即可，**不作为成功判据** | p11c 证明它会降（1.85→1.47）而 acc 不动 |
 
 ### 5.2 过程判据（每 25 个 update 看一次）
 
@@ -204,6 +222,7 @@ grep -o '\[budget\] [0-9]*' rlab_new/native_p11d_anchor/traj.jsonl \
 
 | 不做 | 原因 |
 |---|---|
+| **抬 `--lr` 加剂量** | p3 已实锤 5e-6 会把策略学崩（条件精度 82.4→55.6%、clen −67%，[docs/05 §7.4](05-retool-math-diagnosis-plan.md)）。唯一安全的加剂量途径是增加 updates 数 |
 | 降 GAS 提更多 update | **本轮先不动**。p11c 的因果链只能容纳"接线修复"这一个变量；GAS 改的是更新次数与单步方差，属于第二变量。若本轮 held-out 兑现，p11e 阶段再作为吞吐杠杆单独 A/B |
 | 上 p11e 的全对组效率训练 | 见 [p11e][§6]：会改变上传组人群构成，与本轮归属冲突 |
 | 改 `adv_mode` 为 `group_std` | p9 定论：8 条组可用，但需单变量 A/B；本轮不动 |
@@ -237,3 +256,23 @@ grep -o '\[budget\] [0-9]*' rlab_new/native_p11d_anchor/traj.jsonl \
 
 **任何一步不兑现，就停在那一步查，不要叠加下一步**——这是 p1~p11 全部失败
 的共同形态（[docs/08 §8.1](08-sft-cold-start.md)：四个变量同时动，故障归因不可能收敛）。
+
+### 9.1 ★ 但如果 p11d 也落在噪声里（最可能的结果）
+
+p11c 已经预演过一次：**改了机制、行为真的变了、acc 却读不出来**。若 p11d 重复这个
+形态，问题不是"机制没用"，而是**这个实验规模看不见 3pp**。届时的正确动作是
+**加剂量，不是加机制**：
+
+| 杠杆 | 代价 | 效果 | 备注 |
+|---|---|---|---|
+| **GAS 8 → 2** | **零额外 token** | updates 42 → **168（×4）** | 生成 token 完全不变；只是 optimizer.step 变多、单步方差变大 |
+| `--steps 400 → 1200` | token ×3（16.7h → ~50h） | updates ×3 | 与上一条叠加可达 ×12 |
+
+**为什么这是安全的**：p3 实锤的是"lr 太大把策略学崩"，不是"步数太多"。
+p11c 的 42 updates 对应参数位移 ≈4.2e-5，而 SFT 是 268 updates @ lr 1e-5
+（≈2.7e-3）——**RL 至今只动了 SFT 位移的 1.6%**。
+
+**GAS 8→2 的判据**（若走这条）：`M_raw ≥ 85%` 必须保持（p11c 实测 90.8%，
+近窗 83.3%），因为降 GAS = 每批样本变少 = 混合组供给变稀。若 M_raw 掉到 70%
+以下，说明信号不够分，此时应该先抬 `--steps` 而不是继续降 GAS。
+
