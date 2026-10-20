@@ -342,6 +342,15 @@ def eval_is_blind(path: str) -> bool:
     return r.get("n") is None or r.get("acc") is None
 
 
+def _conditional_accuracy_cell(result: dict) -> str:
+    """条件精度 = acc/fmt；缺失或非正分母显示未定义，不冒充 0%。"""
+    acc, fmt = result.get("acc"), result.get("fmt")
+    if (not isinstance(acc, (int, float)) or not isinstance(fmt, (int, float))
+            or not math.isfinite(acc) or not math.isfinite(fmt) or fmt <= 0):
+        return "—"
+    return f"{acc / fmt * 100:.1f}"
+
+
 def summarize_eval(path: str, base_name: str = "BASE") -> str:
     with open(path, encoding="utf-8") as f:
         results = json.load(f)
@@ -376,15 +385,16 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
         _rnd_cells.append(f"{_ar:.2f}" if isinstance(_ar, (int, float)) else "—")
         if isinstance(_at, (int, float)):
             _any_tok = True
-    lines += [f"| 模型 | acc%(±95%CI) | fmt% | code% | 平均token | 工具轮数 | Δacc vs {base_name} | 检验 | 判定 |",
-              "|---|---|---|---|---|---|---|---|---|"]
+    lines += [f"| 模型 | acc%(±95%CI) | fmt% | 条件精度% | code% | 平均token | 工具轮数 | Δacc vs {base_name} | 检验 | 判定 |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
     _ci = 0
     for name, r in models.items():
         n = r.get("n") or 0
         acc = r.get("acc", 0.0) * 100
         hw = ci95(r.get("acc", 0.0), n)
         acc_col = f"{acc:.1f}±{hw:.1f}" if hw == hw else f"{acc:.1f}"
-        fmt_col = f"{r.get('fmt', 0.0) * 100:.1f}"
+        fmt = r.get("fmt")
+        fmt_col = f"{fmt * 100:.1f}" if isinstance(fmt, (int, float)) else "—"
         _cr, _fixed = legacy_code_rate(r)
         code_col = f"{_cr * 100:.1f}{'*' if _fixed else ''}" if _cr is not None else "—"
         if name == base_name or not base or not n or not n_base:
@@ -406,9 +416,10 @@ def summarize_eval(path: str, base_name: str = "BASE") -> str:
                 delta = f"{d:+.1f}±{h:.1f}pp"
                 test = "两比例（无 per-item）"
                 verdict = _verdict(d, h)
-        lines.append(f"| {name} | {acc_col} | {fmt_col} | {code_col} | "
+        lines.append(f"| {name} | {acc_col} | {fmt_col} | {_conditional_accuracy_cell(r)} | {code_col} | "
                      f"{_tok_cells[_ci]} | {_rnd_cells[_ci]} | {delta} | {test} | {verdict} |")
         _ci += 1
+    lines += ["", "> 条件精度 = acc/fmt；fmt=0 或字段缺失时显示 —。检验与判定仍针对 acc，不单独证明条件精度提升。"]
     if models and not _any_tok:
         lines += ["",
                   "> ⚠️ 本表**没有任何模型带 `avg_ans_tokens`**（该字段 2026-10-01 才在 "
@@ -529,14 +540,16 @@ def pair_eval(path_a: str, path_b: str, name_a: str, name_b: str) -> str:
                 f"{', '.join(avail) if avail else '（无）'}")
     lines = [f"> [跨json配对] {name_a} ← {os.path.basename(sa)}"
              f"  vs  {name_b} ← {os.path.basename(sb)}（同题 qk 配对，模型本体无需在世）",
-             "| 模型 | acc%(±95%CI) | n | Δacc(A−B) | 检验 | 判定 |",
-             "|---|---|---:|---|---|---|"]
+             "| 模型 | acc%(±95%CI) | fmt% | 条件精度% | n | Δacc(A−B) | 检验 | 判定 |",
+             "|---|---|---|---|---:|---|---|---|"]
     for name, r in ((name_a, ma), (name_b, mb)):
         n = r.get("n") or 0
         acc = r.get("acc", 0.0) * 100
         hw = ci95(r.get("acc", 0.0), n)
         acc_col = f"{acc:.1f}±{hw:.1f}" if hw == hw else f"{acc:.1f}"
-        lines.append(f"| {name} | {acc_col} | {n} | — | — | — |")
+        fmt = r.get("fmt")
+        fmt_col = f"{fmt * 100:.1f}" if isinstance(fmt, (int, float)) else "—"
+        lines.append(f"| {name} | {acc_col} | {fmt_col} | {_conditional_accuracy_cell(r)} | {n} | — | — | — |")
     na, nb = ma.get("n") or 0, mb.get("n") or 0
     if na and nb:
         d, h = diff_ci95(ma.get("acc", 0.0), na, mb.get("acc", 0.0), nb)
@@ -550,7 +563,8 @@ def pair_eval(path_a: str, path_b: str, name_a: str, name_b: str) -> str:
         else:
             test = "两比例（无 per-item 可配对）"
             verdict = _verdict(d, h)
-        lines.append(f"| **A−B** | {d:+.1f}±{h:.1f}pp | {min(na, nb)} | {d:+.1f}pp | {test} | {verdict} |")
+        lines.append(f"| **A−B** | {d:+.1f}±{h:.1f}pp | — | — | {min(na, nb)} | {d:+.1f}pp | {test} | {verdict} |")
+    lines += ["", "> 条件精度 = acc/fmt；fmt=0 或字段缺失时显示 —。检验与判定仍针对 acc，不单独证明条件精度提升。"]
     return "\n".join(lines)
 
 

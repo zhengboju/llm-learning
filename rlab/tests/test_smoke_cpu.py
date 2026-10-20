@@ -1121,7 +1121,59 @@ def test_traj_dump():
           'cmd += ["--dump_traj"]' in _ev and 'cmd += ["--dump_traj"]' in _re_)
 
 
+def test_eval_conditional_accuracy():
+    """评测汇总/配对表统一显示 acc/fmt，不改变 acc 配对检验。"""
+    import json
+    import os
+    import tempfile
+    from rlab.analysis import summarize_eval, pair_eval
+
+    print("[G] 评测条件精度列")
+    results = {
+        "BASE": {"acc": 0.792, "fmt": 0.935, "n": 293},
+        "step400": {"acc": 0.812, "fmt": 0.911, "n": 293},
+        "sampled": {"acc": 0.75, "fmt": 0.875, "n": 300,
+                    "eval_protocol": {"val_n": 8}},
+        "zero_acc": {"acc": 0.0, "fmt": 0.5, "n": 2},
+        "zero_fmt": {"acc": 0.0, "fmt": 0.0, "n": 2},
+        "missing_fmt": {"acc": 0.5, "n": 2},
+        "null_fmt": {"acc": 0.5, "fmt": None, "n": 2},
+    }
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "eval.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(results, f)
+        table = summarize_eval(path)
+        lines = {line.split("|")[1].strip(): line
+                 for line in table.splitlines() if line.startswith("| ")}
+        check("汇总表在 fmt 后显示条件精度列",
+              "| fmt% | 条件精度% | code% |" in table)
+        check("p11c BASE/step400 条件精度显示 84.7/89.1（用原始率计算）",
+              "| 93.5 | 84.7 |" in lines["BASE"]
+              and "| 91.1 | 89.1 |" in lines["step400"])
+        check("Average@N 仍按聚合 acc/fmt 计算，零准确率显示 0.0",
+              "| 87.5 | 85.7 |" in lines["sampled"]
+              and "| 50.0 | 0.0 |" in lines["zero_acc"])
+        check("fmt=0、缺失或 None 时条件精度显示 —",
+              lines["zero_fmt"].split("|")[4].strip() == "—"
+              and "| — | — |" in lines["missing_fmt"]
+              and "| — | — |" in lines["null_fmt"])
+        check("汇总表每行列数与表头一致",
+              all(line.count("|") == lines["模型"].count("|")
+                  for line in lines.values()))
+        pair = pair_eval(path, path, "step400", "BASE")
+        pair_lines = [line for line in pair.splitlines() if line.startswith("| ")]
+        check("配对表同时显示 fmt/条件精度且列数一致",
+              "| 91.1 | 89.1 |" in pair and "| 93.5 | 84.7 |" in pair
+              and all(line.count("|") == pair_lines[0].count("|")
+                      for line in pair_lines))
+        check("配对检验仍针对 acc，未对条件精度给出显著性结论",
+              "+2.0" in pair and "两比例（无 per-item 可配对）" in pair
+              and "不单独证明条件精度提升" in pair)
+
+
 if __name__ == "__main__":
+    test_eval_conditional_accuracy()
     test_advantages()
     test_losses()
     test_protocol()
