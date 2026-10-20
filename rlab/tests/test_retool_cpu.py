@@ -4930,6 +4930,19 @@ def test_attempt_shaping_and_err_tier():
           and json.loads(open(_tbl.name, encoding="utf-8").read().strip())["n_correct"] == 0)
     os.unlink(_rec.name); os.unlink(_tbl.name); os.unlink(_mout)
 
+    # 【2026-10-20 修复锁】诊断原三象限里有两个**结构上恒 0**："表判 p≈0 但在线已能
+    # 做对" 与 "表判 p≈1" 都要求该题同时出现在 record 里，而被 band 排除的题永远
+    # 不进训练池 → 永不出现 → 计数必 0。真机上它被当成"表没过期"的证据读过
+    # （p11c 复盘）。恒 0 是系统性 bug 签名，故锁死：两个假计数不许回来，
+    # 必须报"未被在线覆盖的行数"（那才是这个工具答不了的部分）。
+    _pr_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "passrate.py"), encoding="utf-8").read()
+    check("passrate: 删掉结构上恒 0 的两象限（不许再当'表没过期'的证据）",
+          "可释放" not in _pr_src and "table_p_one" not in _pr_src
+          and "结构上恒 0" in _pr_src)
+    check("passrate: 诊断改报在线覆盖率（未覆盖行数 = 必须独立探针的部分）",
+          "被在线观测覆盖" in _pr_src and "从未进过训练池" in _pr_src)
+
 
     # ---- 6. #3 核对结论的文档锁：EOS 契约注释存在于 rollout.py ----
     _ro = open(os.path.join(os.path.dirname(os.path.dirname(

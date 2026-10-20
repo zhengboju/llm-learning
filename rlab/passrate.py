@@ -169,26 +169,30 @@ def main():
     if args.difficulty_path:
         from rlab.data import load_difficulty_table
         tbl = load_difficulty_table(args.difficulty_path)
-        # 交叉三象限：表判 p≈0 但在线已能做对（表过期→该释放）；表判 band 内但
-        # 在线 p≈0（模型退化或表过于乐观）；表判 p≈1（band 太宽/简单题白占位）
-        stale_releasable, table_optimistic, table_p_one = 0, 0, 0
+        # 【2026-10-20 修复·原三象限里两个结构上恒 0】
+        # "表判 p≈0 但在线已能做对" 与 "表判 p≈1" 都要求该题**同时出现在 record 里**，
+        # 而被 band 排除的题永远不进训练池 → 永远不会出现在 record → 计数必为 0。
+        # 也就是说这两个 0 不是"表没过期"的证据，只是这个工具答不了那个问题；
+        # 真机上它已经被当成过证据读（p11c 复盘）。恒 0 是系统性 bug 签名
+        # （AGENTS.md），改成诚实的覆盖率报告 + 唯一可判的象限。
+        # 要回答"被排除的题能不能用"，只能对该子集单独跑 probe_difficulty。
+        table_optimistic = 0
+        online_covered = 0
         for q, row in tbl.items():
-            key = qk_of(q)
-            on = by_qk.get(key)
+            on = by_qk.get(qk_of(q))
             if not on or on["k"] < 8:      # 在线样本太少不下结论
                 continue
+            online_covered += 1
             table_rate = row["n_correct"] / row["k"]
             online_rate = on["n_correct"] / on["k"]
-            if table_rate <= lo and online_rate > hi - (hi - lo) * 0.5 and online_rate > lo:
-                stale_releasable += 1      # 表判 0，在线已非 0 → 表过期
             if lo < table_rate < hi and online_rate <= lo:
-                table_optimistic += 1      # 表判可学，在线全错 → 表乐观
-            if table_rate >= hi:
-                table_p_one += 1
-    print("\n=== 表过期诊断（表=%s，在线 k>=8 的题）===" % args.difficulty_path)
-    print(f"  表判 p≈0 但在线已能做对（可释放）: {stale_releasable}")
+                table_optimistic += 1      # 表判可学，在线全错 → 表乐观/模型退化
+    print("\n=== 表诊断（表=%s，可判象限只有第二象限）===" % args.difficulty_path)
+    print(f"  表内 {len(tbl)} 行，被在线观测覆盖 {online_covered} 行（在线 k>=8）")
     print(f"  表判 band 内但在线全错（表乐观/模型退化）: {table_optimistic}")
-    print(f"  表判 p≈1（band 太宽，白占算力）: {table_p_one}")
+    print(f"  ⚠ 余下 {len(tbl) - online_covered} 行**从未进过训练池**（被 band 排除或"
+          "未被抽到）——它们能不能用，record 答不了。原版「可释放 / 表判 p≈1」两个"
+          "计数结构上恒 0，已删除（别再把它读成「表没过期」）。")
 
     if args.merge_out:
         m = merge_into_table(by_qk, args.difficulty_path or "", args.merge_out,
