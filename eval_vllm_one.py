@@ -756,7 +756,7 @@ else:
     _temp = 0.0
     _topp = 1.0
 if is_retool_family:
-    from rlab.rollout import multi_turn_rollout_group
+    from rlab.rollout import multi_turn_rollout_group, run_code
     from rlab.protocol import RETOOL_STOP_KWARGS as _STOP_KW
     # 【2026-09-18 stop 机制】评测与训练同节奏铁律：stop 从训练 config 回读
     # （_rcfg 即 --proto_from 对齐的那份），旧 ckpt（无 retool_stop 键）不带 stop
@@ -836,7 +836,14 @@ if is_retool_family:
         _probe_msgs = None
     _segs, _full, code_stats = multi_turn_rollout_group(
         llm, sp_mt, tokenizer, _probe_prompts, mt_cfg, prompts_messages=_probe_msgs,
-        code_runner=_eval_search_runner)
+        # 【2026-10-20 回归修复】2026-10-16 的 52b522b（search-grpo）为接检索而
+        # **无条件**传了 code_runner=_eval_search_runner，但该变量只在
+        # eval_task == "search_qa" 分支里被赋值，其余任务恒为 None —— 显式传
+        # None 会**覆盖掉函数签名的默认值 run_code**，于是 retool_math 一进多轮
+        # 执行就 `TypeError: 'NoneType' object is not callable`（真机在
+        # rollout.py:829 `code_runner(code, ...)` 炸）。
+        # 正确写法与 collect_retool_group（rollout.py:1746）一致：or run_code 兜底。
+        code_runner=_eval_search_runner or run_code)
     answers = ["".join(s["text"] for s in segs_i if s["kind"] == "assistant")
                for segs_i in _segs]
     # 打分域：retool_math 剥离代码块（与训练端 total_reward_retool_math 同口径）

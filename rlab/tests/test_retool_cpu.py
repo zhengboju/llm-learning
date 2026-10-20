@@ -2096,6 +2096,62 @@ def test_eval_thinking_switch():
           and '"--no-difficulty_filter"' in _rl_src2)
 
 
+def test_code_runner_none_regression():
+    """【2026-10-20 回归锁】显式传 code_runner=None 会覆盖签名默认值 run_code。
+
+    事故链（真机 eval 直接崩，2026-10-20）：
+      52b522b（2026-10-16 search-grpo）为接检索执行器，在 eval_vllm_one.py 与
+      probe_difficulty.py 里**无条件**写了 `code_runner=_eval_search_runner`，
+      而该变量只在 eval_task/data_task == "search_qa" 分支里被赋值，其余任务
+      恒为 None。Python 的默认值只在**参数缺失**时生效，显式传 None 会把它盖掉
+      → retool_math 一进多轮执行就
+          TypeError: 'NoneType' object is not callable   (rollout.py:829)
+    这类 bug 的签名是「非 search_qa 路径整条不可用」，但只有真机跑到执行那一步才
+    炸（探针同理），CPU 静态检查看不见 —— 所以必须锁调用形态。
+
+    正确形态（collect_retool_group, rollout.py:1746 一直是这么写的）：
+        code_runner=xxx or run_code
+    即"没注入执行器"必须落回默认代码沙箱，而不是落成 None。"""
+    print("[N2] code_runner None 覆盖回归锁：非 search_qa 档必须落回 run_code")
+    import inspect
+    from rlab.rollout import run_code, multi_turn_rollout_group
+
+    # ① 函数签名默认值本身是正确的（问题在调用点，不在定义）
+    check("multi_turn_rollout_group 的 code_runner 默认值是 run_code",
+          inspect.signature(multi_turn_rollout_group).parameters["code_runner"].default
+          is run_code)
+    from rlab.rollout import multi_turn_rollout_group_native
+    check("multi_turn_rollout_group_native 的 code_runner 默认值也是 run_code",
+          inspect.signature(multi_turn_rollout_group_native)
+          .parameters["code_runner"].default is run_code)
+
+    # ② 所有调用点都不得裸传一个"可能为 None"的变量
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    _one = open(os.path.join(_root, "eval_vllm_one.py"), encoding="utf-8").read()
+    _probe = open(os.path.join(_root, "rlab", "probe_difficulty.py"),
+                  encoding="utf-8").read()
+    _roll = open(os.path.join(_root, "rlab", "rollout.py"), encoding="utf-8").read()
+
+    check("eval_vllm_one 用 `code_runner=_eval_search_runner or run_code` 兜底",
+          "code_runner=_eval_search_runner or run_code)" in _one
+          and "code_runner=_eval_search_runner)" not in _one)
+    check("probe_difficulty 用 `code_runner=_search_runner or run_code` 兜底",
+          "code_runner=_search_runner or run_code)" in _probe
+          and "code_runner=_search_runner)" not in _probe)
+    check("collect_retool_group 侧一直是 `or run_code`（正确形态的参照）",
+          "code_runner=code_runner or run_code)" in _roll)
+    check("两处都 import 了 run_code（否则 or 兜底会 NameError）",
+          "multi_turn_rollout_group, run_code" in _one
+          and "multi_turn_rollout_group, run_code" in _probe)
+
+    # ③ 行为级：None 落回真沙箱后确实能执行（证明"不是 None"就够了，
+    #    这里只跑一条最便宜的语句，真机全套件在 pod）
+    _res = run_code("print(1+1)", timeout=5.0, mem_mb=256, max_chars=500)
+    check("run_code 真实可调用且返回 ok（兜底目标有效）",
+          isinstance(_res, dict) and _res.get("ok") == 1)
+
+
 
 def test_overlong_ref_and_opt_cli():
     print("[X] overlong 参考系修复 + 优化超参 CLI：retool 多轮总预算 ≠ 单轮 max_gen_tokens")
@@ -6496,6 +6552,7 @@ if __name__ == "__main__":
     test_question_scheduler()
     test_collect_retool_group_split()
     test_difficulty_filter()
+    test_code_runner_none_regression()
     test_probe_aggregate()
     test_sandbox_hardening()
     test_chat_template_kwargs()

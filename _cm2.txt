@@ -1,0 +1,29 @@
+fix(rollout): code_runner=None 覆盖签名默认值导致非 search_qa 档全灭
+
+现象(真机 2026-10-20):
+  python -m rlab.eval --algo retool_math ... (eval_vllm_one.py:837)
+  -> rlab/rollout.py:829 in _run
+       return i, code_runner(code, timeout=...)
+     TypeError: 'NoneType' object is not callable
+
+根因:
+  52b522b(2026-10-16 search-grpo) 为接检索执行器，在 eval_vllm_one.py 与
+  probe_difficulty.py 里**无条件**写了 code_runner=_eval_search_runner /
+  code_runner=_search_runner，而这两个变量只在 search_qa 档分支里被赋值，
+  其余任务恒为 None。Python 的默认值只在参数缺失时生效，显式传 None 会把它
+  覆盖掉 -> retool_math 一进多轮执行就炸。
+
+  这类 bug 的签名是「非 search_qa 路径整条不可用」，但只有真机跑到执行那一步
+  才暴露（探针同理），CPU 静态检查与 import 冒烟都看不见。
+
+修复:
+  - eval_vllm_one / probe_difficulty 改为 `xxx or run_code`
+    (与 collect_retool_group rollout.py:1746 一直是这么写的形态对齐)
+  - 两处补 `run_code` 的 import
+  - 顺手清掉 probe_difficulty 里上一轮遗留的未使用 import budget_target_tokens
+
+回归锁 (test_code_runner_none_regression, 7 checks):
+  - 两个 rollout 入口的签名默认值确实是 run_code(问题在调用点不在定义)
+  - 两个调用点都是 `or run_code` 兜底, 且没有裸传形态残留
+  - 两处都 import 了 run_code(否则 or 兜底变 NameError)
+  - run_code 真实可调用且返回 ok(证明兜底目标有效)

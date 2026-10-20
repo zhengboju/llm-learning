@@ -393,14 +393,13 @@ def main():
     cfg["_tool_reserve"] = validate_retool_budget(cfg)
     # 【2026-10-20】通告预算的两条硬约束（同上：探针路径必须与训练同源校验，
     # 否则"合法配置"的定义在两条路径间漂移——本文件正是 get_config 之后改 cfg 的形态）
-    from rlab.config import budget_target_tokens as _bt_tokens, \
-        validate_budget_target as _vbt
+    from rlab.config import validate_budget_target as _vbt
     _vbt(cfg)
 
     from rlab.data import load_qas, load_difficulty_table
     from rlab.protocol import initial_messages
     from rlab.reward import overlong_ref_tokens, total_reward_retool_math
-    from rlab.rollout import build_prompt, multi_turn_rollout_group
+    from rlab.rollout import build_prompt, multi_turn_rollout_group, run_code
     # 【docs/16 Search-GRPO】QA 档的探针必须用**检索执行器 + QA 打分**：用代码沙箱接
     # search 调用会条条执行失败、用数学口径打分会让每个答案判错——产出的难度表是
     # 一张全 0 的表，而它正是训练池过滤的依据（用错表比没有课程更糟）。
@@ -606,7 +605,11 @@ def main():
         segs, texts, code_stats = multi_turn_rollout_group(
             vllm_gen, sps, tokenizer, group_prompts, cfg,
             prompts_messages=(group_msgs or None),
-            code_runner=_search_runner)
+            # 【2026-10-20 回归修复】与 eval_vllm_one.py 同一 bug：52b522b 无条件传
+            # _search_runner（非 search_qa 档恒 None）会覆盖签名默认值 run_code →
+            # retool_math 探针一进多轮执行就 TypeError: 'NoneType' object is not
+            # callable。与 collect_retool_group（rollout.py:1746）统一用 or 兜底。
+            code_runner=_search_runner or run_code)
         for qi, x in enumerate(wave):
             for j in range(k):
                 idx = qi * k + j
