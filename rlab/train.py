@@ -512,10 +512,17 @@ def _run_inline_eval(cfg, ckpt_dir, step, eval_gpu="0", eval_gpu_mem=0.20,
     summary = {}
     for _split in ("test", "train"):
         _out = os.path.join(ckpt_dir, f"eval_{_split}.json")
+        # 【2026-10-20 评测口径】内嵌评测**必须**显式关难度过滤，两个真机后果：
+        #   ① run_info 里带着 difficulty_path（探针表只覆盖训练池）→ `--split test`
+        #      全落 missing → 池 0 题 → fail-fast（returncode≠0）→ 这个 ckpt 的
+        #      test 窗口直接变盲，正是 p10/p11 反复踩的形态；
+        #   ② 过滤后的 acc 是「条件于难度带」的量，换 band 的 run 之间不可比
+        #      （p9 的 fmt 93.9% 跨池比较事故）。
+        # 曲线只作趋势与熔断；权威判定走离线完整 dev（--no-difficulty_filter）。
         _cmd = [_sys.executable, _one,
                 "--model", ckpt_dir, "--name", f"step{step}_{_split}",
                 "--n", str(eval_n), "--seed", "42",
-                "--split", _split, "--algo", _algo,
+                "--split", _split, "--no-difficulty_filter", "--algo", _algo,
                 "--gpu_mem", str(eval_gpu_mem),
                 "--proto_from", ckpt_dir, "--out", _out]
         if _mp:
@@ -869,6 +876,19 @@ def run_training(cfg, args):
                 sample_weight=batch.get("sample_weight"))
             engine.backward(loss)
             loss = float(loss.item())
+        # 【2026-10-20 sw 自证】守卫+trunc_counts_as_wrong 下 sample_weight 必须恒 1
+        # （负信用由 acc=−1 承担，不再靠整行清零）。p11c 有 563/2696≈21% 的样本被
+        # 清零，且正好是"啰嗦→不交卷"的族 → 模型从未收到该负梯度，是 fmt 下滑与
+        # 散文尾膨胀的直接来源。修好只是代码层，**真实数据流是否生效只能靠这里报**：
+        # 零权重样本 >0 就说明修复没接到（本轮的第一条"立即停"判据）。
+        if step % 10 == 0:
+            _sw = batch.get("sample_weight")
+            if _sw is not None:
+                _sw = _sw.detach().float()
+                _row = _sw if _sw.dim() == 1 else _sw.reshape(_sw.shape[0], -1).amax(dim=1)
+                _n0 = int((_row <= 0).sum().item())
+                print(f"[sw] 第{step}步 零权重样本 {_n0}/{_row.numel()}"
+                      f"（guard+tcw 下应为 0）", flush=True)
         # 梯度健康探针：策略梯度全零 = 零梯度 bug 的直接签名（cispo 教训：
         # 300 步 loss 数值"正常"但梯度处处为零，训完评测才发现）。连续 3 次
         # 全零直接 fail-fast，不在废训上继续烧 GPU。

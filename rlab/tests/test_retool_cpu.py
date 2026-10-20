@@ -2094,6 +2094,14 @@ def test_eval_thinking_switch():
     check("rlab.eval 透传 --difficulty_filter（含 --no- 形态）",
           '"--difficulty_filter"' in _rl_src2
           and '"--no-difficulty_filter"' in _rl_src2)
+    # 内嵌评测（train.py::_run_inline_eval）同样必须显式关过滤：它的协议来自
+    # ckpt 的 run_info，而 run_info 带着只覆盖训练池的 difficulty_path →
+    # `--split test` 全落 missing → 池 0 题 → fail-fast → 该 ckpt 的 test 窗口
+    # 直接变盲（p10/p11 的盲窗形态）；且过滤后的 acc 是「条件于 band」的量，
+    # 换 band 的 run 之间不可比——而这正是本轮唯一权威判据的口径。
+    _tr_src = open(os.path.join(_root, "rlab", "train.py"), encoding="utf-8").read()
+    check("内嵌评测显式关难度过滤（run_info 的表不含 dev → test 必盲窗）",
+          '"--split", _split, "--no-difficulty_filter", "--algo", _algo' in _tr_src)
 
 
 def test_code_runner_none_regression():
@@ -6401,6 +6409,20 @@ def test_loss_weight_guard_tcw():
         from rlab.analysis import _credit_enabled
         check("analysis：guard+tcw 档读成『两者都有梯度』（与代码同向，不是零梯度）",
               _credit_enabled(_rec) == (True, True))
+
+    # ---------- 7. 训练期自证：接线是否真的生效只能靠日志（2026-10-20）----------
+    # 单测全绿 ≠ 真机生效（AGENTS.md 训练纪律：过滤器存在且测试全绿 ≠ 真实数据流
+    # 生效）。p11c 的 21% 零梯度恰恰是「配置对、接线断」；所以必须把每步**真实的**
+    # 零权重样本数打进日志——它是本轮第一条"立即停"判据的唯一数据源。
+    # 口径注意：analysis 的 `zero_grad` 列是 `trunc_final or code_wasted` 的**重构**，
+    # 修复后该族是**有**梯度的；能判定 sw 是否生效的只有这里。
+    _tr7 = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "rlab", "train.py"), encoding="utf-8").read()
+    check("train：每 10 步打印真实零权重样本数（stop 判据的数据源，不是重构列）",
+          "零权重样本 {_n0}/{_row.numel()}" in _tr7
+          and '_row = _sw if _sw.dim() == 1 else _sw.reshape(_sw.shape[0], -1).amax(dim=1)'
+          in _tr7
+          and 'if _sw is not None:' in _tr7)
     print()
 
 
