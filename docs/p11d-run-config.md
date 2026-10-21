@@ -448,23 +448,43 @@ p11c 已经预演过一次：机制改了、行为动了、acc 读不出来。�
 或预算通告同步改成 12288**。默认回包估算 266 时，调用放行线从已用轨迹 6902
 移到 10998 token（执行预算 − reserve − 回包估算）。
 
-pod 更新代码后，仅评同一 step400，用新输出名避免覆盖原表：
+### 10.1 实测（2026-10-21，全量同批重评）
+
+**关键修正**：原方案只评 step400、复用旧表做 `step400` 的对照，**做不出差中差分解**——
+BASE 必须与全部 ckpt 放进**同一批**重评（同一个 harness 参数对 BASE 与 ckpt 的伤害不同，
+这正是要测的量）。实际执行是五臂同批：
 
 ```bash
 git pull
-python -m rlab.eval --algo retool_math --skip_base \
-  --models step400_exec12288=./rlab_new/native_p11f_wiring/step_400 \
+python -m rlab.eval --algo retool_math \
+  --base_path=./rlab_out/sft_budget_v3/epoch1 \
+  --models step100=./rlab_new/native_p11f_wiring/step_100 \
+           step200=./rlab_new/native_p11f_wiring/step_200 \
+           step300=./rlab_new/native_p11f_wiring/step_300 \
+           step400=./rlab_new/native_p11f_wiring/step_400 \
   --tool_execution_budget 12288 \
   --n 300 --seed 42 --no-difficulty_filter \
-  --gpus 0 --gpu_mem 0.2 --dump_traj \
-  --out eval_p11f_step400_exec12288.json
+  --gpus 0 --gpu_mem 0.2 --out eval_p11f_exec12288.json
 
+# 跨口径配一条（同权重、只差执行闸）；标签用你落盘的实际名字
 python -m rlab.analysis \
-  --eval-json eval_p11f_step400_exec12288.json \
+  --eval-json eval_p11f_exec12288.json \
   --pair-json eval_vllm_all.json \
-  --pair-a step400_exec12288 --pair-b step400
+  --pair-a <step400_exec12288> --pair-b <step400>
 ```
 
-比较对象是原表的 `step400`，不是 BASE；同题、同 seed、同 greedy、同 `gpu_mem=0.2`。
-联合看 acc / fmt / 条件精度 / token，并按落盘轨迹核对新增答对题是否在旧放行线之后
-调用工具。仅 C 减少但 acc 不升，不能认定放宽恢复了有效解题。
+| 模型 | 8192 acc/fmt/条件 | 12288 acc/fmt/条件 | Δacc | Δfmt |
+|---|---|---|---|---|
+| BASE | 76.1 / 89.8 / 84.8 | 79.9 / 97.3 / 82.1 | **+3.8** | **+7.5** |
+| step100 | 76.1 / 90.8 / 83.8 | 77.8 / 95.2 / 81.7 | +1.7 | +4.4 |
+| step200 | 77.1 / 87.0 / 88.6 | 80.2 / 94.5 / 84.8 | +3.1 | +7.5 |
+| step300 | 78.5 / 91.5 / 85.8 | 81.6 / 95.6 / 85.4 | +3.1 | +4.1 |
+| step400 | 79.2 / 93.5 / 84.7 | 80.5 / 96.2 / 83.7 | +1.3 | +2.7 |
+
+**结论（详见 [p11f-diagnosis](p11f-diagnosis.md) §5）**：五臂一致变好（位移远超同配置重跑
+噪声标尺 acc ≤0.4pp / fmt ≤2.4pp）⇒ **8192 执行闸是全局压制项**；step400 vs BASE 从
++3.1pp 塌到 +0.7pp，差中差给出 **约 2.5pp（≈80%）来自 BASE 对紧预算更敏感**。
+真实保留的是"预算内交卷"（fmt），不是推理能力；条件精度两口径都平坦。
+
+> 该分析的臂仍缺**跨口径的同题配对检验**（本节用的是聚合差中差）。另注意两表必须
+> 同批同 `gpu_mem`，否则配对不成立（p9 已为此出过两次事故）。
