@@ -50,6 +50,7 @@ def effective_table(cfg: dict) -> list:
     note 用来标出**被自动改写**的键——这类键最危险：用户以为设了 A，
     实际生效 B，而日志里只有一行容易被淹没的 print。
     """
+    from rlab.config import tool_execution_budget_tokens
     rows = []
     ttp = float(cfg.get("trunc_tail_penalty", 0.0) or 0.0)
     twp = float(cfg.get("tool_waste_penalty", 0.0) or 0.0)
@@ -62,12 +63,14 @@ def effective_table(cfg: dict) -> list:
               "trunc_shaping", "trunc_tail_penalty",
               "len_penalty_w", "len_eff_w", "len_eff_penalty_w",
               "task_adv_guard", "aux_clip_alpha", "trunc_counts_as_wrong",
-              "adv_mode", "budget_target", "max_traj_tokens",
+              "adv_mode", "budget_target", "max_traj_tokens", "tool_execution_budget",
               "answer_reserve", "budget_hint"):
         note = ""
         if k in ("tool_waste_penalty", "trunc_tail_penalty") and guard and tcw:
             note = "已被 guard+tcw 自动归零（覆盖语义会削掉一半负信用）"
         rows.append((k, cfg.get(k), note))
+    rows.append(("tool_execution_budget_effective",
+                 tool_execution_budget_tokens(cfg), ""))
     return rows
 
 
@@ -148,10 +151,15 @@ def budget_geometry(cfg: dict, clen_samples=None) -> dict:
     clen_samples 是实测 completion 长度样本（如 p11c 的分位数）；不给则用
     p11c 实测的典型分布做参照。**这一步专门抓"惩罚区间落在真实分布之外"**。
     """
-    from rlab.config import budget_target_tokens
+    from rlab.config import (budget_target_tokens, tool_execution_budget_tokens,
+                             validate_tool_execution_budget)
     from rlab.reward import overlong_ref_tokens
+    validate_tool_execution_budget(cfg)
     mtj = int(cfg.get("max_traj_tokens", 0) or 0)
     announce = budget_target_tokens(cfg) if mtj > 0 else 0
+    execution = tool_execution_budget_tokens(cfg) if mtj > 0 else 0
+    obs_est = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
+    reserve = max(1, int(cfg.get("answer_reserve", 0) or 0))
     ref = overlong_ref_tokens(cfg) if cfg.get("overlong_shaping") else 0
     buf = int(cfg.get("overlong_buffer", 64) or 64)
     trigger = (ref - buf) if ref else 0
@@ -160,6 +168,9 @@ def budget_geometry(cfg: dict, clen_samples=None) -> dict:
         clen_samples = [2600, 5000, 5600, 6056, 6800, 7200, 8060, 11059, 12000]
     hit = [c for c in clen_samples if trigger and c > trigger]
     return {"max_traj_tokens": mtj, "announce": announce,
+            "tool_execution_budget": execution,
+            "tool_execution_cutoff": (execution - reserve - obs_est) if mtj > 0 else 0,
+            "answer_reserve": reserve, "tool_observation_est": obs_est,
             "overlong_ref": ref, "overlong_buffer": buf,
             "overlong_trigger": trigger,
             "announce_gap": (mtj - announce) if announce else 0,
@@ -313,6 +324,10 @@ def render(rep: dict) -> str:
     out.append(f"  保险丝 max_traj_tokens = {g['max_traj_tokens']}")
     out.append(f"  通告 budget_target    = {g['announce']}"
                f"（差 {g['announce_gap']} = 模型看不见的溢出余量）")
+    out.append(f"  工具执行有效预算     = {g['tool_execution_budget']}")
+    out.append(f"  调用放行线（已用轨迹 ≤）= {g['tool_execution_cutoff']}"
+               f" = 执行预算 − reserve {g['answer_reserve']}"
+               f" − 回包估算 {g['tool_observation_est']}")
     out.append(f"  overlong ref={g['overlong_ref']} buffer={g['overlong_buffer']}"
                f" → 触发线 {g['overlong_trigger']}")
     out.append(f"  受罚区间宽度 = 保险丝 − 触发线 = {g['penalty_zone_width']} token")
@@ -351,6 +366,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="机器可读输出")
     # 常用覆盖（与 train 同名，便于把 run.sh 里的关键项搬过来）
     for _k, _t in (("max_traj_tokens", int), ("budget_target", int),
+                   ("tool_execution_budget", int),
                    ("answer_reserve", int), ("max_context_tokens", int),
                    ("round_gen_tokens", int), ("overlong_ref", int),
                    ("overlong_buffer", int), ("tool_call_cost", float),
@@ -368,7 +384,7 @@ def main():
 
     from rlab.config import get_config
     ov = {}
-    for k in ("max_traj_tokens", "budget_target", "answer_reserve",
+    for k in ("max_traj_tokens", "budget_target", "tool_execution_budget", "answer_reserve",
               "max_context_tokens", "round_gen_tokens", "overlong_ref",
               "overlong_buffer", "tool_call_cost", "tool_waste_penalty",
               "trunc_tail_penalty", "code_w", "code_attempt_w", "len_eff_w",

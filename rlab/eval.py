@@ -48,6 +48,9 @@ def main():
                     default=None,
                     help="难度过滤：None=随 ckpt 的 run_info（有表就过滤，历史行为）；"
                          "--no-difficulty_filter=完整 split（跨 run 可比口径，主评测推荐）")
+    ap.add_argument("--tool_execution_budget", type=int, default=None,
+                    help="工具执行预算：None=随 run_info；0=沿用通告预算；"
+                         ">0=仅覆盖工具放行预算，不改变通告或轨迹硬上限")
     ap.add_argument("--base_path", default="/root/Qwen2.5-3B")
     ap.add_argument("--skip_base", action="store_true")
     ap.add_argument("--retool", action="store_true",
@@ -101,6 +104,8 @@ def main():
     if args.difficulty_filter is not None:
         cmd.append("--difficulty_filter" if args.difficulty_filter
                    else "--no-difficulty_filter")
+    if args.tool_execution_budget is not None:
+        cmd += ["--tool_execution_budget", str(args.tool_execution_budget)]
     if args.retool:
         cmd.append("--retool")
     if algo is not None:

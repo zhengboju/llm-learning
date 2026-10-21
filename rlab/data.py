@@ -477,6 +477,8 @@ def load_difficulty_table(path: str, expected_meta: dict = None,
                     # 旧表无这两个键 → None → 跳过（旧表兼容）。
                     for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
                                 "tool_protocol", "max_traj_tokens", "answer_reserve",
+                                # 有效执行预算改变调用截止线；旧表无键仍兼容跳过。
+                                "tool_execution_budget",
                                 "max_prompt_length", "nsc", "model_path",
                                 "native_tool_name", "data_task",
                                 # 【docs/17】swe_l0 的表同样是"模型×提示×预算×

@@ -43,6 +43,9 @@ parser.add_argument("--difficulty_filter", action=argparse.BooleanOptionalAction
                     default=None,
                     help="难度过滤：None=随各 ckpt 的 run_info（有表就过滤）；"
                          "--no-difficulty_filter=完整 split（跨 run 可比口径）")
+parser.add_argument("--tool_execution_budget", type=int, default=None,
+                    help="工具执行预算：None=随 run_info；0=沿用通告预算；"
+                         ">0=仅覆盖工具放行预算，不改变通告或轨迹硬上限")
 parser.add_argument("--out", default="eval_vllm_all.json", help="合并结果json")
 parser.add_argument("--retool", action="store_true", help="阶段2：多轮代码交织评测（兼容旧 flag，等价 --algo retool）")
 parser.add_argument("--algo", type=str, default=None, help="算法名：grpo/retool/retool_math/search_qa/swe_l0；自动决定 prompt/预算/奖励口径")
@@ -177,6 +180,8 @@ def run_one(gpu, idx, name, path):
     if args.difficulty_filter is not None:
         cmd += ["--difficulty_filter"] if args.difficulty_filter \
             else ["--no-difficulty_filter"]
+    if args.tool_execution_budget is not None:
+        cmd += ["--tool_execution_budget", str(args.tool_execution_budget)]
     if args.dump_traj:
         cmd += ["--dump_traj"]
     if args.mm_base:
@@ -252,6 +257,7 @@ results["_meta"] = {"base_path": base_path, "tuned": args.tuned, "n": args.n,
                     "mm_base": args.mm_base, "vllm_gen_kwargs": VLLM_KWARGS,
                     # 【2026-10-20】None = 各模型随自己 run_info（同批内可能不同口径）
                     "difficulty_filter": args.difficulty_filter,
+                    "tool_execution_budget": args.tool_execution_budget,
                     "failures": [list(x) for x in failures],
                     "created": time.strftime("%Y-%m-%d %H:%M:%S")}
 with open(args.out, "w", encoding="utf-8") as f:

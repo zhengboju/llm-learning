@@ -71,6 +71,9 @@ parser.add_argument("--temperature", type=float, default=None,
                     help="采样温度；None=val_n>1 时取 1.0（参考项目），否则 0（greedy）")
 parser.add_argument("--top_p", type=float, default=None,
                     help="采样 top_p；None=val_n>1 时取 0.7（参考项目），否则 1.0")
+parser.add_argument("--tool_execution_budget", type=int, default=None,
+                    help="工具执行预算：None=随 run_info；0=沿用通告预算；"
+                         ">0=仅覆盖工具放行预算，不改变通告或轨迹硬上限")
 parser.add_argument("--proto_from", default=None,
                     help="协议来源目录（含 run_info.json）；None=从 --model 自己的 run_info 回读。"
                          "供 BASE 等无 run_info 的裸模型复用『被测 checkpoint 的训练协议』，"
@@ -150,7 +153,9 @@ if args.eval_task is None:
 _SEARCH_EP = args.search_endpoint
 
 # ---- 预算/轮次自动对齐训练配置 ----
-from rlab.config import get_config as _get_config, BASE as _BASE_CFG
+from rlab.config import (get_config as _get_config, BASE as _BASE_CFG,
+                         tool_execution_budget_tokens,
+                         validate_tool_execution_budget)
 
 try:
     _rcfg = _get_config(args.algo)
@@ -167,6 +172,21 @@ if _run_cfg:
 _tool_protocol = (args.tool_protocol if getattr(args, "tool_protocol", None)
                   else _rcfg.get("tool_protocol") or "fence")
 _rcfg["tool_protocol"] = _tool_protocol
+# CLI 显式值（含 0）优先于协议来源；旧 run_info 缺键时保持历史放行预算。
+if args.tool_execution_budget is not None:
+    _tool_exec_requested = args.tool_execution_budget
+    _tool_exec_src = "cli"
+elif _run_cfg.get("tool_execution_budget") is not None:
+    _tool_exec_requested = int(_run_cfg["tool_execution_budget"])
+    _tool_exec_src = "run_info"
+else:
+    _tool_exec_requested = 0
+    _tool_exec_src = "default"
+_rcfg["tool_execution_budget"] = _tool_exec_requested
+validate_tool_execution_budget(_rcfg)
+_tool_exec_effective = tool_execution_budget_tokens(_rcfg)
+print(f"[eval] 工具执行预算 requested={_tool_exec_requested} "
+      f"effective={_tool_exec_effective} source={_tool_exec_src}")
 # 原生档的解析形态同源回读（探针钉死的值必须与训练一致）
 if getattr(args, "native_tool_style", None):
     _rcfg["native_tool_style"] = args.native_tool_style
@@ -805,12 +825,9 @@ if is_retool_family:
               # ckpt（轨迹长度/终止点/答案截断率全不同）＝测的是另一套协议下的模型。
               # 这正是 docs/09 §8 那条"改档必须同步"的纪律在新档上的延续。
               "max_traj_tokens": _mtj_eval,
-              # 【2026-10-20】通告预算必须一起回读：它决定系统提示里的数字、
-              # `[budget]` 剩余额度与 `_can` 执行阈值三处。漏了它 → eval 按
-              # max_traj_tokens 通告而训练按 budget_target 通告 → 同一个 ckpt
-              # 在两边被"告知"了不同的预算，轨迹长度与终止点不可比（与
-              # round_gen_tokens 缺键退化成 400 是同一类"评测不同档"事故）。
+              # 通告预算保持回读；显式工具执行预算独立覆盖，0 保留历史判据。
               "budget_target": int(_rcfg.get("budget_target", 0) or 0),
+              "tool_execution_budget": _tool_exec_requested,
               "answer_reserve": int(_rcfg.get("answer_reserve", 0) or 0),
               "budget_hint": bool(_rcfg.get("budget_hint")),
               # 【2026-09-29 单轮上限必须一起传】token 档下每轮额度是
@@ -1100,6 +1117,11 @@ result = {"acc": acc / n_valid if n_valid else 0, "fmt": fmt / n_valid if n_vali
                                           else "default"),
                             "max_rounds": args.max_rounds, "round_tokens": args.round_tokens,
                             "max_tokens": args.max_tokens, "max_len": args.max_len,
+                             "budget_target": int(_rcfg.get("budget_target", 0) or 0),
+                             "max_traj_tokens": int(_rcfg.get("max_traj_tokens", 0) or 0),
+                             "tool_execution_budget": _tool_exec_requested,
+                             "tool_execution_budget_effective": _tool_exec_effective,
+                             "tool_execution_budget_src": _tool_exec_src,
                             # 【2026-09-20】确定性档落盘：采样评测的跨 run 可比性前提。
                             # 缺这两项的旧 json（或 batch_invariant=false）不可与新
                             # json 直接比 Δacc——同权重漂移可达 2pp。

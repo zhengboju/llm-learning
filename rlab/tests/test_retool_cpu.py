@@ -6138,16 +6138,7 @@ def test_signal_observation():
 
 
 def test_budget_target_announcement():
-    """[AQ] 通告预算（budget_target）：模型看得见的数字必须三处一致。
-
-    【为什么这组必须存在】p9 §7.6 的锚机制（提示 8192 / 上限 12288"承诺紧、余量
-    松"）+5.2pp acc / +4.1pp fmt，但那条腿此前**只靠提示文本**：`[budget]` 回包与
-    `_can` 执行判据仍按 max_traj_tokens 算，模型一旦读到"11600 tokens left"就把
-    余量当预算花掉。p9 没暴露是因为题简单（avg_clen 2602）；p11c 进难度带后
-    avg_clen 6056~8056、B 桶 272/272 全部 clen≥0.9·cap。
-    ⇒ 若哪天有人把这三处中的任一处改回 max_traj_tokens，锚会**静默失效**，
-    而所有指标（acc/fmt/trunc）都只表现为"题变难了"。本组锁的就是这条。
-    """
+    """[AQ] 通告与默认执行判据的历史兼容；显式覆盖另由新测试验证。"""
     print("[AQ] 通告预算 budget_target（三信道一致 + 两条 fail-fast + 签名）")
     from rlab.config import (budget_target_tokens, inject_budget_prompt,
                              validate_budget_target)
@@ -6186,8 +6177,9 @@ def test_budget_target_announcement():
     check("信道②：[budget] 剩余额度按承诺算（announce_budget 而非 traj_budget）",
           "announce_budget\n                                - (len(ctx_ids[i]) - p0[i])"
           in _ro)
-    check("信道③：执行判据按承诺算（announce_budget − used − obs ≥ reserve）",
-          "_can = (announce_budget - _used_tokens(i) - _obs_est) >= _ans_res" in _ro)
+    check("信道③：执行判据使用独立预算，默认沿用通告",
+          "_can = (execution_budget - _used_tokens(i) - _obs_est) >= _ans_res" in _ro
+          and "execution_budget = tool_execution_budget_tokens(cfg)" in _ro)
     check("announce_budget 收敛到单点真相 budget_target_tokens()",
           "announce_budget = budget_target_tokens(cfg) or traj_budget" in _ro)
     # 保险丝语义不变：停止生成 / trunc_final 仍按 traj_budget（承诺只影响"通告"，

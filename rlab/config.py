@@ -639,32 +639,15 @@ BASE = dict(
     answer_reserve=0,
     # True = 工具回包追加一行剩余 token 额度（只在 max_traj_tokens>0 时有意义）
     budget_hint=False,
-    # 【2026-10-20 计划预算 vs 真实上限】通告给模型的**轨迹预算数字**（0 = 用
-    # max_traj_tokens 的旧行为，逐位不变）。
-    #
-    # 【为什么需要它】p9 §7.6 的锚机制实测：提示里写 8192、真实上限 12288
-    # （"承诺紧、余量松"）比两者相等好 +5.2pp acc / +4.1pp fmt，且少花 token。
-    # 但那条腿**只靠提示文本**，模型能看见预算的另外两个信道仍然漏出真实总量：
-    #   ① 工具回包的 `[budget] N tokens left` = max_traj_tokens − used；
-    #   ② 调用执行判据 `_can` = (max_traj_tokens − used − obs) ≥ answer_reserve。
-    # p9 没暴露这个漏洞，是因为题简单（avg_clen 2602，模型在总量撞墙前就收完了）；
-    # p11c 换进难度带后 avg_clen 涨到 6056~8056，B 桶（散文写到撞墙）272/272
-    # 全部 clen≥0.9·cap —— 正是"模型第一次真正用上了那个 11600"。
-    #
-    # 【本键做什么】>0 时把**三处通告口径**统一到它：系统提示的预算数字、
-    # `[budget]` 剩余额度、`_can` 执行阈值。`max_traj_tokens` 退化为纯保险丝
-    # （模型看不见，只在最后兜底持有 +4096 的溢出余量）。于是"承诺紧、余量松"
-    # 从"取决于题不够难"变成**结构性成立**。
-    #
-    # 【超出的部分会发生什么】used 越过 budget_target 后：提示行变成"0 left，
-    # 别调用、立刻 boxed 收尾"，而调用一律不执行（记 code_wasted）；但**生成
-    # 不终止**——保险丝给的那段余量正是留给它把 boxed 写出来。
-    #
-    # 约束（validate_budget_target fail-fast）：必须 ≤ max_traj_tokens（通告比
-    # 保险丝还大＝纯说谎，只能换来截断）；且必须留得下一次调用
-    # （budget_target − answer_reserve − obs_est > 0），否则从第 0 秒起所有调用
-    # 都不执行，等于把协议废掉。进签名（改生成端行为与终止结构）。
+    # 【2026-10-21】通告预算：0=沿用 max_traj_tokens；>0 只改变系统提示
+    # 与工具回包里的剩余额度。默认工具执行阈值也沿用它，可通过
+    # tool_execution_budget 单独覆盖；轨迹生成硬上限始终是 max_traj_tokens。
+    # 被拒绝的完整调用会直接终止轨迹并记 code_wasted，不会补一轮作答。
     budget_target=0,
+    # 原生 token 档的工具执行预算：0=沿用通告预算（历史行为）；>0 只改
+    # 放行判据，不改变提示/预算回包/保险丝。必须 <= max_traj_tokens 且
+    # 能容纳工具回包与 answer_reserve；显式非零值进训练签名。
+    tool_execution_budget=0,
     # ---- 工具协议档位（docs/09-native-tool-protocol.md）----
     # "fence"（缺省）= 自造围栏 + [TOOL RESULT] 文本（p1–p11 逐位可复现）；
     # "native"       = Qwen 原生 <tool_call>（方案 A 主线，参考实现 +23.89pp 的形态）。
@@ -901,22 +884,40 @@ _BUDGET_PROMPT_PARA = (
 
 
 def budget_target_tokens(cfg: dict) -> int:
-    """**通告给模型**的轨迹预算（单点真相，纯函数，CPU 可测）。0 = 未开预算档。
+    """通告给模型的轨迹预算（纯函数）。缺省 0 沿用 max_traj_tokens。
 
-    【为什么必须收敛成一个函数】模型的预算认知有三个信道，三者说的数字必须
-    是同一个，否则"承诺紧、余量松"立刻失效：
-      ① 系统提示里的 "Token budget: N tokens"（inject_budget_prompt）；
-      ② 工具回包的 `[budget] M tokens left`（rollout.py 的 `_left`）；
-      ③ 调用执行判据 `_can`（rollout.py 的 `traj_budget − used − obs ≥ reserve`）。
-    p11c 的事故形态就是 ①=8192 而 ②③=12288：模型一旦读到比承诺更大的剩余额度，
-    就把"余量"当成"预算"花掉。把三者绑到本函数，是让这条腿**结构性成立**，
-    而不是靠"题目不够难所以没被发现"。
-
-    budget_target=0（缺省）→ 返回 max_traj_tokens，即历史行为逐位不变。"""
+    系统提示和工具回包共用本函数；工具放行判据由
+    tool_execution_budget_tokens 决定，未覆盖时仍沿用本值。"""
     _t = int(cfg.get("budget_target", 0) or 0)
     if _t > 0:
         return _t
     return int(cfg.get("max_traj_tokens", 0) or 0)
+
+
+def tool_execution_budget_tokens(cfg: dict) -> int:
+    """工具执行预算；0/缺省沿用通告预算，不改变历史判据。"""
+    value = int(cfg.get("tool_execution_budget", 0) or 0)
+    return value if value > 0 else budget_target_tokens(cfg)
+
+
+def validate_tool_execution_budget(cfg: dict) -> None:
+    """显式执行预算只支持原生 token 档，不能越过轨迹保险丝。"""
+    value = int(cfg.get("tool_execution_budget", 0) or 0)
+    if value < 0:
+        raise ValueError("[config] tool_execution_budget 必须 >= 0（0=沿用通告预算）")
+    if value == 0:
+        return
+    cap = int(cfg.get("max_traj_tokens", 0) or 0)
+    if cap <= 0 or cfg.get("tool_protocol") != "native":
+        raise ValueError("[config] tool_execution_budget>0 需要原生 token 预算档"
+                         "（tool_protocol=native 且 max_traj_tokens>0）")
+    if value > cap:
+        raise ValueError(f"[config] tool_execution_budget({value}) > max_traj_tokens({cap})")
+    reserve = max(1, int(cfg.get("answer_reserve", 0) or 0))
+    obs = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
+    if value - reserve - obs <= 0:
+        raise ValueError(f"[config] tool_execution_budget({value}) 无法容纳工具回包"
+                         f"({obs}) 与 answer_reserve({reserve})，会造成全员 code_wasted")
 
 
 def validate_budget_target(cfg: dict) -> None:
@@ -925,7 +926,7 @@ def validate_budget_target(cfg: dict) -> None:
     【两条硬约束，都是"不报错、只是白跑"的形态，必须在第 0 秒拦】
     1. `budget_target > max_traj_tokens`：通告的数字比保险丝还大 ⇒ 提示在**说谎**，
        模型照着写必然撞 max_traj_tokens 被切（trunc_final 全红），比不开还糟。
-    2. `budget_target − answer_reserve − obs_est ≤ 0`：连一次最短调用都装不下
+    2. 未覆盖工具执行预算时，`budget_target − answer_reserve − obs_est ≤ 0`：
        ⇒ 从第 0 秒起 `_can` 恒 False，每一次调用都被记 code_wasted（结构性无
        boxed），模型收到的 `[budget]` 永远是 "0 left / 别调用"，协议被整段废掉。
        这条与 docs/05 里"预算不自洽 → 丢弃率慢慢爬、训练零产出"同类：不崩，只空转。"""
@@ -945,7 +946,7 @@ def validate_budget_target(cfg: dict) -> None:
             f"p9 §7.6 实测 +5.2pp acc / +4.1pp fmt）。")
     _res = max(0, int(cfg.get("answer_reserve", 0) or 0))
     _obs = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
-    if _t - _res - _obs <= 0:
+    if int(cfg.get("tool_execution_budget", 0) or 0) == 0 and _t - _res - _obs <= 0:
         raise ValueError(
             f"[config] budget_target({_t}) − answer_reserve({_res}) − 工具回包估算"
             f"({_obs}) = {_t - _res - _obs} ≤ 0：连一次最短调用都装不下 → `_can` 恒 "
@@ -964,10 +965,8 @@ def inject_budget_prompt(cfg: dict) -> bool:
     旧 run 不会被静默复用。marker 判重：eval 回读 run_info（已含预算段）再走
     get_config 时不会叠加第二遍。
 
-    【2026-10-20】提示里的数字改用 `budget_target_tokens(cfg)`（而不是裸的
-    max_traj_tokens）：本段是模型的三个预算信道之一，它必须与 `[budget]` 行、
-    `_can` 阈值说同一个数。budget_target=0 时该函数恒返回 max_traj_tokens，
-    历史提示逐字节不变。"""
+    提示预算和工具回包共用 budget_target_tokens；执行阈值可独立覆盖。
+    budget_target=0 时历史提示逐字节不变。"""
     if not (cfg.get("budget_hint")
             and int(cfg.get("max_traj_tokens", 0) or 0) > 0
             and cfg.get("tool_protocol") == "native"):
@@ -1494,6 +1493,7 @@ def get_config(algo: str, **overrides) -> dict:
     # 【2026-10-20】通告预算（budget_target）的两条"不报错只白跑"约束
     # （见 validate_budget_target：通告>保险丝=说谎；连一次调用都装不下=全员废码）
     validate_budget_target(cfg)
+    validate_tool_execution_budget(cfg)
     # 【2026-10-19】正确性优先档的互斥项净化（ttp/twp 与 tcw 的覆盖语义冲突）
     _zeroed = validate_guard_conflicts(cfg)
     if _zeroed:

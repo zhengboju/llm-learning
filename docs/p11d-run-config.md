@@ -438,3 +438,33 @@ p11c 已经预演过一次：机制改了、行为动了、acc 读不出来。�
 
 **任何一步不兑现，就停在那一步查，不要叠加下一步**——这是 p1~p11 全部失败的
 共同形态（[docs/08 §8.1](08-sft-cold-start.md)：四个变量同时动，故障归因不可能收敛）。
+
+## 10. 工具执行预算单变量对照（不重训）
+
+`tool_execution_budget=0` 沿用原语义：工具执行预算跟随 `budget_target`，本轮有效值
+为 8192。显式设为 `12288` **只改变 `_can` 的调用放行判据**；`budget_target=8192`、
+`max_traj_tokens=12288`、`answer_reserve=1024` 均不变。回包仍按 8192 通告剩余额度，
+包括原有“不会执行”的强警文案；这是有意保持提示不变的单变量对照，**不是把提示
+或预算通告同步改成 12288**。默认回包估算 266 时，调用放行线从已用轨迹 6902
+移到 10998 token（执行预算 − reserve − 回包估算）。
+
+pod 更新代码后，仅评同一 step400，用新输出名避免覆盖原表：
+
+```bash
+git pull
+python -m rlab.eval --algo retool_math --skip_base \
+  --models step400_exec12288=./rlab_new/native_p11f_wiring/step_400 \
+  --tool_execution_budget 12288 \
+  --n 300 --seed 42 --no-difficulty_filter \
+  --gpus 0 --gpu_mem 0.2 --dump_traj \
+  --out eval_p11f_step400_exec12288.json
+
+python -m rlab.analysis \
+  --eval-json eval_p11f_step400_exec12288.json \
+  --pair-json eval_vllm_all.json \
+  --pair-a step400_exec12288 --pair-b step400
+```
+
+比较对象是原表的 `step400`，不是 BASE；同题、同 seed、同 greedy、同 `gpu_mem=0.2`。
+联合看 acc / fmt / 条件精度 / token，并按落盘轨迹核对新增答对题是否在旧放行线之后
+调用工具。仅 C 减少但 acc 不升，不能认定放宽恢复了有效解题。

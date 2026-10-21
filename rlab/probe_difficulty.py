@@ -248,6 +248,9 @@ def main():
     ap.add_argument("--max_traj_tokens", type=int, default=None,
                     help="token 预算档：整条轨迹的生成 token 预算（0/None=轮数档）。"
                          "**必须与训练同档**，否则表描述的是另一套终止结构")
+    ap.add_argument("--tool_execution_budget", type=int, default=None,
+                    help="工具执行预算：None=随 run_info/preset，0=沿用通告预算；"
+                         "显式正值只改变调用放行线，不改变预算通告")
     ap.add_argument("--answer_reserve", type=int, default=None,
                     help="token 预算档下留给最终作答的 token 数（须与训练同档）")
     ap.add_argument("--budget_hint", action=argparse.BooleanOptionalAction,
@@ -288,8 +291,9 @@ def main():
                     help="显式 attention backend（如 FLASH_ATTN）；确定性档必需")
     args = ap.parse_args()
 
-    from rlab.config import (get_config, validate_max_prompt_length,
-                             validate_retool_budget)
+    from rlab.config import (get_config, tool_execution_budget_tokens,
+                             validate_max_prompt_length, validate_retool_budget,
+                             validate_tool_execution_budget)
     # 【2026-09-28 原生协议入口】协议档必须先落进 overrides——get_config 靠它决定
     # 要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感，与 train.py 同一约定）；
     # preset 系统提示也随档切换（native → system_prompt_retool_math_native，
@@ -332,11 +336,8 @@ def main():
                "max_prompt_length", "max_traj_tokens", "answer_reserve",
                "budget_hint", "native_stop_at_call", "temperature",
                "top_p", "top_k", "chat_template_kwargs", "data_task",
-               # 【2026-10-20】通告预算必须回读：它决定系统提示里的数字、`[budget]`
-               # 剩余额度与执行阈值三处。漏了它 → 探针按 max_traj_tokens 通告而
-               # 训练按 budget_target 通告 → 两张不同分布的表（难度表只对同提示
-               # 同预算的模型有效，这是"表是协议的一半"的又一处）。
-               "budget_target",
+               # 通告与执行预算分别回读；执行预算不改写提示或剩余额度。
+               "budget_target", "tool_execution_budget",
                "vllm_gen_kwargs"):
         if _ri_cfg.get(_k) is not None:
             cfg[_k] = _ri_cfg[_k]
@@ -360,6 +361,8 @@ def main():
         cfg["max_prompt_length"] = args.max_prompt_length
     if args.max_traj_tokens is not None:
         cfg["max_traj_tokens"] = args.max_traj_tokens
+    if args.tool_execution_budget is not None:
+        cfg["tool_execution_budget"] = args.tool_execution_budget
     if args.answer_reserve is not None:
         cfg["answer_reserve"] = args.answer_reserve
     if args.budget_hint is not None:
@@ -395,6 +398,7 @@ def main():
     # 否则"合法配置"的定义在两条路径间漂移——本文件正是 get_config 之后改 cfg 的形态）
     from rlab.config import validate_budget_target as _vbt
     _vbt(cfg)
+    validate_tool_execution_budget(cfg)
 
     from rlab.data import load_qas, load_difficulty_table
     from rlab.protocol import initial_messages
@@ -515,6 +519,7 @@ def main():
         # 【2026-09-29】预算档（轮数 / token）——同协议同模型下两档的通过率分布不同
         # （终止结构不同），换档续跑同一 --out 会静默混表。
         "max_traj_tokens": _mtj,
+        "tool_execution_budget": tool_execution_budget_tokens(cfg),
         "answer_reserve": int(cfg.get("answer_reserve", 0) or 0),
     }
     if not todo:

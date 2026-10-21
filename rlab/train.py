@@ -38,7 +38,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from rlab.config import (ALGO_DEFAULTS, BASE, default_system_prompt, ds_config,
-                         get_config)
+                         get_config, tool_execution_budget_tokens)
 from rlab.losses import ALGOS, compute_loss, forward_per_token_logps
 from rlab.model_loading import load_causal_lm
 from rlab.protocol import decode_batch
@@ -174,6 +174,8 @@ def run_signature(cfg: dict) -> str:
     # 约定同 stop_tag：=0（用 max_traj_tokens，历史行为）时一个字符都不加。
     _bt = int(cfg.get("budget_target", 0) or 0)
     bt_tag = f"-bt{_bt}" if _bt > 0 else ""
+    _teb = int(cfg.get("tool_execution_budget", 0) or 0)
+    teb_tag = f"-teb{_teb}" if _teb > 0 else ""
     _lew = float(cfg.get("len_eff_w", 0.0) or 0.0)
     lew_tag = f"-lew{_lew:g}" if _lew > 0.0 else ""
     # 正确且超组内 ref 的 capped 惩罚独立成档：不与 MiMo 失败样本惩罚共用键，
@@ -276,7 +278,7 @@ def run_signature(cfg: dict) -> str:
             f"-r{cfg.get('max_rounds', 1)}x{cfg.get('round_gen_tokens') or 0}"
             f"-s{cfg.get('all_steps')}x{cfg.get('save_steps')}"
             f"-lr{lr_tag}-{dtag}{vk_tag}{tp_tag}{nsc_tag}{sp_tag}{stop_tag}{of_tag}"
-            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{bt_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}{ofo_tag}{tag_tag}"
+            f"{caw_tag}{cw_tag}{tool_credit_tag}{qt_tag}{lp_tag}{mtj_tag}{bt_tag}{teb_tag}{lew_tag}{lep_tag}{olr_tag}{omp_tag}{ofo_tag}{tag_tag}"
             f"{once_tag}{hint_tag}{toolname_tag}{search_tag}{swe_tag}{_opt_tag}")
 
 
@@ -343,6 +345,7 @@ def write_run_info(path: str, cfg: dict) -> None:
             # 【2026-10-20】通告预算：eval/诊断端据此还原"模型看到的数字"与
             # "真实保险丝"的关系（两者不同才是锚生效）
             "budget_target": cfg.get("budget_target"),
+            "tool_execution_budget": cfg.get("tool_execution_budget", 0),
             "overlong_fail_only": cfg.get("overlong_fail_only"),
             "task_adv_guard": cfg.get("task_adv_guard"),
             "aux_clip_alpha": cfg.get("aux_clip_alpha"),
@@ -1204,11 +1207,12 @@ def main():
     # p9 §7.6 的锚机制（承诺紧、余量松）+5.2pp acc / +4.1pp fmt，但那条腿此前只靠
     # 提示文本，`[budget]` 回包与 `_can` 判据仍漏出真实总量 → 题一难就失效。
     ap.add_argument("--budget_target", type=int, default=None,
-                    help="通告给模型的轨迹预算（0=用 max_traj_tokens，旧行为）。"
-                         ">0 时把系统提示的数字、[budget] 剩余额度、调用执行阈值"
-                         "三处统一到它，max_traj_tokens 退化为纯保险丝（模型看不见）"
-                         "→ 「承诺紧、余量松」结构性成立。必须 < max_traj_tokens，"
-                         "且 ≥ answer_reserve+工具回包估算")
+                    help="通告给模型的轨迹预算（0=用 max_traj_tokens）。"
+                         "系统提示与 [budget] 剩余额度使用它；工具执行阈值默认沿用，"
+                         "可用 --tool_execution_budget 单独覆盖。必须 <= max_traj_tokens")
+    ap.add_argument("--tool_execution_budget", type=int, default=None,
+                    help="原生 token 档工具执行预算（0=沿用通告预算）。"
+                         ">0 只改放行线，不改提示/回包/轨迹硬上限；必须 <= max_traj_tokens")
     ap.add_argument("--retool_stop", action=argparse.BooleanOptionalAction, default=None,
                     help="retool 家族：写到代码块闭合围栏立即停（stop 机制，工具结果"
                          "紧跟代码回填）。默认取 preset（retool_math/retool 均开）；"
@@ -1543,6 +1547,8 @@ def main():
     # 在 get_config 内部就要读它（提示里的数字），晚一步就会写进旧数字。
     if args.budget_target is not None:
         overrides["budget_target"] = args.budget_target
+    if args.tool_execution_budget is not None:
+        overrides["tool_execution_budget"] = args.tool_execution_budget
     if args.retool_stop is not None: overrides["retool_stop"] = args.retool_stop
     # 【2026-09-25 原生工具协议】tool_protocol 必须先落进 overrides——get_config
     # 靠它决定要不要套 NATIVE_PROTOCOL_DEFAULTS 预算档（顺序敏感）。
@@ -1656,7 +1662,8 @@ def main():
     # 跑的哪条协议"在日志第一屏就能看到，不必回读 run_info.json。
     if (cfg.get("tool_protocol") or "fence") != "fence":
         _mtj_b = int(cfg.get("max_traj_tokens", 0) or 0)
-        _bg = (f"token档：轨迹 {_mtj_b}tok + 作答预留 "
+        _bg = (f"token档：轨迹 {_mtj_b}tok + 工具执行预算 "
+               f"{tool_execution_budget_tokens(cfg)}tok + 作答预留 "
                f"{int(cfg.get('answer_reserve', 0) or 0)}tok（预算判据取代末轮判据、"
                f"切断改续写、额度提示{'开' if cfg.get('budget_hint') else '关'}）"
                if _mtj_b > 0 else

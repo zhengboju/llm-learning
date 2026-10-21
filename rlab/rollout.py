@@ -40,7 +40,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from rlab.config import budget_target_tokens, get_config
+from rlab.config import budget_target_tokens, get_config, tool_execution_budget_tokens
 from rlab.data import filter_qas_by_difficulty, load_difficulty_table, load_qas
 from rlab.health import HealthMonitor as _HealthMonitor
 from rlab.health import weight_fingerprint as _weight_fingerprint
@@ -573,8 +573,9 @@ def budget_hint_line(left: int, call_need: int) -> str:
         预警"尽快收尾"；
       · 其余 → 维持旧文案（逐位不变）。
 
-    call_need = 回包估算（tool_result_max_chars//2+16）+ answer_reserve，与
-    执行判据 `_can` 同口径——提示说的是真话，这是它能被学进去的前提。"""
+    call_need = 回包估算（tool_result_max_chars//2+16）+ answer_reserve。
+    默认与执行判据同口径；显式覆盖 tool_execution_budget 时仍保留通告文案，
+    用于只改变放行阈值的对照，不把额外执行余量透露给模型。"""
     if left < call_need:
         return (f"\n[budget] Only {left} tokens left — NOT enough for another "
                 f"tool call (a call needs about {call_need} tokens of free space "
@@ -632,20 +633,10 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
     traj_budget = int(cfg.get("max_traj_tokens", 0) or 0)
     tok_mode = traj_budget > 0
     _hint = bool(cfg.get("budget_hint", False)) and tok_mode
-    # 【2026-10-20 通告预算 vs 真实上限】traj_budget 是**保险丝**（决定何时停止生成、
-    # 何时置 trunc_final），announce_budget 是**告诉模型的承诺**。两者错开时
-    # （承诺紧、余量松）p9 §7.6 实测 +5.2pp acc / +4.1pp fmt 且更省 token。
-    #
-    # 关键：模型的预算认知有三个信道——系统提示的数字、下面 budget_hint_line 里的
-    # `left`、以及 `_can` 执行阈值。三者必须说同一个数，否则"锚"立刻失效：
-    # p11c 实测提示写 8192 而回包按 12288 报剩余额度，avg_clen 从 2602 涨到
-    # 6056~8056、B 桶（散文撞墙）272/272 全部 clen≥0.9·cap。
-    # 收敛到 budget_target_tokens() 单一来源（budget_target=0 → 等于 traj_budget，
-    # 历史行为逐位不变）。
+    # 提示和工具回包按通告预算计算；执行预算可单独覆盖，0=历史判据。
     announce_budget = budget_target_tokens(cfg) or traj_budget
-    # 执行一次调用的预算开销估算：工具回包（obs）+ 之后作答的空间（reserve）。
-    # 执行判据（_can）与分档提示（budget_hint_line）共用同一口径——提示里说的
-    # 阈值必须就是真实阈值，否则模型学到的是错误判据。
+    execution_budget = tool_execution_budget_tokens(cfg)
+    # 执行一次调用要能容纳工具回包（obs）与之后作答的 reserve。
     _obs_est = int(cfg.get("tool_result_max_chars", 500) or 500) // 2 + 16
     _ans_res = max(1, int(cfg.get("answer_reserve", 0) or 0))
     # 每样本状态：messages（协议用）/ prompt_ids（生成端喂 vLLM 的真实序列）/ 调用数
@@ -799,10 +790,8 @@ def multi_turn_rollout_group_native(vllm_gen, sampling_params, tokenizer,
             # 执行一次调用要花掉两笔：工具回包（obs）+ 之后作答的空间
             # （answer_reserve），两者都装得下才执行。
             if tok_mode:
-                # 用 **announce_budget**（承诺）而不是 traj_budget（保险丝）判：真实阈值
-                # 必须就是提示里说的那个数，否则模型学到的判据是假的（p11c：提示
-                # 8192 而这里按 12288 放行，模型于是一路写到 11k 才被拒）。
-                _can = (announce_budget - _used_tokens(i) - _obs_est) >= _ans_res
+                # 默认沿用通告；显式覆盖只改放行线，不改提示/回包/保险丝。
+                _can = (execution_budget - _used_tokens(i) - _obs_est) >= _ans_res
             else:
                 _can = (not is_final_round
                         and code_stats[i]["code_used"] < max_code_calls)
@@ -2311,6 +2300,7 @@ def gen_worker(Q, cfg: dict):
             # 截止 vs 预算判据），同模型同提示下的通过率是两个分布——不比对就会把
             # 轮数档探的表当 token 档的难度表用（与协议档同一类静默混表）。
             "max_traj_tokens": int(cfg.get("max_traj_tokens", 0) or 0),
+            "tool_execution_budget": tool_execution_budget_tokens(cfg),
             "answer_reserve": int(cfg.get("answer_reserve", 0) or 0),
             # 【2026-09-29 budget 第四件套】prompt 上限也进比对：它决定哪些题被
             # 跳组（plen 超限不采）且进 overlong 参考系（ctx − plen），换它探的
