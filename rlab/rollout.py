@@ -1192,9 +1192,17 @@ def tool_credit_advantages(base_adv: torch.Tensor, segs, total_len: int,
     """序列级任务优势 + turn-level 工具动作成本 -> (B,T) per-token advantage。
 
     普通 assistant 轮继承组内任务优势；已执行工具调用轮减 call_cost；预算不足仍
-    调用的浪费轮覆盖为 -waste_penalty；截断轨迹（trunc_flags[i] 为真）的**最后一个
-    assistant 段**覆盖为 -trunc_tail_penalty。工具回包/pad 保持 0；成本在构造时按
-    该样本有效 assistant token 数归一化，抵达 sample_mean 后是固定的每次动作成本。
+    调用的浪费轮在 waste_penalty>0 时覆盖为 -waste_penalty；截断轨迹（trunc_flags[i]
+    为真）的**最后一个 assistant 段**在 trunc_tail_penalty>0 时覆盖为
+    -trunc_tail_penalty。工具回包/pad 保持 0；成本在构造时按该样本有效 assistant
+    token 数归一化，抵达 sample_mean 后是固定的每次动作成本。
+
+    【2026-10-21 两个覆盖分支都带 >0 门槛】覆盖语义的前提是"该段没有可信的
+    任务优势"（旧口径下截断/废码样本 base_adv 已被 sample_mask 置 0）。guard +
+    trunc_counts_as_wrong 打破了这个前提：它们以 acc=−1 进组均值，base_adv 是
+    真实的组内负优势。validate_guard_conflicts 会把 ttp/twp 归零，但旧版 wasted
+    分支**无条件**覆盖 ⇒ `-0.0*L/m = 0` 把 −1.75 改写成 0（sw≡1 也救不回被覆盖
+    的 adv）。现在两支都只在惩罚>0 时覆盖，惩罚为 0 时继承 base_adv。
 
     【2026-10-01 截断末段信用】trunc_final 轨迹的任务结果不可信（预算耗尽时可能
     还没作答），故其 base_adv 恒为 0（retool_score_flat 的 sample_mask 已把它排除
@@ -1239,9 +1247,20 @@ def tool_credit_advantages(base_adv: torch.Tensor, segs, total_len: int,
                 if m <= 0:
                     pos = end
                     continue
-                if action == "wasted":
+                if action == "wasted" and waste_penalty > 0.0:
                     # 预算已不足却继续调用是当前动作本身的坏结果：覆盖任务优势，
                     # 只给固定的局部负信用；此前正确推理不被连坐。
+                    # 【2026-10-21 修复·覆盖必须带门槛】旧版这里**无条件**覆盖，
+                    # 而 guard+trunc_counts_as_wrong 会把 tool_waste_penalty 自动
+                    # 归零（validate_guard_conflicts）⇒ val = -0.0*L/m = 0，把该段
+                    # 真实的组内任务负优势（6对2错组 = −1.75）改写成 **0**。
+                    # sample_weight 已修成 ≡1 也救不回来——sw 只决定这一行是否进
+                    # loss，不能恢复被覆盖掉的 adv。后果：C 桶（p11f 实测 398/505
+                    # 条无 boxed）的"末轮废调用"整段零策略梯度，与它同源的 ttp 分支
+                    # 却一直有 `trunc_tail_penalty > 0.0` 门槛（上面 tail_idx 的搜索
+                    # 条件）。现在两支语义对齐：惩罚为 0 ⇒ 不覆盖 ⇒ 落到下面的
+                    # else 分支继承 base_adv。waste_penalty>0（非 guard 档）时行为
+                    # 与历史逐位相同。
                     val = -float(waste_penalty) * assistant_len / m
                 elif _k == tail_idx:
                     # 预算耗尽（trunc_final）：同样只罚末段动作，整条轨迹的未知

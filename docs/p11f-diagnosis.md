@@ -197,6 +197,38 @@ B 桶被压到 3.7% 说明接线 1 生效。
 
 ---
 
+## 8. ★ 奖励接线修复：废调用末段的负优势曾被覆盖成 0（2026-10-21）
+
+**它推翻了本文 §3.2 的一条判读**：sw 修好（`sample_weight ≡ 1`）**不等于**废调用拿到了
+负梯度。实锤在 `tool_credit_advantages` 的覆盖分支。
+
+| | 旧行为 | 影响 |
+|---|---|---|
+| `wasted` 分支 | **无条件** `val = -waste_penalty · L/m` | guard+tcw 把 `tool_waste_penalty` 自动归零 ⇒ `val = -0.0·L/m = 0`，把该段**真实的组内负优势**（6对2错组 = −1.75）改写成 **0** |
+| `trunc_tail` 分支 | 一直有 `trunc_tail_penalty > 0` 门槛（`tail_idx` 搜索条件） | 两支语义不一致，只有 wasted 漏了门槛 |
+
+**为什么 sw 救不回来**：`sample_weight` 只决定这一行是否进 loss，**不能恢复已被覆盖掉的
+advantage**。CPU 探针（真实 `retool_score_flat → tool_credit_advantages → compute_loss →
+backward`）实测：末段 300 token 的 adv `−1.75 → 0.0`，策略梯度**恒 0**。
+
+**边界（不要过度归因）**：被清零的是**废调用那一段**，不是整条轨迹 —— 前缀推理仍按
+base_adv 受罚；只有"整条只剩废调用段"时整条 PG 才为 0。C 桶 p11f 实测 **398/505**
+条无 boxed，是该形态的高发族。
+
+**修复**：`if action == "wasted" and waste_penalty > 0.0:` —— 惩罚为 0 时不覆盖、落到
+`else` 继承 `base_adv`；`waste_penalty>0`（非 guard 档）行为与历史**逐位相同**。
+
+**测试**：旧测试只走到 `sample_weights_for_loss` 就宣称"端到端"，从未把真实 segs 送进
+`tool_credit_advantages → loss → backward`，所以漏测。已补该接缝的回归（adv 与梯度双断言）。
+
+**顺带对齐了两条过期断言**（跑本次改动时先红，`git show HEAD` 证实改动前就红）：
+① `test_code_wasted_adv_exclusion` 锁的 rollout 内联 sw 片段在 2026-10-20 收敛到
+`reward.sample_weights_for_loss` 后已不存在；② `test_attempt_shaping_and_err_tier` 的
+passrate 锁用全文 `in` 判断，而提示文案里就写着"原版「可释放…」两个计数已删除"→ 恒假。
+两条都改成锁**契约**（规则在 reward 单点 / 去字符串后再判），而不是易变字面量。
+
+---
+
 ## 附：本轮新增的两条通用教训
 
 1. **通告值 ≠ 执行值，二者必须各自有名字。** "模型看到的预算"与"harness 实际放行的预算"

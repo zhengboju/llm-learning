@@ -4667,13 +4667,24 @@ def test_code_wasted_adv_exclusion():
           adv4[6].item() != 0)
 
     # ---- 5. 两侧同人群的源码锁（防 advantage/loss 口径再次分叉） ----
+    # 【2026-10-21 对齐】旧断言锁的是 rollout 里**已不存在**的内联 sw 片段——
+    # 2026-10-20 sw 已收敛到 reward.sample_weights_for_loss（单一真相）。它属于
+    # AGENTS.md 记过的「过期断言长期假红」形态（本次跑该函数时先红后才发现）。
+    # 改为锁**契约**：规则在 reward 侧、rollout 只消费。
     _ro = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "rollout.py"), encoding="utf-8").read()
+    _rw = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "reward.py"), encoding="utf-8").read()
     check("F1：advantage 侧排除 = trunc OR wasted",
           "for tf, wf in zip(trunc_finals, wasted_flags)" in _ro)
-    check("F1：loss侧关闭新信用时仍排除 trunc OR wasted；开启后废调用/截断重新入loss",
-          's.get("code_wasted", 0) and _waste_pen <= 0.0' in _ro
-          and '(s["trunc_final"] and _trunc_tail <= 0.0)' in _ro)
+    check("F1：loss侧关闭新信用时仍排除 trunc OR wasted（规则在 reward 单点）",
+          "excl = ((tf and trunc_tail_penalty <= 0.0)" in _rw
+          and "wf and waste_penalty <= 0.0" in _rw
+          and "out.append(0.0 if excl else 1.0)" in _rw)
+    check("F1：rollout 不再内联 sw 判据，只消费 sample_weights_for_loss",
+          "sample_weights_for_loss(" in _ro
+          and "and _waste_pen <= 0.0" not in _ro
+          and "and _trunc_tail <= 0.0" not in _ro)
 
 
 def test_attempt_shaping_and_err_tier():
@@ -4937,8 +4948,18 @@ def test_attempt_shaping_and_err_tier():
     # 必须报"未被在线覆盖的行数"（那才是这个工具答不了的部分）。
     _pr_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))), "rlab", "passrate.py"), encoding="utf-8").read()
+    # 【2026-10-21 对齐】旧锁用 `in _pr_src` 判**全文**字符串，而 passrate.py 的
+    # **提示文案**里保留了一句说明这两个计数为何被删的话（"原版「可释放 / 表判 p≈1」
+    # 两个计数结构上恒 0，已删除"）→ 断言恒假（本次跑该函数时先红，属 AGENTS.md
+    # 记过的「过期断言长期假红会掩盖真回归」）。去字符串/注释后再判：禁止的是
+    # **计数被重新引入代码**，不是禁止在文案里解释它。
+    import io as _io
+    import tokenize as _tk
+    _pr_code = " ".join(
+        t.string for t in _tk.generate_tokens(_io.StringIO(_pr_src).readline)
+        if t.type not in (_tk.STRING, _tk.COMMENT))
     check("passrate: 删掉结构上恒 0 的两象限（不许再当'表没过期'的证据）",
-          "可释放" not in _pr_src and "table_p_one" not in _pr_src
+          "可释放" not in _pr_code and "table_p_one" not in _pr_code
           and "结构上恒 0" in _pr_src)
     check("passrate: 诊断改报在线覆盖率（未覆盖行数 = 必须独立探针的部分）",
           "被在线观测覆盖" in _pr_src and "从未进过训练池" in _pr_src)
@@ -5840,6 +5861,57 @@ def test_tool_credit_assignment():
           torch.allclose(adv_off[0, :2], torch.full((2,), 0.6))
           and adv_off[0, 5].item() == torch.tensor(0.6).item()
           and bool((adv_off[0, 2:5] == 0).all()))
+    check("【2026-10-21 修复】waste_penalty=0 时废调用段继承任务优势（不再被 −0.0 覆盖成 0）",
+          torch.allclose(adv_off[0, 6:8], torch.full((2,), 0.6)))
+
+    # ---- 【2026-10-21】真实接缝回归：打分 → token优势 → loss 梯度 ----
+    # 旧测试只走到 sample_weights_for_loss（sw≡1），于是"sw 修好了"被当成"废调用
+    # 拿到负梯度"。实测 p11f 的 wasted 段 adv 被 −0.0 覆盖成 0、梯度为 0。这条把
+    # **真实 segs** 送进 tool_credit_advantages 再进 compute_loss + backward 锁住。
+    from rlab.rollout import retool_score_flat as _rsf
+    _n8 = 8
+    _st8 = [{"code_used": 1, "code_ok": 1, "code_wasted": 0, "invalid_final": 0,
+             "ctx_full": 0, "trunc_final": 0, "trunc_in_call": 0, "err_types": []}
+            for _ in range(_n8)]
+    _st8[7]["code_wasted"] = 1        # 末轮写了完整调用但不会被放行 → acc 判负
+    _cfg8 = get_config("retool_math", use_wandb=False,
+                       task_adv_guard=True, trunc_counts_as_wrong=True,
+                       tool_call_cost=0.02, tool_waste_penalty=0.20,
+                       max_traj_tokens=12288, budget_target=8192,
+                       max_context_tokens=13312, round_gen_tokens=2048,
+                       answer_reserve=1024)
+    _sig8 = {}
+    _adv8, _acc8, *_ = _rsf([{"Q": "q", "A": "42"}],
+                            ["x \\boxed{42}"] * 7 + ["x not finished"],
+                            _st8, _cfg8, 0, completion_lens=[2000] * _n8,
+                            signal_out=_sig8)
+    check("真实 config：guard+tcw 已把 twp/ttp 归零（否则测的不是 p11f 档）",
+          float(_cfg8["tool_waste_penalty"]) == 0.0
+          and float(_cfg8["trunc_tail_penalty"]) == 0.0)
+    _base8 = float(_adv8[7])
+    _segs8 = [[{"kind": "assistant", "ids": [1] * 100, "tool_action": "executed"},
+               {"kind": "tool", "ids": [2] * 20},
+               {"kind": "assistant", "ids": [3] * 300, "tool_action": "wasted"}]]
+    _loc8 = tool_credit_advantages(
+        torch.tensor([_base8]), _segs8, 420,
+        call_cost=float(_cfg8["tool_call_cost"]),
+        waste_penalty=float(_cfg8["tool_waste_penalty"]),
+        trunc_flags=[0], trunc_tail_penalty=float(_cfg8["trunc_tail_penalty"]))
+    check("端到端：废调用段保住真实组内负优势（−1.75 量级，不是 0）",
+          _base8 < -1.0
+          and torch.allclose(_loc8[0, 120:], torch.full((300,), _base8)))
+    _mask8 = torch.ones(1, 420)
+    _mask8[:, 100:120] = 0                     # 工具回包不进 loss
+    _pol8 = torch.zeros((1, 420), requires_grad=True)
+    _loss8, _ = compute_loss("retool_math", _pol8, torch.zeros_like(_pol8),
+                             _loc8, _mask8, cfg_loss,
+                             ref_logps=torch.zeros_like(_pol8),
+                             sample_weight=torch.ones(1))
+    _loss8.backward()
+    check("端到端：废调用段的策略梯度非零，方向为降低其概率",
+          bool((_pol8.grad[0, 120:] > 0).all()))
+    check("端到端：工具回包仍严格 0 梯度",
+          bool((_pol8.grad[0, 100:120] == 0).all()))
 
     cfg = get_config("retool_math", use_wandb=False)
     check("retool_math推荐工具信用剂量=0.02/0.10",
