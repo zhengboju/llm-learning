@@ -1,6 +1,7 @@
 # p11g 方案：按在线通过率重建训练池（下一步最优方案）
 
-**日期**：2026-10-22　**状态**：方案定版，**未实现、未上机**
+**日期**：2026-10-22　**状态**：方案定版；**阶段 1 的判读工具已落地（本地验证通过），训练未上机**；
+阶段 2（hard 桶探索通道）按 §3.3 门控未写
 **上游**：[p11f 训练诊断](p11f-diagnosis.md)（§9 采样档检出 / §9.5 错答直方图）、
 [p11f 启动配置](p11d-run-config.md)、[纯 RL 解题能力路线](15-pure-rl-reasoning-plan.md)
 **一句话**：把训练池从"宽 band `0.0 1.0` + 半陈旧的探针刻度"改成**按当前策略在线通过率
@@ -50,15 +51,21 @@
 | 指标 | 期望 | 数据源 |
 |---|---:|---|
 | **`M_raw`（可评分混合组占比）** | **≥ 80%**（p11f 实测 62%） | 生成端日志 + `rlab.sigstats` |
-| `difficulty_filter.json` 的 `kept` | 明显小于 850，且 `p_one`/`band_out` 有读数 | `out_dir/difficulty_filter.json`（已落盘） |
+| `difficulty_filter.json` 的四个计数 | `kept ≈ 500`（**不能用来判"表换成功没有"**，见 §2.3-1）；`全对`(p_one) 计的是**被排除**的 `rate=1.0` 行、不可能为 0；`kept+p_zero+p_one+band_out+missing == total` | `out_dir/difficulty_filter.json`（已落盘）+ `passrate` 的 band 预演（同一函数，启动前就能对账） |
+| **表的刻度直方图（新增读数）** | `rate=1.000` 档（1029 行）被在线率明显重排；输出表 `online_meta` 行数 ≈ 在线覆盖行数 | `passrate` 打印的"输入表/输出表"两段直方图 |
 | `[sw]` 零权重样本 | **= 0** | 训练日志（每 10 步一行） |
 | 符号翻转 | **= 0** | `sigstats` |
 | token/update | 不高于 p11f | `sigstats` |
 
 ### 2.3 三条"立即停"
 
-1. `difficulty_filter.json` 的 `kept` 与 p11f 几乎相同 ⇒ 表没换成功（指纹 strict 本应拦住，
-   若没拦则是更大的问题），**停**。
+1. **`kept` 单独不具判别力**（2026-10-22 落地修正）：band 从 `0.0 1.0` 收到 `0.1 0.8`，
+   在**未回填**的探针表上就已经把 850 降到 **499**（0.125/0.25/0.375/0.5/0.625/0.75
+   六档共 499 行，p11d §1.1）——与 §1 预期的 499 **是同一个数**，两条路（表换了 /
+   表没换）给出同一个 `kept`。真正的判别读数是 `passrate` 打印的
+   **输入表 vs 输出表两张刻度直方图**：`rate=1.000` 那一档（1029 行）必须被在线率
+   明显重排，且输出表带 `online_meta` 的行数 ≈ 在线覆盖行数。两者都没动 ⇒ 表没换
+   成功（指纹 strict 本应拦住，若没拦则是更大的问题），**停**。
 2. `M_raw < 70%` ⇒ 池子组成没生效，**停**，先查表与 band，不要接着跑完。
 3. 条件精度退 >1.5pp 且 acc 退 >2pp ⇒ 池子过窄（丢了必要的题），**停**。
 
@@ -129,19 +136,27 @@ P11F=rlab_new/native_p11f_wiring
 # (a) 生命周期平均（对照用）
 python -m rlab.passrate --record $P11F/record.jsonl \
   --difficulty_path rlab_out/difficulty_v3e1_train_online.jsonl \
-  --difficulty_band 0.0 1.0 --min_k 8 \
+  --difficulty_band 0.1 0.8 --min_k 8 \
   --merge_out rlab_out/difficulty_v3e1_train_online_wide_all.jsonl
 
 # (b) 最近窗口（本轮要用这张）——先造 record 的尾部副本
 tail -n 1600 $P11F/record.jsonl > /tmp/record_recent.jsonl
 python -m rlab.passrate --record /tmp/record_recent.jsonl \
   --difficulty_path rlab_out/difficulty_v3e1_train_online.jsonl \
-  --difficulty_band 0.0 1.0 --min_k 8 \
+  --difficulty_band 0.1 0.8 --min_k 8 \
   --merge_out rlab_out/difficulty_v3e1_train_online_wide_recent.jsonl
 ```
 
-**判读**：把两张表的三行"表过期诊断"和被在线覆盖的行数抄进本轮记录，并打印两张表的
-`k=19` 刻度直方图——**它们之间的差就是"这轮训练把池子刻度推了多少"**。
+> **band 参数是 `0.1 0.8` 而不是 `0.0 1.0`**（2026-10-22 落地修正）：`--merge_out`
+> 的回填**完全不看 band**（band 只作用于三处读数：在线率切片、表过期诊断象限、
+> 以及新增的 band 预演）。给 p11g 的训练 band ⇒ 这三处读数直接说的是 p11g 的池子
+> （预演会打印"2000 → K 题（全错 … / 全对 … / 区间外 …）"，与训练启动日志同一函数、
+> 数字必然一致）。要 p11f 口径的对照读数就用 `0.0 1.0` 再跑一次。
+
+**判读**：把两张表的三行"表过期诊断"和被在线覆盖的行数抄进本轮记录。**刻度直方图由
+`passrate` 直接打印**（输入表 + 输出表各一段，含精确 rate 分档、`online_meta` 行数、
+行加权的"有对有错"预期占比）——**输出表直方图与输入表之差就是"这轮训练把池子刻度推了
+多少"**，这是 §2.3-1 与 §4.2 的唯一判别读数（`kept` 不具备判别力）。
 若两张表差异很大，说明用生命周期平均会系统性低估当前策略，必须用 (b)。
 
 > ⚠ `--min_k 8` 不是默认 16：一个 run 里每题约 8~19 条在线样本，用 16 会把绝大多数题排除在回填外
@@ -160,8 +175,15 @@ python -m rlab.passrate --record /tmp/record_recent.jsonl \
 
 启动后**第一件事**是核对这两个自证读数（都在既有日志里）：
 
-1. `[rollout] 难度过滤 band=(0.1,0.8): N -> K 题（全错 … / 全对 … / 区间外 …）`
-   —— `K` 应明显小于 p11f 的池子；`全对`（`p_one`）应为 0；
+1. `[rollout] 难度过滤 band=(0.1,0.8): 2000 -> K 题（全错 … / 全对 … / 区间外 …）`
+   —— `K` 应与 §4.1 里 `passrate` 打印的 **band 预演**逐位相同（同一函数）；
+   ⚠ **`全对`(p_one) 不是应为 0**（2026-10-22 落地修正）：`p_one` 计的是
+   `rate=1.0` 的**被排除**行数（band 只要 `hi<1`，落在 `rate>=hi` 且恰为 1.0 的行就
+   记进 `p_one`），探针表里那一档是 1029 行 ⇒ 输出表上它应该**从 1029 明显下降**
+   （被在线率重排到 `0.8~1.0` 的算 `band_out`），而不是变成 0。留池里的全对题数
+   恒 0（band 已排除）——那才是"p_one=0"想说的话。
+   另核 `kept + p_zero + p_one + band_out + missing == total`（口径自洽，防某一路
+   计数被静默改掉）；
 2. `out_dir/difficulty_filter.json` 与日志一致。
 
 ### 4.3 权威判定（采样档，与 p11f 同批）
@@ -183,8 +205,11 @@ python -m rlab.analysis \
 - **两臂同批**是硬要求（`gpu_mem` 0.20 vs 0.78 同权重同题差过 +7.0pp）。
 - 判据按 §2.1：Δ≥+2pp 且 **z 检验 p<0.05**（采样档自动分派
   [paired_test_auto](<rlab/analysis.py#L141-L156>)；**不要**再看 McNemar）。
-- 同时跑一次**该文件的 per-item 直方图**（p11f-diagnosis §9.5 的命令），
-  看 p=0 的题数是否下降 —— 那是"边界池是否把难题推上去"的直接读数。
+- 同时跑一次**该文件的 per-item 直方图**（命令已落地：
+  `python -m rlab.analysis --item-hist eval_p11g_avg8.json`，输出 p̂=0/8…8/8 各档
+  题数 + 期望"有对有错"组占比 + 与 json `acc` 的逐位自洽校验），看 `p̂=0/8` 的题数
+  是否下降 —— 那是"边界池是否把难题推上去"的直接读数；"期望有对有错组占比"就是
+  训练池 `M_raw` 的评测侧镜像。
 
 ### 4.4 一次评测回答两个问题（可选，零额外成本）
 
@@ -219,14 +244,23 @@ python -m rlab.analysis \
 
 ---
 
-## 7. 代码缺口（精确到函数；阶段 1 为 0 行）
+## 7. 代码缺口（2026-10-22 更新：阶段 1 的判读工具已落地）
 
-| 阶段 | 缺口 | 位置 | 规模 |
-|---|---|---|---|
-| **1** | **无** | — | **0 行**：`passrate --merge_out` / `--difficulty_band` / `--difficulty_path` 全部已有 |
-| 2 | hard 集导出 | `rlab/passrate.py`：新增 `--dump_qk_set hard:<path>`（一行一个 `qk`） | ~15 行 |
-| 2 | probe 只探给定题集 | `rlab/probe_difficulty.py`：新增 `--only_qk_file`（`--pool train` 的进一步收窄） | ~20 行 + 测试 |
-| 2 | 探针结果并回主表 | 新增 `passrate --merge_probe <probe_table>`（按 Q 合并、绝不动原表） | ~20 行 + 测试 |
+| 阶段 | 缺口 | 位置 | 规模 | 状态 |
+|---|---|---|---|---|
+| **1** | **训练路径无** | — | **0 行** | `passrate --merge_out` / `--difficulty_band` / `--difficulty_path` / `difficulty_filter.json` / `sigstats --record` 全部已有 |
+| **1** | 表刻度直方图（§2.2/§4.1/§4.2 的判别读数） | `rlab/passrate.py`：`mixed_prob` / `rate_histogram` / `format_hist` | ~40 行 | **已实现** |
+| **1** | band 预演＝训练端同一函数（启动前对账 `N -> K`） | `rlab/passrate.py`：`band_preview`（调用 `data.filter_qas_by_difficulty`） | ~15 行 | **已实现** |
+| **1** | per-item p̂ 直方图（§4.3，p11f §9.5 那张表此前无命令） | `rlab/analysis.py`：`item_pass_hist` + `--item-hist` | ~55 行 | **已实现** |
+| **1** | 接缝测试：`merge_out` 真输出 → strict 加载 → band 过滤 | `rlab/tests/test_retool_cpu.py`（⑤-6 段） | 5 条断言 | **已实现，本地通过** |
+| 2 | hard 集导出 | `rlab/passrate.py`：新增 `--dump_qk_set hard:<path>`（一行一个 `qk`） | ~15 行 | 未做（§3.3 门控） |
+| 2 | probe 只探给定题集 | `rlab/probe_difficulty.py`：新增 `--only_qk_file`（`--pool train` 的进一步收窄） | ~20 行 + 测试 | 未做（§3.3 门控） |
+| 2 | 探针结果并回主表 | 新增 `passrate --merge_probe <probe_table>`（按 Q 合并、绝不动原表） | ~20 行 + 测试 | 未做（§3.3 门控） |
+
+**为什么阶段 1 还要加这三处只读工具**：§4.1/§4.2/§4.3 的判读要求的三张读数
+（两表刻度直方图、`N -> K` 预演、per-item p̂ 直方图）在 2026-10-22 前**没有命令能产**，
+只能临场手写——而"临场手写"正是 p11c 把两个恒 0 象限读成证据的成因。它们全是
+**纯函数 + 只读**，不进训练路径，因此不构成第二个变量。
 
 **阶段 2 的验收**：三项都必须是**纯函数 + CPU 可测**（与 `filter_qas_by_difficulty`
 同一形态），且"给出题集 → 只探这些题"要有断言锁死（否则又是"过滤器存在但数据流没生效"）。
@@ -235,9 +269,11 @@ python -m rlab.analysis \
 
 ## 8. 未做清单（如实声明）
 
-- 本方案**未实现、未上机**；上面所有 p11g 数字都是**预期**，不是读数。
+- **阶段 1 的判读工具已落地并在本地通过定向验证与 CPU 接缝测试；训练本身未上机**，
+  上面所有 p11g 数字（含 `kept≈500`）都是**预期**，不是读数。
 - §1 的"36% → 92%"用的是 **2026-10 的 `k=8` 探针直方图**做量级估算；
-  真实值要等 §4.1 用**在线率**重算（两张表对照）。
+  真实值要等 §4.1 用**在线率**重算（两张表直方图对照）。
+- **阶段 2（hard 桶的探索通道）一行未写**：按 §3.3 的门控，先拿阶段 1 的读数。
 - `passrate` 是**跨权重版本的生命周期平均**，即使取最近窗口，也仍是"过去 N 个 attempt
   的平均策略"下测的，不等于启动时刻的当前策略——这是本方案最大的残留测量误差。
 - hard 桶的 27.5% 错答质量在阶段 1 **仍然零梯度**（只是不再占主池算力）。

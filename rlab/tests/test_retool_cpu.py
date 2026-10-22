@@ -4941,6 +4941,65 @@ def test_attempt_shaping_and_err_tier():
           and json.loads(open(_tbl.name, encoding="utf-8").read().strip())["n_correct"] == 0)
     os.unlink(_rec.name); os.unlink(_tbl.name); os.unlink(_mout)
 
+    # 【2026-10-22 p11g 落地锁】接缝测试：passrate 的 `--merge_out` **真输出** →
+    # 训练端 `load_difficulty_table(strict)` → `filter_qas_by_difficulty(band)`。
+    # 为什么必须端到端：p11g 的全部单变量就是"换这张表"，而两个接缝各自都能静默
+    # 失败——① 回填写的行若丢掉 probe_meta，训练启动会被 strict 指纹校验拦住
+    # （不是数据问题而是接线问题）；② 对 band 语义的理解错一格，就会把
+    # `kept`/`p_one` 读成相反的意思并触发假的"立即停"。两者都是 CPU 可判的。
+    from rlab.data import (load_difficulty_table as _ldt,
+                           filter_qas_by_difficulty as _flt)
+    from rlab.passrate import (rate_histogram as _rhist, band_preview as _bprev,
+                               mixed_prob as _mp)
+    _qlist = ["题面甲", "题面乙", "题面丙", "题面丁", "题面戊"]
+    _tbl2 = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    # 探针刻度 k=8：1.0 / 0.0 / 0.75 / 0.375 / 0.875（覆盖全对、全错、带内、带外）
+    for _q, _nc in zip(_qlist, [8, 0, 6, 3, 7]):
+        _tbl2.write(json.dumps({"Q": _q, "A": "1", "k": 8, "n_correct": _nc,
+                                "probe_meta": {"model_path": "/root/m"}}) + "\n")
+    _tbl2.close()
+    _rec2 = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    # 在线把"探针全对"的丙重排到 5/19=0.263（进带）——这正是 p11g 要的那个动作
+    _rec2.write(json.dumps({"qk": _qkof(_qlist[2]),
+                            "acc": [1.0] * 5 + [-1.0] * 14}) + "\n")
+    _rec2.close()
+    _mout2 = _tf.NamedTemporaryFile(suffix=".jsonl", delete=False).name
+    _merge(_agg(_rec2.name), _tbl2.name, _mout2, min_k=8)
+    # ① strict 指纹校验不许 raise（probe_meta 必须随行保留）
+    _out2 = _ldt(_mout2, expected_meta={"model_path": "/root/m"}, strict=True)
+    _c = _out2[_qlist[2]]
+    check("p11g 接缝①: 在线增强表过 strict 指纹校验，且在线率已覆盖该行",
+          len(_out2) == 5 and _c["k"] == 19 and _c["n_correct"] == 5
+          and abs(_c["n_correct"] / _c["k"] - 5 / 19) < 1e-9
+          and bool(_c.get("online_meta")))
+    # ② band 预演必须与训练端同一函数同一口径：全对/全错/区间外计的是**被排除**的行
+    _pv2 = _bprev(_out2, 0.1, 0.8)
+    check("p11g 接缝②: band(0.1,0.8) 预演（kept 2 / 全对 1（被排除）/ 全错 1 / 区间外 1）",
+          (_pv2["kept"], _pv2["p_zero"], _pv2["p_one"], _pv2["band_out"],
+           _pv2["missing"], _pv2["total"]) == (2, 1, 1, 1, 0, 5)
+          and _pv2["kept"] == len(_flt([{"Q": q} for q in _out2], _out2,
+                                      lo=0.1, hi=0.8)[0]))
+    _h2 = _rhist(_out2.values())
+    check("p11g: 表刻度直方图（k 双网格 {8:4,19:1}、在线行 1、带内计数与 filter 同口径）",
+          _h2["online_rows"] == 1 and _h2["k_counts"] == {8: 4, 19: 1}
+          and sum(c for r, c in _h2["hist"].items() if 0.1 < r < 0.8) == _pv2["kept"])
+    check("p11g: 混合概率端点（p=1/0 → 0 完全无梯度；p=0.5 → 0.9921875）",
+          _mp(1.0) == 0.0 and _mp(0.0) == 0.0 and abs(_mp(0.5) - 0.9921875) < 1e-12)
+    # ③ per-item p̂ 直方图：直方图必须与 json 的聚合 acc 自洽（否则是两个数）
+    from rlab.analysis import item_pass_hist as _iph
+    _ev2 = _tf.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    json.dump({"BASE": {"acc": 0.375, "fmt": 1.0, "n": 4,
+                        "items": [{"acc": 0.0, "val_n": 8}, {"acc": 0.5, "val_n": 8},
+                                  {"acc": 1.0, "val_n": 8}, {"acc": 0.0, "val_n": 8}]}},
+              _ev2)
+    _ev2.close()
+    _txt2 = _iph(_ev2.name)
+    check("p11g: analysis --item-hist（p̂=0 题数 + 「有对有错」期望 + 与 acc 自洽）",
+          "| 0/8 | 2 (50.0%) |" in _txt2 and "p̂=0 的题 2 题" in _txt2
+          and "自洽" in _txt2 and "✓" in _txt2)
+    os.unlink(_tbl2.name); os.unlink(_rec2.name); os.unlink(_mout2)
+    os.unlink(_ev2.name)
+
     # 【2026-10-20 修复锁】诊断原三象限里有两个**结构上恒 0**："表判 p≈0 但在线已能
     # 做对" 与 "表判 p≈1" 都要求该题同时出现在 record 里，而被 band 排除的题永远
     # 不进训练池 → 永不出现 → 计数必 0。真机上它被当成"表没过期"的证据读过

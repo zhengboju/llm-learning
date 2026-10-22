@@ -1398,6 +1398,93 @@ def summarize_record(path: str, window: int = 160, clen_cap: int = None) -> str:
     return "\n".join(out)
 
 
+def item_pass_hist(path: str) -> str:
+    """per-item p̂ 直方图（p11g §4.3；从 eval json 的 items 零成本算）。
+
+    回答的是"惰性组"的直接读数：每题 Average@N 的 p̂ = k/N（采样档），把它摊成
+    0/N … N/N 的直方图后，两件事变得可见：
+      1. `p̂=0` 的题数（"从没做出来"的能力缺口）；
+      2. 按 $1-p^N-(1-p)^N$ 算出的**整组"有对有错"期望占比**——它就是训练池
+         M_raw（可评分混合组占比）的上限，也是"全对题占算力"的量化口径。
+    口径纪律：p̂ 由 item["acc"]×val_n 还原，且必须与 json 的 acc 逐位自洽
+    （Σk·n_k/(N·题数) == acc），不吻合就报出来——否则直方图与聚合是两个数。
+    greedy 档（val_n=1）只有 0/1 两格，直方图无信息量，显式标注而非假装成直方图。"""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        return f"[item-hist] 读不出（非 dict）: {path}"
+    models = {k: v for k, v in raw.items()
+              if not str(k).startswith("_") and isinstance(v, dict)}
+    if not models:
+        return f"[item-hist] 该 json 没有模型条目: {path}"
+    per = {}
+    for name, r in models.items():
+        items = r.get("items") or []
+        if not items:
+            per[name] = None
+            continue
+        val_n = int(items[0].get("val_n") or r.get("val_n") or 1)
+        counts = {k: 0 for k in range(val_n + 1)}
+        accs = []
+        for it in items:
+            a = it.get("acc")
+            if not isinstance(a, (int, float)):
+                continue
+            k = int(round(float(a) * val_n))
+            k = min(max(k, 0), val_n)
+            counts[k] += 1
+            accs.append(float(a))
+        n = len(accs)
+        if not n:
+            per[name] = None
+            continue
+        sacc = sum(accs) / n
+        # 自洽校验：直方图还原出的 Average@N 必须等于 json 里的 acc
+        jacc = r.get("acc")
+        recon = sum(k * c for k, c in counts.items()) / (val_n * n)
+        mix = sum(c * (1.0 - (k / val_n) ** val_n - (1.0 - k / val_n) ** val_n)
+                  for k, c in counts.items()) / n
+        allw = sum(c * ((1.0 - k / val_n) ** val_n) for k, c in counts.items()) / n
+        per[name] = {"val_n": val_n, "n": n, "counts": counts, "acc": sacc,
+                     "json_acc": jacc, "recon": recon, "mixed": mix,
+                     "all_wrong": allw}
+    L = [f"=== per-item p̂ 直方图（{path}）==="]
+    _any = [n for n, d in per.items() if d]
+    if not _any:
+        L.append("  所有模型都没有 per-item 明细（items 缺失或 --no-dump_items）——"
+                 "该 json 答不了这个问题，不要用聚合 acc 代替。")
+        return "\n".join(L)
+    _val_n = max(per[n]["val_n"] for n in _any)
+    if _val_n < 2:
+        L.append("  ⚠ 该文件是 greedy 档（val_n=1）：每题只有 0/1 两种取值，"
+                 "直方图无梯度信息；能力比较请用采样档（--val_n 8）。")
+    _hd = "| p̂ |" + "".join(f" {n} |" for n in per)
+    L += [_hd, "|---|" + "---|" * len(per)]
+    for k in range(_val_n, -1, -1):
+        cells = []
+        for n in per:
+            d = per[n]
+            if not d or k > d["val_n"]:
+                cells.append(" — |")
+            else:
+                c = d["counts"][k]
+                cells.append(f" {c} ({100.0 * c / d['n']:.1f}%) |")
+        L.append(f"| {k}/{_val_n} |" + "".join(cells))
+    L.append("")
+    for n in _any:
+        d = per[n]
+        jacc = d["json_acc"]
+        ok = (isinstance(jacc, (int, float)) and abs(jacc - d["recon"]) < 1e-6)
+        L.append(f"  [{n}] N={d['n']} val_n={d['val_n']}；p̂=0 的题 {d['counts'][0]} 题"
+                 f"（{100.0 * d['counts'][0] / d['n']:.1f}%）；"
+                 f"期望「有对有错」组占比 **{d['mixed'] * 100:.1f}%**、"
+                 f"期望「整组全错」{d['all_wrong'] * 100:.1f}%")
+        L.append(f"    自洽：Σk·n_k/(val_n·N) = {d['recon']:.4f} vs json acc = "
+                 f"{jacc if jacc is None else format(float(jacc), '.4f')}"
+                 f"{'  ✓' if ok else '  ✗（直方图与聚合口径不一致，先查再读数）'}")
+    return "\n".join(L)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval-json", default=None)
@@ -1422,6 +1509,10 @@ if __name__ == "__main__":
                     help="另一份 eval json（--pair-a/--pair-b 的模型可来自任一份）")
     ap.add_argument("--pair-a", default=None, help="配对臂 A 的模型名")
     ap.add_argument("--pair-b", default=None, help="配对臂 B 的模型名")
+    ap.add_argument("--item-hist", default=None, metavar="EVAL_JSON",
+                    help="per-item p̂ 直方图（每题 Average@N 摊成 0/N…N/N）："
+                         "直接读出 p̂=0 题数与期望「有对有错」组占比（=M_raw 上限），"
+                         "p11g §4.3 用它回答『边界池是否把难题推上去』")
     args = ap.parse_args()
     _primary = args.eval_json
     if args.pair_json and args.pair_a and args.pair_b:
@@ -1441,8 +1532,11 @@ if __name__ == "__main__":
         print(summarize_record(args.record, window=args.window))
     if args.no_boxed_breakdown:
         print(summarize_no_boxed(args.no_boxed_breakdown))
+    if args.item_hist:
+        print(item_pass_hist(args.item_hist))
     if (not args.eval_json and not args.record and not args.code_layer
-            and not args.pair_json and not args.no_boxed_breakdown):
+            and not args.pair_json and not args.no_boxed_breakdown
+            and not args.item_hist):
         cands = sorted(glob.glob("eval_vllm_all*.json"))
         if cands:
             print(summarize_eval(cands[-1], args.base))
