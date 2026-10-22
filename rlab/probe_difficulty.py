@@ -23,6 +23,14 @@ avg_clen, avg_code_ok}。训练时 `--difficulty_path <该文件>` 即启用过�
         --out rlab_out/difficulty_probe.jsonl
     # 断点续跑：同 --out 重跑即自动跳过已有题（逐题追加写，崩溃可续）
 
+    # 【p11g 阶段2 hard 桶探索】只探指定题集（换新 seed 重探那批"整组全错"的题）：
+    CUDA_VISIBLE_DEVICES=0 python -m rlab.probe_difficulty --pool train \
+        --only_qk_file rlab_out/p11g_hard_qk.txt --k 16 --seed 4242 \
+        --from_run_info rlab_new/<run>/run_info.json \
+        --out rlab_out/p11g_hard_probe.jsonl
+    # 题集由 `passrate --dump_qk_set hard:<path>` 导出；探完用 `passrate --merge_probe`
+    # 并回主表副本 → 出现 ≥1 次正确的题下一轮自然升进 boundary（**探索轨迹不上传**）
+
     bash rlab/run_gsm8k.sh retool_math /root/Qwen2.5-3B \
         --difficulty_path rlab_out/difficulty_probe.jsonl
 
@@ -52,6 +60,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 # 允许 `python rlab/probe_difficulty.py` 直接跑（sys.path[0] 会变成 rlab/ 目录）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 【p11g 阶段2】题面指纹只此一处实现：rollout/eval/passrate 已各自有一份同算法，
+# 探索通道的"导出题集 → 只探这些题"两侧必须逐位一致，故直接复用 passrate 的 qk_of
+# （stdlib-only，不触 vllm/torch，可放在模块级）。
+from rlab.passrate import qk_of   # noqa: E402
 
 
 def aggregate_rows(rows: list, probe_meta: dict = None) -> list:
@@ -115,6 +128,65 @@ def shard_items(items: list, index: int, count: int) -> list:
     if not (0 <= index < count):
         raise ValueError(f"shard_index 必须落在 [0,{count})，收到 {index}")
     return list(items)[index::count]
+
+
+def load_qk_set(path: str) -> set:
+    """读 qk 题集文件（一行一个 12 hex 指纹，`passrate --dump_qk_set` 的产物）。
+
+    校验格式并**报出坏行数**：坏行静默丢弃会让"只探这些题"悄悄缩水，而缩水后的表
+    仍然看起来正常——这正是"过滤器存在但数据流没生效"的经典形态。空文件/全坏行
+    直接 raise（没有待探题却继续跑 = 白烧一轮算力）。"""
+    keys, bad = set(), 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if len(s) == 12 and all(c in "0123456789abcdef" for c in s.lower()):
+                keys.add(s.lower())
+            else:
+                bad += 1
+    if not keys:
+        raise ValueError(f"[probe] --only_qk_file 里没有有效的 qk（坏行 {bad}）: {path}")
+    if bad:
+        print(f"[probe] ⚠ --only_qk_file 有 {bad} 行不是合法 qk，已丢弃（"
+              f"有效 {len(keys)} 个）", flush=True)
+    return keys
+
+
+def restrict_by_qk(QAs: list, qk_set: set):
+    """纯函数（CPU 可测）：把候选池收窄到给定 qk 集合 → `(kept, stats)`。
+
+    **必须在 probe_plan 之前**（打乱 → max_questions → 分片 → done 过滤的顺序铁律
+    不变）：收窄是"候选集"的事，不是"待探顺序"的事；放到后面会让 --max_questions
+    与分片作用在错误的集合上。返回的 stats 让"请求了 N 题 / 命中 M 题"可对账——
+    文件里的题不在池子里（换了池/换了数据源）是**必须看见**的静默错误。"""
+    qk_set = {str(k).lower() for k in qk_set}
+    kept, hit = [], set()
+    for q in QAs:
+        key = qk_of(str(q["Q"]))
+        if key in qk_set:
+            kept.append(q)
+            hit.add(key)
+    stats = {"requested": len(qk_set), "matched": len(hit),
+             "pool": len(QAs), "kept": len(kept),
+             "not_in_pool": sorted(qk_set - hit)}
+    return kept, stats
+
+
+def require_all_in_pool(stats: dict) -> dict:
+    """纯函数：题集里存在不在候选池里的题 → raise（fail-fast，原样返回 stats）。
+
+    为什么是 raise 而不是告警：题集与池不同源（换了 --pool、换了数据源、dump 的是
+    另一张表）时，探针会**只探命中的那部分**、产出一张悄悄缩水的表，而训练端看不
+    出任何异常——本项目把这类"过滤器存在但数据流没生效"列为最贵的一类。"""
+    miss = list(stats.get("not_in_pool") or [])
+    if miss:
+        raise ValueError(
+            f"[probe] 题集里有 {len(miss)} 个 qk 不在候选池里（例：{miss[:3]}）"
+            f"——题集与池/数据源不同源，或 band/池换过了。继续跑只会产出一张悄悄"
+            f"缩水的表；先核对 --pool 与 --dump_qk_set 用的是同一张表。")
+    return stats
 
 
 def probe_plan(QAs: list, done: dict, *, seed: int = 42, max_questions: int = 0,
@@ -226,6 +298,11 @@ def main():
                     help="候选池：train_dev=训练池+dev 联探（历史行为，供 eval 过滤用表）；"
                          "train=只探去重后的训练池（doc15 阶段C 课程表契约——dev 不进"
                          "候选，训练集候选数以打印为准）")
+    ap.add_argument("--only_qk_file", default=None,
+                    help="【p11g 阶段2 hard 桶探索】只探该 qk 题集里的题（一行一个 12hex "
+                         "指纹，`passrate --dump_qk_set hard:<path>` 的产物）。作用在"
+                         "候选池上（打乱/max_questions/分片之前），命中数会打印并与"
+                         "文件里的题数对账——请求了 N 题只命中 M 题是必须看见的静默错误")
     ap.add_argument("--chat_template_kwargs", default=None,
                     help='JSON dict 透传 apply_chat_template；Qwen3.5 系必传 '
                          '\'{"enable_thinking": false}\'（不关 thinking 会烧穿单轮预算）')
@@ -454,6 +531,19 @@ def main():
         QAs = QAs + _dev_new
         print(f"[probe] 训练池 {len(QAs) - len(_dev_new)} 题 + dev {len(_dev_new)} 题"
               f" = {len(QAs)} 题联合探针")
+    # 【p11g 阶段2 hard 桶探索】候选池收窄必须发生在 probe_plan **之前**：收窄是
+    # "候选集"的事，而 probe_plan 的（打乱 → max_questions → 分片 → done）顺序铁律
+    # 管的是"待探顺序"。放到后面会让 --max_questions/分片作用在错的集合上。
+    if args.only_qk_file:
+        _qk_set = load_qk_set(args.only_qk_file)
+        QAs, _rst = restrict_by_qk(QAs, _qk_set)
+        print(f"[probe] --only_qk_file: 题集 {_rst['requested']} 题 → 池内命中 "
+              f"{_rst['matched']} 题，候选池 {_rst['pool']} → {_rst['kept']} 题",
+              flush=True)
+        try:
+            require_all_in_pool(_rst)
+        except ValueError as _e:
+            raise SystemExit(str(_e))
     # 断点续跑：已探过的题跳过（表逐题追加写，崩溃/中断不丢进度）。
     # 【2026-09-17】分片 × 续跑的顺序交给 probe_plan 纯函数（切片与 done 无关），
     # 否则续跑时切片错位 → 两片互相探对方的题（重叠浪费 + 不变量失效）。

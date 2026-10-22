@@ -416,6 +416,20 @@ def _strip_dapo_template(q: str) -> str:
 # 探针用 k 条短样本把 p≈0 / p≈1 的题在训练开始前一次性出清。两级过滤互补：
 # 静态过滤出清"base 从未做对过的题"，在线调度出清"当前学不动的题"。
 
+# 难度表的**协议指纹键**（单一出处：训练端 strict 校验与 passrate 的
+# `--merge_probe` 一致性校验都读它）。刻意不含 `k`（探针 "每题探几条" 与训练
+# "每题采几条" 语义不同，见 load_difficulty_table docstring）、也不含 `pool`/`seed`
+# （探索通道**必须**能换 seed 重探；把 seed 当指纹会把合法的"新 seed 探索"判成混表）。
+PROBE_META_FINGERPRINT_KEYS = (
+    "model", "rounds", "round_tokens", "ctx", "temp", "sp",
+    "tool_protocol", "max_traj_tokens", "answer_reserve",
+    "tool_execution_budget", "max_prompt_length", "nsc", "model_path",
+    "native_tool_name", "data_task",
+    # 【docs/17】swe_l0 的表同样是"模型×提示×预算×判分口径"的联合产物：
+    # 测试超时/内存上限变了，"超时算失败"的边界就变了 → 通过率是另一个分布。
+    "swe_test_timeout",
+)
+
 
 def load_difficulty_table(path: str, expected_meta: dict = None,
                           strict: bool = False) -> dict:
@@ -475,16 +489,7 @@ def load_difficulty_table(path: str, expected_meta: dict = None,
                     # 【docs/16 Search-GRPO】新增 native_tool_name/data_task：换工具
                     # （code→search）就是换任务，同模型同提示下通过率是两个分布；
                     # 旧表无这两个键 → None → 跳过（旧表兼容）。
-                    for _fk in ("model", "rounds", "round_tokens", "ctx", "temp", "sp",
-                                "tool_protocol", "max_traj_tokens", "answer_reserve",
-                                # 有效执行预算改变调用截止线；旧表无键仍兼容跳过。
-                                "tool_execution_budget",
-                                "max_prompt_length", "nsc", "model_path",
-                                "native_tool_name", "data_task",
-                                # 【docs/17】swe_l0 的表同样是"模型×提示×预算×
-                                # 判分口径"的联合产物：测试超时/内存上限变了，
-                                # "超时算失败"的边界就变了 → 通过率是另一个分布。
-                                "swe_test_timeout"):
+                    for _fk in PROBE_META_FINGERPRINT_KEYS:
                         _rv = r["probe_meta"].get(_fk)
                         _ev = expected_meta.get(_fk)
                         if _rv is not None and _rv != _ev and _fk not in warned:

@@ -1,7 +1,6 @@
 # p11g 方案：按在线通过率重建训练池（下一步最优方案）
 
-**日期**：2026-10-22　**状态**：方案定版；**阶段 1 的判读工具已落地（本地验证通过），训练未上机**；
-阶段 2（hard 桶探索通道）按 §3.3 门控未写
+**日期**：2026-10-22　**状态**：方案定版；**阶段 1 判读工具与阶段 2 hard 桶探索通道均已落地（本地 CPU 测试通过），两者都未上机**（阶段 2 运行手册见 §9）
 **上游**：[p11f 训练诊断](p11f-diagnosis.md)（§9 采样档检出 / §9.5 错答直方图）、
 [p11f 启动配置](p11d-run-config.md)、[纯 RL 解题能力路线](15-pure-rl-reasoning-plan.md)
 **一句话**：把训练池从"宽 band `0.0 1.0` + 半陈旧的探针刻度"改成**按当前策略在线通过率
@@ -106,8 +105,9 @@ doc15 阶段 D 的最小版：对 hard 桶用 **固定 16 次新 seed** 采样
 - 仍全错 → 保留在 hard，下次探索再试（**不永久判死**）；
 - 预算上限：探索开销计入总生成 token，控制在 **~10%** 以内（doc15 §阶段C 的要求）。
 
-**为什么放到阶段 2**：它需要两处**新增代码**（§7），而阶段 1 的价值（惰性组 64%→~9%）
-不需要任何新代码。先拿到阶段 1 的读数，再决定要不要为 27.5% 的错答质量付这笔工程费。
+**落地状态（2026-10-22）**：三段工具**已实现并在本地 CPU 通过**（`passrate --dump_qk_set`
+/ `probe_difficulty --only_qk_file` / `passrate --merge_probe`，§7），**未上机**；
+运行手册见 §9。它仍受"先拿阶段 1 读数"的门控，但不再是代码缺口。
 
 ---
 
@@ -261,7 +261,7 @@ python -m rlab.analysis \
 
 ---
 
-## 7. 代码缺口（2026-10-22 更新：阶段 1 的判读工具已落地）
+## 7. 代码缺口（2026-10-22 更新：阶段 1 判读工具 + 阶段 2 探索通道均已落地）
 
 | 阶段 | 缺口 | 位置 | 规模 | 状态 |
 |---|---|---|---|---|
@@ -270,29 +270,105 @@ python -m rlab.analysis \
 | **1** | band 预演＝训练端同一函数（启动前对账 `N -> K`） | `rlab/passrate.py`：`band_preview`（调用 `data.filter_qas_by_difficulty`） | ~15 行 | **已实现** |
 | **1** | per-item p̂ 直方图（§4.3，p11f §9.5 那张表此前无命令） | `rlab/analysis.py`：`item_pass_hist` + `--item-hist` | ~55 行 | **已实现** |
 | **1** | 接缝测试：`merge_out` 真输出 → strict 加载 → band 过滤 | `rlab/tests/test_retool_cpu.py`（⑤-6 段） | 5 条断言 | **已实现，本地通过** |
-| 2 | hard 集导出 | `rlab/passrate.py`：新增 `--dump_qk_set hard:<path>`（一行一个 `qk`） | ~15 行 | 未做（§3.3 门控） |
-| 2 | probe 只探给定题集 | `rlab/probe_difficulty.py`：新增 `--only_qk_file`（`--pool train` 的进一步收窄） | ~20 行 + 测试 | 未做（§3.3 门控） |
-| 2 | 探针结果并回主表 | 新增 `passrate --merge_probe <probe_table>`（按 Q 合并、绝不动原表） | ~20 行 + 测试 | 未做（§3.3 门控） |
+| **2** | hard 集导出 | `rlab/passrate.py`：`--dump_qk_set BUCKET:PATH`（`bucket_rows` 纯函数，判据与训练端同分支） | ~35 行 | **已实现** |
+| **2** | probe 只探给定题集 | `rlab/probe_difficulty.py`：`--only_qk_file`（`load_qk_set` + `restrict_by_qk` + `require_all_in_pool`；作用在 probe_plan **之前**） | ~45 行 | **已实现** |
+| **2** | 探针结果并回主表 | `rlab/passrate.py`：`--merge_probe`（`apply_probe_merge` 纯函数，按 Q 合并、指纹校验、出处自证） | ~45 行 | **已实现** |
+| **2** | 指纹键单一出处（训练端 strict 校验与并表校验不得各写一份） | `rlab/data.py`：`PROBE_META_FINGERPRINT_KEYS` | 重构 | **已实现** |
+| **2** | 验收测试：「给出题集 → 只探这些题」断言锁死 | `rlab/tests/test_retool_cpu.py::test_p11g_hard_exploration` | 16 条断言 | **已实现，本地通过** |
 
 **为什么阶段 1 还要加这三处只读工具**：§4.1/§4.2/§4.3 的判读要求的三张读数
 （两表刻度直方图、`N -> K` 预演、per-item p̂ 直方图）在 2026-10-22 前**没有命令能产**，
 只能临场手写——而"临场手写"正是 p11c 把两个恒 0 象限读成证据的成因。它们全是
-**纯函数 + 只读**，不进训练路径，因此不构成第二个变量。
+**纯函数 + 只读**，不进训练路径。
 
-**阶段 2 的验收**：三项都必须是**纯函数 + CPU 可测**（与 `filter_qas_by_difficulty`
-同一形态），且"给出题集 → 只探这些题"要有断言锁死（否则又是"过滤器存在但数据流没生效"）。
+**阶段 2 的验收（已满足）**：三项都是**纯函数 + CPU 可测**（`bucket_rows` /
+`restrict_by_qk` / `apply_probe_merge`，与 `filter_qas_by_difficulty` 同一形态），
+且"给出题集 → 只探这些题"由断言锁死（`test_p11g_hard_exploration` ②：收窄后
+`probe_plan` 的待探集合 == 题集，不多不少）。
 
 ---
 
 ## 8. 未做清单（如实声明）
 
-- **阶段 1 的判读工具已落地并在本地通过定向验证与 CPU 接缝测试；训练本身未上机**，
-  上面所有 p11g 数字（含 `kept≈500`）都是**预期**，不是读数。
+- **阶段 1 判读工具与阶段 2 探索通道都已落地并在本地通过 CPU 测试；两者都未上机**，
+  所有 p11g 数字（含 `kept≈500`、`hard≈157`）里的前者已由 §4.1 实测替换，后者仍是**预期**。
 - §1 的"36% → 92%"用的是 **2026-10 的 `k=8` 探针直方图**做量级估算；
-  真实值要等 §4.1 用**在线率**重算（两张表直方图对照）。
-- **阶段 2（hard 桶的探索通道）一行未写**：按 §3.3 的门控，先拿阶段 1 的读数。
+  §4.1 已用**在线率**重算（两张表直方图已落盘）。
+- **阶段 2 只探 hard 桶、只影响"下一轮"的池子**：本轮训练启动时池子已冻结；仍全错的题
+  不会被永久判死，但**没有自动排期**——每轮探索要人工发起（§9 的四步）。
 - `passrate` 是**跨权重版本的生命周期平均**，即使取最近窗口，也仍是"过去 N 个 attempt
   的平均策略"下测的，不等于启动时刻的当前策略——这是本方案最大的残留测量误差。
-- hard 桶的 27.5% 错答质量在阶段 1 **仍然零梯度**（只是不再占主池算力）。
+- hard 桶的 27.5% 错答质量在阶段 1 **仍然零梯度**（只是不再占主池算力）；阶段 2 落地后
+  它有了入口，但**收益尚未实测**。
 - 修复 `e166120` 的效果**尚未在真机验证**（需要重训后的 ckpt）。
 - 训练 seed 只跑 42；要把它升格为"配方级结论"，需要第二个训练 seed（doc15 §6 建议 42/43）。
+
+---
+
+## 9. 阶段 2 运行手册：hard 桶探索（代码已落地，待真机）
+
+### 9.1 四步闭环
+
+```bash
+# ① 导出 hard 桶题集（band 与训练同值；不需要 --record）
+python -m rlab.passrate \
+  --difficulty_path rlab_out/<本轮用的增强表>.jsonl --difficulty_band 0.1 0.8 \
+  --dump_qk_set hard:rlab_out/p11g_hard_qk.txt
+
+# ② 只探这些题；固定 16 个**新 seed**；协议/预算与训练同源（否则 ③ 会拒绝并表）
+CUDA_VISIBLE_DEVICES=1 python -m rlab.probe_difficulty --pool train \
+  --only_qk_file rlab_out/p11g_hard_qk.txt --k 16 --seed 4242 \
+  --max_questions <按 9.2 算出的上限> \
+  --from_run_info rlab_new/native_p11g_poolmath/run_info.json \
+  --out rlab_out/p11g_hard_probe_s4242.jsonl
+
+# ③ 并回主表副本（绝不动原表）→ 得到下一轮的 --difficulty_path
+python -m rlab.passrate \
+  --difficulty_path rlab_out/<本轮用的增强表>.jsonl --difficulty_band 0.1 0.8 \
+  --merge_probe rlab_out/p11g_hard_probe_s4242.jsonl \
+  --merge_out rlab_out/<下一轮增强表>.jsonl
+
+# ④ 下一轮训练把 --difficulty_path 指向 ③ 的产物（band 仍是 0.1 0.8）
+```
+
+**为什么这样就不可能污染 on-policy 上传**：① 导出的是**指纹**、② 探针只写**难度表**、
+③ 并的是**刻度**——全程没有一条探索轨迹进入 `record.jsonl`／训练组。回流的是
+"这题现在可学了"这个判断，下一轮**用当前策略重新生成常规组**
+（测试 ④ 锁了"并表产物仍是纯难度表、无 acc/轨迹列"）。
+
+### 9.2 预算上限（计划 §3.3 的 ~10% 必须落成数字）
+
+按 §4.1 实测，hard 桶（rate ≤ 0.1）在 454 题的池外共 **157 题**（148 全错 + 8×(1/16)
++ 1×0.094）。**一次全探 = 157×16 = 2512 条轨迹，而一轮训练只有 400×8 = 3200 条
+——那是 78%，不是 10%。** 所以必须用 `--max_questions` 截断：
+
+```
+--max_questions ≈ 10% × (steps × num_pre_Q) × mean_clen(池) / (k × mean_clen(hard))
+```
+
+`mean_clen` 两边都能从**表自己的 `avg_clen` 列**现算（探针逐题落了它），不用估：
+池均值用 band 内行、hard 均值用 hard 行。**代数量级**：k=16、硬题轨迹按 1.3× 池均值
+折算时 ≈ **15 题/轮** ⇒ 157 题要 ~10 轮才轮完一遍，每轮一个新 seed。
+
+### 9.3 每轮判读
+
+| 读数 | 期望 | 去向 |
+|---|---|---|
+| ② 的 `题集 N 题 → 池内命中 M 题` | M == N（不等就 fail-fast） | 不同源 ⇒ 查 `--pool` |
+| ② 的探针表 `n_correct > 0` 的题数 | ≥1 才好；全 0 也是**合法结果** | 全 0 ⇒ 留在 hard，下轮换 seed 再试（不永久判死） |
+| ③ 的 `hard 桶 X → Y 题` | Y < X，差额 = 本轮回流收益 | 直接进下一轮的 boundary |
+| ③ 的 `skipped_low_k` / `probe_only` / `probe_no_meta` | 都应为 0；非 0 要看是哪一类 | `probe_only>0` ⇒ 题集与主表不同源 |
+| ④ 下一轮启动日志 `难度过滤` | 与 ③ 的 band 预演逐位相同 | 同一函数，不一致即接线问题 |
+
+### 9.4 易踩五件事
+
+1. **探针必须 `--from_run_info <本 run 的 run_info.json>`**：协议/预算不同档时 ③ 会
+   **拒绝并表**（设计如此）——这是静态混表的拦网，不要去改它。
+2. **`--seed` 每轮换新值，且 `--out` 用新文件**：`--out` 里已有的题会被续跑逻辑跳过，
+   复用旧 `--out` 会变成"探 0 题"的空转。
+3. **`--only_qk_file` 的题必须在 `--pool train` 候选里**：否则 fail-fast；
+   别用 `--pool train_dev`（会混进 held-out）。
+4. **`--max_questions` 作用在收窄后的集合上**（先按题集收窄 → 再打乱截断 → 再分片），
+   与 `probe_difficulty` 原有的打乱铁律不冲突。
+5. **探索要 GPU**：它和训练抢卡，错峰跑（或 `CUDA_VISIBLE_DEVICES` 指定空闲卡；
+   探针本身是 vLLM 单进程）。

@@ -5031,6 +5031,137 @@ def test_attempt_shaping_and_err_tier():
           "EOS" in _ro and "vllm_token_ids_keep_eos" in _ro)
 
 
+def test_p11g_hard_exploration():
+    """【2026-10-22 p11g 阶段2】hard 桶探索通道：导出题集 → 只探这些题 → 并回主表。
+
+    四段各自都能静默失败，故各锁一条：
+      ① 分桶口径（hard 含 `0<rate<=lo` 的"罕见可解"，不只是 rate==0）与训练端
+         `filter_qas_by_difficulty` 的 boundary 计数必须逐位对上；
+      ② "给出题集 → 只探这些题"（断言锁死：todo 的 qk 集合 == 题集，不多不少）；
+         题集里有池外题 → fail-fast（否则产出一张悄悄缩水的表）；
+      ③ 并表按 Q 匹配、只覆盖测量字段、原 probe_meta 与 A 不动、出处写进
+         probe_merge_meta；协议指纹不符 → 拒绝（静默混表比没有课程更糟）；
+      ④ 回流的语义：新刻度把题**抬出 hard**，下一轮以当前策略重新生成常规组
+         ——探索轨迹本身绝不进 on-policy 上传。
+    """
+    print("[N4] p11g 阶段2：hard 桶探索通道（导出/只探这些题/并回）")
+    from rlab.passrate import (apply_probe_merge, bucket_rows, dump_qk_set,
+                               parse_qk_set_spec, qk_of, read_table_rows)
+    from rlab.data import filter_qas_by_difficulty
+    from rlab.probe_difficulty import (load_qk_set, probe_plan, require_all_in_pool,
+                                       restrict_by_qk)
+    _LO, _HI = 0.1, 0.8
+    # 表：硬题两种形态（全错 / 罕见可解 1/16）、boundary、near-mastered、全对
+    _spec = [("硬甲", "1", 8, 0), ("硬乙", "2", 16, 1), ("边界丙", "3", 8, 1),
+             ("近熟丁", "4", 8, 7), ("全对戊", "5", 8, 8), ("硬己", "6", 16, 0)]
+    _meta = {"model_path": "/root/m", "round_tokens": 2048, "seed": 42}
+    _tbody = [{"Q": q, "A": a, "k": k, "n_correct": nc, "pass_rate": nc / k,
+               "probe_meta": dict(_meta)} for q, a, k, nc in _spec]
+    _tmp = tempfile.mkdtemp(prefix="p11g_n4_")
+    _main = os.path.join(_tmp, "main.jsonl")
+    with open(_main, "w", encoding="utf-8") as f:
+        for r in _tbody:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    _rows = read_table_rows(_main)
+    # ① 分桶口径 + 与训练端 filter 对账
+    _hard = bucket_rows(_rows, _LO, _HI, "hard")
+    _bnd = bucket_rows(_rows, _LO, _HI, "boundary")
+    _easy = bucket_rows(_rows, _LO, _HI, "easy")
+    _tbl_d = {r["Q"]: r for r in _rows}
+    _kept_f, _st_f = filter_qas_by_difficulty(
+        [{"Q": q} for q in _tbl_d], _tbl_d, lo=_LO, hi=_HI)
+    check("p11g阶段2 ①: 三桶互斥且并集 = 全表（hard 含 1/16 罕见可解，不只是 rate==0）",
+          len(_hard) == 3 and len(_bnd) == 1 and len(_easy) == 2
+          and [r["Q"] for r in _hard] == ["硬甲", "硬乙", "硬己"])
+    check("p11g阶段2 ①: boundary 桶 == 训练端 filter_qas_by_difficulty 的 kept",
+          len(_bnd) == len(_kept_f) == 1 and _bnd[0]["Q"] == _kept_f[0]["Q"])
+    # ② 导出题集 + 只探这些题（数据流锁）
+    _qkf = os.path.join(_tmp, "hard_qk.txt")
+    _d = dump_qk_set(_rows, _LO, _HI, f"hard:{_qkf}")
+    check("p11g阶段2 ②: --dump_qk_set 一行一个 qk，题数与 hard 桶一致",
+          _d["n"] == 3
+          and set(open(_qkf, encoding="utf-8").read().split())
+          == {qk_of(r["Q"]) for r in _hard})
+    check("p11g阶段2 ②: BUCKET:PATH 解析（按第一个冒号切，盘符不受影响）",
+          parse_qk_set_spec("hard:C:\\x\\y.txt") == ("hard", "C:\\x\\y.txt"))
+    _keys = load_qk_set(_qkf)
+    # 坏行只报警不静默缩水；空文件必须 raise
+    _bq = os.path.join(_tmp, "bad_qk.txt")
+    open(_bq, "w", encoding="utf-8").write("zzzz\n" + "\n".join(sorted(_keys)) + "\n")
+    check("p11g阶段2 ②: 题集坏行被丢弃但有效 qk 保留", load_qk_set(_bq) == _keys)
+    _eq = os.path.join(_tmp, "empty_qk.txt")
+    open(_eq, "w", encoding="utf-8").close()
+    try:
+        load_qk_set(_eq)
+        _empty_ok = False
+    except ValueError:
+        _empty_ok = True
+    check("p11g阶段2 ②: 空题集 → raise（没有待探题却继续跑 = 白烧一轮算力）", _empty_ok)
+    _pool = [{"Q": r["Q"], "A": r["A"]} for r in _rows] + [{"Q": "池外题", "A": "9"}]
+    _sel, _rst = restrict_by_qk(_pool, _keys)
+    _order, _todo = probe_plan(_sel, {}, seed=42, max_questions=0)
+    check("p11g阶段2 ②: ★数据流锁——给出题集后，待探集合 == 题集（不多不少）",
+          {qk_of(q["Q"]) for q in _todo} == _keys and len(_todo) == 3
+          and _rst["matched"] == 3 and not _rst["not_in_pool"])
+    _order2, _todo2 = probe_plan(_sel, {}, seed=42, max_questions=2)
+    check("p11g阶段2 ②: --max_questions 作用在收窄后的集合上（≤ 题集，不改集合身份）",
+          len(_todo2) == 2 and {qk_of(q["Q"]) for q in _todo2} <= _keys)
+    _, _rst_miss = restrict_by_qk(_pool, _keys | {"0" * 12})
+    try:
+        require_all_in_pool(_rst_miss)
+        _miss_ok = False
+    except ValueError as _e:
+        _miss_ok = "不在候选池" in str(_e)
+    check("p11g阶段2 ②: 题集含池外题 → fail-fast（否则产出悄悄缩水的表）", _miss_ok)
+    # ③ 并表：只覆盖测量字段、原指纹与 A 不动、出处可自证
+    _probe = [{"Q": "硬乙", "A": "2", "k": 16, "n_correct": 2, "pass_rate": 0.125,
+               "fmt_rate": 0.9, "trunc_rate": 0.1, "avg_clen": 5000.0,
+               "avg_code_ok": 1.0, "probe_meta": {**_meta, "seed": 4242}},
+              {"Q": "硬甲", "A": "1", "k": 4, "n_correct": 0, "pass_rate": 0.0,
+               "probe_meta": {**_meta, "seed": 4242}},      # k<min_k → 不覆盖
+              {"Q": "表外题", "A": "0", "k": 16, "n_correct": 8, "pass_rate": 0.5,
+               "probe_meta": {**_meta, "seed": 4242}}]      # 主表没有 → 丢弃
+    _merged, _st = apply_probe_merge(_rows, _probe, min_k=16)
+    _mb = {r["Q"]: r for r in _merged}
+    check("p11g阶段2 ③: 并表只覆盖测量字段（k/n_correct/质量列），A 与原指纹不动",
+          _mb["硬乙"]["k"] == 16 and _mb["硬乙"]["n_correct"] == 2
+          and abs(_mb["硬乙"]["fmt_rate"] - 0.9) < 1e-9
+          and _mb["硬乙"]["A"] == "2"
+          and _mb["硬乙"]["probe_meta"] == _meta
+          and _mb["硬乙"]["probe_merge_meta"]["seed"] == 4242)
+    check("p11g阶段2 ③: k<min_k 不覆盖 / 表外题丢弃 / 主表行数不变",
+          _mb["硬甲"]["n_correct"] == 0 and _st["skipped_low_k"] == 1
+          and _st["probe_only"] == 1 and _st["table_rows"] == len(_rows)
+          and "表外题" not in _mb)
+    check("p11g阶段2 ③: 原表未动（入参行与磁盘都不变）",
+          [r["n_correct"] for r in _rows] == [0, 1, 1, 7, 8, 0]
+          and [r["n_correct"] for r in read_table_rows(_main)] == [0, 1, 1, 7, 8, 0])
+    try:
+        apply_probe_merge(_rows, [{"Q": "硬乙", "A": "2", "k": 16, "n_correct": 2,
+                                   "pass_rate": 0.125,
+                                   "probe_meta": {**_meta, "round_tokens": 9999}}],
+                          min_k=16)
+        _mm_ok = False
+    except ValueError as _e:
+        _mm_ok = "round_tokens" in str(_e)
+    check("p11g阶段2 ③: 探针与主表协议指纹不符 → 拒绝并表（点明哪个键）", _mm_ok)
+    _nm = apply_probe_merge(_rows, [{"Q": "硬乙", "k": 16, "n_correct": 2,
+                                     "pass_rate": 0.125}], min_k=16)[1]
+    check("p11g阶段2 ③: 探针行不能自证出处（无 probe_meta）→ 计数并跳过",
+          _nm["probe_no_meta"] == 1 and _nm["matched"] == 0)
+    # ④ 回流语义：硬乙 2/16=0.125 进 boundary（被抬出 hard），不是"上传探索轨迹"
+    check("p11g阶段2 ④: 新刻度把硬乙抬出 hard（hard 3 → 2），下一轮重生成常规组",
+          len(bucket_rows(_merged, _LO, _HI, "hard")) == 2
+          and [r["Q"] for r in bucket_rows(_merged, _LO, _HI, "hard")]
+          == ["硬甲", "硬己"]
+          and [r["Q"] for r in bucket_rows(_merged, _LO, _HI, "boundary")]
+          == ["硬乙", "边界丙"])
+    check("p11g阶段2 ④: 并表产物仍是纯难度表（无轨迹/无 acc 列 → 结构上不可能"
+          "污染 on-policy 上传）",
+          all("acc" not in r and "traj" not in json.dumps(r) for r in _merged))
+    print()
+
+
 def test_health_code_collapse():
     """【2026-09-21 签名⑦ code_collapse】点火后 code% 掉 15pp 的压灭签名。
 
@@ -6746,6 +6877,7 @@ if __name__ == "__main__":
     test_preflight_audit_fixes()
     test_overlong_filter()
     test_attempt_shaping_and_err_tier()
+    test_p11g_hard_exploration()
     test_health_code_collapse()
     test_token_budget_mode()
     test_max_prompt_length_cli()
